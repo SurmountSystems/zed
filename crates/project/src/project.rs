@@ -758,7 +758,7 @@ impl LspAction {
         }
     }
 
-    fn edit(&self) -> Option<&lsp::WorkspaceEdit> {
+    pub fn edit(&self) -> Option<&lsp::WorkspaceEdit> {
         match self {
             Self::Action(action) => action.edit.as_ref(),
             Self::Command(_) => None,
@@ -766,7 +766,7 @@ impl LspAction {
         }
     }
 
-    fn command(&self) -> Option<&lsp::Command> {
+    pub fn command(&self) -> Option<&lsp::Command> {
         match self {
             Self::Action(action) => action.command.as_ref(),
             Self::Command(command) => Some(command),
@@ -4382,11 +4382,19 @@ impl Project {
         let code_lens_actions = self
             .lsp_store
             .update(cx, |lsp_store, cx| lsp_store.code_lens_actions(buffer, cx));
+        let lsp_store = self.lsp_store.clone();
+        let buffer = buffer.clone();
 
-        cx.background_spawn(async move {
+        cx.spawn(async move |_, cx| {
             let mut code_lens_actions = code_lens_actions
                 .await
                 .map_err(|e| anyhow!("code lens fetch failed: {e:#}"))?;
+            let resolved = lsp_store
+                .update(cx, |lsp_store, cx| {
+                    lsp_store.resolve_visible_code_lenses(&buffer, range.clone(), cx)
+                })
+                .await;
+
             if let Some(code_lens_actions) = &mut code_lens_actions {
                 code_lens_actions.retain(|code_lens_action| {
                     range
@@ -4398,6 +4406,14 @@ impl Project {
                             .cmp(&code_lens_action.range.end, &snapshot)
                             .is_le()
                 });
+                for resolved_action in resolved {
+                    if let Some(existing) = code_lens_actions.iter_mut().find(|existing_action| {
+                        existing_action.server_id == resolved_action.server_id
+                            && existing_action.range == resolved_action.range
+                    }) {
+                        *existing = resolved_action;
+                    }
+                }
             }
             Ok(code_lens_actions)
         })

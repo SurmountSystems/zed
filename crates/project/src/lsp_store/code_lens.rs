@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -8,14 +9,14 @@ use futures::{
     future::{Shared, join_all},
 };
 use gpui::{AppContext as _, AsyncApp, Context, Entity, Task};
-use language::Buffer;
+use language::{Anchor, Buffer, ToOffset as _};
 use lsp::LanguageServerId;
 use rpc::{TypedEnvelope, proto};
 use settings::Settings as _;
 use std::time::Duration;
 
 use crate::{
-    CodeAction, LspStore, LspStoreEvent,
+    CodeAction, LspAction, LspStore, LspStoreEvent,
     lsp_command::{GetCodeLens, LspCommand as _},
     project_settings::ProjectSettings,
 };
@@ -36,6 +37,12 @@ impl CodeLensData {
 }
 
 impl LspStore {
+    pub(super) fn invalidate_code_lens(&mut self) {
+        for lsp_data in self.lsp_data.values_mut() {
+            lsp_data.code_lens = None;
+        }
+    }
+
     pub fn code_lens_actions(
         &mut self,
         buffer: &Entity<Buffer>,
@@ -107,7 +114,7 @@ impl LspStore {
                 };
 
                 lsp_store
-                    .update(cx, |lsp_store, _| {
+                    .update(cx, |lsp_store, cx| {
                         let lsp_data = lsp_store.current_lsp_data(buffer_id)?;
                         let code_lens = lsp_data.code_lens.as_mut()?;
                         if let Some(fetched_lens) = fetched_lens {
@@ -119,6 +126,11 @@ impl LspStore {
                             {
                                 lsp_data.buffer_version = query_version_queried_for;
                                 code_lens.lens = fetched_lens;
+                            }
+                            let snapshot = buffer.read(cx).snapshot();
+                            for actions in code_lens.lens.values_mut() {
+                                actions
+                                    .sort_by(|a, b| a.range.start.cmp(&b.range.start, &snapshot));
                             }
                         }
                         code_lens.update = None;
@@ -202,6 +214,112 @@ impl LspStore {
         }
     }
 
+    pub fn resolve_visible_code_lenses(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        visible_range: Range<Anchor>,
+        cx: &mut Context<Self>,
+    ) -> Task<Vec<CodeAction>> {
+        let buffer_id = buffer.read(cx).remote_id();
+        let snapshot = buffer.read(cx).snapshot();
+        let visible_start = visible_range.start.to_offset(&snapshot);
+        let visible_end = visible_range.end.to_offset(&snapshot);
+
+        let Some(code_lens) = self
+            .lsp_data
+            .get(&buffer_id)
+            .and_then(|data| data.code_lens.as_ref())
+        else {
+            return Task::ready(Vec::new());
+        };
+
+        let capable_servers = code_lens
+            .lens
+            .keys()
+            .filter_map(|server_id| {
+                let server = self.language_server_for_id(*server_id)?;
+                GetCodeLens::can_resolve_lens(&server.capabilities())
+                    .then_some((*server_id, server))
+            })
+            .collect::<HashMap<_, _>>();
+        if capable_servers.is_empty() {
+            return Task::ready(Vec::new());
+        }
+
+        let to_resolve = code_lens
+            .lens
+            .iter()
+            .flat_map(|(server_id, actions)| {
+                let start_idx =
+                    actions.partition_point(|a| a.range.start.to_offset(&snapshot) < visible_start);
+                let end_idx = start_idx
+                    + actions[start_idx..]
+                        .partition_point(|a| a.range.start.to_offset(&snapshot) <= visible_end);
+                actions[start_idx..end_idx].iter().enumerate().filter_map(
+                    move |(local_idx, action)| {
+                        let LspAction::CodeLens(lens) = &action.lsp_action else {
+                            return None;
+                        };
+                        if lens.command.is_some() {
+                            return None;
+                        }
+                        Some((*server_id, start_idx + local_idx, lens.clone()))
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        if to_resolve.is_empty() {
+            return Task::ready(Vec::new());
+        }
+
+        let request_timeout = ProjectSettings::get_global(cx)
+            .global_lsp_settings
+            .get_request_timeout();
+
+        cx.spawn(async move |lsp_store, cx| {
+            let mut resolved = Vec::new();
+            for (server_id, index, lens) in to_resolve {
+                let Some(server) = capable_servers.get(&server_id) else {
+                    continue;
+                };
+                match server
+                    .request::<lsp::request::CodeLensResolve>(lens, request_timeout)
+                    .await
+                    .into_response()
+                {
+                    Ok(resolved_lens) => resolved.push((server_id, index, resolved_lens)),
+                    Err(e) => log::warn!("Failed to resolve code lens: {e:#}"),
+                }
+            }
+            if resolved.is_empty() {
+                return Vec::new();
+            }
+
+            lsp_store
+                .update(cx, |lsp_store, _| {
+                    let Some(code_lens) = lsp_store
+                        .lsp_data
+                        .get_mut(&buffer_id)
+                        .and_then(|data| data.code_lens.as_mut())
+                    else {
+                        return Vec::new();
+                    };
+                    let mut newly_resolved = Vec::new();
+                    for (server_id, index, resolved_lens) in resolved {
+                        if let Some(actions) = code_lens.lens.get_mut(&server_id) {
+                            if let Some(action) = actions.get_mut(index) {
+                                action.resolved = true;
+                                action.lsp_action = LspAction::CodeLens(resolved_lens);
+                                newly_resolved.push(action.clone());
+                            }
+                        }
+                    }
+                    newly_resolved
+                })
+                .unwrap_or_default()
+        })
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn forget_code_lens_task(&mut self, buffer_id: text::BufferId) -> Option<CodeLensTask> {
         Some(
@@ -220,7 +338,8 @@ impl LspStore {
         _: TypedEnvelope<proto::RefreshCodeLens>,
         mut cx: AsyncApp,
     ) -> Result<proto::Ack> {
-        this.update(&mut cx, |_, cx| {
+        this.update(&mut cx, |this, cx| {
+            this.invalidate_code_lens();
             cx.emit(LspStoreEvent::RefreshCodeLens);
         });
         Ok(proto::Ack {})
