@@ -761,7 +761,7 @@ impl LspAction {
         }
     }
 
-    fn edit(&self) -> Option<&lsp::WorkspaceEdit> {
+    pub fn edit(&self) -> Option<&lsp::WorkspaceEdit> {
         match self {
             Self::Action(action) => action.edit.as_ref(),
             Self::Command(_) => None,
@@ -769,7 +769,7 @@ impl LspAction {
         }
     }
 
-    fn command(&self) -> Option<&lsp::Command> {
+    pub fn command(&self) -> Option<&lsp::Command> {
         match self {
             Self::Action(action) => action.command.as_ref(),
             Self::Command(command) => Some(command),
@@ -4400,27 +4400,20 @@ impl Project {
             snapshot.anchor_after(range.end)
         };
         let range = range_start..range_end;
-        let code_lens_actions = self
-            .lsp_store
-            .update(cx, |lsp_store, cx| lsp_store.code_lens_actions(buffer, cx));
-
-        cx.background_spawn(async move {
-            let mut code_lens_actions = code_lens_actions
-                .await
-                .map_err(|e| anyhow!("code lens fetch failed: {e:#}"))?;
-            if let Some(code_lens_actions) = &mut code_lens_actions {
-                code_lens_actions.retain(|code_lens_action| {
-                    range
-                        .start
-                        .cmp(&code_lens_action.range.start, &snapshot)
-                        .is_ge()
-                        && range
-                            .end
-                            .cmp(&code_lens_action.range.end, &snapshot)
-                            .is_le()
+        let task = self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.code_lens_actions(buffer, range.clone(), cx)
+        });
+        let buffer = buffer.clone();
+        cx.spawn(async move |_, cx| {
+            let mut actions = task.await?;
+            if let Some(actions) = &mut actions {
+                let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+                actions.retain(|action| {
+                    range.start.cmp(&action.range.start, &snapshot).is_ge()
+                        && range.end.cmp(&action.range.end, &snapshot).is_le()
                 });
             }
-            Ok(code_lens_actions)
+            Ok(actions)
         })
     }
 
