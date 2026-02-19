@@ -1762,7 +1762,7 @@ impl MultiBuffer {
     }
 
     #[instrument(skip_all)]
-    fn merge_excerpt_ranges<'a>(
+    pub fn merge_excerpt_ranges<'a>(
         expanded_ranges: impl IntoIterator<Item = &'a ExcerptRange<Point>> + 'a,
     ) -> Vec<ExcerptRange<Point>> {
         let mut sorted: Vec<_> = expanded_ranges.into_iter().collect();
