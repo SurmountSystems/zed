@@ -337,11 +337,9 @@ where
                     selected_index: 0,
                 };
 
-                let picker_view = cx.new(|cx| {
+                Some(cx.new(|cx| {
                     Picker::uniform_list(delegate, window, cx).max_height(Some(rems(20.).into()))
-                });
-
-                Some(picker_view.clone())
+                }))
             })
             .trigger_with_tooltip(self.trigger, self.tooltip)
             .attach(gpui::Corner::TopLeft)
