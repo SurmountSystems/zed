@@ -90,6 +90,14 @@ pub trait PanelHandle: Send + Sync {
     fn to_any(&self) -> AnyView;
     fn activation_priority(&self, cx: &App) -> u32;
     fn enabled(&self, cx: &App) -> bool;
+    fn add_to_dock(
+        &self,
+        dock: &Entity<Dock>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> usize;
+    fn remove_from_dock(&self, dock: &Entity<Dock>, window: &mut Window, cx: &mut App);
     fn move_to_next_position(&self, window: &mut Window, cx: &mut App) {
         let current_position = self.position(window, cx);
         let next_position = [
@@ -190,6 +198,22 @@ where
     fn enabled(&self, cx: &App) -> bool {
         self.read(cx).enabled(cx)
     }
+
+    fn add_to_dock(
+        &self,
+        dock: &Entity<Dock>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> usize {
+        dock.update(cx, |dock, cx| {
+            dock.add_panel(self.clone(), workspace, window, cx)
+        })
+    }
+
+    fn remove_from_dock(&self, dock: &Entity<Dock>, window: &mut Window, cx: &mut App) {
+        dock.update(cx, |dock, cx| dock.remove_panel(self, window, cx));
+    }
 }
 
 impl From<&dyn PanelHandle> for AnyView {
@@ -265,7 +289,7 @@ impl DockPosition {
 
 struct PanelEntry {
     panel: Arc<dyn PanelHandle>,
-    _subscriptions: [Subscription; 3],
+    _subscriptions: [Subscription; 2],
 }
 
 impl Dock {
@@ -465,57 +489,6 @@ impl Dock {
     ) -> usize {
         let subscriptions = [
             cx.observe(&panel, |_, _, cx| cx.notify()),
-            cx.observe_global_in::<SettingsStore>(window, {
-                let workspace = workspace.clone();
-                let panel = panel.clone();
-
-                move |this, window, cx| {
-                    let new_position = panel.read(cx).position(window, cx);
-                    if new_position == this.position {
-                        return;
-                    }
-
-                    let Ok(new_dock) = workspace.update(cx, |workspace, cx| {
-                        if panel.is_zoomed(window, cx) {
-                            workspace.zoomed_position = Some(new_position);
-                        }
-                        match new_position {
-                            DockPosition::Left => &workspace.left_dock,
-                            DockPosition::Bottom => &workspace.bottom_dock,
-                            DockPosition::Right => &workspace.right_dock,
-                        }
-                        .clone()
-                    }) else {
-                        return;
-                    };
-
-                    let was_visible = this.is_open()
-                        && this.visible_panel().is_some_and(|active_panel| {
-                            active_panel.panel_id() == Entity::entity_id(&panel)
-                        });
-
-                    this.remove_panel(&panel, window, cx);
-
-                    new_dock.update(cx, |new_dock, cx| {
-                        new_dock.remove_panel(&panel, window, cx);
-                    });
-
-                    new_dock.update(cx, |new_dock, cx| {
-                        let index =
-                            new_dock.add_panel(panel.clone(), workspace.clone(), window, cx);
-                        if was_visible {
-                            new_dock.set_open(true, window, cx);
-                            new_dock.activate_panel(index, window, cx);
-                        }
-                    });
-
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.serialize_workspace(window, cx);
-                        })
-                        .ok();
-                }
-            }),
             cx.subscribe_in(
                 &panel,
                 window,
@@ -571,11 +544,15 @@ impl Dock {
             ),
         ];
 
-        let index = match self
-            .panel_entries
-            .binary_search_by_key(&panel.read(cx).activation_priority(), |entry| {
-                entry.panel.activation_priority(cx)
-            }) {
+        let position = self.position;
+        let priority = panel.activation_priority(cx);
+        let index = match self.panel_entries.binary_search_by(|probe| {
+            let other_priority = probe.panel.activation_priority(cx);
+            match position {
+                DockPosition::Left | DockPosition::Bottom => other_priority.cmp(&priority),
+                DockPosition::Right => priority.cmp(&other_priority),
+            }
+        }) {
             Ok(ix) => {
                 if cfg!(debug_assertions) {
                     panic!(
@@ -666,6 +643,10 @@ impl Dock {
 
     pub fn panels_len(&self) -> usize {
         self.panel_entries.len()
+    }
+
+    pub fn panels(&self) -> impl Iterator<Item = &Arc<dyn PanelHandle>> {
+        self.panel_entries.iter().map(|entry| &entry.panel)
     }
 
     pub fn activate_panel(&mut self, panel_ix: usize, window: &mut Window, cx: &mut Context<Self>) {

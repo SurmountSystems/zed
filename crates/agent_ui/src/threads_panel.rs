@@ -2209,7 +2209,7 @@ impl Panel for ThreadsPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        4
+        0
     }
 
     fn enabled(&self, cx: &App) -> bool {

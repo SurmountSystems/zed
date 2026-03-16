@@ -1394,7 +1394,7 @@ impl Workspace {
             })
             .detach();
 
-            cx.observe_global::<SettingsStore>(|_, cx| {
+            cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
                 if ProjectSettings::get_global(cx).session.trust_all_worktrees {
                     if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
                         trusted_worktrees.update(cx, |trusted_worktrees, cx| {
@@ -1402,6 +1402,7 @@ impl Workspace {
                         })
                     }
                 }
+                this.reposition_panels(window, cx);
             })
             .detach();
         }
@@ -2151,6 +2152,40 @@ impl Workspace {
         for dock in [&self.left_dock, &self.bottom_dock, &self.right_dock] {
             dock.update(cx, |dock, cx| dock.remove_panel(panel, window, cx));
         }
+    }
+
+    fn reposition_panels(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut panels_to_move = Vec::new();
+        for dock_entity in [&self.left_dock, &self.bottom_dock, &self.right_dock] {
+            let dock = dock_entity.read(cx);
+            let old_position = dock.position();
+            let visible_panel_id = dock.visible_panel().map(|panel| panel.panel_id());
+            for panel in dock.panels() {
+                let new_position = panel.position(window, cx);
+                if new_position != old_position {
+                    let was_visible = Some(panel.panel_id()) == visible_panel_id;
+                    panels_to_move.push((dock_entity, panel.clone(), new_position, was_visible));
+                }
+            }
+        }
+
+        for (old_dock, panel, new_position, was_visible) in panels_to_move {
+            if panel.is_zoomed(window, cx) {
+                self.zoomed_position = Some(new_position);
+            }
+
+            panel.remove_from_dock(old_dock, window, cx);
+            let new_dock = self.dock_at_position(new_position).clone();
+            let index = panel.add_to_dock(&new_dock, self.weak_self.clone(), window, cx);
+            if was_visible {
+                new_dock.update(cx, |new_dock, cx| {
+                    new_dock.set_open(true, window, cx);
+                    new_dock.activate_panel(index, window, cx);
+                });
+            }
+        }
+
+        self.serialize_workspace(window, cx);
     }
 
     pub fn status_bar(&self) -> &Entity<StatusBar> {
@@ -7012,6 +7047,11 @@ impl Workspace {
         view: Entity<V>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(drawer) = self.right_drawer.as_mut() {
+            if drawer.view.entity_id() == view.entity_id() {
+                self.right_drawer.take();
+            }
+        }
         self.left_drawer = Some(Drawer::new(view));
         cx.notify();
     }
@@ -7021,6 +7061,11 @@ impl Workspace {
         view: Entity<V>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(drawer) = self.left_drawer.as_mut() {
+            if drawer.view.entity_id() == view.entity_id() {
+                self.left_drawer.take();
+            }
+        }
         self.right_drawer = Some(Drawer::new(view));
         cx.notify();
     }
@@ -7938,7 +7983,7 @@ impl Drawer {
         Self {
             view: view.into(),
             focus_handle_fn: Box::new(move |cx| entity.focus_handle(cx)),
-            open: true,
+            open: false,
             custom_width: None,
         }
     }

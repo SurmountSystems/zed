@@ -4002,7 +4002,6 @@ mod tests {
         use crate::multi_workspace::MultiWorkspace;
         use crate::persistence::read_multi_workspace_state;
         use feature_flags::FeatureFlagAppExt;
-
         use project::Project;
 
         crate::tests::init_test(cx);

@@ -83,6 +83,7 @@ use util::rel_path::RelPath;
 use util::{ResultExt, asset_str, maybe};
 use uuid::Uuid;
 use vim_mode_setting::VimModeSetting;
+use workspace::dock::PanelHandle;
 use workspace::notifications::{
     NotificationId, SuppressEvent, dismiss_app_notification, show_app_notification,
 };
@@ -669,41 +670,63 @@ fn setup_or_teardown_ai_panels(
         || cfg!(test);
     let existing_panel = workspace.panel::<agent_ui::ThreadsPanel>(cx);
     match (disable_ai, existing_panel) {
-        (false, None) => cx.spawn_in(window, async move |workspace, cx| {
-            let agent_drawer =
-                agent_ui::AgentPanel::load(workspace.clone(), prompt_builder.clone(), cx.clone())
-                    .await?;
-            let sidebar_panel = agent_ui::ThreadsPanel::load(workspace.clone(), cx.clone()).await?;
-            workspace.update_in(cx, |workspace, window, cx| {
-                let disable_ai = SettingsStore::global(cx)
-                    .get::<DisableAiSettings>(None)
-                    .disable_ai;
-                let have_panel = workspace.panel::<agent_ui::ThreadsPanel>(cx).is_some();
-                if !disable_ai && !have_panel {
-                    let position =
-                        workspace::dock::PanelHandle::position(&sidebar_panel, window, cx);
-                    workspace.add_panel(sidebar_panel, window, cx);
-                    match position {
-                        workspace::dock::DockPosition::Left => {
-                            workspace.set_left_drawer(agent_drawer, cx)
-                        }
-                        workspace::dock::DockPosition::Right => {
-                            workspace.set_right_drawer(agent_drawer, cx)
-                        }
-                        workspace::dock::DockPosition::Bottom => {
-                            unreachable!("drawers cannot go on the bottom")
+        (false, None) => {
+            return cx.spawn_in(window, async move |workspace, cx| {
+                let agent_drawer = agent_ui::AgentPanel::load(
+                    workspace.clone(),
+                    prompt_builder.clone(),
+                    cx.clone(),
+                )
+                .await?;
+                let threads_panel =
+                    agent_ui::ThreadsPanel::load(workspace.clone(), cx.clone()).await?;
+                workspace.update_in(cx, |workspace, window, cx| {
+                    let disable_ai = SettingsStore::global(cx)
+                        .get::<DisableAiSettings>(None)
+                        .disable_ai;
+                    let have_panel = workspace.panel::<agent_ui::ThreadsPanel>(cx).is_some();
+                    let position = PanelHandle::position(&threads_panel, window, cx);
+                    if !disable_ai && !have_panel {
+                        workspace.add_panel(threads_panel, window, cx);
+                        match position {
+                            workspace::dock::DockPosition::Left => {
+                                workspace.set_left_drawer(agent_drawer, cx)
+                            }
+                            workspace::dock::DockPosition::Right => {
+                                workspace.set_right_drawer(agent_drawer, cx)
+                            }
+                            workspace::dock::DockPosition::Bottom => {
+                                unreachable!("drawers cannot go on the bottom")
+                            }
                         }
                     }
-                }
-            })
-        }),
+                })
+            });
+        }
         (true, Some(existing_panel)) => {
             workspace.remove_panel(&existing_panel, window, cx);
             workspace.remove_drawer::<agent_ui::AgentPanel>(cx);
-            Task::ready(Ok(()))
         }
-        _ => Task::ready(Ok(())),
+        (false, Some(existing_panel)) => {
+            let position = PanelHandle::position(&existing_panel, window, cx);
+            if let Some(agent_drawer) = workspace.drawer::<agent_ui::AgentPanel>() {
+                match position {
+                    workspace::dock::DockPosition::Left => {
+                        workspace.set_left_drawer(agent_drawer, cx)
+                    }
+                    workspace::dock::DockPosition::Right => {
+                        workspace.set_right_drawer(agent_drawer, cx)
+                    }
+                    workspace::dock::DockPosition::Bottom => {
+                        unreachable!("drawers cannot go on the bottom")
+                    }
+                }
+            }
+        }
+        _ => {}
     }
+
+    Task::ready(Ok(()))
 }
 
 async fn initialize_agent_panel(
