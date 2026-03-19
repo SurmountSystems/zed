@@ -46,10 +46,7 @@ pub struct BedrockModelCacheConfiguration {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, EnumIter)]
 pub enum Model {
     // Anthropic Claude 4+ models
-    #[serde(
-        rename = "claude-haiku-4-5",
-        alias = "claude-haiku-4-5-latest"
-    )]
+    #[serde(rename = "claude-haiku-4-5", alias = "claude-haiku-4-5-latest")]
     ClaudeHaiku4_5,
     #[serde(
         rename = "claude-sonnet-4",
@@ -184,25 +181,17 @@ impl Model {
     }
 
     pub fn from_id(id: &str) -> anyhow::Result<Self> {
-        // Order matters: longer prefixes must be checked first to avoid
-        // "claude-opus-4-6" matching before "claude-opus-4-6-thinking".
-        // The "-thinking" aliases map to the same model since thinking
-        // is now controlled by the UI toggle.
-        if id.starts_with("claude-opus-4-6-thinking") || id.starts_with("claude-opus-4-6") {
+        if id.starts_with("claude-opus-4-6") {
             Ok(Self::ClaudeOpus4_6)
-        } else if id.starts_with("claude-opus-4-5-thinking") || id.starts_with("claude-opus-4-5") {
+        } else if id.starts_with("claude-opus-4-5") {
             Ok(Self::ClaudeOpus4_5)
-        } else if id.starts_with("claude-opus-4-1-thinking") || id.starts_with("claude-opus-4-1") {
+        } else if id.starts_with("claude-opus-4-1") {
             Ok(Self::ClaudeOpus4_1)
-        } else if id.starts_with("claude-sonnet-4-6-thinking")
-            || id.starts_with("claude-sonnet-4-6")
-        {
+        } else if id.starts_with("claude-sonnet-4-6") {
             Ok(Self::ClaudeSonnet4_6)
-        } else if id.starts_with("claude-sonnet-4-5-thinking")
-            || id.starts_with("claude-sonnet-4-5")
-        {
+        } else if id.starts_with("claude-sonnet-4-5") {
             Ok(Self::ClaudeSonnet4_5)
-        } else if id.starts_with("claude-sonnet-4-thinking") || id.starts_with("claude-sonnet-4") {
+        } else if id.starts_with("claude-sonnet-4") {
             Ok(Self::ClaudeSonnet4)
         } else if id.starts_with("claude-haiku-4-5") {
             Ok(Self::ClaudeHaiku4_5)
@@ -624,9 +613,7 @@ impl Model {
             ) => Ok(format!("{}.{}", region_group, model_id)),
 
             // US Government region inference profiles
-            (Self::ClaudeSonnet4_5, "us-gov") => {
-                Ok(format!("{}.{}", region_group, model_id))
-            }
+            (Self::ClaudeSonnet4_5, "us-gov") => Ok(format!("{}.{}", region_group, model_id)),
 
             // US region inference profiles
             (
