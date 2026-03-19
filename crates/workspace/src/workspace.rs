@@ -3137,6 +3137,12 @@ impl Workspace {
         let is_remote = self.project.read(cx).is_via_collab();
         let has_worktree = self.project.read(cx).worktrees(cx).next().is_some();
         let has_dirty_items = self.items(cx).any(|item| item.is_dirty(cx));
+        let location = self
+            .project
+            .read(cx)
+            .remote_connection_options(cx)
+            .map(SerializedWorkspaceLocation::Remote)
+            .unwrap_or(SerializedWorkspaceLocation::Local);
 
         let window_to_replace = if replace_current_window {
             window_handle
@@ -3146,8 +3152,56 @@ impl Workspace {
             window_handle
         };
         let app_state = self.app_state.clone();
+        let fs = app_state.fs.clone();
 
         cx.spawn(async move |_, cx| {
+            let all_paths_are_directories = if replace_current_window {
+                let metadata =
+                    futures::future::join_all(paths.iter().map(|path| fs.metadata(path))).await;
+                metadata
+                    .into_iter()
+                    .all(|entry| entry.ok().flatten().is_some_and(|entry| entry.is_dir))
+            } else {
+                false
+            };
+
+            if all_paths_are_directories {
+                let mut normalized_paths = Vec::with_capacity(paths.len());
+                for path in &paths {
+                    if let Some(canonical) = fs.canonicalize(path).await.ok() {
+                        normalized_paths.push(canonical);
+                    } else {
+                        normalized_paths.push(path.clone());
+                    }
+                }
+
+                if let Some((target_window, workspace)) =
+                    cx.update(|cx| find_exact_existing_workspace(&normalized_paths, &location, cx))
+                {
+                    target_window.update(cx, |multi_workspace, window, cx| {
+                        window.activate_window();
+                        multi_workspace.activate(workspace.clone(), cx);
+                    })?;
+                    return Ok(workspace);
+                }
+
+                let OpenResult { workspace, .. } = cx
+                    .update(|cx| {
+                        open_paths(
+                            &normalized_paths,
+                            app_state,
+                            OpenOptions {
+                                open_new_workspace: Some(true),
+                                replace_window: window_to_replace,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    })
+                    .await?;
+                return Ok(workspace);
+            }
+
             let OpenResult { workspace, .. } = cx
                 .update(|cx| {
                     open_paths(
@@ -8779,6 +8833,40 @@ pub fn workspace_windows_for_location(
         .collect()
 }
 
+fn find_exact_existing_workspace(
+    abs_paths: &[PathBuf],
+    location: &SerializedWorkspaceLocation,
+    cx: &App,
+) -> Option<(WindowHandle<MultiWorkspace>, Entity<Workspace>)> {
+    let requested_paths = PathList::new(abs_paths);
+    let active_window = cx
+        .active_window()
+        .and_then(|window| window.downcast::<MultiWorkspace>());
+    let mut windows = workspace_windows_for_location(location, cx);
+
+    if let Some(active_window) = active_window {
+        if let Some(index) = windows.iter().position(|window| *window == active_window) {
+            let active_window = windows.remove(index);
+            windows.insert(0, active_window);
+        }
+    }
+
+    windows.into_iter().find_map(|window| {
+        let multi_workspace = window.read(cx).ok()?;
+        multi_workspace.workspaces().iter().find_map(|workspace| {
+            match workspace.read(cx).workspace_location(cx) {
+                WorkspaceLocation::Location(workspace_location, workspace_paths)
+                    if &workspace_location == location
+                        && workspace_paths.paths() == requested_paths.paths() =>
+                {
+                    Some((window, workspace.clone()))
+                }
+                _ => None,
+            }
+        })
+    })
+}
+
 pub async fn find_existing_workspace(
     abs_paths: &[PathBuf],
     open_options: &OpenOptions,
@@ -10389,6 +10477,110 @@ mod tests {
             multi_workspace_handle.update(cx, |_, _, _| ()).is_ok(),
             "window should still exist after cancelling one workspace's close"
         );
+    }
+
+    #[gpui::test]
+    async fn test_open_workspace_for_paths_keeps_overlapping_directory_workspaces_distinct(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            use feature_flags::FeatureFlagAppExt as _;
+            cx.update_flags(false, vec!["agent-v2".to_string()]);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/zed", json!({ "src": {} })).await;
+        fs.insert_tree("/foo", json!({ "lib": {} })).await;
+
+        let project = Project::test(fs.clone(), ["/zed".as_ref()], cx).await;
+        let multi_workspace_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+
+        let open_task = multi_workspace_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_workspace_for_paths(
+                        true,
+                        vec![PathBuf::from("/zed"), PathBuf::from("/foo")],
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+
+        let opened_workspace = open_task.await.unwrap();
+        cx.run_until_parked();
+
+        multi_workspace_handle
+            .read_with(cx, |multi_workspace, cx| {
+                assert_eq!(multi_workspace.workspaces().len(), 2);
+
+                let original_paths =
+                    PathList::new(&multi_workspace.workspaces()[0].read(cx).root_paths(cx));
+                assert_eq!(original_paths.paths(), &[PathBuf::from("/zed")]);
+
+                let opened_paths = PathList::new(&opened_workspace.read(cx).root_paths(cx));
+                assert_eq!(
+                    opened_paths.paths(),
+                    &[PathBuf::from("/foo"), PathBuf::from("/zed")]
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_open_workspace_for_paths_reuses_exact_directory_workspace_match(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            use feature_flags::FeatureFlagAppExt as _;
+            cx.update_flags(false, vec!["agent-v2".to_string()]);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/zed", json!({ "src": {} })).await;
+        fs.insert_tree("/foo", json!({ "lib": {} })).await;
+
+        let project = Project::test(fs.clone(), ["/zed".as_ref(), "/foo".as_ref()], cx).await;
+        let multi_workspace_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        cx.run_until_parked();
+
+        let original_workspace = multi_workspace_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let original_workspace_id = original_workspace.entity_id();
+
+        let open_task = multi_workspace_handle
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_workspace_for_paths(
+                        true,
+                        vec![PathBuf::from("/foo"), PathBuf::from("/zed")],
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap();
+
+        let opened_workspace = open_task.await.unwrap();
+        cx.run_until_parked();
+
+        multi_workspace_handle
+            .read_with(cx, |multi_workspace, _| {
+                assert_eq!(multi_workspace.workspaces().len(), 1);
+                assert_eq!(multi_workspace.active_workspace_index(), 0);
+            })
+            .unwrap();
+
+        assert_eq!(opened_workspace.entity_id(), original_workspace_id);
     }
 
     #[gpui::test]
