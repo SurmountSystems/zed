@@ -650,16 +650,33 @@ impl ActionLog {
         baseline_snapshot: text::BufferSnapshot,
         cx: &mut Context<Self>,
     ) {
+        self.infer_buffer_created_impl(buffer, baseline_snapshot, true, cx);
+    }
+
+    fn infer_buffer_created_impl(
+        &mut self,
+        buffer: Entity<Buffer>,
+        baseline_snapshot: text::BufferSnapshot,
+        record_file_read_time: bool,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(linked_action_log) = &self.linked_action_log {
             let linked_baseline_snapshot = baseline_snapshot.clone();
             if !linked_action_log.read(cx).has_changed_buffer(&buffer, cx) {
                 linked_action_log.update(cx, |log, cx| {
-                    log.infer_buffer_created(buffer.clone(), linked_baseline_snapshot, cx);
+                    log.infer_buffer_created_impl(
+                        buffer.clone(),
+                        linked_baseline_snapshot,
+                        false,
+                        cx,
+                    );
                 });
             }
         }
 
-        self.update_file_read_time(&buffer, cx);
+        if record_file_read_time {
+            self.update_file_read_time(&buffer, cx);
+        }
         self.prime_tracked_buffer_from_snapshot(
             buffer.clone(),
             baseline_snapshot,
@@ -680,20 +697,33 @@ impl ActionLog {
         baseline_snapshot: text::BufferSnapshot,
         cx: &mut Context<Self>,
     ) {
+        self.infer_buffer_edited_from_snapshot_impl(buffer, baseline_snapshot, true, cx);
+    }
+
+    fn infer_buffer_edited_from_snapshot_impl(
+        &mut self,
+        buffer: Entity<Buffer>,
+        baseline_snapshot: text::BufferSnapshot,
+        record_file_read_time: bool,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(linked_action_log) = &self.linked_action_log {
             let linked_baseline_snapshot = baseline_snapshot.clone();
             if !linked_action_log.read(cx).has_changed_buffer(&buffer, cx) {
                 linked_action_log.update(cx, |log, cx| {
-                    log.infer_buffer_edited_from_snapshot(
+                    log.infer_buffer_edited_from_snapshot_impl(
                         buffer.clone(),
                         linked_baseline_snapshot,
+                        false,
                         cx,
                     );
                 });
             }
         }
 
-        self.update_file_read_time(&buffer, cx);
+        if record_file_read_time {
+            self.update_file_read_time(&buffer, cx);
+        }
         self.prime_tracked_buffer_from_snapshot(
             buffer.clone(),
             baseline_snapshot,
@@ -712,20 +742,33 @@ impl ActionLog {
         baseline_snapshot: text::BufferSnapshot,
         cx: &mut Context<Self>,
     ) {
+        self.infer_buffer_deleted_from_snapshot_impl(buffer, baseline_snapshot, true, cx);
+    }
+
+    fn infer_buffer_deleted_from_snapshot_impl(
+        &mut self,
+        buffer: Entity<Buffer>,
+        baseline_snapshot: text::BufferSnapshot,
+        record_file_read_time: bool,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(linked_action_log) = &self.linked_action_log {
             let linked_baseline_snapshot = baseline_snapshot.clone();
             if !linked_action_log.read(cx).has_changed_buffer(&buffer, cx) {
                 linked_action_log.update(cx, |log, cx| {
-                    log.infer_buffer_deleted_from_snapshot(
+                    log.infer_buffer_deleted_from_snapshot_impl(
                         buffer.clone(),
                         linked_baseline_snapshot,
+                        false,
                         cx,
                     );
                 });
             }
         }
 
-        self.remove_file_read_time(&buffer, cx);
+        if record_file_read_time {
+            self.remove_file_read_time(&buffer, cx);
+        }
         let has_linked_action_log = self.linked_action_log.is_some();
         self.prime_tracked_buffer_from_snapshot(
             buffer.clone(),
@@ -3430,6 +3473,304 @@ mod tests {
         assert!(
             parent_log.read_with(cx, |log, _| log.file_read_time(&abs_path).is_none()),
             "parent should NOT get file_read_time from child's buffer_created"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_file_read_time_not_forwarded_to_linked_action_log_for_inferred_edits(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "edit": "hello world\n",
+                "delete": "goodbye world\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let parent_log = cx.new(|_| ActionLog::new(project.clone()));
+        let child_log =
+            cx.new(|_| ActionLog::new(project.clone()).with_linked_action_log(parent_log.clone()));
+
+        let edit_file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/edit", cx))
+            .unwrap();
+        let edit_buffer = project
+            .update(cx, |project, cx| project.open_buffer(edit_file_path, cx))
+            .await
+            .unwrap();
+        let edit_abs_path = PathBuf::from(path!("/dir/edit"));
+        let edit_baseline_snapshot = edit_buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+
+        edit_buffer.update(cx, |buffer, cx| buffer.set_text("hello world!\n", cx));
+        project
+            .update(cx, |project, cx| {
+                project.save_buffer(edit_buffer.clone(), cx)
+            })
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            child_log.update(cx, |log, cx| {
+                log.infer_buffer_edited_from_snapshot(
+                    edit_buffer.clone(),
+                    edit_baseline_snapshot.clone(),
+                    cx,
+                );
+            });
+        });
+
+        assert!(
+            child_log.read_with(cx, |log, _| log.file_read_time(&edit_abs_path).is_some()),
+            "child should record file_read_time on inferred edit"
+        );
+        assert!(
+            parent_log.read_with(cx, |log, _| log.file_read_time(&edit_abs_path).is_none()),
+            "parent should NOT get file_read_time from child's inferred edit"
+        );
+
+        let create_file_path = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path("dir/new_file", cx)
+            })
+            .unwrap();
+        let create_buffer = project
+            .update(cx, |project, cx| project.open_buffer(create_file_path, cx))
+            .await
+            .unwrap();
+        let create_abs_path = PathBuf::from(path!("/dir/new_file"));
+        let create_baseline_snapshot =
+            create_buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+
+        create_buffer.update(cx, |buffer, cx| buffer.set_text("new file\n", cx));
+        project
+            .update(cx, |project, cx| {
+                project.save_buffer(create_buffer.clone(), cx)
+            })
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            child_log.update(cx, |log, cx| {
+                log.infer_buffer_created(
+                    create_buffer.clone(),
+                    create_baseline_snapshot.clone(),
+                    cx,
+                );
+            });
+        });
+
+        assert!(
+            child_log.read_with(cx, |log, _| log.file_read_time(&create_abs_path).is_some()),
+            "child should record file_read_time on inferred create"
+        );
+        assert!(
+            parent_log.read_with(cx, |log, _| log.file_read_time(&create_abs_path).is_none()),
+            "parent should NOT get file_read_time from child's inferred create"
+        );
+
+        let delete_file_path = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path("dir/delete", cx)
+            })
+            .unwrap();
+        let delete_buffer = project
+            .update(cx, |project, cx| project.open_buffer(delete_file_path, cx))
+            .await
+            .unwrap();
+        let delete_abs_path = PathBuf::from(path!("/dir/delete"));
+        let delete_baseline_snapshot =
+            delete_buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+
+        cx.update(|cx| {
+            parent_log.update(cx, |log, cx| log.buffer_read(delete_buffer.clone(), cx));
+            child_log.update(cx, |log, cx| log.buffer_read(delete_buffer.clone(), cx));
+        });
+
+        assert!(
+            parent_log.read_with(cx, |log, _| log.file_read_time(&delete_abs_path).is_some()),
+            "parent should record its own file_read_time before inferred delete"
+        );
+        assert!(
+            child_log.read_with(cx, |log, _| log.file_read_time(&delete_abs_path).is_some()),
+            "child should record its own file_read_time before inferred delete"
+        );
+
+        fs.remove_file(path!("/dir/delete").as_ref(), RemoveOptions::default())
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            child_log.update(cx, |log, cx| {
+                log.infer_buffer_deleted_from_snapshot(
+                    delete_buffer.clone(),
+                    delete_baseline_snapshot.clone(),
+                    cx,
+                );
+            });
+        });
+
+        assert!(
+            child_log.read_with(cx, |log, _| log.file_read_time(&delete_abs_path).is_none()),
+            "child should remove file_read_time on inferred delete"
+        );
+        assert!(
+            parent_log.read_with(cx, |log, _| log.file_read_time(&delete_abs_path).is_some()),
+            "parent should keep its own file_read_time on linked inferred delete"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_linked_action_log_infer_buffer_edited_from_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "one\ntwo\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let parent_log = cx.new(|_| ActionLog::new(project.clone()));
+        let child_log =
+            cx.new(|_| ActionLog::new(project.clone()).with_linked_action_log(parent_log.clone()));
+
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        let baseline_snapshot = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+
+        buffer.update(cx, |buffer, cx| buffer.set_text("one\ntwo\nthree\n", cx));
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            child_log.update(cx, |log, cx| {
+                log.infer_buffer_edited_from_snapshot(
+                    buffer.clone(),
+                    baseline_snapshot.clone(),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let child_hunks = unreviewed_hunks(&child_log, cx);
+        assert!(
+            !child_hunks.is_empty(),
+            "child should track the inferred edit"
+        );
+        assert_eq!(
+            unreviewed_hunks(&parent_log, cx),
+            child_hunks,
+            "parent should also track the inferred edit via linked log forwarding"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_linked_action_log_infer_buffer_created(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({})).await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let parent_log = cx.new(|_| ActionLog::new(project.clone()));
+        let child_log =
+            cx.new(|_| ActionLog::new(project.clone()).with_linked_action_log(parent_log.clone()));
+
+        let file_path = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path("dir/new_file", cx)
+            })
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        let baseline_snapshot = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+
+        buffer.update(cx, |buffer, cx| buffer.set_text("hello\n", cx));
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            child_log.update(cx, |log, cx| {
+                log.infer_buffer_created(buffer.clone(), baseline_snapshot.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let child_hunks = unreviewed_hunks(&child_log, cx);
+        assert!(
+            !child_hunks.is_empty(),
+            "child should track the inferred creation"
+        );
+        assert_eq!(
+            unreviewed_hunks(&parent_log, cx),
+            child_hunks,
+            "parent should also track the inferred creation via linked log forwarding"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_linked_action_log_infer_buffer_deleted_from_snapshot(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "hello\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let parent_log = cx.new(|_| ActionLog::new(project.clone()));
+        let child_log =
+            cx.new(|_| ActionLog::new(project.clone()).with_linked_action_log(parent_log.clone()));
+
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        let baseline_snapshot = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+
+        fs.remove_file(path!("/dir/file").as_ref(), RemoveOptions::default())
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            child_log.update(cx, |log, cx| {
+                log.infer_buffer_deleted_from_snapshot(
+                    buffer.clone(),
+                    baseline_snapshot.clone(),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        let child_hunks = unreviewed_hunks(&child_log, cx);
+        assert!(
+            !child_hunks.is_empty(),
+            "child should track the inferred deletion"
+        );
+        assert_eq!(
+            unreviewed_hunks(&parent_log, cx),
+            child_hunks,
+            "parent should also track the inferred deletion via linked log forwarding"
         );
     }
 
