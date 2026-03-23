@@ -684,8 +684,9 @@ impl Sidebar {
         }
     }
 
-    /// When modifying this thread, aim for a single forward pass over workspaces
-    /// and threads plus an O(T log T) sort. Avoid adding extra scans over the data.
+    /// When modifying this thread, aim for a single forward pass over
+    /// workspaces and threads plus an O(T log T) sort, where T is the number of
+    /// threads. Avoid adding extra scans over the data.
     fn rebuild_contents(&mut self, cx: &App) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
@@ -797,26 +798,7 @@ impl Sidebar {
         // Build a mapping from worktree checkout paths → root repo paths so
         // that threads saved against a worktree checkout can be grouped under
         // the root repo's sidebar header.
-        let mut worktree_to_root = build_worktree_root_mapping(&workspaces, cx);
-
-        // Also add mappings discovered during absorption detection.
-        // These are robust against snapshot timing because they come
-        // from each worktree workspace's own repo snapshot (which
-        // always knows its own work_directory and original_repo),
-        // even when the main repo's linked-worktree list is
-        // temporarily incomplete.
-        for workspace in &workspaces {
-            let project = workspace.read(cx).project().read(cx);
-            for repo in project.repositories(cx).values() {
-                let snapshot = repo.read(cx).snapshot();
-                if snapshot.work_directory_abs_path != snapshot.original_repo_abs_path {
-                    worktree_to_root.insert(
-                        snapshot.work_directory_abs_path.to_path_buf(),
-                        snapshot.original_repo_abs_path.clone(),
-                    );
-                }
-            }
-        }
+        let worktree_to_root = build_worktree_root_mapping(&workspaces, cx);
 
         // Build a canonicalized thread index: for each thread in the store,
         // map its folder_paths to root repo paths and index by the result.
