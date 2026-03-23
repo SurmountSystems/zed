@@ -183,6 +183,8 @@ impl ActionLog {
                     unreviewed_edits,
                     snapshot: text_snapshot,
                     status,
+                    mode: TrackedBufferMode::Normal,
+                    expected_external_edit: None,
                     version: buffer.read(cx).version(),
                     diff,
                     diff_update: diff_update_tx,
@@ -208,6 +210,10 @@ impl ActionLog {
         event: &BufferEvent,
         cx: &mut Context<Self>,
     ) {
+        if self.handle_expected_external_edit_event(buffer.clone(), event, cx) {
+            return;
+        }
+
         match event {
             BufferEvent::Edited { .. } => {
                 let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
@@ -266,6 +272,245 @@ impl ActionLog {
                 cx.notify();
             }
         }
+    }
+
+    fn handle_expected_external_edit_event(
+        &mut self,
+        buffer: Entity<Buffer>,
+        event: &BufferEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((_, expected_external_edit)) =
+            self.tracked_buffers
+                .get(&buffer)
+                .and_then(|tracked_buffer| {
+                    tracked_buffer
+                        .expected_external_edit
+                        .clone()
+                        .map(|expected_external_edit| (tracked_buffer.mode, expected_external_edit))
+                })
+        else {
+            return false;
+        };
+
+        if expected_external_edit.is_disqualified {
+            return false;
+        }
+
+        match event {
+            BufferEvent::Saved
+                if expected_external_edit.observed_external_file_change
+                    && !expected_external_edit.has_attributed_change =>
+            {
+                self.mark_expected_external_edit_disqualified(&buffer);
+                true
+            }
+            BufferEvent::Edited { is_local: true } => {
+                if expected_external_edit.pending_delete {
+                    let (is_deleted, is_empty) = buffer.read_with(cx, |buffer, _| {
+                        (
+                            buffer
+                                .file()
+                                .is_some_and(|file| file.disk_state().is_deleted()),
+                            buffer.text().is_empty(),
+                        )
+                    });
+
+                    if is_deleted && is_empty {
+                        self.apply_expected_external_delete_local(buffer, cx);
+                        return true;
+                    }
+                }
+
+                expected_external_edit.observed_external_file_change
+            }
+            BufferEvent::FileHandleChanged => {
+                let (is_deleted, is_empty, is_dirty) = buffer.read_with(cx, |buffer, _| {
+                    (
+                        buffer
+                            .file()
+                            .is_some_and(|file| file.disk_state().is_deleted()),
+                        buffer.text().is_empty(),
+                        buffer.is_dirty(),
+                    )
+                });
+
+                if let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) {
+                    if let Some(expected_external_edit) =
+                        tracked_buffer.expected_external_edit.as_mut()
+                    {
+                        if !is_dirty || is_deleted {
+                            expected_external_edit.observed_external_file_change = true;
+                        }
+                        expected_external_edit.pending_delete = is_deleted;
+                    }
+                }
+
+                if is_deleted {
+                    if is_empty {
+                        self.apply_expected_external_delete_local(buffer, cx);
+                    } else if self.linked_action_log.is_none() {
+                        let buffer = buffer.clone();
+                        cx.defer(move |cx| {
+                            buffer.update(cx, |buffer, cx| buffer.set_text("", cx));
+                        });
+                    }
+                }
+
+                true
+            }
+            BufferEvent::Reloaded
+                if expected_external_edit.observed_external_file_change
+                    && !expected_external_edit.pending_delete =>
+            {
+                if self.expected_external_edit_has_meaningful_change(&buffer, cx) {
+                    self.apply_expected_external_reload_local(buffer, cx);
+                } else if let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) {
+                    if let Some(expected_external_edit) =
+                        tracked_buffer.expected_external_edit.as_mut()
+                    {
+                        expected_external_edit.observed_external_file_change = false;
+                        expected_external_edit.pending_delete = false;
+                    }
+                }
+
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn mark_expected_external_edit_disqualified(&mut self, buffer: &Entity<Buffer>) {
+        let Some(tracked_buffer) = self.tracked_buffers.get_mut(buffer) else {
+            return;
+        };
+        let Some(expected_external_edit) = tracked_buffer.expected_external_edit.as_mut() else {
+            return;
+        };
+
+        expected_external_edit.is_disqualified = true;
+        expected_external_edit.observed_external_file_change = false;
+        expected_external_edit.pending_delete = false;
+    }
+
+    fn expected_external_edit_has_meaningful_change(
+        &self,
+        buffer: &Entity<Buffer>,
+        cx: &App,
+    ) -> bool {
+        let Some(tracked_buffer) = self.tracked_buffers.get(buffer) else {
+            return false;
+        };
+        let Some(expected_external_edit) = tracked_buffer.expected_external_edit.as_ref() else {
+            return false;
+        };
+
+        let (current_snapshot, current_exists) = buffer.read_with(cx, |buffer, _| {
+            (
+                buffer.text_snapshot(),
+                buffer.file().is_some_and(|file| file.disk_state().exists()),
+            )
+        });
+
+        if !expected_external_edit.initial_exists_on_disk {
+            current_exists || current_snapshot.text() != tracked_buffer.snapshot.text()
+        } else {
+            !current_exists || current_snapshot.text() != tracked_buffer.snapshot.text()
+        }
+    }
+
+    fn apply_expected_external_reload_local(
+        &mut self,
+        buffer: Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) {
+        let current_version = buffer.read(cx).version();
+        let (record_file_read_time, initial_exists_on_disk) = self
+            .tracked_buffers
+            .get(&buffer)
+            .and_then(|tracked_buffer| {
+                tracked_buffer
+                    .expected_external_edit
+                    .as_ref()
+                    .map(|expected_external_edit| {
+                        (
+                            expected_external_edit.record_file_read_time_source_count > 0,
+                            expected_external_edit.initial_exists_on_disk,
+                        )
+                    })
+            })
+            .unwrap_or((false, true));
+
+        if record_file_read_time {
+            self.update_file_read_time(&buffer, cx);
+        }
+
+        let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
+            return;
+        };
+        let Some(expected_external_edit) = tracked_buffer.expected_external_edit.as_mut() else {
+            return;
+        };
+
+        expected_external_edit.has_attributed_change = true;
+        expected_external_edit.observed_external_file_change = false;
+        expected_external_edit.pending_delete = false;
+        tracked_buffer.mode = TrackedBufferMode::Normal;
+
+        if !initial_exists_on_disk {
+            let existing_file_content = if tracked_buffer.diff_base.len() == 0 {
+                None
+            } else {
+                Some(tracked_buffer.diff_base.clone())
+            };
+            tracked_buffer.status = TrackedBufferStatus::Created {
+                existing_file_content,
+            };
+        } else {
+            tracked_buffer.status = TrackedBufferStatus::Modified;
+        }
+
+        tracked_buffer.version = current_version;
+        tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+    }
+
+    fn apply_expected_external_delete_local(
+        &mut self,
+        buffer: Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) {
+        let current_version = buffer.read(cx).version();
+        let remove_file_read_time = self
+            .tracked_buffers
+            .get(&buffer)
+            .and_then(|tracked_buffer| {
+                tracked_buffer
+                    .expected_external_edit
+                    .as_ref()
+                    .map(|expected_external_edit| {
+                        expected_external_edit.record_file_read_time_source_count > 0
+                    })
+            })
+            .unwrap_or(false);
+
+        if remove_file_read_time {
+            self.remove_file_read_time(&buffer, cx);
+        }
+
+        let Some(tracked_buffer) = self.tracked_buffers.get_mut(&buffer) else {
+            return;
+        };
+        let Some(expected_external_edit) = tracked_buffer.expected_external_edit.as_mut() else {
+            return;
+        };
+
+        expected_external_edit.has_attributed_change = true;
+        expected_external_edit.observed_external_file_change = false;
+        expected_external_edit.pending_delete = false;
+        tracked_buffer.mode = TrackedBufferMode::Normal;
+        tracked_buffer.status = TrackedBufferStatus::Deleted;
+        tracked_buffer.version = current_version;
+        tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
     }
 
     async fn maintain_diff(
@@ -642,6 +887,111 @@ impl ActionLog {
         self.tracked_buffers
             .get(buffer)
             .is_some_and(|tracked_buffer| tracked_buffer.has_edits(cx))
+    }
+
+    pub fn begin_expected_external_edit(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        self.begin_expected_external_edit_impl(buffer, true, cx);
+    }
+
+    fn begin_expected_external_edit_impl(
+        &mut self,
+        buffer: Entity<Buffer>,
+        record_file_read_time: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(linked_action_log) = &self.linked_action_log {
+            linked_action_log.update(cx, |log, cx| {
+                log.begin_expected_external_edit_impl(buffer.clone(), false, cx);
+            });
+        }
+
+        let initial_exists_on_disk = buffer
+            .read(cx)
+            .file()
+            .is_some_and(|file| file.disk_state().exists());
+        let had_tracked_buffer = self.tracked_buffers.contains_key(&buffer);
+        let has_attributed_change = self
+            .tracked_buffers
+            .get(&buffer)
+            .is_some_and(|tracked_buffer| tracked_buffer.has_edits(cx));
+
+        let tracked_buffer = self.track_buffer_internal(buffer.clone(), false, cx);
+        if !had_tracked_buffer {
+            tracked_buffer.mode = TrackedBufferMode::ExpectationOnly;
+            tracked_buffer.status = TrackedBufferStatus::Modified;
+            tracked_buffer.diff_base = buffer.read(cx).as_rope().clone();
+            tracked_buffer.snapshot = buffer.read(cx).text_snapshot();
+            tracked_buffer.unreviewed_edits.clear();
+        }
+
+        let expected_external_edit =
+            tracked_buffer
+                .expected_external_edit
+                .get_or_insert_with(|| ExpectedExternalEdit {
+                    active_source_count: 0,
+                    record_file_read_time_source_count: 0,
+                    initial_exists_on_disk,
+                    observed_external_file_change: false,
+                    has_attributed_change,
+                    pending_delete: false,
+                    is_disqualified: false,
+                });
+        expected_external_edit.active_source_count += 1;
+        if record_file_read_time {
+            expected_external_edit.record_file_read_time_source_count += 1;
+        }
+    }
+
+    pub fn end_expected_external_edit(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
+        self.end_expected_external_edit_impl(buffer, true, cx);
+    }
+
+    fn end_expected_external_edit_impl(
+        &mut self,
+        buffer: Entity<Buffer>,
+        record_file_read_time: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(linked_action_log) = &self.linked_action_log {
+            linked_action_log.update(cx, |log, cx| {
+                log.end_expected_external_edit_impl(buffer.clone(), false, cx);
+            });
+        }
+
+        let remove_tracked_buffer = if let Some(tracked_buffer) =
+            self.tracked_buffers.get_mut(&buffer)
+        {
+            let Some(expected_external_edit) = tracked_buffer.expected_external_edit.as_mut()
+            else {
+                return;
+            };
+
+            expected_external_edit.active_source_count =
+                expected_external_edit.active_source_count.saturating_sub(1);
+            if record_file_read_time {
+                expected_external_edit.record_file_read_time_source_count = expected_external_edit
+                    .record_file_read_time_source_count
+                    .saturating_sub(1);
+            }
+
+            if expected_external_edit.active_source_count > 0 {
+                false
+            } else {
+                let remove_tracked_buffer = tracked_buffer.mode
+                    == TrackedBufferMode::ExpectationOnly
+                    && !expected_external_edit.has_attributed_change;
+                tracked_buffer.expected_external_edit = None;
+                tracked_buffer.mode = TrackedBufferMode::Normal;
+                remove_tracked_buffer
+            }
+        } else {
+            false
+        };
+
+        if remove_tracked_buffer {
+            self.tracked_buffers.remove(&buffer);
+            cx.notify();
+        }
     }
 
     pub fn infer_buffer_created(
@@ -1223,7 +1573,8 @@ impl ActionLog {
             .filter(|(buffer, tracked)| {
                 let buffer = buffer.read(cx);
 
-                tracked.version != buffer.version
+                tracked.mode == TrackedBufferMode::Normal
+                    && tracked.version != buffer.version
                     && buffer
                         .file()
                         .is_some_and(|file| !file.disk_state().is_deleted())
@@ -1448,6 +1799,23 @@ enum ChangeAuthor {
     Agent,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TrackedBufferMode {
+    Normal,
+    ExpectationOnly,
+}
+
+#[derive(Clone, Debug)]
+struct ExpectedExternalEdit {
+    active_source_count: usize,
+    record_file_read_time_source_count: usize,
+    initial_exists_on_disk: bool,
+    observed_external_file_change: bool,
+    has_attributed_change: bool,
+    pending_delete: bool,
+    is_disqualified: bool,
+}
+
 #[derive(Debug)]
 enum TrackedBufferStatus {
     Created { existing_file_content: Option<Rope> },
@@ -1460,6 +1828,8 @@ pub struct TrackedBuffer {
     diff_base: Rope,
     unreviewed_edits: Patch<u32>,
     status: TrackedBufferStatus,
+    mode: TrackedBufferMode,
+    expected_external_edit: Option<ExpectedExternalEdit>,
     version: clock::Global,
     diff: Entity<BufferDiff>,
     snapshot: text::BufferSnapshot,
@@ -3771,6 +4141,219 @@ mod tests {
             unreviewed_hunks(&parent_log, cx),
             child_hunks,
             "parent should also track the inferred deletion via linked log forwarding"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_expected_external_edit_does_not_mark_read_time_or_stale_before_first_agent_change(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "one\ntwo\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+        let abs_path = PathBuf::from(path!("/dir/file"));
+
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| {
+                log.begin_expected_external_edit(buffer.clone(), cx);
+            });
+        });
+
+        assert!(
+            action_log.read_with(cx, |log, _| log.file_read_time(&abs_path).is_none()),
+            "expected external edit should not record file_read_time before an agent change"
+        );
+        assert!(
+            action_log.read_with(cx, |log, cx| log.stale_buffers(cx).next().is_none()),
+            "expected external edit should not mark a synthetic tracker as stale"
+        );
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "zero\n")], None, cx).unwrap();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            action_log.read_with(cx, |log, cx| log.changed_buffers(cx).is_empty()),
+            "local edits before the first external change should not become review hunks"
+        );
+        assert!(
+            action_log.read_with(cx, |log, cx| log.stale_buffers(cx).next().is_none()),
+            "expectation-only tracking should stay out of stale_buffers"
+        );
+        assert!(
+            action_log.read_with(cx, |log, _| log.file_read_time(&abs_path).is_none()),
+            "local edits before the first external change should not record file_read_time"
+        );
+
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| {
+                log.end_expected_external_edit(buffer.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            action_log.read_with(cx, |log, cx| log.changed_buffers(cx).is_empty()),
+            "ending an expectation without an agent change should remove synthetic tracking"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_expected_external_edit_preserves_local_edits_before_first_agent_change(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "one\ntwo\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| {
+                log.begin_expected_external_edit(buffer.clone(), cx);
+            });
+        });
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "zero\n")], None, cx).unwrap();
+        });
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        fs.save(
+            path!("/dir/file").as_ref(),
+            &"zero\none\ntwo\nthree\n".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            action_log.read_with(cx, |log, cx| log.changed_buffers(cx).len()),
+            1,
+            "the first external change should be attributed relative to the local user baseline"
+        );
+
+        cx.update(|cx| {
+            action_log.update(cx, |log, cx| {
+                log.end_expected_external_edit(buffer.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        action_log
+            .update(cx, |log, cx| log.reject_all_edits(None, cx))
+            .await;
+        cx.run_until_parked();
+
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "zero\none\ntwo\n"
+        );
+        assert_eq!(
+            String::from_utf8(fs.read_file_sync(path!("/dir/file")).unwrap()).unwrap(),
+            "zero\none\ntwo\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_linked_expected_external_edit_tracks_review_without_parent_file_read_time(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "one\ntwo\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let parent_log = cx.new(|_| ActionLog::new(project.clone()));
+        let child_log =
+            cx.new(|_| ActionLog::new(project.clone()).with_linked_action_log(parent_log.clone()));
+
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+        let abs_path = PathBuf::from(path!("/dir/file"));
+
+        cx.update(|cx| {
+            child_log.update(cx, |log, cx| {
+                log.begin_expected_external_edit(buffer.clone(), cx);
+            });
+        });
+
+        assert!(
+            child_log.read_with(cx, |log, _| log.file_read_time(&abs_path).is_none()),
+            "child should not record file_read_time until the first external agent change"
+        );
+        assert!(
+            parent_log.read_with(cx, |log, _| log.file_read_time(&abs_path).is_none()),
+            "parent should not inherit file_read_time from the child's pending expectation"
+        );
+
+        fs.save(
+            path!("/dir/file").as_ref(),
+            &"one\ntwo\nthree\n".into(),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            child_log.update(cx, |log, cx| {
+                log.end_expected_external_edit(buffer.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let child_hunks = unreviewed_hunks(&child_log, cx);
+        assert!(
+            !child_hunks.is_empty(),
+            "child should track the expected external edit"
+        );
+        assert_eq!(
+            unreviewed_hunks(&parent_log, cx),
+            child_hunks,
+            "parent should also track the expected external edit"
+        );
+        assert!(
+            child_log.read_with(cx, |log, _| log.file_read_time(&abs_path).is_some()),
+            "child should record file_read_time once the expected external edit is attributed"
+        );
+        assert!(
+            parent_log.read_with(cx, |log, _| log.file_read_time(&abs_path).is_none()),
+            "parent should still not inherit file_read_time from the child's expected external edit"
         );
     }
 

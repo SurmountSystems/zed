@@ -9,15 +9,10 @@ use collections::HashSet;
 pub use connection::*;
 pub use diff::*;
 use futures::{FutureExt, channel::oneshot, future::BoxFuture};
-use gpui::{
-    AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
-    WeakEntity,
-};
+use gpui::{AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task, WeakEntity};
 use itertools::Itertools;
 use language::language_settings::FormatOnSave;
-use language::{
-    Anchor, Buffer, BufferEvent, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff,
-};
+use language::{Anchor, Buffer, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff};
 use markdown::Markdown;
 pub use mention::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
@@ -1021,12 +1016,6 @@ struct RunningTurn {
 struct InferredEditCandidateReady {
     nonce: u64,
     buffer: Entity<Buffer>,
-    baseline_snapshot: text::BufferSnapshot,
-    existed_on_disk: bool,
-    was_dirty: bool,
-    observed_external_file_change: bool,
-    has_inferred_edit: bool,
-    _subscription: Subscription,
 }
 
 enum InferredEditCandidateState {
@@ -1774,19 +1763,31 @@ impl AcpThread {
         tool_call_id: &acp::ToolCallId,
         abs_path: &PathBuf,
         nonce: u64,
+        cx: &mut Context<Self>,
     ) {
+        let mut buffer_to_end = None;
         let remove_tool_call =
             if let Some(candidates) = self.inferred_edit_candidates.get_mut(tool_call_id) {
                 let should_remove = candidates
                     .get(abs_path)
                     .is_some_and(|candidate_state| candidate_state.nonce() == nonce);
                 if should_remove {
-                    candidates.remove(abs_path);
+                    if let Some(InferredEditCandidateState::Ready(candidate)) =
+                        candidates.remove(abs_path)
+                    {
+                        buffer_to_end = Some(candidate.buffer);
+                    }
                 }
                 candidates.is_empty()
             } else {
                 false
             };
+
+        if let Some(buffer) = buffer_to_end {
+            self.action_log.update(cx, |action_log, cx| {
+                action_log.end_expected_external_edit(buffer, cx);
+            });
+        }
 
         if remove_tool_call {
             self.inferred_edit_candidates.remove(tool_call_id);
@@ -1798,11 +1799,26 @@ impl AcpThread {
     fn clear_inferred_edit_candidates_for_tool_calls(
         &mut self,
         tool_call_ids: impl IntoIterator<Item = acp::ToolCallId>,
+        cx: &mut Context<Self>,
     ) {
+        let mut buffers_to_end = Vec::new();
+
         for tool_call_id in tool_call_ids {
-            self.inferred_edit_candidates.remove(&tool_call_id);
+            if let Some(candidates) = self.inferred_edit_candidates.remove(&tool_call_id) {
+                for candidate_state in candidates.into_values() {
+                    if let InferredEditCandidateState::Ready(candidate) = candidate_state {
+                        buffers_to_end.push(candidate.buffer);
+                    }
+                }
+            }
             self.finalizing_inferred_edit_tool_calls
                 .remove(&tool_call_id);
+        }
+
+        for buffer in buffers_to_end {
+            self.action_log.update(cx, |action_log, cx| {
+                action_log.end_expected_external_edit(buffer, cx);
+            });
         }
     }
 
@@ -1827,19 +1843,38 @@ impl AcpThread {
         &mut self,
         tool_call_id: &acp::ToolCallId,
         locations: &[acp::ToolCallLocation],
+        cx: &mut Context<Self>,
     ) {
         let mut current_paths = HashSet::default();
         for location in locations {
             current_paths.insert(location.path.clone());
         }
 
-        let remove_tool_call =
-            if let Some(candidates) = self.inferred_edit_candidates.get_mut(tool_call_id) {
-                candidates.retain(|path, _| current_paths.contains(path));
-                candidates.is_empty()
-            } else {
-                false
-            };
+        let mut buffers_to_end = Vec::new();
+        let remove_tool_call = if let Some(candidates) =
+            self.inferred_edit_candidates.get_mut(tool_call_id)
+        {
+            let removed_paths = candidates
+                .keys()
+                .filter(|path| !current_paths.contains(*path))
+                .cloned()
+                .collect::<Vec<_>>();
+            for path in removed_paths {
+                if let Some(InferredEditCandidateState::Ready(candidate)) = candidates.remove(&path)
+                {
+                    buffers_to_end.push(candidate.buffer);
+                }
+            }
+            candidates.is_empty()
+        } else {
+            false
+        };
+
+        for buffer in buffers_to_end {
+            self.action_log.update(cx, |action_log, cx| {
+                action_log.end_expected_external_edit(buffer, cx);
+            });
+        }
 
         if remove_tool_call {
             self.inferred_edit_candidates.remove(tool_call_id);
@@ -1854,7 +1889,7 @@ impl AcpThread {
         locations: &[acp::ToolCallLocation],
         cx: &mut Context<Self>,
     ) {
-        self.sync_inferred_edit_candidate_paths(&tool_call_id, locations);
+        self.sync_inferred_edit_candidate_paths(&tool_call_id, locations, cx);
 
         let mut unique_paths = HashSet::default();
         for location in locations {
@@ -1880,38 +1915,40 @@ impl AcpThread {
             let open_buffer = self.project.update(cx, |project, cx| {
                 let project_path = project.project_path_for_absolute_path(&abs_path, cx)?;
                 if let Some(buffer) = project.get_open_buffer(&project_path, cx) {
-                    let (baseline_snapshot, existed_on_disk, was_dirty) =
-                        Self::inferred_edit_candidate_baseline(&buffer, cx);
-                    return Some((
-                        Some((buffer, baseline_snapshot, existed_on_disk, was_dirty)),
-                        None,
-                    ));
+                    return Some((Some(buffer), None));
                 }
 
                 Some((None, Some(project.open_buffer(project_path, cx))))
             });
 
-            let Some((ready_candidate, open_buffer)) = open_buffer else {
-                self.remove_inferred_edit_candidate_if_matching(&tool_call_id, &abs_path, nonce);
+            let Some((ready_buffer, open_buffer)) = open_buffer else {
+                self.remove_inferred_edit_candidate_if_matching(
+                    &tool_call_id,
+                    &abs_path,
+                    nonce,
+                    cx,
+                );
                 continue;
             };
 
-            if let Some((buffer, baseline_snapshot, existed_on_disk, was_dirty)) = ready_candidate {
+            if let Some(buffer) = ready_buffer {
                 self.set_inferred_edit_candidate_ready(
                     tool_call_id.clone(),
                     abs_path,
                     nonce,
                     buffer,
-                    baseline_snapshot,
-                    existed_on_disk,
-                    was_dirty,
                     cx,
                 );
                 continue;
             }
 
             let Some(open_buffer) = open_buffer else {
-                self.remove_inferred_edit_candidate_if_matching(&tool_call_id, &abs_path, nonce);
+                self.remove_inferred_edit_candidate_if_matching(
+                    &tool_call_id,
+                    &abs_path,
+                    nonce,
+                    cx,
+                );
                 continue;
             };
 
@@ -1920,11 +1957,12 @@ impl AcpThread {
                 let buffer = match open_buffer.await {
                     Ok(buffer) => buffer,
                     Err(_) => {
-                        this.update(cx, |this, _| {
+                        this.update(cx, |this, cx| {
                             this.remove_inferred_edit_candidate_if_matching(
                                 &tool_call_id,
                                 &abs_path,
                                 nonce,
+                                cx,
                             );
                         })
                         .ok();
@@ -1932,18 +1970,12 @@ impl AcpThread {
                     }
                 };
 
-                let (baseline_snapshot, existed_on_disk, was_dirty) =
-                    Self::inferred_edit_candidate_baseline(&buffer, cx);
-
                 this.update(cx, |this, cx| {
                     this.set_inferred_edit_candidate_ready(
                         tool_call_id.clone(),
                         abs_path.clone(),
                         nonce,
                         buffer,
-                        baseline_snapshot,
-                        existed_on_disk,
-                        was_dirty,
                         cx,
                     );
                 })
@@ -1955,67 +1987,14 @@ impl AcpThread {
         }
     }
 
-    fn inferred_edit_candidate_baseline(
-        buffer: &Entity<Buffer>,
-        cx: &mut impl AppContext,
-    ) -> (text::BufferSnapshot, bool, bool) {
-        buffer.read_with(cx, |buffer, _| {
-            (
-                buffer.text_snapshot(),
-                buffer.file().is_some_and(|file| file.disk_state().exists()),
-                buffer.is_dirty(),
-            )
-        })
-    }
-
-    fn update_ready_inferred_edit_candidate_if_matching(
-        &mut self,
-        tool_call_id: &acp::ToolCallId,
-        abs_path: &PathBuf,
-        nonce: u64,
-        update: impl FnOnce(&mut InferredEditCandidateReady),
-    ) -> bool {
-        let Some(candidates) = self.inferred_edit_candidates.get_mut(tool_call_id) else {
-            return false;
-        };
-        let Some(InferredEditCandidateState::Ready(candidate)) = candidates.get_mut(abs_path)
-        else {
-            return false;
-        };
-        if candidate.nonce != nonce {
-            return false;
-        }
-
-        update(candidate);
-        true
-    }
-
     fn set_inferred_edit_candidate_ready(
         &mut self,
         tool_call_id: acp::ToolCallId,
         abs_path: PathBuf,
         nonce: u64,
         buffer: Entity<Buffer>,
-        baseline_snapshot: text::BufferSnapshot,
-        existed_on_disk: bool,
-        was_dirty: bool,
         cx: &mut Context<Self>,
     ) {
-        let subscription = cx.subscribe(&buffer, {
-            let tool_call_id = tool_call_id.clone();
-            let abs_path = abs_path.clone();
-            move |this, buffer, event: &BufferEvent, cx| {
-                this.handle_inferred_edit_candidate_buffer_event(
-                    tool_call_id.clone(),
-                    abs_path.clone(),
-                    nonce,
-                    buffer,
-                    event,
-                    cx,
-                );
-            }
-        });
-
         let Some(candidates) = self.inferred_edit_candidates.get_mut(&tool_call_id) else {
             return;
         };
@@ -2026,235 +2005,13 @@ impl AcpThread {
             return;
         }
 
-        *candidate_state = InferredEditCandidateState::Ready(InferredEditCandidateReady {
-            nonce,
-            buffer,
-            baseline_snapshot,
-            existed_on_disk,
-            was_dirty,
-            observed_external_file_change: false,
-            has_inferred_edit: false,
-            _subscription: subscription,
+        let buffer_for_action_log = buffer.clone();
+        *candidate_state =
+            InferredEditCandidateState::Ready(InferredEditCandidateReady { nonce, buffer });
+
+        self.action_log.update(cx, |action_log, cx| {
+            action_log.begin_expected_external_edit(buffer_for_action_log, cx);
         });
-    }
-
-    fn can_infer_initial_external_edit_for_candidate(
-        &self,
-        buffer: &Entity<Buffer>,
-        was_dirty: bool,
-        cx: &App,
-    ) -> bool {
-        if was_dirty {
-            return false;
-        }
-
-        if buffer.read_with(cx, |buffer, _| buffer.is_dirty()) {
-            return false;
-        }
-
-        !self.action_log.read_with(cx, |action_log, cx| {
-            action_log.has_changed_buffer(buffer, cx)
-        })
-    }
-
-    fn inferred_edit_candidate_has_meaningful_change(
-        existed_on_disk: bool,
-        baseline_snapshot: &text::BufferSnapshot,
-        buffer: &Entity<Buffer>,
-        cx: &App,
-    ) -> bool {
-        let (current_snapshot, current_exists) = buffer.read_with(cx, |buffer, _| {
-            (
-                buffer.text_snapshot(),
-                buffer.file().is_some_and(|file| file.disk_state().exists()),
-            )
-        });
-
-        if !existed_on_disk {
-            current_exists || current_snapshot.text() != baseline_snapshot.text()
-        } else {
-            current_snapshot.text() != baseline_snapshot.text()
-        }
-    }
-
-    fn infer_inferred_edit_candidate_from_baseline(
-        &mut self,
-        buffer: Entity<Buffer>,
-        baseline_snapshot: text::BufferSnapshot,
-        existed_on_disk: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if existed_on_disk {
-            self.action_log.update(cx, |action_log, cx| {
-                action_log.infer_buffer_edited_from_snapshot(buffer.clone(), baseline_snapshot, cx);
-            });
-        } else {
-            self.action_log.update(cx, |action_log, cx| {
-                action_log.infer_buffer_created(buffer.clone(), baseline_snapshot, cx);
-            });
-        }
-    }
-
-    fn handle_inferred_edit_candidate_buffer_event(
-        &mut self,
-        tool_call_id: acp::ToolCallId,
-        abs_path: PathBuf,
-        nonce: u64,
-        buffer: Entity<Buffer>,
-        event: &BufferEvent,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(InferredEditCandidateState::Ready(candidate)) = self
-            .inferred_edit_candidates
-            .get(&tool_call_id)
-            .and_then(|candidates| candidates.get(&abs_path))
-        else {
-            return;
-        };
-        if candidate.nonce != nonce {
-            return;
-        }
-
-        let baseline_snapshot = candidate.baseline_snapshot.clone();
-        let existed_on_disk = candidate.existed_on_disk;
-        let was_dirty = candidate.was_dirty;
-        let observed_external_file_change = candidate.observed_external_file_change;
-        let has_inferred_edit = candidate.has_inferred_edit;
-
-        enum Action {
-            None,
-            Remove,
-            SetObservedExternalFileChange,
-            ClearObservedExternalFileChange,
-            ClearObservedAndTrackEdited,
-            ClearObservedAndInferCreatedOrEdited,
-            RemoveAndWillDeleteBuffer,
-            RemoveAndInferDeleted,
-        }
-
-        let action = match event {
-            BufferEvent::Edited { is_local: true }
-                if !has_inferred_edit && !observed_external_file_change =>
-            {
-                Action::Remove
-            }
-            BufferEvent::Saved if !has_inferred_edit => Action::Remove,
-            BufferEvent::FileHandleChanged => {
-                let is_deleted = buffer.read_with(cx, |buffer, _| {
-                    buffer
-                        .file()
-                        .is_some_and(|file| file.disk_state().is_deleted())
-                });
-
-                if is_deleted {
-                    if has_inferred_edit {
-                        Action::RemoveAndWillDeleteBuffer
-                    } else if self
-                        .can_infer_initial_external_edit_for_candidate(&buffer, was_dirty, cx)
-                    {
-                        Action::RemoveAndInferDeleted
-                    } else {
-                        Action::Remove
-                    }
-                } else {
-                    Action::SetObservedExternalFileChange
-                }
-            }
-            BufferEvent::Reloaded if observed_external_file_change => {
-                if has_inferred_edit {
-                    Action::ClearObservedAndTrackEdited
-                } else if self.can_infer_initial_external_edit_for_candidate(&buffer, was_dirty, cx)
-                    && Self::inferred_edit_candidate_has_meaningful_change(
-                        existed_on_disk,
-                        &baseline_snapshot,
-                        &buffer,
-                        cx,
-                    )
-                {
-                    Action::ClearObservedAndInferCreatedOrEdited
-                } else {
-                    Action::ClearObservedExternalFileChange
-                }
-            }
-            _ => Action::None,
-        };
-
-        match action {
-            Action::None => {}
-            Action::Remove => {
-                self.remove_inferred_edit_candidate_if_matching(&tool_call_id, &abs_path, nonce);
-            }
-            Action::SetObservedExternalFileChange => {
-                self.update_ready_inferred_edit_candidate_if_matching(
-                    &tool_call_id,
-                    &abs_path,
-                    nonce,
-                    |candidate| {
-                        candidate.observed_external_file_change = true;
-                    },
-                );
-            }
-            Action::ClearObservedExternalFileChange => {
-                self.update_ready_inferred_edit_candidate_if_matching(
-                    &tool_call_id,
-                    &abs_path,
-                    nonce,
-                    |candidate| {
-                        candidate.observed_external_file_change = false;
-                    },
-                );
-            }
-            Action::ClearObservedAndTrackEdited => {
-                let updated = self.update_ready_inferred_edit_candidate_if_matching(
-                    &tool_call_id,
-                    &abs_path,
-                    nonce,
-                    |candidate| {
-                        candidate.observed_external_file_change = false;
-                    },
-                );
-                if updated {
-                    self.action_log.update(cx, |action_log, cx| {
-                        action_log.buffer_edited(buffer.clone(), cx);
-                    });
-                }
-            }
-            Action::ClearObservedAndInferCreatedOrEdited => {
-                let updated = self.update_ready_inferred_edit_candidate_if_matching(
-                    &tool_call_id,
-                    &abs_path,
-                    nonce,
-                    |candidate| {
-                        candidate.observed_external_file_change = false;
-                        candidate.has_inferred_edit = true;
-                    },
-                );
-                if updated {
-                    self.infer_inferred_edit_candidate_from_baseline(
-                        buffer,
-                        baseline_snapshot,
-                        existed_on_disk,
-                        cx,
-                    );
-                }
-            }
-            Action::RemoveAndWillDeleteBuffer => {
-                self.remove_inferred_edit_candidate_if_matching(&tool_call_id, &abs_path, nonce);
-                self.action_log.update(cx, |action_log, cx| {
-                    action_log.will_delete_buffer(buffer.clone(), cx);
-                });
-            }
-            Action::RemoveAndInferDeleted => {
-                self.remove_inferred_edit_candidate_if_matching(&tool_call_id, &abs_path, nonce);
-                self.action_log.update(cx, |action_log, cx| {
-                    action_log.infer_buffer_deleted_from_snapshot(
-                        buffer.clone(),
-                        baseline_snapshot,
-                        cx,
-                    );
-                });
-            }
-        }
     }
 
     fn finalize_inferred_edit_tool_call(
@@ -2267,7 +2024,7 @@ impl AcpThread {
                 && Self::is_inferred_edit_terminal_status(&tool_call.status)
         });
         if !should_finalize {
-            self.clear_inferred_edit_candidates_for_tool_calls([tool_call_id]);
+            self.clear_inferred_edit_candidates_for_tool_calls([tool_call_id], cx);
             return;
         }
 
@@ -2284,42 +2041,34 @@ impl AcpThread {
             const ATTEMPT_DELAY: Duration = Duration::from_millis(50);
 
             for attempt in 0..MAX_ATTEMPTS {
-                let (buffers_to_reload, has_pending, has_observed_external_file_change) = this
+                let (ready_buffers, has_pending) = this
                     .read_with(cx, |this, _| {
                         let Some(candidates) = this.inferred_edit_candidates.get(&tool_call_id)
                         else {
-                            return (Vec::new(), false, false);
+                            return (Vec::new(), false);
                         };
 
-                        let mut buffers_to_reload = HashSet::default();
+                        let mut ready_buffers = Vec::new();
                         let mut has_pending = false;
-                        let mut has_observed_external_file_change = false;
 
                         for candidate_state in candidates.values() {
                             match candidate_state {
                                 InferredEditCandidateState::Pending { .. } => has_pending = true,
                                 InferredEditCandidateState::Ready(candidate) => {
-                                    if candidate.observed_external_file_change {
-                                        has_observed_external_file_change = true;
-                                        buffers_to_reload.insert(candidate.buffer.clone());
-                                    }
+                                    ready_buffers.push(candidate.buffer.clone());
                                 }
                             }
                         }
 
-                        (
-                            buffers_to_reload.into_iter().collect::<Vec<_>>(),
-                            has_pending,
-                            has_observed_external_file_change,
-                        )
+                        (ready_buffers, has_pending)
                     })
-                    .unwrap_or((Vec::new(), false, false));
+                    .unwrap_or((Vec::new(), false));
 
-                if buffers_to_reload.is_empty() && !has_pending {
+                if ready_buffers.is_empty() && !has_pending {
                     break;
                 }
 
-                for buffer in buffers_to_reload {
+                for buffer in ready_buffers {
                     let should_reload = buffer.read_with(cx, |buffer, _| !buffer.is_dirty());
                     if !should_reload {
                         continue;
@@ -2333,17 +2082,15 @@ impl AcpThread {
                     reload.await.log_err();
                 }
 
-                if (!has_pending && !has_observed_external_file_change)
-                    || attempt + 1 == MAX_ATTEMPTS
-                {
+                if !has_pending || attempt + 1 == MAX_ATTEMPTS {
                     break;
                 }
 
                 cx.background_executor().timer(ATTEMPT_DELAY).await;
             }
 
-            this.update(cx, |this, _| {
-                this.clear_inferred_edit_candidates_for_tool_calls([tool_call_id.clone()]);
+            this.update(cx, |this, cx| {
+                this.clear_inferred_edit_candidates_for_tool_calls([tool_call_id.clone()], cx);
             })
             .ok();
 
@@ -2366,7 +2113,7 @@ impl AcpThread {
         let locations = tool_call.locations.clone();
 
         if !should_track {
-            self.clear_inferred_edit_candidates_for_tool_calls([tool_call_id]);
+            self.clear_inferred_edit_candidates_for_tool_calls([tool_call_id], cx);
             return;
         }
 
@@ -2892,6 +2639,7 @@ impl AcpThread {
                             let canceled_tool_call_ids = this.mark_pending_tools_as_canceled();
                             this.clear_inferred_edit_candidates_for_tool_calls(
                                 canceled_tool_call_ids,
+                                cx,
                             );
                             this.finalize_all_inferred_edit_tool_calls(cx);
                         }
@@ -2934,6 +2682,7 @@ impl AcpThread {
                                             .collect::<Vec<_>>();
                                         this.clear_inferred_edit_candidates_for_tool_calls(
                                             removed_tool_call_ids,
+                                            cx,
                                         );
                                         this.entries.truncate(user_msg_ix);
                                         cx.emit(AcpThreadEvent::EntriesRemoved(range));
@@ -2973,7 +2722,7 @@ impl AcpThread {
 
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         let canceled_tool_call_ids = self.mark_pending_tools_as_canceled();
-        self.clear_inferred_edit_candidates_for_tool_calls(canceled_tool_call_ids);
+        self.clear_inferred_edit_candidates_for_tool_calls(canceled_tool_call_ids, cx);
         self.finalize_all_inferred_edit_tool_calls(cx);
 
         cx.background_spawn(turn.send_task)
@@ -3066,7 +2815,7 @@ impl AcpThread {
                         .collect::<Vec<_>>();
 
                     let range = ix..this.entries.len();
-                    this.clear_inferred_edit_candidates_for_tool_calls(removed_tool_call_ids);
+                    this.clear_inferred_edit_candidates_for_tool_calls(removed_tool_call_ids, cx);
                     this.entries.truncate(ix);
                     cx.emit(AcpThreadEvent::EntriesRemoved(range));
 
