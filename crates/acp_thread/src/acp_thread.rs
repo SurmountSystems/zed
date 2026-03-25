@@ -2367,6 +2367,10 @@ impl AcpThread {
                             });
                         }
                     }
+
+                    // Release buffer handles that were tracked during the
+                    // rewound portion so they don't keep buffers alive.
+                    this.shared_buffers.clear();
                 }
                 this.action_log().update(cx, |action_log, cx| {
                     action_log.reject_all_edits(Some(telemetry), cx)

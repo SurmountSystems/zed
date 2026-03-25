@@ -1,5 +1,6 @@
 use crate::{DEFAULT_THREAD_TITLE, SelectPermissionGranularity};
 use std::cell::RefCell;
+use std::ops::Range;
 
 use acp_thread::ContentBlock;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
@@ -731,6 +732,37 @@ impl ThreadView {
                 self.open_diff_location(path, *position, *split, window, cx);
             }
         }
+    }
+
+    pub fn on_entries_removed(&mut self, range: &Range<usize>, cx: &mut Context<Self>) {
+        let entries = self.thread.read(cx).entries();
+        let valid_tool_call_ids: HashSet<_> = entries
+            .iter()
+            .filter_map(|entry| {
+                if let AgentThreadEntry::ToolCall(tool_call) = entry {
+                    Some(&tool_call.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let entry_count = entries.len();
+
+        self.expanded_tool_calls
+            .retain(|id| valid_tool_call_ids.contains(id));
+        self.expanded_tool_call_raw_inputs
+            .retain(|id| valid_tool_call_ids.contains(id));
+        self.expanded_thinking_blocks
+            .retain(|&(entry_index, _)| entry_index < entry_count);
+        if let Some((entry_index, _)) = self.auto_expanded_thinking_block {
+            if range.contains(&entry_index) || entry_index >= range.start {
+                self.auto_expanded_thinking_block = None;
+            }
+        }
+        self.discarded_partial_edits
+            .retain(|id| valid_tool_call_ids.contains(id));
+        self.permission_selections
+            .retain(|id, _| valid_tool_call_ids.contains(id));
     }
 
     fn open_diff_location(

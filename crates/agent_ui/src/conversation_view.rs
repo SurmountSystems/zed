@@ -1234,6 +1234,9 @@ impl ConversationView {
                     let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
+                    active.update(cx, |thread_view, cx| {
+                        thread_view.on_entries_removed(range, cx);
+                    });
                 }
             }
             AcpThreadEvent::SubagentSpawned(session_id) => self.load_subagent_session(
