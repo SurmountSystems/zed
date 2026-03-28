@@ -45,29 +45,10 @@ use workspace::{
 use zed_actions::OpenRecent;
 use zed_actions::editor::{MoveDown, MoveUp};
 
-use zed_actions::agents_sidebar::FocusSidebarFilter;
-
-gpui::actions!(
-    agents_sidebar,
-    [
-        /// Creates a new thread in the currently selected or active project group.
-        NewThreadInGroup,
-        /// Toggles between the thread list and the archive view.
-        ToggleArchive,
-        /// Closes the currently selected workspace.
-        RemoveSelectedWorkspace,
-        /// Removes the selected entry: archives a thread or closes a workspace.
-        RemoveSelected,
-        /// Stops the currently selected running thread.
-        StopSelectedThread,
-        /// Activates the workspace that owns the currently selected entry.
-        ActivateSelectedWorkspace,
-        /// Expands the selected group to show more threads.
-        ShowMoreThreads,
-        /// Collapses expanded threads in the selected group back to the default count.
-        ShowFewerThreads,
-    ]
-);
+use zed_actions::agents_sidebar::{
+    ActivateSelectedWorkspace, FocusSidebarFilter, NewThreadInGroup, RemoveSelected,
+    RemoveSelectedWorkspace, ShowFewerThreads, ShowMoreThreads, StopSelectedThread, ToggleArchive,
+};
 
 const DEFAULT_WIDTH: Pixels = px(300.0);
 const MIN_WIDTH: Pixels = px(200.0);
