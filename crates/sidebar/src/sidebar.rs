@@ -48,8 +48,8 @@ use zed_actions::editor::{MoveDown, MoveUp};
 
 use zed_actions::agents_sidebar::{
     ActivateSelectedWorkspace, FocusSidebarFilter, NewThreadInGroup, RemoveSelected,
-    RemoveSelectedWorkspace, ShowFewerThreads, ShowMoreThreads, StopSelectedThread,
-    ToggleArchive, ToggleThreadSwitcher,
+    RemoveSelectedWorkspace, ShowFewerThreads, ShowMoreThreads, StopSelectedThread, ToggleArchive,
+    ToggleThreadSwitcher,
 };
 
 use crate::thread_switcher::{ThreadSwitcher, ThreadSwitcherEntry, ThreadSwitcherEvent};
