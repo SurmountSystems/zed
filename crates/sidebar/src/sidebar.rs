@@ -1715,7 +1715,7 @@ impl Sidebar {
 
         if to_remove.len() == workspaces.len() {
             multi_workspace.update(cx, |multi_workspace, cx| {
-                multi_workspace.create_empty_workspace(window, cx).detach();
+                multi_workspace.create_empty_workspace(window, cx);
             });
         }
 
