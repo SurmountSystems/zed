@@ -3588,13 +3588,110 @@ impl ScrollHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AppContext as _, Context, TestAppContext};
+    use crate::{AppContext as _, Context, InputEvent, MouseMoveEvent, TestAppContext};
+    use std::rc::Weak;
 
     struct TestTooltipView;
 
     impl Render for TestTooltipView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().w(px(20.)).h(px(20.)).child("tooltip")
+        }
+    }
+
+    type CapturedActiveTooltip = Rc<RefCell<Option<Weak<RefCell<Option<ActiveTooltip>>>>>>;
+
+    struct TooltipCaptureElement {
+        child: AnyElement,
+        captured_active_tooltip: CapturedActiveTooltip,
+    }
+
+    impl IntoElement for TooltipCaptureElement {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl Element for TooltipCaptureElement {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> (LayoutId, Self::RequestLayoutState) {
+            (self.child.request_layout(window, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            window: &mut Window,
+            cx: &mut App,
+        ) -> Self::PrepaintState {
+            self.child.prepaint(window, cx);
+        }
+
+        fn paint(
+            &mut self,
+            _id: Option<&GlobalElementId>,
+            _inspector_id: Option<&InspectorElementId>,
+            _bounds: Bounds<Pixels>,
+            _request_layout: &mut Self::RequestLayoutState,
+            _prepaint: &mut Self::PrepaintState,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            self.child.paint(window, cx);
+            window.with_global_id("target".into(), |global_id, window| {
+                window.with_element_state::<InteractiveElementState, _>(
+                    global_id,
+                    |state, _window| {
+                        let state = state.unwrap();
+                        *self.captured_active_tooltip.borrow_mut() =
+                            state.active_tooltip.as_ref().map(Rc::downgrade);
+                        ((), state)
+                    },
+                )
+            });
+        }
+    }
+
+    struct TooltipOwner {
+        captured_active_tooltip: CapturedActiveTooltip,
+    }
+
+    impl Render for TooltipOwner {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            TooltipCaptureElement {
+                child: div()
+                    .size_full()
+                    .child(
+                        div()
+                            .id("target")
+                            .w(px(50.))
+                            .h(px(50.))
+                            .tooltip(|_, cx| cx.new(|_| TestTooltipView).into()),
+                    )
+                    .into_any_element(),
+                captured_active_tooltip: self.captured_active_tooltip.clone(),
+            }
         }
     }
 
@@ -3636,46 +3733,78 @@ mod tests {
         assert_eq!(handle.offset().y, px(-25.));
     }
 
-    #[test]
-    fn tooltip_is_released_when_its_owner_disappears() {
+    fn setup_tooltip_owner_test() -> (
+        TestAppContext,
+        crate::AnyWindowHandle,
+        CapturedActiveTooltip,
+    ) {
         let mut test_app = TestAppContext::single();
-        let window = test_app.add_window(|_, _| crate::Empty);
+        let captured_active_tooltip: CapturedActiveTooltip = Rc::new(RefCell::new(None));
+        let window = test_app.add_window({
+            let captured_active_tooltip = captured_active_tooltip.clone();
+            move |_, _| TooltipOwner {
+                captured_active_tooltip,
+            }
+        });
         let any_window = window.into();
-
-        let active_tooltip: Rc<RefCell<Option<ActiveTooltip>>> = Rc::new(RefCell::new(None));
-        let weak_active_tooltip = Rc::downgrade(&active_tooltip);
-
-        let mut interactivity = Interactivity::default();
-        interactivity.tooltip(|_, cx| cx.new(|_| TestTooltipView).into());
-        let tooltip_builder = interactivity.tooltip_builder.take().unwrap();
-        let tooltip_is_hoverable = tooltip_builder.hoverable;
-        let build_tooltip: Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>> =
-            Rc::new(move |window: &mut Window, cx: &mut App| {
-                Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
-            });
-        let check_is_hovered: Rc<dyn Fn(&Window) -> bool> = Rc::new(|_: &Window| true);
-        let check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool> =
-            Rc::new(|_: &Window| true);
 
         test_app
             .update_window(any_window, |_, window, cx| {
-                handle_tooltip_mouse_move(
-                    &active_tooltip,
-                    &build_tooltip,
-                    &check_is_hovered,
-                    &check_is_hovered_during_prepaint,
-                    DispatchPhase::Bubble,
-                    window,
+                window.draw(cx).clear();
+            })
+            .unwrap();
+
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: point(px(10.), px(10.)),
+                        modifiers: Default::default(),
+                        pressed_button: None,
+                    }
+                    .to_platform_input(),
                     cx,
                 );
             })
             .unwrap();
 
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear();
+            })
+            .unwrap();
+
+        (test_app, any_window, captured_active_tooltip)
+    }
+
+    #[test]
+    fn tooltip_waiting_for_show_is_released_when_its_owner_disappears() {
+        let (mut test_app, any_window, captured_active_tooltip) = setup_tooltip_owner_test();
+
+        let weak_active_tooltip = captured_active_tooltip.borrow().clone().unwrap();
+        let active_tooltip = weak_active_tooltip.upgrade().unwrap();
         assert!(matches!(
             active_tooltip.borrow().as_ref(),
             Some(ActiveTooltip::WaitingForShow { .. })
         ));
-        assert_eq!(Rc::strong_count(&active_tooltip), 1);
+
+        test_app
+            .update_window(any_window, |_, window, _| {
+                window.remove_window();
+            })
+            .unwrap();
+        test_app.run_until_parked();
+        drop(active_tooltip);
+
+        assert!(weak_active_tooltip.upgrade().is_none());
+    }
+
+    #[test]
+    fn tooltip_is_released_when_its_owner_disappears() {
+        let (mut test_app, any_window, captured_active_tooltip) = setup_tooltip_owner_test();
+
+        let weak_active_tooltip = captured_active_tooltip.borrow().clone().unwrap();
+        let active_tooltip = weak_active_tooltip.upgrade().unwrap();
 
         test_app.dispatcher.advance_clock(TOOLTIP_SHOW_DELAY);
         test_app.run_until_parked();
@@ -3684,8 +3813,13 @@ mod tests {
             active_tooltip.borrow().as_ref(),
             Some(ActiveTooltip::Visible { .. })
         ));
-        assert_eq!(Rc::strong_count(&active_tooltip), 1);
 
+        test_app
+            .update_window(any_window, |_, window, _| {
+                window.remove_window();
+            })
+            .unwrap();
+        test_app.run_until_parked();
         drop(active_tooltip);
 
         assert!(weak_active_tooltip.upgrade().is_none());
