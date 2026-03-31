@@ -698,7 +698,7 @@ impl Sidebar {
         };
         let mw = multi_workspace.read(cx);
         let workspaces = mw.workspaces().to_vec();
-        let active_workspace = mw.workspaces().get(mw.active_workspace_index()).cloned();
+        let active_workspace = Some(mw.active_workspace());
 
         let agent_server_store = workspaces
             .first()
@@ -2232,12 +2232,10 @@ impl Sidebar {
             return;
         }
 
-        let active_workspace = self.multi_workspace.upgrade().and_then(|w| {
-            w.read(cx)
-                .workspaces()
-                .get(w.read(cx).active_workspace_index())
-                .cloned()
-        });
+        let active_workspace = self
+            .multi_workspace
+            .upgrade()
+            .map(|w| w.read(cx).active_workspace());
 
         if let Some(workspace) = active_workspace {
             self.activate_thread_locally(&metadata, &workspace, window, cx);

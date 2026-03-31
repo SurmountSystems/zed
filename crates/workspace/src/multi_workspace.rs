@@ -8,13 +8,14 @@ use gpui::{
 use project::DisableAiSettings;
 #[cfg(any(test, feature = "test-support"))]
 use project::Project;
+use remote::RemoteConnectionOptions;
 use settings::Settings;
 pub use settings::SidebarSide;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use ui::prelude::*;
-use util::ResultExt;
+use util::{ResultExt, debug_panic, path_list::PathList};
 use zed_actions::agents_sidebar::{MoveWorkspaceToNewWindow, ToggleThreadSwitcher};
 
 use agent_settings::AgentSettings;
@@ -218,16 +219,69 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
     }
 }
 
+/// Identifies a project group by a set of paths the workspaces in this group
+/// have.
+///
+/// Paths are mapped to their main worktree path first so we can group
+/// workspaces by main repos.
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub struct ProjectGroupKey {
+    pub main_worktree_paths: PathList,
+    pub host: Option<RemoteConnectionOptions>,
+}
+
+impl ProjectGroupKey {
+    pub fn display_name(&self) -> SharedString {
+        let mut names = Vec::with_capacity(self.main_worktree_paths.paths().len());
+        for abs_path in self.main_worktree_paths.paths() {
+            if let Some(name) = abs_path.file_name() {
+                names.push(name.to_string_lossy().to_string());
+            }
+        }
+        if names.is_empty() {
+            // TODO: Can we do something better in this case?
+            "Empty Workspace".into()
+        } else {
+            names.join(", ").into()
+        }
+    }
+
+    pub fn path_list(&self) -> &PathList {
+        &self.main_worktree_paths
+    }
+
+    pub fn from_paths(paths: &[PathBuf], host: Option<RemoteConnectionOptions>) -> Self {
+        Self {
+            main_worktree_paths: PathList::new(paths),
+            host,
+        }
+    }
+}
+
 pub struct MultiWorkspace {
     window_id: WindowId,
-    workspaces: Vec<Entity<Workspace>>,
-    active_workspace_index: usize,
+    project_groups: Vec<ProjectGroup>,
+    active_workspace: Entity<Workspace>,
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
     pending_removal_tasks: Vec<Task<()>>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+struct ProjectGroup {
+    key: ProjectGroupKey,
+    workspaces: Vec<Entity<Workspace>>,
+}
+
+impl ProjectGroup {
+    fn from_workspace(workspace: Entity<Workspace>, cx: &App) -> Self {
+        Self {
+            key: workspace.read(cx).project_group_key(cx),
+            workspaces: vec![workspace],
+        }
+    }
 }
 
 impl EventEmitter<MultiWorkspaceEvent> for MultiWorkspace {}
@@ -269,8 +323,8 @@ impl MultiWorkspace {
         });
         Self {
             window_id: window.window_handle().window_id(),
-            workspaces: vec![workspace],
-            active_workspace_index: 0,
+            project_groups: vec![ProjectGroup::from_workspace(workspace.clone(), cx)],
+            active_workspace: workspace,
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
@@ -381,10 +435,17 @@ impl MultiWorkspace {
         }
     }
 
+    pub fn workspaces(&self) -> Vec<Entity<Workspace>> {
+        self.project_groups
+            .iter()
+            .flat_map(|group| group.workspaces.iter().cloned())
+            .collect()
+    }
+
     pub fn open_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_open = true;
         let sidebar_focus_handle = self.sidebar.as_ref().map(|s| s.focus_handle(cx));
-        for workspace in &self.workspaces {
+        for workspace in self.workspaces() {
             workspace.update(cx, |workspace, _cx| {
                 workspace.set_sidebar_focus_handle(sidebar_focus_handle.clone());
             });
@@ -395,7 +456,7 @@ impl MultiWorkspace {
 
     pub fn close_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_open = false;
-        for workspace in &self.workspaces {
+        for workspace in self.workspaces() {
             workspace.update(cx, |workspace, _cx| {
                 workspace.set_sidebar_focus_handle(None);
             });
@@ -409,9 +470,8 @@ impl MultiWorkspace {
 
     pub fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
-            let workspaces = this.update(cx, |multi_workspace, _cx| {
-                multi_workspace.workspaces().to_vec()
-            })?;
+            let workspaces =
+                this.update(cx, |multi_workspace, _cx| multi_workspace.workspaces())?;
 
             for workspace in workspaces {
                 let should_continue = workspace
@@ -447,15 +507,21 @@ impl MultiWorkspace {
     }
 
     pub fn workspace(&self) -> &Entity<Workspace> {
-        &self.workspaces[self.active_workspace_index]
+        &self.active_workspace
     }
 
-    pub fn workspaces(&self) -> &[Entity<Workspace>] {
-        &self.workspaces
+    pub fn active_workspace(&self) -> Entity<Workspace> {
+        self.active_workspace.clone()
     }
 
     pub fn active_workspace_index(&self) -> usize {
-        self.active_workspace_index
+        self.workspaces()
+            .iter()
+            .position(|workspace| workspace == &self.active_workspace)
+            .unwrap_or_else(|| {
+                debug_panic!("active workspace was not present in project groups");
+                0
+            })
     }
 
     /// Adds a workspace to this window without changing which workspace is
@@ -481,9 +547,9 @@ impl MultiWorkspace {
             return;
         }
 
-        let index = self.insert_workspace(workspace, &*window, cx);
-        let changed = self.active_workspace_index != index;
-        self.active_workspace_index = index;
+        self.insert_workspace(workspace.clone(), &*window, cx);
+        let changed = self.active_workspace != workspace;
+        self.active_workspace = workspace;
         if changed {
             cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
             self.serialize(cx);
@@ -505,9 +571,9 @@ impl MultiWorkspace {
             return;
         }
 
-        if let Some(index) = self.workspaces.iter().position(|w| *w == workspace) {
-            let changed = self.active_workspace_index != index;
-            self.active_workspace_index = index;
+        if let Some(index) = self.workspaces().iter().position(|w| *w == workspace) {
+            let changed = self.active_workspace_index() != index;
+            self.active_workspace = self.workspaces()[index].clone();
             if changed {
                 cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
                 self.serialize(cx);
@@ -516,10 +582,7 @@ impl MultiWorkspace {
             return;
         }
 
-        let old_workspace = std::mem::replace(
-            &mut self.workspaces[self.active_workspace_index],
-            workspace.clone(),
-        );
+        let old_workspace = std::mem::replace(&mut self.active_workspace, workspace.clone());
 
         let old_entity_id = old_workspace.entity_id();
         self.detach_workspace(&old_workspace, cx);
@@ -535,35 +598,42 @@ impl MultiWorkspace {
     }
 
     fn set_single_workspace(&mut self, workspace: Entity<Workspace>, cx: &mut Context<Self>) {
-        self.workspaces[0] = workspace;
-        self.active_workspace_index = 0;
+        self.active_workspace = workspace;
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
         cx.notify();
     }
 
-    /// Inserts a workspace into the list if not already present. Returns the
-    /// index of the workspace (existing or newly inserted). Does not change
-    /// the active workspace index.
+    /// Inserts a workspace into the matching project group, creating a new
+    /// group if none exists. Does nothing if the workspace is already present.
     fn insert_workspace(
         &mut self,
         workspace: Entity<Workspace>,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> usize {
-        if let Some(index) = self.workspaces.iter().position(|w| *w == workspace) {
-            index
-        } else {
-            Self::subscribe_to_workspace(&workspace, window, cx);
-            self.sync_sidebar_to_workspace(&workspace, cx);
-            let weak_self = cx.weak_entity();
-            workspace.update(cx, |workspace, cx| {
-                workspace.set_multi_workspace(weak_self, cx);
-            });
-            self.workspaces.push(workspace.clone());
-            cx.emit(MultiWorkspaceEvent::WorkspaceAdded(workspace));
-            cx.notify();
-            self.workspaces.len() - 1
+    ) {
+        if self.workspaces().iter().any(|w| *w == workspace) {
+            return;
         }
+
+        Self::subscribe_to_workspace(&workspace, window, cx);
+        self.sync_sidebar_to_workspace(&workspace, cx);
+        let weak_self = cx.weak_entity();
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_multi_workspace(weak_self, cx);
+        });
+
+        let key = workspace.read(cx).project_group_key(cx);
+        if let Some(group) = self.project_groups.iter_mut().find(|g| g.key == key) {
+            group.workspaces.push(workspace.clone());
+        } else {
+            self.project_groups.push(ProjectGroup {
+                key,
+                workspaces: vec![workspace.clone()],
+            });
+        }
+
+        cx.emit(MultiWorkspaceEvent::WorkspaceAdded(workspace));
+        cx.notify();
     }
 
     /// Clears session state and DB binding for a workspace that is being
@@ -598,13 +668,14 @@ impl MultiWorkspace {
     }
 
     fn cycle_workspace(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.workspaces.len() as isize;
+        let workspaces = self.workspaces();
+        let count = workspaces.len() as isize;
         if count <= 1 {
             return;
         }
-        let current = self.active_workspace_index as isize;
+        let current = self.active_workspace_index() as isize;
         let next = ((current + delta).rem_euclid(count)) as usize;
-        let workspace = self.workspaces[next].clone();
+        let workspace = workspaces[next].clone();
         self.activate(workspace, window, cx);
     }
 
@@ -838,28 +909,37 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(index) = self.workspaces.iter().position(|w| w == workspace) else {
+        let all_workspaces = self.workspaces();
+        if all_workspaces.len() <= 1 {
+            return false;
+        }
+
+        let Some(group) = self
+            .project_groups
+            .iter_mut()
+            .find(|g| g.workspaces.contains(workspace))
+        else {
             return false;
         };
-        if self.workspaces.len() <= 1 {
-            return false;
+        group.workspaces.retain(|w| w != workspace);
+
+        // Remove empty groups.
+        self.project_groups.retain(|g| !g.workspaces.is_empty());
+
+        // If we removed the active workspace, pick a new one.
+        if self.active_workspace == *workspace {
+            self.active_workspace = self
+                .workspaces()
+                .into_iter()
+                .next()
+                .expect("there is always at least one workspace after the len() > 1 check");
         }
 
-        let removed_workspace = self.workspaces.remove(index);
-
-        if self.active_workspace_index >= self.workspaces.len() {
-            self.active_workspace_index = self.workspaces.len() - 1;
-        } else if self.active_workspace_index > index {
-            self.active_workspace_index -= 1;
-        }
-
-        self.detach_workspace(&removed_workspace, cx);
+        self.detach_workspace(workspace, cx);
 
         self.serialize(cx);
         self.focus_active_workspace(window, cx);
-        cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(
-            removed_workspace.entity_id(),
-        ));
+        cx.emit(MultiWorkspaceEvent::WorkspaceRemoved(workspace.entity_id()));
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
         cx.notify();
 
