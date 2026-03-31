@@ -3639,23 +3639,46 @@ mod tests {
     #[test]
     fn tooltip_is_released_when_its_owner_disappears() {
         let mut test_app = TestAppContext::single();
+        let window = test_app.add_window(|_, _| crate::Empty);
+        let any_window = window.into();
 
         let active_tooltip: Rc<RefCell<Option<ActiveTooltip>>> = Rc::new(RefCell::new(None));
         let weak_active_tooltip = Rc::downgrade(&active_tooltip);
-        let tooltip_view = test_app.update(|cx| cx.new(|_| TestTooltipView).into());
+        let build_tooltip: Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>> =
+            Rc::new(|_, cx| Some((cx.new(|_| TestTooltipView).into(), false)));
+        let check_is_hovered: Rc<dyn Fn(&Window) -> bool> = Rc::new(|_: &Window| true);
+        let check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool> =
+            Rc::new(|_: &Window| true);
 
-        *active_tooltip.borrow_mut() = Some(ActiveTooltip::Visible {
-            tooltip: AnyTooltip {
-                view: tooltip_view,
-                mouse_position: point(px(0.), px(0.)),
-                check_visible_and_update: Rc::new(move |_, _, _| {
-                    weak_active_tooltip.upgrade().is_some()
-                }),
-            },
-            is_hoverable: false,
-        });
+        test_app
+            .update_window(any_window, |_, window, cx| {
+                handle_tooltip_mouse_move(
+                    &active_tooltip,
+                    &build_tooltip,
+                    &check_is_hovered,
+                    &check_is_hovered_during_prepaint,
+                    DispatchPhase::Bubble,
+                    window,
+                    cx,
+                );
+            })
+            .unwrap();
 
-        let weak_active_tooltip = Rc::downgrade(&active_tooltip);
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::WaitingForShow { .. })
+        ));
+        assert_eq!(Rc::strong_count(&active_tooltip), 1);
+
+        test_app.dispatcher.advance_clock(TOOLTIP_SHOW_DELAY);
+        test_app.run_until_parked();
+
+        assert!(matches!(
+            active_tooltip.borrow().as_ref(),
+            Some(ActiveTooltip::Visible { .. })
+        ));
+        assert_eq!(Rc::strong_count(&active_tooltip), 1);
+
         drop(active_tooltip);
 
         assert!(weak_active_tooltip.upgrade().is_none());
