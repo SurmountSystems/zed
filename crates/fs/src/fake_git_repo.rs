@@ -225,14 +225,40 @@ impl GitRepository for FakeGitRepository {
 
     fn reset(
         &self,
-        _commit: String,
+        commit: String,
         mode: ResetMode,
         _env: Arc<HashMap<String, String>>,
     ) -> BoxFuture<'_, Result<()>> {
         self.with_state_async(true, move |state| {
-            let Some(snapshot) = state.commit_history.pop() else {
-                anyhow::bail!("No commit to reset to");
+            let pop_count = if commit == "HEAD~" {
+                1
+            } else if let Some(suffix) = commit.strip_prefix("HEAD~") {
+                suffix
+                    .parse::<usize>()
+                    .with_context(|| format!("Invalid HEAD~ offset: {commit}"))?
+            } else {
+                match state
+                    .commit_history
+                    .iter()
+                    .rposition(|entry| entry.sha == commit)
+                {
+                    Some(index) => state.commit_history.len() - index,
+                    None => anyhow::bail!("Unknown commit ref: {commit}"),
+                }
             };
+
+            if pop_count == 0 || pop_count > state.commit_history.len() {
+                anyhow::bail!(
+                    "Cannot reset {pop_count} commit(s): only {} in history",
+                    state.commit_history.len()
+                );
+            }
+
+            let mut snapshot = None;
+            for _ in 0..pop_count {
+                snapshot = state.commit_history.pop();
+            }
+            let snapshot = snapshot.expect("pop_count validated above");
 
             match mode {
                 ResetMode::Soft => {
