@@ -880,6 +880,7 @@ fn into_copilot_chat(
 ) -> Result<CopilotChatRequest> {
     let temperature = request.temperature;
     let tool_choice = request.tool_choice;
+    let thinking_allowed = request.thinking_allowed;
 
     let mut request_messages: Vec<LanguageModelRequestMessage> = Vec::new();
     for message in request.messages {
@@ -1049,7 +1050,15 @@ fn into_copilot_chat(
             LanguageModelToolChoice::Any => ToolChoice::Required,
             LanguageModelToolChoice::None => ToolChoice::None,
         }),
-        thinking_budget: None,
+        thinking_budget: if thinking_allowed && model.can_think() {
+            compute_thinking_budget(
+                model.min_thinking_budget(),
+                model.max_thinking_budget(),
+                model.max_output_tokens() as u32,
+            )
+        } else {
+            None
+        },
     })
 }
 
@@ -1101,7 +1110,7 @@ fn into_copilot_responses(
         stop: _,
         temperature,
         thinking_allowed,
-        thinking_effort: _,
+        thinking_effort,
         speed: _,
     } = request;
 
@@ -1268,8 +1277,12 @@ fn into_copilot_responses(
         tools: converted_tools,
         tool_choice: mapped_tool_choice,
         reasoning: if thinking_allowed {
+            let effort = thinking_effort
+                .as_deref()
+                .and_then(|e| e.parse::<copilot_responses::ReasoningEffort>().ok())
+                .unwrap_or(copilot_responses::ReasoningEffort::Medium);
             Some(copilot_responses::ReasoningConfig {
-                effort: copilot_responses::ReasoningEffort::Medium,
+                effort,
                 summary: Some(copilot_responses::ReasoningSummary::Detailed),
             })
         } else {
