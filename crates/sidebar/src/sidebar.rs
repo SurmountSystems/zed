@@ -2834,7 +2834,7 @@ impl Sidebar {
                         && *snapshot.work_directory_abs_path == *worktree_path
                     {
                         let branch_name = snapshot.branch.as_ref().map(|b| b.name().to_string());
-                        let main_repo_path = snapshot.original_repo_abs_path.clone();
+                        let main_repo_path = snapshot.original_repo_abs_path;
                         Some((repo_entity.clone(), branch_name, main_repo_path))
                     } else {
                         None
@@ -2857,7 +2857,7 @@ impl Sidebar {
         let fs = <dyn fs::Fs>::global(cx);
         let worktree_path_str = worktree_path.to_string_lossy().to_string();
         let main_repo_path_str = main_repo_path.to_string_lossy().to_string();
-        let branch_name_clone = branch_name.clone();
+        let branch_name_clone = branch_name;
 
         cx.spawn_in(window, async move |_this, cx| {
             if !is_last_thread {
@@ -2979,7 +2979,7 @@ impl Sidebar {
                         store.create_archived_worktree(
                             worktree_path_str,
                             main_repo_path_str,
-                            branch_name_clone,
+                            branch_name_clone, // moved
                             commit_hash.clone(),
                             cx,
                         )
