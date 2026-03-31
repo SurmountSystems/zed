@@ -2314,7 +2314,7 @@ impl GitStore {
                     CommitOptions {
                         amend: options.amend,
                         signoff: options.signoff,
-                        allow_empty: false,
+                        allow_empty: options.allow_empty,
                     },
                     askpass,
                     cx,
@@ -5376,6 +5376,7 @@ impl Repository {
                             options: Some(proto::commit::CommitOptions {
                                 amend: options.amend,
                                 signoff: options.signoff,
+                                allow_empty: options.allow_empty,
                             }),
                             askpass_id,
                         })
