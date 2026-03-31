@@ -2308,7 +2308,8 @@ impl Sidebar {
 
         // Check if the original worktree path is already in use.
         let worktree_path = &row.worktree_path;
-        let already_exists = worktree_path.exists();
+        let fs = cx.update(|_window, cx| <dyn fs::Fs>::global(cx))?;
+        let already_exists = fs.metadata(worktree_path).await?.is_some();
 
         let final_worktree_path = if !already_exists {
             worktree_path.clone()
