@@ -2413,7 +2413,7 @@ impl Sidebar {
         if !final_path_exists && !is_restored_and_valid {
             // Create the worktree in detached HEAD mode at the WIP commit.
             let create_receiver = main_repo.update(cx, |repo, _cx| {
-                repo.create_worktree_detached(final_worktree_path.clone(), commit_hash)
+                repo.create_worktree_detached(final_worktree_path.clone(), commit_hash.clone())
             });
             match create_receiver.await {
                 Ok(Ok(())) => {}
@@ -2506,10 +2506,36 @@ impl Sidebar {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
                             log::warn!("Failed to soft-reset WIP staged commit: {err}");
+                            // Attempt to undo the mixed reset to return to the WIP commit.
+                            let undo = worktree_repo.update(cx, |repo, cx| {
+                                repo.reset(commit_hash.clone(), ResetMode::Mixed, cx)
+                            });
+                            match undo.await {
+                                Ok(Ok(())) => {
+                                    log::info!("Undid mixed reset after soft-reset failure")
+                                }
+                                Ok(Err(undo_err)) => {
+                                    log::warn!("Could not undo mixed reset: {undo_err}")
+                                }
+                                Err(_) => log::warn!("Undo of mixed reset was canceled"),
+                            }
                             break 'resets false;
                         }
                         Err(_) => {
                             log::warn!("Soft reset was canceled");
+                            // Attempt to undo the mixed reset to return to the WIP commit.
+                            let undo = worktree_repo.update(cx, |repo, cx| {
+                                repo.reset(commit_hash.clone(), ResetMode::Mixed, cx)
+                            });
+                            match undo.await {
+                                Ok(Ok(())) => {
+                                    log::info!("Undid mixed reset after soft-reset cancellation")
+                                }
+                                Ok(Err(undo_err)) => {
+                                    log::warn!("Could not undo mixed reset: {undo_err}")
+                                }
+                                Err(_) => log::warn!("Undo of mixed reset was canceled"),
+                            }
                             break 'resets false;
                         }
                     }
