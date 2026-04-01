@@ -793,13 +793,6 @@ impl Sidebar {
             let should_load_threads = !is_collapsed || !query.is_empty();
             let is_active = group.workspaces.contains(&active_workspace);
 
-            // Pick a representative workspace for the group: prefer the active
-            // workspace if it belongs to this group, otherwise use the main
-            // repo workspace (not a linked worktree).
-            let representative_workspace = Some(&active_workspace)
-                .filter(|_| is_active)
-                .unwrap_or_else(|| group.main_workspace(cx));
-
             // Collect live thread infos from all workspaces in this group.
             let live_infos: Vec<_> = group
                 .workspaces
@@ -854,23 +847,21 @@ impl Sidebar {
 
                 // Load threads from linked git worktrees whose
                 // canonical paths belong to this group.
-                let linked_worktree_queries = group
+                let linked_worktree_paths = group
                     .workspaces
-                    .iter()
-                    .flat_map(|ws| root_repository_snapshots(ws, cx))
-                    .filter(|snapshot| !snapshot.is_linked_worktree())
-                    .flat_map(|snapshot| {
-                        snapshot
-                            .linked_worktrees()
-                            .iter()
-                            .filter(|wt| {
-                                project_groups.group_owns_worktree(group, &path_list, &wt.path)
+                    .first()
+                    .map(|workspace| {
+                        root_repository_snapshots(workspace, cx)
+                            .flat_map(|repo| {
+                                repo.linked_worktrees
+                                    .iter()
+                                    .map(|worktree| worktree.path.clone())
                             })
-                            .map(|wt| PathList::new(std::slice::from_ref(&wt.path)))
                             .collect::<Vec<_>>()
-                    });
+                    })
+                    .unwrap_or_default();
 
-                for worktree_path_list in linked_worktree_queries {
+                for worktree_path_list in linked_worktree_paths {
                     for row in thread_store
                         .read(cx)
                         .entries_for_path(&worktree_path_list)
@@ -1584,7 +1575,8 @@ impl Sidebar {
                                 if let Some(mw) = multi_workspace_for_worktree.upgrade() {
                                     let ws = workspace_for_remove_worktree.clone();
                                     mw.update(cx, |multi_workspace, cx| {
-                                        multi_workspace.remove_group(&ws, window, cx);
+                                        multi_workspace
+                                            .remove_group_containing_workspace(&ws, window, cx);
                                     });
                                 }
                             } else {
@@ -1657,7 +1649,8 @@ impl Sidebar {
                             if let Some(mw) = multi_workspace_for_remove.upgrade() {
                                 let ws = workspace_for_remove.clone();
                                 mw.update(cx, |multi_workspace, cx| {
-                                    multi_workspace.remove_group(&ws, window, cx);
+                                    multi_workspace
+                                        .remove_group_containing_workspace(&ws, window, cx);
                                 });
                             }
                         })

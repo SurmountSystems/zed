@@ -2561,7 +2561,7 @@ mod tests {
                 .nth(1)
                 .expect("no workspace at index 1")
                 .clone();
-            mw.remove_group(&ws, window, cx);
+            mw.remove_group_containing_workspace(&ws, window, cx);
         });
 
         cx.run_until_parked();
@@ -4248,7 +4248,7 @@ mod tests {
                 .nth(1)
                 .expect("no workspace at index 1")
                 .clone();
-            mw.remove_group(&ws, window, cx);
+            mw.remove_group_containing_workspace(&ws, window, cx);
         });
 
         cx.run_until_parked();
@@ -4363,7 +4363,7 @@ mod tests {
                 .nth(1)
                 .expect("no workspace at index 1")
                 .clone();
-            mw.remove_group(&ws, window, cx);
+            mw.remove_group_containing_workspace(&ws, window, cx);
         });
 
         cx.run_until_parked();
@@ -4451,7 +4451,7 @@ mod tests {
                 .nth(1)
                 .expect("no workspace at index 1")
                 .clone();
-            mw.remove_group(&ws, window, cx);
+            mw.remove_group_containing_workspace(&ws, window, cx);
         });
 
         // Simulate the quit handler pattern: collect flush tasks + pending

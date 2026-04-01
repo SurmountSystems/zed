@@ -23,6 +23,7 @@ use ui::{ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 
+use crate::SerializedWorkspaceLocation;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
     Panel, Workspace, WorkspaceId, client_side_decorations,
@@ -255,6 +256,17 @@ impl ProjectGroupKey {
             host,
         }
     }
+
+    pub fn from_location_and_paths(location: SerializedWorkspaceLocation, paths: PathList) -> Self {
+        let host = match location {
+            SerializedWorkspaceLocation::Local => None,
+            SerializedWorkspaceLocation::Remote(options) => Some(options),
+        };
+        Self {
+            main_worktree_paths: paths,
+            host,
+        }
+    }
 }
 
 pub struct MultiWorkspace {
@@ -445,6 +457,10 @@ impl MultiWorkspace {
 
     pub fn project_groups(&self) -> &[ProjectGroup] {
         &self.project_groups
+    }
+
+    pub fn project_group_keys(&self) -> impl Iterator<Item = &ProjectGroupKey> {
+        self.project_groups.iter().map(|group| &group.key)
     }
 
     pub fn open_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -908,7 +924,8 @@ impl MultiWorkspace {
     }
 
     /// Removes the group that contains this workspace.
-    pub fn remove_group(
+    #[deprecated = "use remove_group instead"]
+    pub fn remove_group_containing_workspace(
         &mut self,
         workspace: &Entity<Workspace>,
         window: &mut Window,
@@ -921,11 +938,33 @@ impl MultiWorkspace {
         else {
             return false;
         };
+        self.remove_group_at_index(group_ix, window, cx);
+        true
+    }
 
+    pub fn remove_group(
+        &mut self,
+        key: ProjectGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(group_ix) = self.project_groups.iter_mut().position(|g| g.key == key) else {
+            return false;
+        };
+        self.remove_group_at_index(group_ix, window, cx);
+        true
+    }
+
+    fn remove_group_at_index(
+        &mut self,
+        group_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let removed_group = self.project_groups.remove(group_ix);
 
         // If we removed the active workspace, pick a new one.
-        let app_state = workspace.read(cx).app_state().clone();
+        let app_state = self.active_workspace.read(cx).app_state().clone();
         if removed_group.workspaces.contains(&self.active_workspace) {
             let workspace = self.workspaces().next();
             if let Some(workspace) = workspace {
@@ -958,8 +997,6 @@ impl MultiWorkspace {
         cx.emit(MultiWorkspaceEvent::WorkspaceRemoved);
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged);
         cx.notify();
-
-        true
     }
 
     pub fn move_workspace_to_new_window(
@@ -969,7 +1006,7 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) {
         let workspace = workspace.clone();
-        if !self.remove_group(&workspace, window, cx) {
+        if !self.remove_group_containing_workspace(&workspace, window, cx) {
             return;
         }
 

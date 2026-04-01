@@ -1931,7 +1931,8 @@ impl RecentProjectsDelegate {
                             .workspaces()
                             .find(|ws| ws.read(cx).database_id() == Some(workspace_id));
                         if let Some(workspace) = workspace {
-                            multi_workspace.remove_group(&workspace, window, cx);
+                            multi_workspace
+                                .remove_group_containing_workspace(&workspace, window, cx);
                         }
                     })
                     .log_err();
