@@ -2899,7 +2899,6 @@ impl Sidebar {
         let fs = <dyn fs::Fs>::global(cx);
         let worktree_path_str = worktree_path.to_string_lossy().to_string();
         let main_repo_path_str = main_repo_path.to_string_lossy().to_string();
-        let branch_name_clone = branch_name;
 
         cx.spawn_in(window, async move |_this, cx| {
             if !is_last_thread {
@@ -3117,7 +3116,7 @@ impl Sidebar {
                         store.create_archived_worktree(
                             worktree_path_str,
                             main_repo_path_str,
-                            branch_name_clone,
+                            branch_name,
                             commit_hash.clone(),
                             cx,
                         )

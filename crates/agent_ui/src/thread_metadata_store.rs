@@ -142,6 +142,8 @@ impl From<&ThreadMetadata> for acp_thread::AgentSessionInfo {
     }
 }
 
+/// Record of a git worktree that was archived (deleted from disk) when its last thread was archived.
+/// Lives in this module because it shares the same SQLite database as thread metadata.
 pub struct ArchivedGitWorktree {
     pub id: i64,
     pub worktree_path: PathBuf,
