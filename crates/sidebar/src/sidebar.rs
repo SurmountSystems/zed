@@ -2541,10 +2541,14 @@ impl Sidebar {
         // Generate a new branch name for the fresh worktree.
         let branch_name = format!("restored-{}", row.id);
         let worktree_path = main_repo.update(cx, |repo, _cx| {
-            repo.path_for_new_linked_worktree(
-                &branch_name,
+            let setting = git_store::worktrees_directory_for_repo(
+                &repo.snapshot().original_repo_abs_path,
                 git::repository::DEFAULT_WORKTREE_DIRECTORY,
             )
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+            repo.path_for_new_linked_worktree(&branch_name, &setting)
         })?;
 
         // Create the fresh worktree.
