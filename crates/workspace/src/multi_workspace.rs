@@ -272,9 +272,9 @@ pub struct MultiWorkspace {
 /// Represents a group of workspaces with the same project key (main worktree paths and host).
 ///
 /// Invariant: a project group always has at least one workspace.
-struct ProjectGroup {
-    key: ProjectGroupKey,
-    workspaces: Vec<Entity<Workspace>>,
+pub struct ProjectGroup {
+    pub key: ProjectGroupKey,
+    pub workspaces: Vec<Entity<Workspace>>,
 }
 
 impl ProjectGroup {
@@ -441,6 +441,10 @@ impl MultiWorkspace {
         self.project_groups
             .iter()
             .flat_map(|group| group.workspaces.iter().cloned())
+    }
+
+    pub fn project_groups(&self) -> &[ProjectGroup] {
+        &self.project_groups
     }
 
     pub fn open_sidebar(&mut self, cx: &mut Context<Self>) {

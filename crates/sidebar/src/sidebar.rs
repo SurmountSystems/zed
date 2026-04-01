@@ -54,8 +54,6 @@ use zed_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
 
 use crate::thread_switcher::{ThreadSwitcher, ThreadSwitcherEntry, ThreadSwitcherEvent};
 
-use crate::project_group_builder::ProjectGroupBuilder;
-
 mod project_group_builder;
 
 #[cfg(test)]
@@ -326,7 +324,7 @@ fn workspace_path_list(workspace: &Entity<Workspace>, cx: &App) -> PathList {
 /// with the short worktree name and full path.
 fn worktree_info_from_thread_paths(
     folder_paths: &PathList,
-    project_groups: &ProjectGroupBuilder,
+    project_groups: &[workspace::ProjectGroup],
 ) -> Vec<WorktreeInfo> {
     folder_paths
         .paths()
@@ -696,54 +694,59 @@ impl Sidebar {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return;
         };
-        let mw = multi_workspace.read(cx);
-        let workspaces = mw.workspaces().collect::<Vec<_>>();
-        let active_workspace = Some(mw.active_workspace());
 
-        let agent_server_store = workspaces
-            .first()
-            .map(|ws| ws.read(cx).project().read(cx).agent_server_store().clone());
+        let mw = multi_workspace.read(cx);
+        let project_groups = mw.project_groups();
+        let active_workspace = mw.active_workspace();
+        let agent_server_store = active_workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .agent_server_store()
+            .clone();
 
         let query = self.filter_editor.read(cx).text(cx);
 
         // Derive active_entry from the active workspace's agent panel.
         // Draft is checked first because a conversation can have a session_id
         // before any messages are sent. However, a thread that's still loading
-        // also appears as a "draft" (no messages yet).
-        if let Some(active_ws) = &active_workspace {
-            if let Some(panel) = active_ws.read(cx).panel::<AgentPanel>(cx) {
-                if panel.read(cx).active_thread_is_draft(cx)
-                    || panel.read(cx).active_conversation_view().is_none()
-                {
-                    let conversation_parent_id = panel
-                        .read(cx)
-                        .active_conversation_view()
-                        .and_then(|cv| cv.read(cx).parent_id(cx));
-                    let preserving_thread =
-                        if let Some(ActiveEntry::Thread { session_id, .. }) = &self.active_entry {
-                            self.active_entry_workspace() == Some(active_ws)
-                                && conversation_parent_id
-                                    .as_ref()
-                                    .is_some_and(|id| id == session_id)
-                        } else {
-                            false
-                        };
-                    if !preserving_thread {
-                        self.active_entry = Some(ActiveEntry::Draft(active_ws.clone()));
-                    }
-                } else if let Some(session_id) = panel
+        // also appears as a "draft" (no messages yet), so when we already have
+        // an eager Thread write for this workspace we preserve it. A session_id
+        // on a non-draft is a positive Thread signal. The remaining case
+        // (conversation exists, not draft, no session_id) is a genuine
+        // mid-load — keep the previous value.
+        if let Some(panel) = active_workspace.read(cx).panel::<AgentPanel>(cx) {
+            if panel.read(cx).active_thread_is_draft(cx)
+                || panel.read(cx).active_conversation_view().is_none()
+            {
+                let conversation_parent_id = panel
                     .read(cx)
                     .active_conversation_view()
-                    .and_then(|cv| cv.read(cx).parent_id(cx))
-                {
-                    self.active_entry = Some(ActiveEntry::Thread {
-                        session_id,
-                        workspace: active_ws.clone(),
-                    });
+                    .and_then(|cv| cv.read(cx).parent_id(cx));
+                let preserving_thread =
+                    if let Some(ActiveEntry::Thread { session_id, .. }) = &self.active_entry {
+                        self.active_entry_workspace() == Some(&active_workspace)
+                            && conversation_parent_id
+                                .as_ref()
+                                .is_some_and(|id| id == session_id)
+                    } else {
+                        false
+                    };
+                if !preserving_thread {
+                    self.active_entry = Some(ActiveEntry::Draft(active_workspace.clone()));
                 }
-                // else: conversation exists, not a draft, but no session_id
-                // yet — thread is mid-load. Keep previous value.
+            } else if let Some(session_id) = panel
+                .read(cx)
+                .active_conversation_view()
+                .and_then(|cv| cv.read(cx).parent_id(cx))
+            {
+                self.active_entry = Some(ActiveEntry::Thread {
+                    session_id,
+                    workspace: active_workspace.clone(),
+                });
             }
+            // else: conversation exists, not a draft, but no session_id
+            // yet — thread is mid-load. Keep previous value.
         }
 
         let previous = mem::take(&mut self.contents);
@@ -764,14 +767,9 @@ impl Sidebar {
         let mut current_session_ids: HashSet<acp::SessionId> = HashSet::new();
         let mut project_header_indices: Vec<usize> = Vec::new();
 
-        // Use ProjectGroupBuilder to canonically group workspaces by their
-        // main git repository. This replaces the manual absorbed-workspace
-        // detection that was here before.
-        let project_groups = ProjectGroupBuilder::from_multiworkspace(mw, cx);
-
-        let has_open_projects = workspaces
+        let has_open_projects = project_groups
             .iter()
-            .any(|ws| !workspace_path_list(ws, cx).paths().is_empty());
+            .any(|group| !group.workspaces.is_empty() && !group.key.main_worktree_paths.is_empty());
 
         let resolve_agent_icon = |agent_id: &AgentId| -> (IconName, Option<SharedString>) {
             let agent = Agent::from(agent_id.clone());
@@ -779,32 +777,26 @@ impl Sidebar {
                 Agent::NativeAgent => IconName::ZedAgent,
                 Agent::Custom { .. } => IconName::Terminal,
             };
-            let icon_from_external_svg = agent_server_store
-                .as_ref()
-                .and_then(|store| store.read(cx).agent_icon(&agent_id));
+            let icon_from_external_svg = agent_server_store.read(cx).agent_icon(&agent_id);
             (icon, icon_from_external_svg)
         };
 
-        for (group_name, group) in project_groups.groups() {
-            let path_list = group_name.path_list().clone();
+        for group in project_groups {
+            let path_list = group.key.main_worktree_paths.clone();
             if path_list.paths().is_empty() {
                 continue;
             }
 
-            let label = group_name.display_name();
+            let label = group.key.display_name();
 
             let is_collapsed = self.collapsed_groups.contains(&path_list);
             let should_load_threads = !is_collapsed || !query.is_empty();
-
-            let is_active = active_workspace
-                .as_ref()
-                .is_some_and(|active| group.workspaces.contains(active));
+            let is_active = group.workspaces.contains(&active_workspace);
 
             // Pick a representative workspace for the group: prefer the active
             // workspace if it belongs to this group, otherwise use the main
             // repo workspace (not a linked worktree).
-            let representative_workspace = active_workspace
-                .as_ref()
+            let representative_workspace = Some(&active_workspace)
                 .filter(|_| is_active)
                 .unwrap_or_else(|| group.main_workspace(cx));
 
@@ -975,9 +967,9 @@ impl Sidebar {
                     let session_id = &thread.metadata.session_id;
 
                     let is_thread_workspace_active = match &thread.workspace {
-                        ThreadEntryWorkspace::Open(thread_workspace) => active_workspace
-                            .as_ref()
-                            .is_some_and(|active| active == thread_workspace),
+                        ThreadEntryWorkspace::Open(thread_workspace) => {
+                            &active_workspace == thread_workspace
+                        }
                         ThreadEntryWorkspace::Closed(_) => false,
                     };
 
@@ -1067,7 +1059,7 @@ impl Sidebar {
             } else {
                 let is_draft_for_workspace = is_active
                     && matches!(&self.active_entry, Some(ActiveEntry::Draft(_)))
-                    && self.active_entry_workspace() == Some(representative_workspace);
+                    && self.active_entry_workspace() == Some(&representative_workspace);
 
                 project_header_indices.push(entries.len());
                 entries.push(ListEntry::ProjectHeader {
