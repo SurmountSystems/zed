@@ -36,6 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, Divider, HighlightedLabel, KeyBinding,
@@ -2300,7 +2301,8 @@ impl Sidebar {
                         final_paths.push(path.clone());
                     }
                     Some(row) => {
-                        match Self::restore_archived_worktree(row, &workspaces, cx).await {
+                        let fs = cx.update(|_window, cx| <dyn fs::Fs>::global(cx))?;
+                        match Self::restore_archived_worktree(row, &workspaces, fs, cx).await {
                             Ok(restored_path) => {
                                 final_paths.push(restored_path);
                                 Self::maybe_cleanup_archived_worktree(row, &store, &workspaces, cx)
@@ -2333,6 +2335,7 @@ impl Sidebar {
     async fn restore_archived_worktree(
         row: &ArchivedGitWorktree,
         workspaces: &[Entity<Workspace>],
+        fs: Arc<dyn fs::Fs>,
         cx: &mut AsyncWindowContext,
     ) -> anyhow::Result<PathBuf> {
         let commit_hash = row.commit_hash.clone();
@@ -2344,12 +2347,11 @@ impl Sidebar {
 
         let Some(main_repo) = main_repo else {
             // Main repo not found — fall back to fresh worktree.
-            return Self::create_fresh_worktree(row, cx).await;
+            return Self::create_fresh_worktree(row, &fs, cx).await;
         };
 
         // Check if the original worktree path is already in use.
         let worktree_path = &row.worktree_path;
-        let fs = cx.update(|_window, cx| <dyn fs::Fs>::global(cx))?;
         let already_exists = fs.metadata(worktree_path).await?.is_some();
 
         let is_restored_and_valid = already_exists
@@ -2419,7 +2421,7 @@ impl Sidebar {
                         log::info!("Worktree creation failed ({err}) but path exists — reusing it");
                     } else {
                         log::error!("Failed to create worktree: {err}");
-                        return Self::create_fresh_worktree(row, cx).await;
+                        return Self::create_fresh_worktree(row, &fs, cx).await;
                     }
                 }
                 Err(_) => {
@@ -2594,11 +2596,11 @@ impl Sidebar {
 
     async fn create_fresh_worktree(
         row: &ArchivedGitWorktree,
+        fs: &Arc<dyn fs::Fs>,
         cx: &mut AsyncWindowContext,
     ) -> anyhow::Result<PathBuf> {
-        let fs = cx.update(|_window, cx| <dyn fs::Fs>::global(cx))?;
         let main_repo_path = row.main_repo_path.clone();
-        let dot_git_path = main_repo_path.join(".git");
+        let dot_git_path = main_repo_path.join(git::DOT_GIT);
 
         if fs.metadata(&dot_git_path).await?.is_none() {
             anyhow::bail!(
