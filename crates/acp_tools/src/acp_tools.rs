@@ -17,7 +17,7 @@ use workspace::{
     Item, ItemHandle, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
 };
 
-pub type RequestId = String;
+pub type RequestId = serde_json::Value;
 
 #[derive(Clone)]
 pub enum StreamMessageDirection {
@@ -56,7 +56,7 @@ impl StreamMessage {
         let message = if let Some(method) = obj.get("method").and_then(|m| m.as_str()) {
             if let Some(id) = obj.get("id") {
                 StreamMessageContent::Request {
-                    id: id.to_string(),
+                    id: id.clone(),
                     method: method.into(),
                     params: obj.get("params").cloned(),
                 }
@@ -68,15 +68,18 @@ impl StreamMessage {
             }
         } else if let Some(id) = obj.get("id") {
             if let Some(error) = obj.get("error") {
-                let acp_err = serde_json::from_value::<acp::Error>(error.clone())
-                    .unwrap_or_else(|_| acp::Error::internal_error());
+                let acp_err =
+                    serde_json::from_value::<acp::Error>(error.clone()).unwrap_or_else(|err| {
+                        log::warn!("Failed to deserialize ACP error: {err}");
+                        acp::Error::internal_error()
+                    });
                 StreamMessageContent::Response {
-                    id: id.to_string(),
+                    id: id.clone(),
                     result: Err(acp_err),
                 }
             } else {
                 StreamMessageContent::Response {
-                    id: id.to_string(),
+                    id: id.clone(),
                     result: Ok(obj.get("result").cloned()),
                 }
             }
@@ -107,6 +110,13 @@ struct GlobalAcpConnectionRegistry(Entity<AcpConnectionRegistry>);
 
 impl Global for GlobalAcpConnectionRegistry {}
 
+/// A raw JSON-RPC line captured from the transport, tagged with direction.
+/// Deserialization into [`StreamMessage`] is deferred until a subscriber is listening.
+pub struct RawStreamLine {
+    pub direction: StreamMessageDirection,
+    pub line: Arc<str>,
+}
+
 #[derive(Default)]
 pub struct AcpConnectionRegistry {
     active_agent_id: Option<AgentId>,
@@ -129,7 +139,7 @@ impl AcpConnectionRegistry {
     pub fn set_active_connection(
         &mut self,
         agent_id: AgentId,
-        messages_rx: smol::channel::Receiver<StreamMessage>,
+        raw_rx: smol::channel::Receiver<RawStreamLine>,
         cx: &mut Context<Self>,
     ) {
         self.active_agent_id = Some(agent_id);
@@ -137,10 +147,21 @@ impl AcpConnectionRegistry {
         self.subscribers.clear();
 
         self._broadcast_task = Some(cx.spawn(async move |this, cx| {
-            while let Ok(message) = messages_rx.recv().await {
+            while let Ok(raw) = raw_rx.recv().await {
                 this.update(cx, |this, _cx| {
-                    this.subscribers
-                        .retain(|sender| sender.try_send(message.clone()).is_ok());
+                    if this.subscribers.is_empty() {
+                        return;
+                    }
+
+                    let Some(message) = StreamMessage::from_json_line(raw.direction, &raw.line)
+                    else {
+                        return;
+                    };
+
+                    this.subscribers.retain(|sender| !sender.is_closed());
+                    for sender in &this.subscribers {
+                        sender.try_send(message.clone()).ok();
+                    }
                 })
                 .ok();
             }
@@ -150,7 +171,7 @@ impl AcpConnectionRegistry {
     }
 
     pub fn subscribe(&mut self) -> smol::channel::Receiver<StreamMessage> {
-        let (sender, receiver) = smol::channel::bounded(4096);
+        let (sender, receiver) = smol::channel::unbounded();
         self.subscribers.push(sender);
         receiver
     }

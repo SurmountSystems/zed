@@ -54,6 +54,7 @@ dependencies = [
  "collections",
  "gpui",
  "language",
+ "log",
  "markdown",
  "project",
  "serde",
