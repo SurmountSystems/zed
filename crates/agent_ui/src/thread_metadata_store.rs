@@ -157,7 +157,7 @@ pub struct ArchivedGitWorktree {
     pub worktree_path: PathBuf,
     /// Absolute path of the main repository ("main worktree") that owned this worktree.
     /// Used when restoring, to reattach the recreated worktree to the correct main worktree.
-    /// (If that dir is missing, use worktree_path as the new main worktree.)
+    /// If the main repo isn't found in any open workspace, restoration fails.
     pub main_repo_path: PathBuf,
     /// Branch that was checked out in the worktree at archive time. `None` if
     /// the worktree was in detached HEAD state, which isn't supported in Zed, but
