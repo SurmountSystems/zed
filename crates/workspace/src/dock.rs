@@ -1073,8 +1073,10 @@ impl Render for Dock {
             };
 
             div()
+                .id("dock-panel")
                 .key_context(dispatch_context)
                 .track_focus(&self.focus_handle(cx))
+                .focus_follows_mouse(self.focus_follows_mouse, cx)
                 .flex()
                 .bg(cx.theme().colors().panel_background)
                 .border_color(cx.theme().colors().border)
@@ -1090,8 +1092,6 @@ impl Render for Dock {
                 })
                 .child(
                     div()
-                        .id("dock-panel")
-                        .focus_follows_mouse(self.focus_follows_mouse, cx)
                         .map(|this| match self.position().axis() {
                             Axis::Horizontal => this.min_w(size).h_full(),
                             Axis::Vertical => this.min_h(size).w_full(),
@@ -1108,6 +1108,7 @@ impl Render for Dock {
                 })
         } else {
             div()
+                .id("dock-panel")
                 .key_context(dispatch_context)
                 .track_focus(&self.focus_handle(cx))
         }
