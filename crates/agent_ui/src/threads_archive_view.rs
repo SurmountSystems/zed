@@ -91,14 +91,16 @@ impl TimeBucket {
 }
 
 fn fuzzy_match_positions(query: &str, text: &str) -> Option<Vec<usize>> {
-    let query = query.to_lowercase();
-    let text_lower = text.to_lowercase();
     let mut positions = Vec::new();
     let mut query_chars = query.chars().peekable();
-    for (i, c) in text_lower.chars().enumerate() {
-        if query_chars.peek() == Some(&c) {
-            positions.push(i);
-            query_chars.next();
+    for (byte_idx, candidate_char) in text.char_indices() {
+        if let Some(&query_char) = query_chars.peek() {
+            if candidate_char.eq_ignore_ascii_case(&query_char) {
+                positions.push(byte_idx);
+                query_chars.next();
+            }
+        } else {
+            break;
         }
     }
     if query_chars.peek().is_none() {
