@@ -337,7 +337,8 @@ impl LanguageModel for OpenAiLanguageModel {
             | Model::FivePointFour
             | Model::FivePointFourPro
             | Model::O1
-            | Model::O3 => true,
+            | Model::O3
+            | Model::O4Mini => true,
             Model::ThreePointFiveTurbo
             | Model::Four
             | Model::FourTurbo
@@ -609,6 +610,7 @@ pub fn into_open_ai_response(
 
     ResponseRequest {
         model: model_id.into(),
+        instructions: None,
         input: input_items,
         stream,
         temperature,
@@ -1265,6 +1267,7 @@ pub fn count_open_ai_tokens(
             | Model::O1
             | Model::O3
             | Model::O3Mini
+            | Model::O4Mini
             | Model::Five
             | Model::FiveCodex
             | Model::FiveMini

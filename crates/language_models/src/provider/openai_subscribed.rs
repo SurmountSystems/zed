@@ -11,17 +11,20 @@ use language_model::{
     LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
     LanguageModelRequest, LanguageModelToolChoice, RateLimiter,
 };
-use open_ai::{ReasoningEffort, responses::stream_response};
+use open_ai::responses::stream_response;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use smol::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use strum::IntoEnumIterator as _;
 use ui::{ConfiguredApiCard, prelude::*};
 use util::ResultExt as _;
 
-use crate::provider::open_ai::{OpenAiResponseEventMapper, into_open_ai_response};
+use crate::provider::open_ai::{
+    OpenAiResponseEventMapper, count_open_ai_tokens, into_open_ai_response,
+};
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("openai-subscribed");
 const PROVIDER_NAME: LanguageModelProviderName =
@@ -191,8 +194,9 @@ impl OpenAiSubscribedProvider {
         .detach();
     }
 
-    fn create_language_model(&self, model: CodexModel) -> Arc<dyn LanguageModel> {
+    fn create_language_model(&self, model: open_ai::Model) -> Arc<dyn LanguageModel> {
         Arc::new(OpenAiSubscribedLanguageModel {
+            id: LanguageModelId::from(model.id().to_string()),
             model,
             state: self.state.clone(),
             http_client: self.http_client.clone(),
@@ -223,18 +227,30 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
     }
 
     fn default_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        Some(self.create_language_model(CodexModel::O4Mini))
+        Some(self.create_language_model(open_ai::Model::default()))
     }
 
     fn default_fast_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        Some(self.create_language_model(CodexModel::CodexMini))
+        Some(self.create_language_model(open_ai::Model::default_fast()))
     }
 
     fn provided_models(&self, _cx: &App) -> Vec<Arc<dyn LanguageModel>> {
-        CodexModel::all()
-            .into_iter()
+        let mut models: Vec<Arc<dyn LanguageModel>> = open_ai::Model::iter()
+            .filter(|m| !matches!(m, open_ai::Model::Custom { .. }))
             .map(|m| self.create_language_model(m))
-            .collect()
+            .collect();
+
+        models.push(self.create_language_model(open_ai::Model::Custom {
+            name: "codex-mini-latest".into(),
+            display_name: Some("Codex Mini".into()),
+            max_tokens: 200_000,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: None,
+            supports_chat_completions: false,
+        }));
+
+        models
     }
 
     fn is_authenticated(&self, cx: &App) -> bool {
@@ -269,52 +285,11 @@ impl LanguageModelProvider for OpenAiSubscribedProvider {
     }
 }
 
-// --- Models ---
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum CodexModel {
-    CodexMini,
-    O4Mini,
-    O3,
-}
-
-impl CodexModel {
-    pub fn all() -> Vec<Self> {
-        vec![Self::CodexMini, Self::O4Mini, Self::O3]
-    }
-
-    fn id(&self) -> &str {
-        match self {
-            Self::CodexMini => "codex-mini-latest",
-            Self::O4Mini => "o4-mini",
-            Self::O3 => "o3",
-        }
-    }
-
-    fn display_name(&self) -> &str {
-        match self {
-            Self::CodexMini => "Codex Mini",
-            Self::O4Mini => "o4-mini",
-            Self::O3 => "o3",
-        }
-    }
-
-    fn max_token_count(&self) -> u64 {
-        200_000
-    }
-
-    fn reasoning_effort(&self) -> Option<ReasoningEffort> {
-        match self {
-            Self::CodexMini => None,
-            Self::O4Mini | Self::O3 => Some(ReasoningEffort::Medium),
-        }
-    }
-}
-
 // --- Language model ---
 
 struct OpenAiSubscribedLanguageModel {
-    model: CodexModel,
+    id: LanguageModelId,
+    model: open_ai::Model,
     state: Entity<State>,
     http_client: Arc<dyn HttpClient>,
     request_limiter: RateLimiter,
@@ -322,7 +297,7 @@ struct OpenAiSubscribedLanguageModel {
 
 impl LanguageModel for OpenAiSubscribedLanguageModel {
     fn id(&self) -> LanguageModelId {
-        LanguageModelId::from(self.model.id().to_string())
+        self.id.clone()
     }
 
     fn name(&self) -> LanguageModelName {
@@ -342,7 +317,29 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
     }
 
     fn supports_images(&self) -> bool {
-        false
+        use open_ai::Model;
+        match &self.model {
+            Model::FourOmniMini
+            | Model::FourPointOneNano
+            | Model::Five
+            | Model::FiveCodex
+            | Model::FiveMini
+            | Model::FiveNano
+            | Model::FivePointOne
+            | Model::FivePointTwo
+            | Model::FivePointTwoCodex
+            | Model::FivePointThreeCodex
+            | Model::FivePointFour
+            | Model::FivePointFourPro
+            | Model::O1
+            | Model::O3
+            | Model::O4Mini => true,
+            Model::ThreePointFiveTurbo
+            | Model::Four
+            | Model::FourTurbo
+            | Model::O3Mini
+            | Model::Custom { .. } => false,
+        }
     }
 
     fn supports_tool_choice(&self, _choice: LanguageModelToolChoice) -> bool {
@@ -365,12 +362,16 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         self.model.max_token_count()
     }
 
+    fn max_output_tokens(&self) -> Option<u64> {
+        self.model.max_output_tokens()
+    }
+
     fn count_tokens(
         &self,
-        _request: LanguageModelRequest,
-        _cx: &App,
+        request: LanguageModelRequest,
+        cx: &App,
     ) -> BoxFuture<'static, Result<u64>> {
-        futures::future::ready(Ok(0)).boxed()
+        count_open_ai_tokens(request, self.model.clone(), cx)
     }
 
     fn stream_completion(
@@ -390,13 +391,33 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         let mut responses_request = into_open_ai_response(
             request,
             self.model.id(),
-            true,  // supports_parallel_tool_calls
+            self.model.supports_parallel_tool_calls(),
             false, // supports_prompt_cache_key
             None,  // max_output_tokens — not supported by Codex backend
             self.model.reasoning_effort(),
         );
         responses_request.store = Some(false);
         responses_request.max_output_tokens = None;
+
+        // The Codex backend requires system messages to be in the top-level
+        // `instructions` field rather than as input items.
+        let mut instructions = Vec::new();
+        responses_request.input.retain(|item| {
+            if let open_ai::responses::ResponseInputItem::Message(msg) = item {
+                if msg.role == open_ai::Role::System {
+                    for part in &msg.content {
+                        if let open_ai::responses::ResponseInputContent::Text { text } = part {
+                            instructions.push(text.clone());
+                        }
+                    }
+                    return false;
+                }
+            }
+            true
+        });
+        if !instructions.is_empty() {
+            responses_request.instructions = Some(instructions.join("\n\n"));
+        }
 
         let state = self.state.downgrade();
         let http_client = self.http_client.clone();
@@ -783,7 +804,7 @@ impl Render for ConfigurationView {
         v_flex()
             .gap_2()
             .child(Label::new(
-                "Sign in with your ChatGPT Plus or Pro subscription to use o3, o4-mini, and Codex models in Zed's agent.",
+                "Sign in with your ChatGPT Plus or Pro subscription to use OpenAI models in Zed's agent.",
             ))
             .child(
                 Button::new("sign-in", "Sign in with ChatGPT")
