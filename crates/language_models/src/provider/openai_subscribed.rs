@@ -308,6 +308,17 @@ impl ChatGptModel {
             _ => Some(ReasoningEffort::Medium),
         }
     }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        match self {
+            Self::Gpt54 | Self::Gpt54Mini => true,
+            _ => false,
+        }
+    }
+
+    fn supports_prompt_cache_key(&self) -> bool {
+        true
+    }
 }
 
 struct OpenAiSubscribedLanguageModel {
@@ -392,13 +403,12 @@ impl LanguageModel for OpenAiSubscribedLanguageModel {
         let mut responses_request = into_open_ai_response(
             request,
             self.model.id(),
-            true,  // supports_parallel_tool_calls
-            false, // supports_prompt_cache_key
-            None,  // max_output_tokens — not supported by Codex backend
+            self.model.supports_parallel_tool_calls(),
+            self.model.supports_prompt_cache_key(),
+            self.max_output_tokens(),
             self.model.reasoning_effort(),
         );
         responses_request.store = Some(false);
-        responses_request.max_output_tokens = None;
 
         // The Codex backend requires system messages to be in the top-level
         // `instructions` field rather than as input items.
