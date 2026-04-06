@@ -474,6 +474,16 @@ impl MultiWorkspace {
         self.project_group_keys.push(project_group_key);
     }
 
+    pub fn restore_project_group_keys(&mut self, keys: Vec<ProjectGroupKey>) {
+        let mut restored = keys;
+        for existing_key in &self.project_group_keys {
+            if !restored.contains(existing_key) {
+                restored.push(existing_key.clone());
+            }
+        }
+        self.project_group_keys = restored;
+    }
+
     pub fn project_group_keys(&self) -> impl Iterator<Item = &ProjectGroupKey> {
         self.project_group_keys.iter()
     }
@@ -639,7 +649,7 @@ impl MultiWorkspace {
         if let Some(workspace) = self
             .workspaces
             .iter()
-            .find(|ws| ws.read(cx).project_group_key(cx).path_list() == &path_list)
+            .find(|ws| PathList::new(&ws.read(cx).root_paths(cx)) == path_list)
             .cloned()
         {
             self.activate(workspace.clone(), window, cx);
