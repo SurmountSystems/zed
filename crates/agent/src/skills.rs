@@ -311,13 +311,18 @@ pub fn is_skills_path_canonical(
     worktree_roots: &[PathBuf],
 ) -> Option<PathBuf> {
     let global_skills_root = global_skills_dir();
-    if canonical_input.starts_with(&global_skills_root) {
+    // Canonicalize the skills roots so that symlinks within the skills directory
+    // resolve to paths that still pass the `starts_with` check.
+    let canonical_global = std::fs::canonicalize(&global_skills_root).unwrap_or(global_skills_root);
+    if canonical_input.starts_with(&canonical_global) {
         return Some(canonical_input.to_path_buf());
     }
 
     for worktree_root in worktree_roots {
         let worktree_skills_path = worktree_root.join(".agents").join("skills");
-        if canonical_input.starts_with(&worktree_skills_path) {
+        let canonical_worktree =
+            std::fs::canonicalize(&worktree_skills_path).unwrap_or(worktree_skills_path);
+        if canonical_input.starts_with(&canonical_worktree) {
             return Some(canonical_input.to_path_buf());
         }
     }
