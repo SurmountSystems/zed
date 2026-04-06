@@ -1041,7 +1041,11 @@ pub async fn restore_worktree_via_git(
 
     let soft_reset_ok = if mixed_reset_ok {
         let rx = wt_repo.update(cx, |repo, cx| {
-            repo.reset(row.original_commit_hash.clone(), ResetMode::Soft, cx)
+            repo.reset(
+                row.original_commit_hash.clone(),
+                ResetMode::Soft,
+                cx,
+            )
         });
         match rx.await {
             Ok(Ok(())) => true,
@@ -1067,7 +1071,11 @@ pub async fn restore_worktree_via_git(
             row.original_commit_hash
         );
         let rx = wt_repo.update(cx, |repo, cx| {
-            repo.reset(row.original_commit_hash.clone(), ResetMode::Mixed, cx)
+            repo.reset(
+                row.original_commit_hash.clone(),
+                ResetMode::Mixed,
+                cx,
+            )
         });
         match rx.await {
             Ok(Ok(())) => {}
@@ -1126,7 +1134,11 @@ pub async fn restore_worktree_via_git(
                     row.original_commit_hash
                 );
                 let rx = wt_repo.update(cx, |repo, cx| {
-                    repo.reset(row.original_commit_hash.clone(), ResetMode::Mixed, cx)
+                    repo.reset(
+                        row.original_commit_hash.clone(),
+                        ResetMode::Mixed,
+                        cx,
+                    )
                 });
                 let _ = rx.await;
                 // Delete the old branch and create fresh
