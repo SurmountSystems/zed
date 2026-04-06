@@ -119,6 +119,10 @@ impl OpenAiSubscribedProvider {
     }
 
     fn sign_in(&self, cx: &mut App) {
+        if self.state.read(cx).is_signing_in() {
+            return;
+        }
+
         let state = self.state.downgrade();
         let http_client = self.http_client.clone();
 
