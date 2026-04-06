@@ -108,8 +108,13 @@ impl OpenAiSubscribedProvider {
                 .await;
             state.update(cx, |s, cx| {
                 if let Ok(Some((_, bytes))) = result {
-                    if let Ok(creds) = serde_json::from_slice::<CodexCredentials>(&bytes) {
-                        s.credentials = Some(creds);
+                    match serde_json::from_slice::<CodexCredentials>(&bytes) {
+                        Ok(creds) => s.credentials = Some(creds),
+                        Err(err) => {
+                            log::warn!(
+                                "Failed to deserialize ChatGPT subscription credentials: {err}"
+                            );
+                        }
                     }
                 }
                 cx.notify();
