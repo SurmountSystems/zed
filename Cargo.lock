@@ -9405,6 +9405,7 @@ dependencies = [
  "tokio",
  "ui",
  "ui_input",
+ "url",
  "util",
  "vercel",
  "x_ai",
