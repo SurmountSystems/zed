@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use credentials_provider::CredentialsProvider;
-use futures::{FutureExt, StreamExt, future::BoxFuture, future::Shared};
+use futures::{FutureExt, StreamExt, future::BoxFuture, future::Either, future::Shared};
 use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, Window};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
 use language_model::{
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use smol::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ui::{ConfiguredApiCard, prelude::*};
 use util::ResultExt as _;
 
@@ -690,7 +690,22 @@ async fn await_oauth_callback(expected_state: &str) -> Result<String> {
         .await
         .context("Failed to bind to port 1455 for OAuth callback. Another application may be using this port.")?;
 
-    let (mut stream, _) = listener.accept().await?;
+    let accept_future = listener.accept();
+    let timeout_future = smol::Timer::after(Duration::from_secs(120));
+
+    let (mut stream, _) = match futures::future::select(
+        std::pin::pin!(accept_future),
+        std::pin::pin!(timeout_future),
+    )
+    .await
+    {
+        Either::Left((result, _)) => result?,
+        Either::Right((_, _)) => {
+            return Err(anyhow!(
+                "OAuth sign-in timed out after 2 minutes. Please try again."
+            ));
+        }
+    };
 
     let mut buffer = vec![0u8; 4096];
     let n = stream.read(&mut buffer).await?;
