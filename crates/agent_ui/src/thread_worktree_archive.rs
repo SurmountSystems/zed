@@ -10,7 +10,10 @@ use collections::HashMap;
 use git::repository::{AskPassDelegate, CommitOptions, ResetMode};
 use gpui::{App, AsyncApp, Entity, Global, Task, WindowHandle};
 use parking_lot::Mutex;
-use project::{LocalProjectFlags, Project, WorktreeId, git_store::Repository};
+use project::{
+    LocalProjectFlags, Project, WorktreeId,
+    git_store::{Repository, resolve_git_worktree_to_main_repo},
+};
 use util::ResultExt;
 use workspace::{
     AppState, MultiWorkspace, OpenMode, OpenOptions, PathList, Toast, Workspace,
@@ -694,7 +697,15 @@ async fn persist_worktree_state(
         .clone()
         .context("no worktree repo entity for persistence")?;
 
-    // Step 1: Create WIP commit #1 (staged state)
+    // Read original HEAD SHA before creating any WIP commits
+    let original_commit_hash = worktree_repo
+        .update(cx, |repo, _cx| repo.head_sha())
+        .await
+        .map_err(|_| anyhow!("head_sha canceled"))?
+        .context("failed to read original HEAD SHA")?
+        .context("HEAD SHA is None before WIP commits")?;
+
+    // Create WIP commit #1 (staged state)
     let askpass = AskPassDelegate::new(cx, |_, _, _| {});
     let commit_rx = worktree_repo.update(cx, |repo, cx| {
         repo.commit(
@@ -730,7 +741,7 @@ async fn persist_worktree_state(
         }
     };
 
-    // Step 2: Stage all files including untracked
+    // Stage all files including untracked
     let stage_rx = worktree_repo.update(cx, |repo, _cx| repo.stage_all_including_untracked());
     if let Err(error) = stage_rx
         .await
@@ -744,7 +755,7 @@ async fn persist_worktree_state(
         return Err(error.context("failed to stage all files including untracked"));
     }
 
-    // Step 3: Create WIP commit #2 (unstaged/untracked state)
+    // Create WIP commit #2 (unstaged/untracked state)
     let askpass = AskPassDelegate::new(cx, |_, _, _| {});
     let commit_rx = worktree_repo.update(cx, |repo, cx| {
         repo.commit(
@@ -770,7 +781,7 @@ async fn persist_worktree_state(
         return Err(error);
     }
 
-    // Step 4: Read HEAD SHA after WIP commits
+    // Read HEAD SHA after WIP commits
     let head_sha_result = worktree_repo
         .update(cx, |repo, _cx| repo.head_sha())
         .await
@@ -788,7 +799,7 @@ async fn persist_worktree_state(
         }
     };
 
-    // Step 5: Create DB record
+    // Create DB record
     let store = cx.update(|cx| ThreadMetadataStore::global(cx));
     let worktree_path_str = root.root_path.to_string_lossy().to_string();
     let main_repo_path_str = root.main_repo_path.to_string_lossy().to_string();
@@ -802,6 +813,7 @@ async fn persist_worktree_state(
                 branch_name.clone(),
                 staged_commit_hash.clone(),
                 unstaged_commit_hash.clone(),
+                original_commit_hash.clone(),
                 cx,
             )
         })
@@ -818,7 +830,7 @@ async fn persist_worktree_state(
         }
     };
 
-    // Step 6: Link all threads on this worktree to the archived record
+    // Link all threads on this worktree to the archived record
     let session_ids: Vec<acp::SessionId> = store.read_with(cx, |store, _cx| {
         store
             .all_session_ids_for_path(&plan.folder_paths)
@@ -855,7 +867,7 @@ async fn persist_worktree_state(
         }
     }
 
-    // Step 7: Create git ref on main repo (non-fatal)
+    // Create git ref on main repo (non-fatal)
     let ref_name = archived_worktree_ref_name(archived_worktree_id);
     let main_repo_result = find_or_create_repository(&root.main_repo_path, cx).await;
     match main_repo_result {
@@ -954,83 +966,186 @@ pub async fn restore_worktree_via_git(
     row: &ArchivedGitWorktree,
     cx: &mut AsyncApp,
 ) -> Result<PathBuf> {
-    // Step 1: Find the main repo entity
+    // Find the main repo entity and verify original_commit_hash exists
     let (main_repo, _temp_project) = find_or_create_repository(&row.main_repo_path, cx).await?;
 
-    // Step 2: Check if worktree path already exists on disk
+    let commit_exists = main_repo
+        .update(cx, |repo, _cx| {
+            repo.resolve_commit(row.original_commit_hash.clone())
+        })
+        .await
+        .map_err(|_| anyhow!("resolve_commit was canceled"))?
+        .context("failed to check if original commit exists")?;
+
+    if !commit_exists {
+        anyhow::bail!(
+            "Original commit {} no longer exists in the repository — \
+             cannot restore worktree. The git history this archive depends on may have been \
+             rewritten or garbage-collected.",
+            row.original_commit_hash
+        );
+    }
+
+    // Check if worktree path already exists on disk
     let worktree_path = &row.worktree_path;
     let app_state = current_app_state(cx).context("no app state available")?;
     let already_exists = app_state.fs.metadata(worktree_path).await?.is_some();
 
     if already_exists {
-        return Ok(worktree_path.clone());
+        let is_git_worktree =
+            resolve_git_worktree_to_main_repo(app_state.fs.as_ref(), worktree_path)
+                .await
+                .is_some();
+
+        if is_git_worktree {
+            // Already a git worktree — another thread on the same worktree
+            // already restored it. Reuse as-is.
+            return Ok(worktree_path.clone());
+        }
+
+        // Path exists but isn't a git worktree. Ask git to adopt it.
+        let rx = main_repo.update(cx, |repo, _cx| repo.repair_worktrees());
+        rx.await
+            .map_err(|_| anyhow!("worktree repair was canceled"))?
+            .context("failed to repair worktrees")?;
+    } else {
+        // Create detached worktree at the unstaged commit
+        let rx = main_repo.update(cx, |repo, _cx| {
+            repo.create_worktree_detached(worktree_path.clone(), row.unstaged_commit_hash.clone())
+        });
+        rx.await
+            .map_err(|_| anyhow!("worktree creation was canceled"))?
+            .context("failed to create worktree")?;
     }
 
-    // Step 3: Create detached worktree
-    let rx = main_repo.update(cx, |repo, _cx| {
-        repo.create_worktree_detached(worktree_path.clone(), row.unstaged_commit_hash.clone())
-    });
-    rx.await
-        .map_err(|_| anyhow!("worktree creation was canceled"))?
-        .context("failed to create worktree")?;
-
-    // Step 4: Get the worktree's repo entity
+    // Get the worktree's repo entity
     let (wt_repo, _temp_wt_project) = find_or_create_repository(worktree_path, cx).await?;
 
-    // Step 5: Mixed reset to staged commit (undo the "WIP unstaged" commit)
-    let rx = wt_repo.update(cx, |repo, cx| {
-        repo.reset(row.staged_commit_hash.clone(), ResetMode::Mixed, cx)
-    });
-    match rx.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            let _ = wt_repo
-                .update(cx, |repo, cx| {
-                    repo.reset(row.unstaged_commit_hash.clone(), ResetMode::Mixed, cx)
-                })
-                .await;
-            return Err(error.context("mixed reset failed while restoring worktree"));
+    // Reset past the WIP commits to recover original state
+    let mixed_reset_ok = {
+        let rx = wt_repo.update(cx, |repo, cx| {
+            repo.reset(row.staged_commit_hash.clone(), ResetMode::Mixed, cx)
+        });
+        match rx.await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                log::error!("Mixed reset to staged commit failed: {error:#}");
+                false
+            }
+            Err(_) => {
+                log::error!("Mixed reset to staged commit was canceled");
+                false
+            }
         }
-        Err(_) => {
-            return Err(anyhow!("mixed reset was canceled"));
-        }
-    }
+    };
 
-    // Step 6: Soft reset to parent of staged commit (undo the "WIP staged" commit)
-    let rx = wt_repo.update(cx, |repo, cx| {
-        repo.reset(format!("{}~1", row.staged_commit_hash), ResetMode::Soft, cx)
-    });
-    match rx.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            let _ = wt_repo
-                .update(cx, |repo, cx| {
-                    repo.reset(row.unstaged_commit_hash.clone(), ResetMode::Mixed, cx)
-                })
-                .await;
-            return Err(error.context("soft reset failed while restoring worktree"));
+    let soft_reset_ok = if mixed_reset_ok {
+        let rx = wt_repo.update(cx, |repo, cx| {
+            repo.reset(row.original_commit_hash.clone(), ResetMode::Soft, cx)
+        });
+        match rx.await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                log::error!("Soft reset to original commit failed: {error:#}");
+                false
+            }
+            Err(_) => {
+                log::error!("Soft reset to original commit was canceled");
+                false
+            }
         }
-        Err(_) => {
-            return Err(anyhow!("soft reset was canceled"));
-        }
-    }
+    } else {
+        false
+    };
 
-    // Step 7: Restore the branch
-    if let Some(branch_name) = &row.branch_name {
-        let rx = wt_repo.update(cx, |repo, _cx| repo.change_branch(branch_name.clone()));
+    // If either WIP reset failed, fall back to a mixed reset directly to
+    // original_commit_hash so we at least land on the right commit.
+    if !mixed_reset_ok || !soft_reset_ok {
+        log::warn!(
+            "WIP reset(s) failed (mixed_ok={mixed_reset_ok}, soft_ok={soft_reset_ok}); \
+             falling back to mixed reset to original commit {}",
+            row.original_commit_hash
+        );
+        let rx = wt_repo.update(cx, |repo, cx| {
+            repo.reset(row.original_commit_hash.clone(), ResetMode::Mixed, cx)
+        });
         match rx.await {
             Ok(Ok(())) => {}
-            _ => {
+            Ok(Err(error)) => {
+                return Err(error.context(format!(
+                    "fallback reset to original commit {} also failed",
+                    row.original_commit_hash
+                )));
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "fallback reset to original commit {} was canceled",
+                    row.original_commit_hash
+                ));
+            }
+        }
+    }
+
+    // Verify HEAD is at original_commit_hash
+    let current_head = wt_repo
+        .update(cx, |repo, _cx| repo.head_sha())
+        .await
+        .map_err(|_| anyhow!("post-restore head_sha was canceled"))?
+        .context("failed to read HEAD after restore")?
+        .context("HEAD is None after restore")?;
+
+    if current_head != row.original_commit_hash {
+        anyhow::bail!(
+            "After restore, HEAD is at {current_head} but expected {}. \
+             The worktree may be in an inconsistent state.",
+            row.original_commit_hash
+        );
+    }
+
+    // Restore the branch
+    if let Some(branch_name) = &row.branch_name {
+        // Check if the branch exists and points at original_commit_hash.
+        // If it does, switch to it. If not, create a new branch there.
+        let rx = wt_repo.update(cx, |repo, _cx| repo.change_branch(branch_name.clone()));
+        if matches!(rx.await, Ok(Ok(()))) {
+            // Verify the branch actually points at original_commit_hash after switching
+            let head_after_switch = wt_repo
+                .update(cx, |repo, _cx| repo.head_sha())
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten();
+
+            if head_after_switch.as_deref() != Some(&row.original_commit_hash) {
+                // Branch exists but doesn't point at the right commit.
+                // Switch back to detached HEAD at original_commit_hash.
+                log::warn!(
+                    "Branch '{}' exists but points at {:?}, not {}. Creating fresh branch.",
+                    branch_name,
+                    head_after_switch,
+                    row.original_commit_hash
+                );
+                let rx = wt_repo.update(cx, |repo, cx| {
+                    repo.reset(row.original_commit_hash.clone(), ResetMode::Mixed, cx)
+                });
+                let _ = rx.await;
+                // Delete the old branch and create fresh
                 let rx = wt_repo.update(cx, |repo, _cx| {
                     repo.create_branch(branch_name.clone(), None)
                 });
-                if let Ok(Err(_)) | Err(_) = rx.await {
-                    log::warn!(
-                        "Could not switch to branch '{}' — \
-                         restored worktree is in detached HEAD state.",
-                        branch_name
-                    );
-                }
+                let _ = rx.await;
+            }
+        } else {
+            // Branch doesn't exist or can't be switched to — create it.
+            let rx = wt_repo.update(cx, |repo, _cx| {
+                repo.create_branch(branch_name.clone(), None)
+            });
+            if let Ok(Err(error)) | Err(error) = rx.await.map_err(|e| anyhow::anyhow!("{e}")) {
+                log::warn!(
+                    "Could not create branch '{}': {error} — \
+                     restored worktree is in detached HEAD state.",
+                    branch_name
+                );
             }
         }
     }
