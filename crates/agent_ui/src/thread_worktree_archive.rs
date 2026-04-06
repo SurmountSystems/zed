@@ -991,7 +991,7 @@ pub async fn restore_worktree_via_git(
     let app_state = current_app_state(cx).context("no app state available")?;
     let already_exists = app_state.fs.metadata(worktree_path).await?.is_some();
 
-    if already_exists {
+    let needs_reset = if already_exists {
         let is_git_worktree =
             resolve_git_worktree_to_main_repo(app_state.fs.as_ref(), worktree_path)
                 .await
@@ -1000,14 +1000,15 @@ pub async fn restore_worktree_via_git(
         if is_git_worktree {
             // Already a git worktree — another thread on the same worktree
             // already restored it. Reuse as-is.
-            return Ok(worktree_path.clone());
+            false
+        } else {
+            // Path exists but isn't a git worktree. Ask git to adopt it.
+            let rx = main_repo.update(cx, |repo, _cx| repo.repair_worktrees());
+            rx.await
+                .map_err(|_| anyhow!("worktree repair was canceled"))?
+                .context("failed to repair worktrees")?;
+            true
         }
-
-        // Path exists but isn't a git worktree. Ask git to adopt it.
-        let rx = main_repo.update(cx, |repo, _cx| repo.repair_worktrees());
-        rx.await
-            .map_err(|_| anyhow!("worktree repair was canceled"))?
-            .context("failed to repair worktrees")?;
     } else {
         // Create detached worktree at the unstaged commit
         let rx = main_repo.update(cx, |repo, _cx| {
@@ -1016,6 +1017,11 @@ pub async fn restore_worktree_via_git(
         rx.await
             .map_err(|_| anyhow!("worktree creation was canceled"))?
             .context("failed to create worktree")?;
+        true
+    };
+
+    if !needs_reset {
+        return Ok(worktree_path.clone());
     }
 
     // Get the worktree's repo entity
