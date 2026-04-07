@@ -1024,7 +1024,7 @@ impl GitGraph {
 
         [
             graph_fraction,
-            fractions[offset + 0],
+            fractions[offset],
             fractions[offset + 1],
             fractions[offset + 2],
             fractions[offset + 3],
