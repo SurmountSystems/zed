@@ -3191,7 +3191,7 @@ fn open_sidebar_test_window(
             let mw_handle: Entity<MultiWorkspace> = root_view
                 .downcast()
                 .map_err(|_| anyhow::anyhow!("Failed to downcast root view to MultiWorkspace"))?;
-            Ok(cx.new(|cx| sidebar::Sidebar::new(mw_handle, window, cx)))
+            Ok::<_, anyhow::Error>(cx.new(|cx| sidebar::Sidebar::new(mw_handle, window, cx)))
         })
         .context("Failed to create sidebar")??;
 
