@@ -423,8 +423,6 @@ message Envelope {
     OpenImageResponse open_image_response = 392;
     CreateImageForPeer create_image_for_peer = 393;
 
-    // 397-398 reserved (was GitFileHistory)
-
     RunGitHook run_git_hook = 399;
 
     GitDeleteBranch git_delete_branch = 400;
@@ -502,6 +500,7 @@ message Envelope {
   reserved 394 to 396;
   reserved 429 to 430;
   reserved 211 to 216, 232 to 233;
+  reserved 397 to 398;
 }
 
 message Hello {
