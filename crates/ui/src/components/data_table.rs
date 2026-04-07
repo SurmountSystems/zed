@@ -835,6 +835,11 @@ impl RenderOnce for Table {
         let table_width = self.column_width_config.table_width(window, cx);
         let horizontal_sizing = self.column_width_config.list_horizontal_sizing(window, cx);
         let no_rows_rendered = self.rows.is_empty();
+        let variable_list_state = if let TableContents::VariableRowHeightList(data) = &self.rows {
+            Some(data.list_state.clone())
+        } else {
+            None
+        };
 
         // Extract redistributable entity for drag/drop/prepaint handlers
         let redistributable_entity =
@@ -980,13 +985,23 @@ impl RenderOnce for Table {
                         .custom_scrollbar
                         .clone()
                         .unwrap_or_else(|| Scrollbars::new(ScrollAxes::Both));
-                    content
-                        .custom_scrollbars(
-                            scrollbars.tracked_scroll_handle(&state.read(cx).scroll_handle),
-                            window,
-                            cx,
-                        )
-                        .into_any_element()
+                    if let Some(list_state) = variable_list_state {
+                        content
+                            .custom_scrollbars(
+                                scrollbars.tracked_scroll_handle(&list_state),
+                                window,
+                                cx,
+                            )
+                            .into_any_element()
+                    } else {
+                        content
+                            .custom_scrollbars(
+                                scrollbars.tracked_scroll_handle(&state.read(cx).scroll_handle),
+                                window,
+                                cx,
+                            )
+                            .into_any_element()
+                    }
                 } else {
                     content.into_any_element()
                 }
