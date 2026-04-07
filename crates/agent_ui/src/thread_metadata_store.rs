@@ -736,8 +736,9 @@ impl Domain for ThreadMetadataDb {
                 worktree_path TEXT NOT NULL,
                 main_repo_path TEXT NOT NULL,
                 branch_name TEXT,
-                commit_hash TEXT NOT NULL,
-                restored INTEGER NOT NULL DEFAULT 0
+                staged_commit_hash TEXT,
+                unstaged_commit_hash TEXT,
+                original_commit_hash TEXT
             ) STRICT;
 
             CREATE TABLE IF NOT EXISTS thread_archived_worktrees(
@@ -745,15 +746,6 @@ impl Domain for ThreadMetadataDb {
                 archived_worktree_id INTEGER NOT NULL REFERENCES archived_git_worktrees(id),
                 PRIMARY KEY (session_id, archived_worktree_id)
             ) STRICT;
-        ),
-        sql!(
-            ALTER TABLE archived_git_worktrees ADD COLUMN staged_commit_hash TEXT;
-            ALTER TABLE archived_git_worktrees ADD COLUMN unstaged_commit_hash TEXT;
-            UPDATE archived_git_worktrees SET staged_commit_hash = commit_hash, unstaged_commit_hash = commit_hash WHERE staged_commit_hash IS NULL;
-        ),
-        sql!(
-            ALTER TABLE archived_git_worktrees ADD COLUMN original_commit_hash TEXT;
-            UPDATE archived_git_worktrees SET original_commit_hash = commit_hash WHERE original_commit_hash IS NULL;
         ),
     ];
 }
@@ -856,14 +848,13 @@ impl ThreadMetadataDb {
         self.write(move |conn| {
             let mut stmt = Statement::prepare(
                 conn,
-                "INSERT INTO archived_git_worktrees(worktree_path, main_repo_path, branch_name, commit_hash, staged_commit_hash, unstaged_commit_hash, original_commit_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                "INSERT INTO archived_git_worktrees(worktree_path, main_repo_path, branch_name, staged_commit_hash, unstaged_commit_hash, original_commit_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  RETURNING id",
             )?;
             let mut i = stmt.bind(&worktree_path, 1)?;
             i = stmt.bind(&main_repo_path, i)?;
             i = stmt.bind(&branch_name, i)?;
-            i = stmt.bind(&unstaged_commit_hash, i)?;
             i = stmt.bind(&staged_commit_hash, i)?;
             i = stmt.bind(&unstaged_commit_hash, i)?;
             stmt.bind(&original_commit_hash, i)?;
