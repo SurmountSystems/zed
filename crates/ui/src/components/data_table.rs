@@ -1,19 +1,19 @@
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    DefiniteLength, Entity, EntityId, FocusHandle, Length, ListHorizontalSizingBehavior,
-    ListSizingBehavior, ListState, Point, Stateful, UniformListScrollHandle, WeakEntity, list,
-    transparent_black, uniform_list,
+    AbsoluteLength, AppContext as _, ClickEvent, DefiniteLength, DragMoveEvent, Empty, Entity,
+    EntityId, FocusHandle, Length, ListHorizontalSizingBehavior, ListSizingBehavior, ListState,
+    Point, ScrollHandle, Stateful, UniformListScrollHandle, WeakEntity, list, transparent_black,
+    uniform_list,
 };
-
 use crate::{
     ActiveTheme as _, AnyElement, App, Button, ButtonCommon as _, ButtonStyle, Color, Component,
     ComponentScope, Context, Div, ElementId, FixedWidth as _, FluentBuilder as _, HeaderResizeInfo,
     Indicator, InteractiveElement, IntoElement, ParentElement, Pixels, RedistributableColumnsState,
     RegisterComponent, RenderOnce, ScrollAxes, ScrollableHandle, Scrollbars, SharedString,
-    StatefulInteractiveElement, Styled, StyledExt as _, StyledTypography, Window, WithScrollbar,
-    bind_redistributable_columns, div, example_group_with_title, h_flex, px,
-    render_redistributable_columns_resize_handles, single_example,
+    StatefulInteractiveElement, Styled, StyledExt as _, StyledTypography, TableResizeBehavior,
+    Window, WithScrollbar, bind_redistributable_columns, div, example_group_with_title, h_flex,
+    px, render_redistributable_columns_resize_handles, single_example,
     table_row::{IntoTableRow as _, TableRow},
     v_flex,
 };
@@ -22,9 +22,97 @@ pub mod table_row;
 #[cfg(test)]
 mod tests;
 
+const RESIZE_DIVIDER_WIDTH: f32 = 1.0;
+const RESIZE_COLUMN_WIDTH: f32 = 8.0;
+
+/// Used as the drag payload when resizing columns in `Resizable` mode.
+#[derive(Debug)]
+pub(crate) struct DraggedResizableColumn(pub(crate) usize);
+
 /// Represents an unchecked table row, which is a vector of elements.
 /// Will be converted into `TableRow<T>` internally
 pub type UncheckedTableRow<T> = Vec<T>;
+
+/// State for independently resizable columns (spreadsheet-style).
+///
+/// Each column has its own absolute width; dragging a resize handle changes only
+/// that column's width, growing or shrinking the overall table width.
+pub struct ResizableColumnsState {
+    initial_widths: TableRow<AbsoluteLength>,
+    widths: TableRow<AbsoluteLength>,
+    resize_behavior: TableRow<TableResizeBehavior>,
+}
+
+impl ResizableColumnsState {
+    pub fn new(
+        cols: usize,
+        initial_widths: Vec<impl Into<AbsoluteLength>>,
+        resize_behavior: Vec<TableResizeBehavior>,
+    ) -> Self {
+        let widths: TableRow<AbsoluteLength> = initial_widths
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<_>>()
+            .into_table_row(cols);
+        Self {
+            initial_widths: widths.clone(),
+            widths,
+            resize_behavior: resize_behavior.into_table_row(cols),
+        }
+    }
+
+    pub fn resize_behavior(&self) -> &TableRow<TableResizeBehavior> {
+        &self.resize_behavior
+    }
+
+    pub(crate) fn on_drag_move(
+        &mut self,
+        drag_event: &DragMoveEvent<DraggedResizableColumn>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let col_idx = drag_event.drag(cx).0;
+        let rem_size = window.rem_size();
+        let drag_x = drag_event.event.position.x - drag_event.bounds.left();
+
+        let left_edge: Pixels = self.widths.as_slice()[..col_idx]
+            .iter()
+            .map(|width| width.to_pixels(rem_size))
+            .fold(px(0.), |acc, x| acc + x)
+            + px(col_idx as f32 * RESIZE_DIVIDER_WIDTH);
+
+        let new_width = drag_x - left_edge;
+        let new_width = self.apply_min_size(new_width, self.resize_behavior[col_idx], rem_size);
+
+        self.widths[col_idx] = AbsoluteLength::Pixels(new_width);
+        cx.notify();
+    }
+
+    pub fn on_double_click(&mut self, col_idx: usize, _window: &mut Window) {
+        self.widths[col_idx] = self.initial_widths[col_idx];
+    }
+
+    fn apply_min_size(
+        &self,
+        width: Pixels,
+        behavior: TableResizeBehavior,
+        rem_size: Pixels,
+    ) -> Pixels {
+        match behavior.min_size() {
+            Some(min_rems) => {
+                let min_px = rem_size * min_rems;
+                width.max(min_px)
+            }
+            None => width,
+        }
+    }
+}
+
+/// Info passed to `render_table_header` for resizable-column double-click reset.
+pub struct ResizableHeaderInfo {
+    pub entity: WeakEntity<ResizableColumnsState>,
+    pub resize_behavior: TableRow<TableResizeBehavior>,
+}
 
 struct UniformListData {
     render_list_of_rows_fn:
@@ -71,6 +159,7 @@ impl TableContents {
 pub struct TableInteractionState {
     pub focus_handle: FocusHandle,
     pub scroll_handle: UniformListScrollHandle,
+    pub horizontal_scroll_handle: ScrollHandle,
     pub custom_scrollbar: Option<Scrollbars>,
 }
 
@@ -79,6 +168,7 @@ impl TableInteractionState {
         Self {
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
+            horizontal_scroll_handle: ScrollHandle::new(),
             custom_scrollbar: None,
         }
     }
@@ -120,6 +210,9 @@ pub enum ColumnWidthConfig {
         columns_state: Entity<RedistributableColumnsState>,
         table_width: Option<DefiniteLength>,
     },
+    /// Independently resizable columns — dragging changes absolute column widths
+    /// and thus the overall table width. Like spreadsheets.
+    Resizable(Entity<ResizableColumnsState>),
 }
 
 pub enum StaticColumnWidths {
@@ -184,24 +277,47 @@ impl ColumnWidthConfig {
                 columns_state: entity,
                 ..
             } => Some(entity.read(cx).widths_to_render()),
+            ColumnWidthConfig::Resizable(entity) => {
+                let state = entity.read(cx);
+                Some(state.widths.map_cloned(|abs| {
+                    Length::Definite(DefiniteLength::Absolute(abs))
+                }))
+            }
         }
     }
 
     /// Table-level width.
-    pub fn table_width(&self) -> Option<Length> {
+    pub fn table_width(&self, window: &Window, cx: &App) -> Option<Length> {
         match self {
             ColumnWidthConfig::Static { table_width, .. }
             | ColumnWidthConfig::Redistributable { table_width, .. } => {
                 table_width.map(Length::Definite)
             }
+            ColumnWidthConfig::Resizable(entity) => {
+                let state = entity.read(cx);
+                let rem_size = window.rem_size();
+                let total: Pixels = state
+                    .widths
+                    .as_slice()
+                    .iter()
+                    .map(|abs| abs.to_pixels(rem_size))
+                    .fold(px(0.), |acc, x| acc + x)
+                    + px((state.widths.cols().saturating_sub(1)) as f32 * RESIZE_DIVIDER_WIDTH);
+                Some(Length::Definite(DefiniteLength::Absolute(
+                    AbsoluteLength::Pixels(total),
+                )))
+            }
         }
     }
 
     /// ListHorizontalSizingBehavior for uniform_list.
-    pub fn list_horizontal_sizing(&self) -> ListHorizontalSizingBehavior {
-        match self.table_width() {
-            Some(_) => ListHorizontalSizingBehavior::Unconstrained,
-            None => ListHorizontalSizingBehavior::FitList,
+    pub fn list_horizontal_sizing(&self, window: &Window, cx: &App) -> ListHorizontalSizingBehavior {
+        match self {
+            ColumnWidthConfig::Resizable(_) => ListHorizontalSizingBehavior::FitList,
+            _ => match self.table_width(window, cx) {
+                Some(_) => ListHorizontalSizingBehavior::Unconstrained,
+                None => ListHorizontalSizingBehavior::FitList,
+            },
         }
     }
 }
@@ -473,6 +589,7 @@ pub fn render_table_header(
     headers: TableRow<impl IntoElement>,
     table_context: TableRenderContext,
     resize_info: Option<HeaderResizeInfo>,
+    resizable_info: Option<ResizableHeaderInfo>,
     entity_id: Option<EntityId>,
     cx: &mut App,
 ) -> impl IntoElement {
@@ -528,6 +645,22 @@ pub fn render_table_header(
                                 this
                             }
                         })
+                        .when_some(resizable_info.as_ref(), |this, info| {
+                            if info.resize_behavior[header_idx].is_resizable() {
+                                let entity = info.entity.clone();
+                                this.on_click(move |event: &ClickEvent, window, cx| {
+                                    if event.click_count() > 1 {
+                                        entity
+                                            .update(cx, |state, _| {
+                                                state.on_double_click(header_idx, window);
+                                            })
+                                            .ok();
+                                    }
+                                })
+                            } else {
+                                this
+                            }
+                        })
                 }),
         )
 }
@@ -572,6 +705,101 @@ impl TableRenderContext {
     }
 }
 
+fn render_resize_handles_resizable(
+    columns_state: &Entity<ResizableColumnsState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let (column_widths, resize_behavior) = {
+        let state = columns_state.read(cx);
+        (
+            state
+                .widths
+                .map_cloned(|abs| Length::Definite(DefiniteLength::Absolute(abs))),
+            state.resize_behavior.clone(),
+        )
+    };
+
+    let resize_behavior = Rc::new(resize_behavior);
+    // Each column contributes a spacer; between columns there is a resize divider.
+    // Structure: [spacer_0][divider_0][spacer_1][divider_1]...[spacer_N-1]
+    let n_cols = column_widths.cols();
+    let mut elements: Vec<AnyElement> = Vec::with_capacity(n_cols * 2 - 1);
+
+    for (col_idx, width) in column_widths.as_slice().iter().copied().enumerate() {
+        elements.push(div().w(width).h_full().into_any_element());
+
+        // Add a resize divider after every column except the last.
+        if col_idx + 1 < n_cols {
+            let resize_behavior = Rc::clone(&resize_behavior);
+            let columns_state = columns_state.clone();
+            let divider = window.with_id(col_idx, |window| {
+                let mut resize_divider = div()
+                    .id(col_idx)
+                    .relative()
+                    .top_0()
+                    .w(px(RESIZE_DIVIDER_WIDTH))
+                    .h_full()
+                    .bg(cx.theme().colors().border.opacity(0.8));
+
+                let mut resize_handle = div()
+                    .id("column-resize-handle")
+                    .absolute()
+                    .left_neg_0p5()
+                    .w(px(RESIZE_COLUMN_WIDTH))
+                    .h_full();
+
+                if resize_behavior[col_idx].is_resizable() {
+                    let is_highlighted = window.use_state(cx, |_window, _cx| false);
+
+                    resize_divider = resize_divider.when(*is_highlighted.read(cx), |div| {
+                        div.bg(cx.theme().colors().border_focused)
+                    });
+
+                    resize_handle = resize_handle
+                        .on_hover({
+                            let is_highlighted = is_highlighted.clone();
+                            move |&was_hovered, _, cx| is_highlighted.write(cx, was_hovered)
+                        })
+                        .cursor_col_resize()
+                        .on_click({
+                            let columns_state = columns_state.clone();
+                            move |event: &ClickEvent, window, cx| {
+                                if event.click_count() >= 2 {
+                                    columns_state.update(cx, |state, _| {
+                                        state.on_double_click(col_idx, window);
+                                    });
+                                }
+                                cx.stop_propagation();
+                            }
+                        })
+                        .on_drag(DraggedResizableColumn(col_idx), {
+                            let is_highlighted = is_highlighted.clone();
+                            move |_, _offset, _window, cx| {
+                                is_highlighted.write(cx, true);
+                                cx.new(|_cx| Empty)
+                            }
+                        })
+                        .on_drop::<DraggedResizableColumn>(move |_, _, cx| {
+                            is_highlighted.write(cx, false);
+                        });
+                }
+
+                resize_divider.child(resize_handle).into_any_element()
+            });
+            elements.push(divider);
+        }
+    }
+
+    h_flex()
+        .id("resize-handles")
+        .absolute()
+        .inset_0()
+        .w_full()
+        .children(elements)
+        .into_any_element()
+}
+
 impl RenderOnce for Table {
     fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let table_context = TableRenderContext::new(&self, cx);
@@ -587,8 +815,19 @@ impl RenderOnce for Table {
                     _ => None,
                 });
 
-        let table_width = self.column_width_config.table_width();
-        let horizontal_sizing = self.column_width_config.list_horizontal_sizing();
+        let resizable_header_info =
+            interaction_state
+                .as_ref()
+                .and_then(|_| match &self.column_width_config {
+                    ColumnWidthConfig::Resizable(entity) => Some(ResizableHeaderInfo {
+                        entity: entity.downgrade(),
+                        resize_behavior: entity.read(cx).resize_behavior.clone(),
+                    }),
+                    _ => None,
+                });
+
+        let table_width = self.column_width_config.table_width(window, cx);
+        let horizontal_sizing = self.column_width_config.list_horizontal_sizing(window, cx);
         let no_rows_rendered = self.rows.is_empty();
 
         // Extract redistributable entity for drag/drop/prepaint handlers
@@ -603,6 +842,17 @@ impl RenderOnce for Table {
                     _ => None,
                 });
 
+        // Extract resizable entity for drag-move handler
+        let resizable_entity =
+            interaction_state
+                .as_ref()
+                .and_then(|_| match &self.column_width_config {
+                    ColumnWidthConfig::Resizable(entity) => Some(entity.clone()),
+                    _ => None,
+                });
+
+        let is_resizable = resizable_entity.is_some();
+
         let resize_handles =
             interaction_state
                 .as_ref()
@@ -610,11 +860,17 @@ impl RenderOnce for Table {
                     ColumnWidthConfig::Redistributable { columns_state, .. } => Some(
                         render_redistributable_columns_resize_handles(columns_state, window, cx),
                     ),
+                    ColumnWidthConfig::Resizable(entity) => {
+                        Some(render_resize_handles_resizable(entity, window, cx))
+                    }
                     _ => None,
                 });
 
         let table = div()
-            .when_some(table_width, |this, width| this.w(width))
+            .when_some(
+                if is_resizable { None } else { table_width },
+                |this, width| this.w(width),
+            )
             .h_full()
             .v_flex()
             .when_some(self.headers.take(), |this, headers| {
@@ -622,12 +878,18 @@ impl RenderOnce for Table {
                     headers,
                     table_context.clone(),
                     header_resize_info,
+                    resizable_header_info,
                     interaction_state.as_ref().map(Entity::entity_id),
                     cx,
                 ))
             })
             .when_some(redistributable_entity, |this, widths| {
                 bind_redistributable_columns(this, widths)
+            })
+            .when_some(resizable_entity, |this, entity| {
+                this.on_drag_move::<DraggedResizableColumn>(move |event, window, cx| {
+                    entity.update(cx, |state, cx| state.on_drag_move(event, window, cx));
+                })
             })
             .child({
                 let content = div()
@@ -742,7 +1004,41 @@ impl RenderOnce for Table {
                 },
             );
 
-        if let Some(interaction_state) = interaction_state.as_ref() {
+        // For resizable mode, wrap in a horizontal-scroll container
+        let table_wrapper = div().size_full();
+
+        if is_resizable {
+            if let Some(state) = interaction_state.as_ref() {
+                let h_scroll_container = div()
+                    .id("table-h-scroll")
+                    .overflow_x_scroll()
+                    .flex_grow()
+                    .h_full()
+                    .when_some(table_width, |this, width| this.w(width))
+                    .track_scroll(&state.read(cx).horizontal_scroll_handle)
+                    .child(table);
+
+                let outer = table_wrapper
+                    .child(h_scroll_container)
+                    .custom_scrollbars(
+                        Scrollbars::new(ScrollAxes::Horizontal)
+                            .tracked_scroll_handle(&state.read(cx).horizontal_scroll_handle),
+                        window,
+                        cx,
+                    );
+
+                if let Some(interaction_state) = interaction_state.as_ref() {
+                    outer
+                        .track_focus(&interaction_state.read(cx).focus_handle)
+                        .id(("table", interaction_state.entity_id()))
+                        .into_any_element()
+                } else {
+                    outer.into_any_element()
+                }
+            } else {
+                table.into_any_element()
+            }
+        } else if let Some(interaction_state) = interaction_state.as_ref() {
             table
                 .track_focus(&interaction_state.read(cx).focus_handle)
                 .id(("table", interaction_state.entity_id()))

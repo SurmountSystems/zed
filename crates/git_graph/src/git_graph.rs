@@ -2599,6 +2599,7 @@ impl Render for GitGraph {
                             ),
                             header_context,
                             Some(header_resize_info),
+                            None,
                             Some(self.column_widths.entity_id()),
                             cx,
                         ))
