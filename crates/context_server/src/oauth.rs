@@ -27,11 +27,9 @@ use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use url::Url;
-use util::ResultExt as _;
 
 /// The CIMD URL where Zed's OAuth client metadata document is hosted.
 pub const CIMD_URL: &str = "https://zed.dev/oauth/client-metadata.json";
@@ -992,57 +990,13 @@ impl OAuthCallback {
     /// Parse the query string from a callback URL like
     /// `http://127.0.0.1:<port>/callback?code=...&state=...`.
     pub fn parse_query(query: &str) -> Result<Self> {
-        let mut code: Option<String> = None;
-        let mut state: Option<String> = None;
-        let mut error: Option<String> = None;
-        let mut error_description: Option<String> = None;
-
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            match key.as_ref() {
-                "code" => {
-                    if !value.is_empty() {
-                        code = Some(value.into_owned());
-                    }
-                }
-                "state" => {
-                    if !value.is_empty() {
-                        state = Some(value.into_owned());
-                    }
-                }
-                "error" => {
-                    if !value.is_empty() {
-                        error = Some(value.into_owned());
-                    }
-                }
-                "error_description" => {
-                    if !value.is_empty() {
-                        error_description = Some(value.into_owned());
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Check for OAuth error response (RFC 6749 Section 4.1.2.1) before
-        // checking for missing code/state.
-        if let Some(error_code) = error {
-            bail!(
-                "OAuth authorization failed: {} ({})",
-                error_code,
-                error_description.as_deref().unwrap_or("no description")
-            );
-        }
-
-        let code = code.ok_or_else(|| anyhow!("missing 'code' parameter in OAuth callback"))?;
-        let state = state.ok_or_else(|| anyhow!("missing 'state' parameter in OAuth callback"))?;
-
-        Ok(Self { code, state })
+        let params = http_client::OAuthCallbackParams::parse_query(query)?;
+        Ok(Self {
+            code: params.code,
+            state: params.state,
+        })
     }
 }
-
-/// How long to wait for the browser to complete the OAuth flow before giving
-/// up and releasing the loopback port.
-const CALLBACK_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 /// Start a loopback HTTP server to receive the OAuth authorization callback.
 ///
@@ -1057,107 +1011,26 @@ const CALLBACK_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// HTML page telling the user they can close the tab, and shuts down.
 ///
 /// The callback server shuts down when the returned oneshot receiver is dropped
-/// (e.g. because the authentication task was cancelled), or after a timeout
-/// ([CALLBACK_TIMEOUT]).
+/// (e.g. because the authentication task was cancelled), or after a timeout.
 pub async fn start_callback_server() -> Result<(
     String,
     futures::channel::oneshot::Receiver<Result<OAuthCallback>>,
 )> {
-    let server = tiny_http::Server::http("127.0.0.1:0")
-        .map_err(|e| anyhow!(e).context("Failed to bind loopback listener for OAuth callback"))?;
-    let port = server
-        .server_addr()
-        .to_ip()
-        .context("server not bound to a TCP address")?
-        .port();
-
-    let redirect_uri = format!("http://127.0.0.1:{}/callback", port);
-
-    let (tx, rx) = futures::channel::oneshot::channel();
-
-    // `tiny_http` is blocking, so we run it on a background thread.
-    // The `recv_timeout` loop lets us check for cancellation (the receiver
-    // being dropped) and enforce an overall timeout.
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + CALLBACK_TIMEOUT;
-
-        loop {
-            if tx.is_canceled() {
-                return;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return;
-            }
-
-            let timeout = remaining.min(Duration::from_millis(500));
-            let Some(request) = (match server.recv_timeout(timeout) {
-                Ok(req) => req,
-                Err(_) => {
-                    let _ = tx.send(Err(anyhow!("OAuth callback server I/O error")));
-                    return;
-                }
-            }) else {
-                // Timeout with no request — loop back and check cancellation.
-                continue;
-            };
-
-            let result = handle_callback_request(&request);
-
-            let (status_code, body) = match &result {
-                Ok(_) => (
-                    200,
-                    http_client::oauth_callback_page(
-                        "Authorization Successful",
-                        "You can close this tab and return to Zed.",
-                    ),
-                ),
-                Err(err) => {
-                    log::error!("OAuth callback error: {}", err);
-                    (
-                        400,
-                        http_client::oauth_callback_page(
-                            "Authorization Failed",
-                            "Something went wrong. Please try again from Zed.",
-                        ),
-                    )
-                }
-            };
-
-            let response = tiny_http::Response::from_string(body)
-                .with_status_code(status_code)
-                .with_header(
-                    tiny_http::Header::from_str("Content-Type: text/html")
-                        .expect("failed to construct response header"),
-                )
-                .with_header(
-                    tiny_http::Header::from_str("Keep-Alive: timeout=0,max=0")
-                        .expect("failed to construct response header"),
-                );
-            request.respond(response).log_err();
-
-            let _ = tx.send(result);
-            return;
-        }
-    });
-
-    Ok((redirect_uri, rx))
-}
-
-/// Extract the `code` and `state` query parameters from an OAuth callback
-/// request to `/callback`.
-fn handle_callback_request(request: &tiny_http::Request) -> Result<OAuthCallback> {
-    let url = Url::parse(&format!("http://localhost{}", request.url()))
-        .context("malformed callback request URL")?;
-
-    if url.path() != "/callback" {
-        bail!("unexpected path in OAuth callback: {}", url.path());
-    }
-
-    let query = url
-        .query()
-        .ok_or_else(|| anyhow!("OAuth callback has no query string"))?;
-    OAuthCallback::parse_query(query)
+    let (redirect_uri, rx) = http_client::start_oauth_callback_server()?;
+    let (tx, mapped_rx) = futures::channel::oneshot::channel();
+    smol::spawn(async move {
+        let result = match rx.await {
+            Ok(Ok(params)) => Ok(OAuthCallback {
+                code: params.code,
+                state: params.state,
+            }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(anyhow!("OAuth callback channel was cancelled")),
+        };
+        let _ = tx.send(result);
+    })
+    .detach();
+    Ok((redirect_uri, mapped_rx))
 }
 
 // -- JSON fetch helper -------------------------------------------------------

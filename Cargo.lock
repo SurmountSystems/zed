@@ -3454,7 +3454,6 @@ dependencies = [
  "smol",
  "tempfile",
  "terminal",
- "tiny_http",
  "url",
  "util",
 ]
@@ -8217,6 +8216,7 @@ dependencies = [
  "serde_urlencoded",
  "sha2",
  "tempfile",
+ "tiny_http",
  "url",
  "util",
 ]
@@ -9388,6 +9388,7 @@ dependencies = [
  "open_ai",
  "open_router",
  "opencode",
+ "parking_lot",
  "partial-json-fixer",
  "pretty_assertions",
  "rand 0.9.2",
