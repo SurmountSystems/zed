@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -201,6 +202,7 @@ pub struct ThreadMetadataStore {
     session_subscriptions: HashMap<acp::SessionId, Subscription>,
     pending_thread_ops_tx: smol::channel::Sender<DbOperation>,
     _db_operations_task: Task<()>,
+    in_flight_archives: HashMap<acp::SessionId, (Task<()>, smol::channel::Sender<()>)>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -425,12 +427,34 @@ impl ThreadMetadataStore {
         }
     }
 
-    pub fn archive(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
+    pub fn archive<F, Fut>(
+        &mut self,
+        session_id: &acp::SessionId,
+        task_builder: Option<F>,
+        cx: &mut Context<Self>,
+    ) where
+        F: FnOnce(smol::channel::Receiver<()>) -> Fut,
+        Fut: Future<Output = ()> + 'static,
+    {
         self.update_archived(session_id, true, cx);
+
+        if let Some(task_builder) = task_builder {
+            let (cancel_tx, cancel_rx) = smol::channel::bounded(1);
+            let future = task_builder(cancel_rx);
+            let task = cx.foreground_executor().spawn(future);
+            self.in_flight_archives
+                .insert(session_id.clone(), (task, cancel_tx));
+        }
     }
 
     pub fn unarchive(&mut self, session_id: &acp::SessionId, cx: &mut Context<Self>) {
         self.update_archived(session_id, false, cx);
+        // Dropping the Sender triggers cancellation in the background task.
+        self.in_flight_archives.remove(session_id);
+    }
+
+    pub fn cleanup_completed_archive(&mut self, session_id: &acp::SessionId) {
+        self.in_flight_archives.remove(session_id);
     }
 
     pub fn complete_worktree_restore(
@@ -626,6 +650,7 @@ impl ThreadMetadataStore {
             session_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             _db_operations_task,
+            in_flight_archives: HashMap::default(),
         };
         let _ = this.reload(cx);
         this
@@ -1882,7 +1907,11 @@ mod tests {
         cx.update(|cx| {
             let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.archive(&acp::SessionId::new("session-1"), cx);
+                store.archive(
+                    &acp::SessionId::new("session-1"),
+                    None::<fn(smol::channel::Receiver<()>) -> std::future::Ready<()>>,
+                    cx,
+                );
             });
         });
 
@@ -1959,7 +1988,11 @@ mod tests {
         cx.update(|cx| {
             let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.archive(&acp::SessionId::new("session-2"), cx);
+                store.archive(
+                    &acp::SessionId::new("session-2"),
+                    None::<fn(smol::channel::Receiver<()>) -> std::future::Ready<()>>,
+                    cx,
+                );
             });
         });
 
@@ -2059,7 +2092,11 @@ mod tests {
         cx.update(|cx| {
             let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.archive(&acp::SessionId::new("session-1"), cx);
+                store.archive(
+                    &acp::SessionId::new("session-1"),
+                    None::<fn(smol::channel::Receiver<()>) -> std::future::Ready<()>>,
+                    cx,
+                );
             });
         });
 
@@ -2107,7 +2144,11 @@ mod tests {
         cx.update(|cx| {
             let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
-                store.archive(&acp::SessionId::new("nonexistent"), cx);
+                store.archive(
+                    &acp::SessionId::new("nonexistent"),
+                    None::<fn(smol::channel::Receiver<()>) -> std::future::Ready<()>>,
+                    cx,
+                );
             });
         });
 
@@ -2136,7 +2177,11 @@ mod tests {
             let store = ThreadMetadataStore::global(cx);
             store.update(cx, |store, cx| {
                 store.save(metadata.clone(), cx);
-                store.archive(&session_id, cx);
+                store.archive(
+                    &session_id,
+                    None::<fn(smol::channel::Receiver<()>) -> std::future::Ready<()>>,
+                    cx,
+                );
             });
         });
 
