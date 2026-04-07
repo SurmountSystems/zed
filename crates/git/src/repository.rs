@@ -2732,7 +2732,6 @@ impl GitRepository for RealGitRepository {
         async move {
             let git = git_binary?;
 
-            // todo!: should we include no optional locks here?
             let mut git_log_command = vec![
                 "log",
                 GRAPH_COMMIT_FORMAT,
@@ -2825,6 +2824,10 @@ impl GitRepository for RealGitRepository {
 
             args.push("--grep");
             args.push(search_args.query.as_str());
+
+            if let LogSource::File(file_path) = &log_source {
+                args.extend(["--", file_path.as_unix_str()]);
+            }
 
             let mut command = git.build_command(&args);
             command.stdout(Stdio::piped());
