@@ -84,6 +84,18 @@ impl ResizableColumnsState {
         cx.notify();
     }
 
+    pub fn set_column_configuration(
+        &mut self,
+        col_idx: usize,
+        width: impl Into<AbsoluteLength>,
+        resize_behavior: TableResizeBehavior,
+    ) {
+        let width = width.into();
+        self.initial_widths[col_idx] = width;
+        self.widths[col_idx] = width;
+        self.resize_behavior[col_idx] = resize_behavior;
+    }
+
     pub fn reset_column_to_initial_width(&mut self, col_idx: usize) {
         self.widths[col_idx] = self.initial_widths[col_idx];
     }

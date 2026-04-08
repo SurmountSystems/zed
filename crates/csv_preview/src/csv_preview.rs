@@ -60,8 +60,7 @@ impl CsvPreviewView {
         let cols = self.engine.contents.headers.cols() + 1;
         let line_number_width = self.calculate_row_identifier_column_width();
 
-        let mut widths: Vec<AbsoluteLength> =
-            vec![AbsoluteLength::Pixels(px(150.)); cols];
+        let mut widths: Vec<AbsoluteLength> = vec![AbsoluteLength::Pixels(px(150.)); cols];
         widths[0] = AbsoluteLength::Pixels(px(line_number_width));
 
         let mut resize_behaviors = vec![TableResizeBehavior::Resizable; cols];
@@ -70,6 +69,12 @@ impl CsvPreviewView {
         self.column_widths.widths.update(cx, |state, _cx| {
             if state.cols() != cols {
                 *state = ResizableColumnsState::new(cols, widths, resize_behaviors);
+            } else {
+                state.set_column_configuration(
+                    0,
+                    AbsoluteLength::Pixels(px(line_number_width)),
+                    TableResizeBehavior::None,
+                );
             }
         });
     }
@@ -172,8 +177,7 @@ impl CsvPreviewView {
                 column_widths: ColumnWidths::new(cx, 1),
                 parsing_task: None,
                 performance_metrics: PerformanceMetrics::default(),
-                list_state: gpui::ListState::new(contents.rows.len(), ListAlignment::Top, px(1.))
-                    .measure_all(),
+                list_state: gpui::ListState::new(contents.rows.len(), ListAlignment::Top, px(1.)),
                 settings: CsvPreviewSettings::default(),
                 last_parse_end_time: None,
                 engine: TableDataEngine::default(),
@@ -201,8 +205,7 @@ impl CsvPreviewView {
 
         // Update list state with filtered row count
         let visible_rows = self.engine.d2d_mapping().visible_row_count();
-        self.list_state = gpui::ListState::new(visible_rows, ListAlignment::Top, px(1.))
-            .measure_all();
+        self.list_state = gpui::ListState::new(visible_rows, ListAlignment::Top, px(100.));
     }
 
     pub fn resolve_active_item_as_csv_editor(
