@@ -14627,6 +14627,8 @@ impl Editor {
         };
 
         let text_layout_details = &self.text_layout_details(window, cx);
+        let selection_count = self.selections.count();
+        let first_selection = self.selections.first_anchor();
 
         self.change_selections(effects, window, cx, |s| {
             s.move_with(&mut |map, selection| {
@@ -14644,6 +14646,11 @@ impl Editor {
                 selection.collapse_to(cursor, goal);
             });
         });
+
+        if selection_count == 1 && first_selection.range() == self.selections.first_anchor().range()
+        {
+            cx.propagate();
+        }
     }
 
     pub fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
@@ -14751,6 +14758,9 @@ impl Editor {
         };
 
         let text_layout_details = &self.text_layout_details(window, cx);
+        let selection_count = self.selections.count();
+        let first_selection = self.selections.first_anchor();
+
         self.change_selections(effects, window, cx, |s| {
             s.move_with(&mut |map, selection| {
                 if !selection.is_empty() {
@@ -14767,6 +14777,11 @@ impl Editor {
                 selection.collapse_to(cursor, goal);
             });
         });
+
+        if selection_count == 1 && first_selection.range() == self.selections.first_anchor().range()
+        {
+            cx.propagate();
+        }
     }
 
     pub fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
@@ -15534,10 +15549,18 @@ impl Editor {
             cx.propagate();
             return;
         }
+        let selection_count = self.selections.count();
+        let first_selection = self.selections.first_anchor();
+
         self.hide_mouse_cursor(HideMouseCursorOrigin::MovementAction, cx);
         self.change_selections(Default::default(), window, cx, |s| {
             s.select_ranges(vec![Anchor::Min..Anchor::Min]);
         });
+
+        if selection_count == 1 && first_selection.range() == self.selections.first_anchor().range()
+        {
+            cx.propagate();
+        }
     }
 
     pub fn select_to_beginning(
@@ -15559,11 +15582,19 @@ impl Editor {
             cx.propagate();
             return;
         }
+        let selection_count = self.selections.count();
+        let first_selection = self.selections.first_anchor();
+
         self.hide_mouse_cursor(HideMouseCursorOrigin::MovementAction, cx);
         let cursor = self.buffer.read(cx).read(cx).len();
         self.change_selections(Default::default(), window, cx, |s| {
             s.select_ranges(vec![cursor..cursor])
         });
+
+        if selection_count == 1 && first_selection.range() == self.selections.first_anchor().range()
+        {
+            cx.propagate();
+        }
     }
 
     pub fn set_nav_history(&mut self, nav_history: Option<ItemNavHistory>) {

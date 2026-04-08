@@ -293,6 +293,8 @@
       "down": "agent::ScrollOutputLineDown",
       "shift-pageup": "agent::ScrollOutputToPreviousMessage",
       "shift-pagedown": "agent::ScrollOutputToNextMessage",
+      "ctrl-home": "agent::ScrollOutputToTop",
+      "ctrl-end": "agent::ScrollOutputToBottom",
       "ctrl-alt-pageup": "agent::ScrollOutputPageUp",
       "ctrl-alt-pagedown": "agent::ScrollOutputPageDown",
       "ctrl-alt-home": "agent::ScrollOutputToTop",
