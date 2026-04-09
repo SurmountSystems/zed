@@ -45,7 +45,7 @@ fn assert_active_thread(sidebar: &Sidebar, session_id: &acp::SessionId, msg: &st
 #[track_caller]
 fn assert_active_draft(sidebar: &Sidebar, workspace: &Entity<Workspace>, msg: &str) {
     assert!(
-        matches!(&sidebar.active_entry, Some(ActiveEntry::Draft(ws)) if ws == workspace),
+        matches!(&sidebar.active_entry, Some(ActiveEntry::Draft { workspace: ws, .. }) if ws == workspace),
         "{msg}: expected active_entry to be Draft for workspace {:?}, got {:?}",
         workspace.entity_id(),
         sidebar.active_entry,
@@ -388,17 +388,14 @@ fn visible_entries_as_strings(
                             format!("  + View More{}", selected)
                         }
                     }
-                    ListEntry::DraftThread {
-                        workspace,
-                        worktrees,
-                        ..
-                    } => {
+                    ListEntry::DraftThread { worktrees, .. } => {
                         let worktree = format_linked_worktree_chips(worktrees);
-                        if workspace.is_some() {
-                            format!("  [+ New Thread{}]{}", worktree, selected)
-                        } else {
-                            format!("  [~ Draft{}]{}{}", worktree, active_indicator, selected)
-                        }
+                        let is_active = sidebar
+                            .active_entry
+                            .as_ref()
+                            .is_some_and(|e| e.matches_entry(entry));
+                        let active_marker = if is_active { " *" } else { "" };
+                        format!("  [~ Draft{}]{}{}", worktree, active_marker, selected)
                     }
                 }
             })
@@ -566,10 +563,7 @@ async fn test_single_workspace_no_threads(cx: &mut TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "v [my-project]",
-        ]
+        vec!["v [my-project]", "  [~ Draft]"]
     );
 }
 
@@ -1329,13 +1323,10 @@ async fn test_keyboard_navigation_on_empty_list(cx: &mut TestAppContext) {
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let sidebar = setup_sidebar(&multi_workspace, cx);
 
-    // An empty project has only the header.
+    // An empty project has the header and an auto-created draft.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "v [empty-project]",
-        ]
+        vec!["v [empty-project]", "  [~ Draft]"]
     );
 
     // Focus sidebar — focus_in does not set a selection
@@ -1346,7 +1337,11 @@ async fn test_keyboard_navigation_on_empty_list(cx: &mut TestAppContext) {
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 
-    // At the end (only one entry), wraps back to first entry
+    // SelectNext advances to index 1 (draft entry)
+    cx.dispatch_action(SelectNext);
+    assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(1));
+
+    // At the end (two entries), wraps back to first entry
     cx.dispatch_action(SelectNext);
     assert_eq!(sidebar.read_with(cx, |s, _| s.selection), Some(0));
 
@@ -2591,9 +2586,10 @@ async fn test_new_thread_button_works_after_adding_folder(cx: &mut TestAppContex
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
         vec![
-            //
-            "v [project-a, project-b]",
-            "  Hello * (active)",
+            "v [project-a, project-b]", //
+            "  Hello *",
+            "v [project-a]",
+            "  [~ Draft]",
         ]
     );
 
@@ -3437,12 +3433,7 @@ async fn test_cmd_n_shows_new_thread_entry(cx: &mut TestAppContext) {
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "v [my-project]",
-            "  [~ Draft] (active)",
-            "  Hello *",
-        ],
+        vec!["v [my-project]", "  [~ Draft] *", "  Hello *"],
         "After Cmd-N the sidebar should show a highlighted Draft entry"
     );
 
@@ -3482,21 +3473,16 @@ async fn test_draft_with_server_session_shows_as_draft(cx: &mut TestAppContext) 
         ]
     );
 
-    // Open a new draft thread via a server connection. This gives the
-    // conversation a parent_id (session assigned by the server) but
-    // no messages have been sent, so active_thread_is_draft() is true.
-    let draft_connection = StubAgentConnection::new();
-    open_thread_with_connection(&panel, draft_connection, cx);
+    // Create a new draft via Cmd-N. Since new_thread() now creates a
+    // tracked draft in the AgentPanel, it appears in the sidebar.
+    panel.update_in(cx, |panel, window, cx| {
+        panel.new_thread(&NewThread, window, cx);
+    });
     cx.run_until_parked();
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "v [my-project]",
-            "  [~ Draft] (active)",
-            "  Hello *",
-        ],
+        vec!["v [my-project]", "  [~ Draft] *", "  Hello *"],
     );
 
     let workspace = multi_workspace.read_with(cx, |mw, _cx| mw.workspace().clone());
@@ -3611,8 +3597,8 @@ async fn test_cmd_n_shows_new_thread_entry_in_absorbed_worktree(cx: &mut TestApp
         vec![
             //
             "v [project]",
-            "  [~ Draft {wt-feature-a}] (active)",
-            "  Hello {wt-feature-a} *",
+            "  [~ Draft {wt-feature-a}] *",
+            "  Hello {wt-feature-a} *"
         ],
         "After Cmd-N in an absorbed worktree, the sidebar should show \
              a highlighted Draft entry under the main repo header"
@@ -3729,11 +3715,7 @@ async fn test_git_worktree_added_live_updates_sidebar(cx: &mut TestAppContext) {
     // The chip name is derived from the path even before git discovery.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "v [project]",
-            "  Worktree Thread {rosewood}",
-        ]
+        vec!["v [project]", "  [~ Draft]"]
     );
 
     // Now add the worktree to the git state and trigger a rescan.
@@ -3925,12 +3907,7 @@ async fn test_threadless_workspace_shows_new_thread_with_worktree_chip(cx: &mut 
     // appears as a "New Thread" button with its worktree chip.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "v [project]",
-            "  [+ New Thread {wt-feature-b}]",
-            "  Thread A {wt-feature-a}",
-        ]
+        vec!["v [project]", "  Thread A {wt-feature-a}",]
     );
 }
 
@@ -4184,12 +4161,7 @@ async fn test_absorbed_worktree_running_thread_shows_live_status(cx: &mut TestAp
     let entries = visible_entries_as_strings(&sidebar, cx);
     assert_eq!(
         entries,
-        vec![
-            //
-            "v [project]",
-            "  [~ Draft] (active)",
-            "  Hello {wt-feature-a} * (running)",
-        ]
+        vec!["v [project]", "  Hello {wt-feature-a} * (running)",]
     );
 }
 
@@ -4272,12 +4244,7 @@ async fn test_absorbed_worktree_completion_triggers_notification(cx: &mut TestAp
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "v [project]",
-            "  [~ Draft] (active)",
-            "  Hello {wt-feature-a} * (running)",
-        ]
+        vec!["v [project]", "  Hello {wt-feature-a} * (running)",]
     );
 
     connection.end_turn(session_id, acp::StopReason::EndTurn);
@@ -4285,12 +4252,7 @@ async fn test_absorbed_worktree_completion_triggers_notification(cx: &mut TestAp
 
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
-        vec![
-            //
-            "v [project]",
-            "  [~ Draft] (active)",
-            "  Hello {wt-feature-a} * (!)",
-        ]
+        vec!["v [project]", "  Hello {wt-feature-a} * (!)",]
     );
 }
 
@@ -5498,6 +5460,7 @@ async fn test_linked_worktree_threads_not_duplicated_across_groups(cx: &mut Test
         vec![
             //
             "v [other, project]",
+            "  [~ Draft]",
             "v [project]",
             "  Worktree Thread {wt-feature-a}",
         ]
@@ -5951,7 +5914,7 @@ async fn test_archive_thread_active_entry_management(cx: &mut TestAppContext) {
     // active_entry should still be a draft on workspace_b (the active one).
     sidebar.read_with(cx, |sidebar, _| {
         assert!(
-            matches!(&sidebar.active_entry, Some(ActiveEntry::Draft(ws)) if ws == &workspace_b),
+            matches!(&sidebar.active_entry, Some(ActiveEntry::Draft { workspace: ws, .. }) if ws == &workspace_b),
             "expected Draft(workspace_b) after archiving non-active thread, got: {:?}",
             sidebar.active_entry,
         );
@@ -5986,7 +5949,7 @@ async fn test_archive_thread_active_entry_management(cx: &mut TestAppContext) {
     // Should fall back to a draft on the same workspace.
     sidebar.read_with(cx, |sidebar, _| {
         assert!(
-            matches!(&sidebar.active_entry, Some(ActiveEntry::Draft(ws)) if ws == &workspace_b),
+            matches!(&sidebar.active_entry, Some(ActiveEntry::Draft { workspace: ws, .. }) if ws == &workspace_b),
             "expected Draft(workspace_b) after archiving active thread, got: {:?}",
             sidebar.active_entry,
         );
@@ -6059,7 +6022,7 @@ async fn test_switch_to_workspace_with_archived_thread_shows_draft(cx: &mut Test
 
     sidebar.read_with(cx, |sidebar, _| {
         assert!(
-            matches!(&sidebar.active_entry, Some(ActiveEntry::Draft(ws)) if ws == &workspace_a),
+            matches!(&sidebar.active_entry, Some(ActiveEntry::Draft { workspace: ws, .. }) if ws == &workspace_a),
             "expected Draft(workspace_a) after switching to workspace with archived thread, got: {:?}",
             sidebar.active_entry,
         );
@@ -6561,9 +6524,10 @@ async fn test_archive_thread_on_linked_worktree_selects_sibling_thread(cx: &mut 
 #[gpui::test]
 async fn test_linked_worktree_workspace_reachable_and_dismissable(cx: &mut TestAppContext) {
     // When a linked worktree is opened as its own workspace and the user
-    // switches away, the workspace must still be reachable from a DraftThread
-    // sidebar entry. Pressing RemoveSelectedThread (shift-backspace) on that
-    // entry should remove the workspace.
+    // creates a draft thread from it, then switches away, the workspace must
+    // still be reachable from that DraftThread sidebar entry. Pressing
+    // RemoveSelectedThread (shift-backspace) on that entry should remove the
+    // workspace.
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
 
@@ -6627,6 +6591,14 @@ async fn test_linked_worktree_workspace_reachable_and_dismissable(cx: &mut TestA
     add_agent_panel(&worktree_workspace, cx);
     cx.run_until_parked();
 
+    // Explicitly create a draft thread from the linked worktree workspace.
+    // Auto-created drafts use the group's first workspace (the main one),
+    // so a user-created draft is needed to make the linked worktree reachable.
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.create_new_thread(&worktree_workspace, window, cx);
+    });
+    cx.run_until_parked();
+
     // Switch back to the main workspace.
     multi_workspace.update_in(cx, |mw, window, cx| {
         let main_ws = mw.workspaces().next().unwrap().clone();
@@ -6656,7 +6628,7 @@ async fn test_linked_worktree_workspace_reachable_and_dismissable(cx: &mut TestA
         "linked worktree workspace should be reachable, but reachable are: {reachable:?}"
     );
 
-    // Find the DraftThread entry for the linked worktree and dismiss it.
+    // Find the DraftThread entry whose workspace is the linked worktree.
     let new_thread_ix = sidebar.read_with(cx, |sidebar, _| {
         sidebar
             .contents
@@ -6666,9 +6638,9 @@ async fn test_linked_worktree_workspace_reachable_and_dismissable(cx: &mut TestA
                 matches!(
                     entry,
                     ListEntry::DraftThread {
-                        workspace: Some(_),
+                        workspace: Some(ws),
                         ..
-                    }
+                    } if ws.entity_id() == worktree_ws_id
                 )
             })
             .expect("expected a DraftThread entry for the linked worktree")
@@ -6687,8 +6659,25 @@ async fn test_linked_worktree_workspace_reachable_and_dismissable(cx: &mut TestA
 
     assert_eq!(
         multi_workspace.read_with(cx, |mw, _| mw.workspaces().count()),
-        1,
-        "linked worktree workspace should be removed after dismissing DraftThread entry"
+        2,
+        "dismissing a draft no longer removes the linked worktree workspace"
+    );
+
+    let has_draft_for_worktree = sidebar.read_with(cx, |sidebar, _| {
+        sidebar.contents.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                ListEntry::DraftThread {
+                    draft_id: Some(_),
+                    workspace: Some(ws),
+                    ..
+                } if ws.entity_id() == worktree_ws_id
+            )
+        })
+    });
+    assert!(
+        !has_draft_for_worktree,
+        "DraftThread entry for the linked worktree should be removed after dismiss"
     );
 }
 
@@ -7899,7 +7888,7 @@ mod property_test {
         let panel = active_workspace.read(cx).panel::<AgentPanel>(cx).unwrap();
         if panel.read(cx).active_thread_is_draft(cx) {
             anyhow::ensure!(
-                matches!(entry, ActiveEntry::Draft(_)),
+                matches!(entry, ActiveEntry::Draft { .. }),
                 "panel shows a draft but active_entry is {:?}",
                 entry,
             );
