@@ -2862,7 +2862,7 @@ async fn test_worktree_collision_removes_active_workspace(cx: &mut TestAppContex
     let (fs, project_a) = init_multi_project_test(&["/project-a", "/project-b"], cx).await;
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
-    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let _sidebar = setup_sidebar(&multi_workspace, cx);
 
     // Create workspace B with both worktrees [/project-a, /project-b].
     let project_b = project::Project::test(
