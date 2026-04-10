@@ -56,7 +56,7 @@ use extension_host::ExtensionStore;
 use fs::Fs;
 use gpui::{
     Action, Animation, AnimationExt, AnyElement, App, AsyncWindowContext, ClipboardItem, Corner,
-    DismissEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable,
+    DismissEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, Focusable, Global,
     KeyContext, Pixels, Subscription, Task, UpdateGlobal, WeakEntity, prelude::*,
     pulsating_between,
 };
@@ -594,15 +594,21 @@ fn build_conflicted_files_resolution_prompt(
 }
 
 /// Unique identifier for a sidebar draft thread. Not persisted across restarts.
-/// IDs are globally unique across all AgentPanel instances.
+/// IDs are globally unique across all AgentPanel instances within the same app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DraftId(pub usize);
 
-static NEXT_DRAFT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[derive(Default)]
+struct DraftIdCounter(usize);
+
+impl Global for DraftIdCounter {}
 
 impl DraftId {
-    fn next() -> Self {
-        Self(NEXT_DRAFT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    fn next(cx: &mut App) -> Self {
+        let counter = cx.default_global::<DraftIdCounter>();
+        let id = counter.0;
+        counter.0 += 1;
+        Self(id)
     }
 }
 
@@ -1324,7 +1330,7 @@ impl AgentPanel {
     /// Creates a new empty draft thread and stores it. Returns the DraftId.
     /// The draft is NOT activated — call `activate_draft` to show it.
     pub fn create_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> DraftId {
-        let id = DraftId::next();
+        let id = DraftId::next(cx);
 
         let workspace = self.workspace.clone();
         let project = self.project.clone();
