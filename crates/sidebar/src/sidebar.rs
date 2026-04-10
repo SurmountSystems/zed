@@ -122,9 +122,7 @@ enum ActiveEntry {
         workspace: Entity<Workspace>,
     },
     Draft {
-        /// `None` for untracked drafts (e.g., from Cmd-N keyboard shortcut
-        /// that goes directly through the AgentPanel).
-        id: Option<DraftId>,
+        id: DraftId,
         workspace: Entity<Workspace>,
     },
 }
@@ -142,7 +140,7 @@ impl ActiveEntry {
     }
 
     fn is_active_draft(&self, draft_id: DraftId) -> bool {
-        matches!(self, ActiveEntry::Draft { id: Some(id), .. } if *id == draft_id)
+        matches!(self, ActiveEntry::Draft { id, .. } if *id == draft_id)
     }
 
     fn matches_entry(&self, entry: &ListEntry) -> bool {
@@ -151,23 +149,12 @@ impl ActiveEntry {
                 thread.metadata.session_id == *session_id
             }
             (
-                ActiveEntry::Draft {
-                    id,
-                    workspace: active_ws,
-                },
+                ActiveEntry::Draft { id, .. },
                 ListEntry::DraftThread {
-                    draft_id,
-                    workspace: entry_ws,
+                    draft_id: Some(entry_id),
                     ..
                 },
-            ) => match (id, draft_id) {
-                // Both have DraftIds — compare directly.
-                (Some(active_id), Some(entry_id)) => *active_id == *entry_id,
-                // Both untracked — match by workspace identity.
-                (None, None) => entry_ws.as_ref().is_some_and(|ws| ws == active_ws),
-                // Mixed tracked/untracked — never match.
-                _ => false,
-            },
+            ) => *id == *entry_id,
             _ => false,
         }
     }
@@ -691,8 +678,6 @@ impl Sidebar {
             window,
             |this, _agent_panel, event: &AgentPanelEvent, _window, cx| match event {
                 AgentPanelEvent::ActiveViewChanged => {
-                    // active_entry is fully derived during
-                    // rebuild_contents — just trigger a rebuild.
                     this.observe_draft_editor(cx);
                     this.update_entries(cx);
                 }
@@ -812,6 +797,42 @@ impl Sidebar {
         .detach_and_log_err(cx);
     }
 
+    fn open_workspace_and_create_draft(
+        &mut self,
+        project_group_key: &ProjectGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+
+        let path_list = project_group_key.path_list().clone();
+        let host = project_group_key.host();
+        let provisional_key = Some(project_group_key.clone());
+        let active_workspace = multi_workspace.read(cx).workspace().clone();
+
+        let task = multi_workspace.update(cx, |this, cx| {
+            this.find_or_create_workspace(
+                path_list,
+                host,
+                provisional_key,
+                |options, window, cx| connect_remote(active_workspace, options, window, cx),
+                window,
+                cx,
+            )
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let workspace = task.await?;
+            this.update_in(cx, |this, window, cx| {
+                this.create_new_thread(&workspace, window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     /// Rebuilds the sidebar contents from current workspace and thread state.
     ///
     /// Iterates [`MultiWorkspace::project_group_keys`] to determine project
@@ -842,56 +863,21 @@ impl Sidebar {
         let query = self.filter_editor.read(cx).text(cx);
 
         // Derive active_entry from the active workspace's agent panel.
-        // Draft is checked first because a conversation can have a session_id
-        // before any messages are sent. However, a thread that's still loading
-        // also appears as a "draft" (no messages yet).
+        // A tracked draft (in `draft_threads`) is checked first via
+        // `active_draft_id`. Then we check for a thread with a session_id.
+        // If a thread is mid-load with no session_id yet, we fall back to
+        // `pending_remote_thread_activation` or keep the previous value.
         if let Some(active_ws) = &active_workspace {
             if let Some(panel) = active_ws.read(cx).panel::<AgentPanel>(cx) {
-                let active_thread_is_draft = panel.read(cx).active_thread_is_draft(cx);
-                let active_conversation_view = panel.read(cx).active_conversation_view();
-
-                if active_thread_is_draft || active_conversation_view.is_none() {
-                    if active_conversation_view.is_none()
-                        && let Some(session_id) = self.pending_remote_thread_activation.clone()
-                    {
-                        self.active_entry = Some(ActiveEntry::Thread {
-                            session_id,
-                            workspace: active_ws.clone(),
-                        });
-                    } else {
-                        let conversation_parent_id =
-                            active_conversation_view.and_then(|cv| cv.read(cx).parent_id(cx));
-                        let preserving_thread = if let Some(ActiveEntry::Thread {
-                            session_id,
-                            ..
-                        }) = &self.active_entry
-                        {
-                            self.active_entry_workspace() == Some(active_ws)
-                                && conversation_parent_id
-                                    .as_ref()
-                                    .is_some_and(|id| id == session_id)
-                        } else {
-                            false
-                        } || self
-                            .pending_remote_thread_activation
-                            .is_some();
-
-                        if !preserving_thread {
-                            // The active panel shows a draft. Read
-                            // the draft ID from the AgentPanel (may be
-                            // None for untracked drafts from Cmd-N).
-                            let draft_id = active_ws
-                                .read(cx)
-                                .panel::<AgentPanel>(cx)
-                                .and_then(|p| p.read(cx).active_draft_id());
-                            self.active_entry = Some(ActiveEntry::Draft {
-                                id: draft_id,
-                                workspace: active_ws.clone(),
-                            });
-                        }
-                    }
-                } else if let Some(session_id) =
-                    active_conversation_view.and_then(|cv| cv.read(cx).parent_id(cx))
+                let panel = panel.read(cx);
+                if let Some(draft_id) = panel.active_draft_id() {
+                    self.active_entry = Some(ActiveEntry::Draft {
+                        id: draft_id,
+                        workspace: active_ws.clone(),
+                    });
+                } else if let Some(session_id) = panel
+                    .active_conversation_view()
+                    .and_then(|cv| cv.read(cx).parent_id(cx))
                 {
                     if self.pending_remote_thread_activation.as_ref() == Some(&session_id) {
                         self.pending_remote_thread_activation = None;
@@ -900,9 +886,13 @@ impl Sidebar {
                         session_id,
                         workspace: active_ws.clone(),
                     });
+                } else if let Some(session_id) = self.pending_remote_thread_activation.clone() {
+                    self.active_entry = Some(ActiveEntry::Thread {
+                        session_id,
+                        workspace: active_ws.clone(),
+                    });
                 }
-                // else: conversation exists, not a draft, but no session_id
-                // yet — thread is mid-load. Keep previous value.
+                // else: conversation is mid-load (no session_id yet), keep previous active_entry
             }
         }
 
@@ -1239,13 +1229,7 @@ impl Sidebar {
                     for ws in group_workspaces {
                         if let Some(panel) = ws.read(cx).panel::<AgentPanel>(cx) {
                             let ids = panel.read(cx).draft_ids();
-                            if !ids.is_empty() {
-                                dbg!(
-                                    "found drafts in panel",
-                                    group_key.display_name(&Default::default()),
-                                    ids.len()
-                                );
-                            }
+
                             for draft_id in ids {
                                 group_draft_ids.push((draft_id, ws.clone()));
                             }
@@ -1672,9 +1656,6 @@ impl Sidebar {
                         let key = key.clone();
                         let focus_handle = self.focus_handle.clone();
 
-                        // TODO DL: Hitting this button for the first time after compiling the app on a non-activated workspace
-                        // is currently NOT creating a draft. It activates the workspace but it requires a second click to
-                        // effectively create the draft.
                         IconButton::new(
                             SharedString::from(format!(
                                 "{id_prefix}project-header-new-thread-{ix}",
@@ -1683,24 +1664,38 @@ impl Sidebar {
                         )
                         .icon_size(IconSize::Small)
                         .tooltip(move |_, cx| {
-                            Tooltip::for_action_in("New Thread", &NewThread, &focus_handle, cx)
+                            Tooltip::for_action_in(
+                                "Start New Agent Thread",
+                                &NewThread,
+                                &focus_handle,
+                                cx,
+                            )
                         })
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
                                 this.collapsed_groups.remove(&key);
                                 this.selection = None;
-                                if let Some(workspace) =
-                                    this.multi_workspace.upgrade().and_then(|mw| {
-                                        mw.read(cx).workspace_for_paths(
+                                // If the active workspace belongs to this
+                                // group, use it (preserves linked worktree
+                                // context). Otherwise resolve from the key.
+                                let workspace = this.multi_workspace.upgrade().and_then(|mw| {
+                                    let mw = mw.read(cx);
+                                    let active = mw.workspace().clone();
+                                    let active_key = active.read(cx).project_group_key(cx);
+                                    if active_key == key {
+                                        Some(active)
+                                    } else {
+                                        mw.workspace_for_paths(
                                             key.path_list(),
                                             key.host().as_ref(),
                                             cx,
                                         )
-                                    })
-                                {
+                                    }
+                                });
+                                if let Some(workspace) = workspace {
                                     this.create_new_thread(&workspace, window, cx);
                                 } else {
-                                    this.open_workspace_for_group(&key, window, cx);
+                                    this.open_workspace_and_create_draft(&key, window, cx);
                                 }
                             },
                         ))
@@ -1722,17 +1717,15 @@ impl Sidebar {
                                     cx,
                                 )
                             }) {
-                                // Find an existing draft for this group
-                                // and activate it, rather than creating
-                                // a new one.
-                                let draft_id = workspace
-                                    .read(cx)
-                                    .panel::<AgentPanel>(cx)
-                                    .and_then(|p| p.read(cx).draft_ids().first().copied());
-                                if let Some(draft_id) = draft_id {
-                                    this.activate_draft(draft_id, &workspace, window, cx);
-                                } else {
-                                    this.create_new_thread(&workspace, window, cx);
+                                // Just activate the workspace. The
+                                // AgentPanel remembers what was last
+                                // shown, so the user returns to whatever
+                                // thread/draft they were looking at.
+                                this.activate_workspace(&workspace, window, cx);
+                                if AgentPanel::is_visible(&workspace, cx) {
+                                    workspace.update(cx, |workspace, cx| {
+                                        workspace.focus_panel::<AgentPanel>(window, cx);
+                                    });
                                 }
                             } else {
                                 this.open_workspace_for_group(&key, window, cx);
@@ -1939,7 +1932,7 @@ impl Sidebar {
         let color = cx.theme().colors();
         let background = color
             .title_bar_background
-            .blend(color.panel_background.opacity(0.25));
+            .blend(color.panel_background.opacity(0.2));
 
         let element = v_flex()
             .absolute()
@@ -2190,6 +2183,8 @@ impl Sidebar {
                     if let Some(workspace) = workspace {
                         self.activate_draft(draft_id, &workspace, window, cx);
                     }
+                } else if let Some(workspace) = workspace {
+                    self.activate_workspace(&workspace, window, cx);
                 } else {
                     self.open_workspace_for_group(&key, window, cx);
                 }
@@ -2828,22 +2823,20 @@ impl Sidebar {
                 .entries_for_path(folder_paths)
                 .filter(|t| t.session_id != *session_id)
                 .count();
+
             if remaining > 0 {
                 return None;
             }
 
             let multi_workspace = self.multi_workspace.upgrade()?;
-            // Thread metadata doesn't carry host info yet, so we pass
-            // `None` here. This may match a local workspace with the same
-            // paths instead of the intended remote one.
             let workspace = multi_workspace
                 .read(cx)
                 .workspace_for_paths(folder_paths, None, cx)?;
 
-            // Don't remove the main worktree workspace — the project
-            // header always provides access to it.
             let group_key = workspace.read(cx).project_group_key(cx);
-            (group_key.path_list() != folder_paths).then_some(workspace)
+            let is_linked_worktree = group_key.path_list() != folder_paths;
+
+            is_linked_worktree.then_some(workspace)
         });
 
         if let Some(workspace_to_remove) = workspace_to_remove {
@@ -2896,7 +2889,6 @@ impl Sidebar {
             })
             .detach_and_log_err(cx);
         } else {
-            // Simple case: no workspace removal needed.
             let neighbor_metadata = neighbor.map(|(metadata, _)| metadata);
             let in_flight = self.start_archive_worktree_task(session_id, roots_to_archive, cx);
             self.archive_and_activate(
@@ -2962,7 +2954,11 @@ impl Sidebar {
                             .is_some_and(|id| id == *session_id);
                         if panel_shows_archived {
                             panel.update(cx, |panel, cx| {
-                                panel.clear_active_thread(window, cx);
+                                // Replace the archived thread with a
+                                // tracked draft so the panel isn't left
+                                // in Uninitialized state.
+                                let id = panel.create_draft(window, cx);
+                                panel.activate_draft(id, false, window, cx);
                             });
                         }
                     }
@@ -2975,6 +2971,7 @@ impl Sidebar {
         // tell the panel to load it and activate that workspace.
         // `rebuild_contents` will reconcile `active_entry` once the thread
         // finishes loading.
+
         if let Some(metadata) = neighbor {
             if let Some(workspace) = self.multi_workspace.upgrade().and_then(|mw| {
                 mw.read(cx)
@@ -2994,8 +2991,6 @@ impl Sidebar {
             .and_then(|folder_paths| {
                 let mw = self.multi_workspace.upgrade()?;
                 let mw = mw.read(cx);
-                // Find the group's main workspace (whose root paths match
-                // the project group key, not the thread's folder paths).
                 let thread_workspace = mw.workspace_for_paths(folder_paths, None, cx)?;
                 let group_key = thread_workspace.read(cx).project_group_key(cx);
                 mw.workspace_for_paths(group_key.path_list(), None, cx)
@@ -3681,30 +3676,13 @@ impl Sidebar {
         // If there is a keyboard selection, walk backwards through
         // `project_header_indices` to find the header that owns the selected
         // row. Otherwise fall back to the active workspace.
-        let workspace = if let Some(selected_ix) = self.selection {
-            self.contents
-                .project_header_indices
-                .iter()
-                .rev()
-                .find(|&&header_ix| header_ix <= selected_ix)
-                .and_then(|&header_ix| match &self.contents.entries[header_ix] {
-                    ListEntry::ProjectHeader { key, .. } => {
-                        self.multi_workspace.upgrade().and_then(|mw| {
-                            mw.read(cx).workspace_for_paths(
-                                key.path_list(),
-                                key.host().as_ref(),
-                                cx,
-                            )
-                        })
-                    }
-                    _ => None,
-                })
-        } else {
-            // Use the currently active workspace.
-            self.multi_workspace
-                .upgrade()
-                .map(|mw| mw.read(cx).workspace().clone())
-        };
+        // Always use the currently active workspace so that drafts
+        // are created in the linked worktree the user is focused on,
+        // not the main worktree resolved from the project header.
+        let workspace = self
+            .multi_workspace
+            .upgrade()
+            .map(|mw| mw.read(cx).workspace().clone());
 
         let Some(workspace) = workspace else {
             return;
@@ -3743,7 +3721,7 @@ impl Sidebar {
 
         if let Some(draft_id) = draft_id {
             self.active_entry = Some(ActiveEntry::Draft {
-                id: Some(draft_id),
+                id: draft_id,
                 workspace: workspace.clone(),
             });
         }
@@ -3772,7 +3750,7 @@ impl Sidebar {
         });
 
         self.active_entry = Some(ActiveEntry::Draft {
-            id: Some(draft_id),
+            id: draft_id,
             workspace: workspace.clone(),
         });
 
@@ -3803,14 +3781,15 @@ impl Sidebar {
             let mut switched = false;
             let group_key = workspace.read(cx).project_group_key(cx);
 
-            // Try the nearest draft in the same panel (prefer the
-            // next one in creation order, fall back to the previous).
+            // Try the next draft below in the sidebar (smaller ID
+            // since the list is newest-first). Fall back to the one
+            // above (larger ID) if the deleted draft was last.
             if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
                 let ids = panel.read(cx).draft_ids();
                 let sibling = ids
                     .iter()
-                    .find(|id| id.0 > draft_id.0)
-                    .or_else(|| ids.last());
+                    .find(|id| id.0 < draft_id.0)
+                    .or_else(|| ids.first());
                 if let Some(&sibling_id) = sibling {
                     self.activate_draft(sibling_id, workspace, window, cx);
                     switched = true;
@@ -3843,6 +3822,38 @@ impl Sidebar {
         self.update_entries(cx);
     }
 
+    fn clear_draft(
+        &mut self,
+        draft_id: DraftId,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        workspace.update(cx, |ws, cx| {
+            if let Some(panel) = ws.panel::<AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.clear_draft_editor(draft_id, window, cx);
+                });
+            }
+        });
+        self.update_entries(cx);
+    }
+
+    /// Cleans, collapses whitespace, and truncates raw editor text
+    /// for display as a draft label in the sidebar.
+    fn truncate_draft_label(raw: &str) -> Option<SharedString> {
+        let cleaned = Self::clean_mention_links(raw);
+        let mut text: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            return None;
+        }
+        const MAX_CHARS: usize = 250;
+        if let Some((truncate_at, _)) = text.char_indices().nth(MAX_CHARS) {
+            text.truncate(truncate_at);
+        }
+        Some(text.into())
+    }
+
     /// Reads a draft's prompt text from its ConversationView in the AgentPanel.
     fn read_draft_text(
         &self,
@@ -3852,20 +3863,7 @@ impl Sidebar {
     ) -> Option<SharedString> {
         let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
         let raw = panel.read(cx).draft_editor_text(draft_id, cx)?;
-        let cleaned = Self::clean_mention_links(&raw);
-        let mut text: String = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-
-        if text.is_empty() {
-            return None;
-        }
-
-        const MAX_CHARS: usize = 250;
-
-        if let Some((truncate_at, _)) = text.char_indices().nth(MAX_CHARS) {
-            text.truncate(truncate_at);
-        }
-
-        Some(text.into())
+        Self::truncate_draft_label(&raw)
     }
 
     fn active_project_group_key(&self, cx: &App) -> Option<ProjectGroupKey> {
@@ -4112,9 +4110,10 @@ impl Sidebar {
     ) -> AnyElement {
         let label: SharedString = draft_id
             .and_then(|id| workspace.and_then(|ws| self.read_draft_text(id, ws, cx)))
-            .unwrap_or_else(|| "Draft Thread".into());
+            .unwrap_or_else(|| "New Agent Thread".into());
 
         let id = SharedString::from(format!("draft-thread-btn-{}", ix));
+
         let worktrees = worktrees
             .iter()
             .map(|worktree| ThreadItemWorktreeInfo {
@@ -4126,9 +4125,11 @@ impl Sidebar {
             .collect();
 
         let is_hovered = self.hovered_thread_index == Some(ix);
+
         let key = key.clone();
         let workspace_for_click = workspace.cloned();
         let workspace_for_remove = workspace.cloned();
+        let workspace_for_clear = workspace.cloned();
 
         ThreadItem::new(id, label)
             .icon(IconName::Pencil)
@@ -4150,13 +4151,22 @@ impl Sidebar {
                     if let Some(workspace) = &workspace_for_click {
                         this.activate_draft(draft_id, workspace, window, cx);
                     }
+                } else if let Some(workspace) = &workspace_for_click {
+                    // Placeholder with an open workspace — just
+                    // activate it. The panel remembers its last view.
+                    this.activate_workspace(workspace, window, cx);
+                    if AgentPanel::is_visible(workspace, cx) {
+                        workspace.update(cx, |ws, cx| {
+                            ws.focus_panel::<AgentPanel>(window, cx);
+                        });
+                    }
                 } else {
-                    // Placeholder for a group with no workspace — open it.
+                    // No workspace at all — just open one. The
+                    // panel's load fallback will create a draft.
                     this.open_workspace_for_group(&key, window, cx);
                 }
             }))
-            .when(can_dismiss && draft_id.is_some(), |this| {
-                let draft_id = draft_id.unwrap();
+            .when_some(draft_id.filter(|_| can_dismiss), |this, draft_id| {
                 this.action_slot(
                     div()
                         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
@@ -4174,6 +4184,30 @@ impl Sidebar {
                                 move |this, _, window, cx| {
                                     if let Some(workspace) = &workspace_for_remove {
                                         this.remove_draft(draft_id, workspace, window, cx);
+                                    }
+                                },
+                            )),
+                        ),
+                )
+            })
+            .when_some(draft_id.filter(|_| !can_dismiss), |this, draft_id| {
+                this.action_slot(
+                    div()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            IconButton::new(
+                                SharedString::from(format!("clear-draft-{}", ix)),
+                                IconName::Close,
+                            )
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Clear Draft"))
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    if let Some(workspace) = &workspace_for_clear {
+                                        this.clear_draft(draft_id, workspace, window, cx);
                                     }
                                 },
                             )),

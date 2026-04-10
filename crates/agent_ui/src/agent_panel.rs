@@ -1322,11 +1322,6 @@ impl AgentPanel {
         self.activate_draft(id, true, window, cx);
     }
 
-    pub fn new_empty_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.reset_start_thread_in_to_default(cx);
-        self.external_thread(None, None, None, None, None, true, window, cx);
-    }
-
     /// Creates a new empty draft thread and stores it. Returns the DraftId.
     /// The draft is NOT activated — call `activate_draft` to show it.
     pub fn create_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> DraftId {
@@ -1399,6 +1394,20 @@ impl AgentPanel {
         } else {
             Some(text)
         }
+    }
+
+    /// Clears the message editor text of a tracked draft.
+    pub fn clear_draft_editor(&self, id: DraftId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cv) = self.draft_threads.get(&id) else {
+            return;
+        };
+        let Some(tv) = cv.read(cx).active_thread() else {
+            return;
+        };
+        let editor = tv.read(cx).message_editor.clone();
+        editor.update(cx, |editor, cx| {
+            editor.clear(window, cx);
+        });
     }
 
     fn take_active_draft_initial_content(
@@ -2293,6 +2302,12 @@ impl AgentPanel {
                         this.handle_first_send_requested(view.clone(), content.clone(), window, cx);
                     }
                     AcpThreadViewEvent::MessageSentOrQueued => {
+                        // When a draft sends its first message it becomes a
+                        // real thread. Remove it from `draft_threads` so the
+                        // sidebar stops showing a stale draft entry.
+                        if let Some(draft_id) = this.active_draft_id() {
+                            this.draft_threads.remove(&draft_id);
+                        }
                         let session_id = view.read(cx).thread.read(cx).session_id().clone();
                         cx.emit(AgentPanelEvent::MessageSentOrQueued { session_id });
                     }
@@ -3556,8 +3571,8 @@ impl Panel for AgentPanel {
                 Some((_, WorktreeCreationStatus::Creating))
             )
         {
-            let selected_agent = self.selected_agent.clone();
-            self.new_agent_thread_inner(selected_agent, false, window, cx);
+            let id = self.create_draft(window, cx);
+            self.activate_draft(id, false, window, cx);
         }
     }
 
