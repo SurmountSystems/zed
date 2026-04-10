@@ -222,6 +222,7 @@ impl ThreadHistory {
 mod tests {
     use super::*;
     use acp_thread::AgentSessionListResponse;
+    use futures_lite::future::yield_now;
     use gpui::TestAppContext;
     use std::{
         any::Any,
@@ -239,13 +240,13 @@ mod tests {
     #[derive(Clone)]
     struct TestSessionList {
         sessions: Vec<AgentSessionInfo>,
-        updates_tx: smol::channel::Sender<SessionListUpdate>,
-        updates_rx: smol::channel::Receiver<SessionListUpdate>,
+        updates_tx: async_channel::Sender<SessionListUpdate>,
+        updates_rx: async_channel::Receiver<SessionListUpdate>,
     }
 
     impl TestSessionList {
         fn new(sessions: Vec<AgentSessionInfo>) -> Self {
-            let (tx, rx) = smol::channel::unbounded();
+            let (tx, rx) = async_channel::unbounded();
             Self {
                 sessions,
                 updates_tx: tx,
@@ -267,7 +268,7 @@ mod tests {
             Task::ready(Ok(AgentSessionListResponse::new(self.sessions.clone())))
         }
 
-        fn watch(&self, _cx: &mut App) -> Option<smol::channel::Receiver<SessionListUpdate>> {
+        fn watch(&self, _cx: &mut App) -> Option<async_channel::Receiver<SessionListUpdate>> {
             Some(self.updates_rx.clone())
         }
 
@@ -286,8 +287,8 @@ mod tests {
         second_page_sessions: Vec<AgentSessionInfo>,
         requested_cursors: Arc<Mutex<Vec<Option<String>>>>,
         async_responses: bool,
-        updates_tx: smol::channel::Sender<SessionListUpdate>,
-        updates_rx: smol::channel::Receiver<SessionListUpdate>,
+        updates_tx: async_channel::Sender<SessionListUpdate>,
+        updates_rx: async_channel::Receiver<SessionListUpdate>,
     }
 
     impl PaginatedTestSessionList {
@@ -295,7 +296,7 @@ mod tests {
             first_page_sessions: Vec<AgentSessionInfo>,
             second_page_sessions: Vec<AgentSessionInfo>,
         ) -> Self {
-            let (tx, rx) = smol::channel::unbounded();
+            let (tx, rx) = async_channel::unbounded();
             Self {
                 first_page_sessions,
                 second_page_sessions,
@@ -353,7 +354,7 @@ mod tests {
 
             if self.async_responses {
                 cx.foreground_executor().spawn(async move {
-                    smol::future::yield_now().await;
+                    yield_now().await;
                     Ok(respond())
                 })
             } else {
@@ -361,7 +362,7 @@ mod tests {
             }
         }
 
-        fn watch(&self, _cx: &mut App) -> Option<smol::channel::Receiver<SessionListUpdate>> {
+        fn watch(&self, _cx: &mut App) -> Option<async_channel::Receiver<SessionListUpdate>> {
             Some(self.updates_rx.clone())
         }
 

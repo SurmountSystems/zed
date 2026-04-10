@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::{Context as _, Result};
+use async_process::Child;
 use async_trait::async_trait;
 use futures::io::{BufReader, BufWriter};
 use futures::{
@@ -9,8 +10,6 @@ use futures::{
 };
 use gpui::AsyncApp;
 use settings::Settings as _;
-use smol::channel;
-use smol::process::Child;
 use terminal::terminal_settings::TerminalSettings;
 use util::TryFutureExt as _;
 use util::shell_builder::ShellBuilder;
@@ -19,9 +18,9 @@ use crate::client::ModelContextServerBinary;
 use crate::transport::Transport;
 
 pub struct StdioTransport {
-    stdout_sender: channel::Sender<String>,
-    stdin_receiver: channel::Receiver<String>,
-    stderr_receiver: channel::Receiver<String>,
+    stdout_sender: async_channel::Sender<String>,
+    stdin_receiver: async_channel::Receiver<String>,
+    stderr_receiver: async_channel::Receiver<String>,
     server: Child,
 }
 
@@ -55,9 +54,9 @@ impl StdioTransport {
         let stdout = server.stdout.take().unwrap();
         let stderr = server.stderr.take().unwrap();
 
-        let (stdin_sender, stdin_receiver) = channel::unbounded::<String>();
-        let (stdout_sender, stdout_receiver) = channel::unbounded::<String>();
-        let (stderr_sender, stderr_receiver) = channel::unbounded::<String>();
+        let (stdin_sender, stdin_receiver) = async_channel::unbounded::<String>();
+        let (stdout_sender, stdout_receiver) = async_channel::unbounded::<String>();
+        let (stderr_sender, stderr_receiver) = async_channel::unbounded::<String>();
 
         cx.spawn(async move |_| Self::handle_output(stdin, stdout_receiver).log_err().await)
             .detach();
@@ -76,7 +75,7 @@ impl StdioTransport {
         })
     }
 
-    async fn handle_input<Stdout>(stdin: Stdout, inbound_rx: channel::Sender<String>)
+    async fn handle_input<Stdout>(stdin: Stdout, inbound_rx: async_channel::Sender<String>)
     where
         Stdout: AsyncRead + Unpin + Send + 'static,
     {
@@ -95,7 +94,7 @@ impl StdioTransport {
 
     async fn handle_output<Stdin>(
         stdin: Stdin,
-        outbound_rx: channel::Receiver<String>,
+        outbound_rx: async_channel::Receiver<String>,
     ) -> Result<()>
     where
         Stdin: AsyncWrite + Unpin + Send + 'static,
@@ -112,7 +111,7 @@ impl StdioTransport {
         Ok(())
     }
 
-    async fn handle_err<Stderr>(stderr: Stderr, stderr_tx: channel::Sender<String>)
+    async fn handle_err<Stderr>(stderr: Stderr, stderr_tx: async_channel::Sender<String>)
     where
         Stderr: AsyncRead + Unpin + Send + 'static,
     {

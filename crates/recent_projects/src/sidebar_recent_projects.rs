@@ -234,7 +234,7 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                 })
                 .collect();
         } else {
-            let mut matches = smol::block_on(fuzzy::match_strings(
+            let mut matches = gpui::block_on(fuzzy::match_strings(
                 &candidates,
                 query,
                 smart_case,

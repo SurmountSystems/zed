@@ -950,7 +950,7 @@ impl PickerDelegate for RecentProjectsDelegate {
                 .map(|(id, folder)| StringMatchCandidate::new(id, folder.name.as_ref()))
                 .collect();
 
-            smol::block_on(fuzzy::match_strings(
+            gpui::block_on(fuzzy::match_strings(
                 &candidates,
                 query,
                 smart_case,
@@ -976,7 +976,7 @@ impl PickerDelegate for RecentProjectsDelegate {
             })
             .collect();
 
-        let mut project_group_matches = smol::block_on(fuzzy::match_strings(
+        let mut project_group_matches = gpui::block_on(fuzzy::match_strings(
             &project_group_candidates,
             query,
             smart_case,
@@ -1008,7 +1008,7 @@ impl PickerDelegate for RecentProjectsDelegate {
             })
             .collect();
 
-        let mut recent_matches = smol::block_on(fuzzy::match_strings(
+        let mut recent_matches = gpui::block_on(fuzzy::match_strings(
             &recent_candidates,
             query,
             smart_case,

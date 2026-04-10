@@ -11,14 +11,14 @@ use util::{ResultExt, paths::SanitizedPath};
 use crate::{PathEvent, PathEventKind, Watcher};
 
 pub struct FsWatcher {
-    tx: smol::channel::Sender<()>,
+    tx: async_channel::Sender<()>,
     pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
     registrations: Mutex<BTreeMap<Arc<std::path::Path>, WatcherRegistrationId>>,
 }
 
 impl FsWatcher {
     pub fn new(
-        tx: smol::channel::Sender<()>,
+        tx: async_channel::Sender<()>,
         pending_path_events: Arc<Mutex<Vec<PathEvent>>>,
     ) -> Self {
         Self {

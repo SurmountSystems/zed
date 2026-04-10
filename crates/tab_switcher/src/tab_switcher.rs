@@ -441,7 +441,7 @@ impl TabSwitcherDelegate {
                     ))
                 })
                 .collect::<Vec<_>>();
-            smol::block_on(fuzzy::match_strings(
+            gpui::block_on(fuzzy::match_strings(
                 &candidates,
                 &query,
                 true,

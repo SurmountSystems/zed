@@ -36,6 +36,7 @@ use http_client::HttpClient;
 
 pub use language_core::highlight_map::{HighlightId, HighlightMap};
 
+use futures::future::FutureExt as _;
 pub use language_core::{
     BlockCommentConfig, BracketPair, BracketPairConfig, BracketPairContent, BracketsConfig,
     BracketsPatternConfig, CodeLabel, CodeLabelBuilder, DebugVariablesConfig, DebuggerTextObject,
@@ -60,7 +61,6 @@ use regex::Regex;
 use semver::Version;
 use serde_json::Value;
 use settings::WorktreeId;
-use smol::future::FutureExt as _;
 use std::{
     ffi::OsStr,
     fmt::Debug,

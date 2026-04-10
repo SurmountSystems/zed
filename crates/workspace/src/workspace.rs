@@ -17,7 +17,6 @@ mod persistence;
 pub mod searchable;
 mod security_modal;
 pub mod shared_screen;
-use db::smol::future::yield_now;
 pub use shared_screen::SharedScreen;
 pub mod focus_follows_mouse;
 mod status_bar;
@@ -3301,7 +3300,7 @@ impl Workspace {
 
                             // Yield between synthetic keystrokes so deferred focus and
                             // other effects can settle before dispatching the next key.
-                            yield_now().await;
+                            futures_lite::future::yield_now().await;
                         }
 
                         *keystrokes.borrow_mut() = Default::default();

@@ -122,7 +122,7 @@ impl picker::PickerDelegate for WslPickerDelegate {
 
             let query = query.trim_start();
             let smart_case = query.chars().any(|c| c.is_uppercase());
-            self.matches = smol::block_on(fuzzy::match_strings(
+            self.matches = gpui::block_on(fuzzy::match_strings(
                 candidates.as_slice(),
                 query,
                 smart_case,

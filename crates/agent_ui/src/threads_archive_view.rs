@@ -1244,7 +1244,7 @@ impl PickerDelegate for ProjectPickerDelegate {
             })
             .collect();
 
-        let mut sibling_matches = smol::block_on(fuzzy::match_strings(
+        let mut sibling_matches = gpui::block_on(fuzzy::match_strings(
             &sibling_candidates,
             query,
             smart_case,
@@ -1278,7 +1278,7 @@ impl PickerDelegate for ProjectPickerDelegate {
             })
             .collect();
 
-        let mut recent_matches = smol::block_on(fuzzy::match_strings(
+        let mut recent_matches = gpui::block_on(fuzzy::match_strings(
             &recent_candidates,
             query,
             smart_case,

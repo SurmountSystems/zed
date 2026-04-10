@@ -32,6 +32,7 @@ use gpui::{
 use ignore::IgnoreStack;
 use language::DiskState;
 
+use async_channel::{self, Sender};
 use parking_lot::Mutex;
 use paths::{local_settings_folder_name, local_vscode_folder_name};
 use postage::{
@@ -46,7 +47,6 @@ use rpc::{
 pub use settings::WorktreeId;
 use settings::{Settings, SettingsLocation, SettingsStore};
 use smallvec::{SmallVec, smallvec};
-use smol::channel::{self, Sender};
 use std::{
     any::Any,
     borrow::Borrow as _,
@@ -128,8 +128,8 @@ impl fmt::Debug for LoadedBinaryFile {
 
 pub struct LocalWorktree {
     snapshot: LocalSnapshot,
-    scan_requests_tx: channel::Sender<ScanRequest>,
-    path_prefixes_to_scan_tx: channel::Sender<PathPrefixScanRequest>,
+    scan_requests_tx: async_channel::Sender<ScanRequest>,
+    path_prefixes_to_scan_tx: async_channel::Sender<PathPrefixScanRequest>,
     is_scanning: (watch::Sender<bool>, watch::Receiver<bool>),
     snapshot_subscriptions: VecDeque<(usize, oneshot::Sender<()>)>,
     _background_scanner_tasks: Vec<Task<()>>,
@@ -482,8 +482,8 @@ impl Worktree {
                     .block_on(snapshot.insert_entry(entry, fs.as_ref()));
             }
 
-            let (scan_requests_tx, scan_requests_rx) = channel::unbounded();
-            let (path_prefixes_to_scan_tx, path_prefixes_to_scan_rx) = channel::unbounded();
+            let (scan_requests_tx, scan_requests_rx) = async_channel::unbounded();
+            let (path_prefixes_to_scan_tx, path_prefixes_to_scan_rx) = async_channel::unbounded();
             let mut worktree = LocalWorktree {
                 share_private_files,
                 next_entry_id,
@@ -1118,8 +1118,8 @@ impl LocalWorktree {
     }
 
     fn restart_background_scanners(&mut self, cx: &Context<Worktree>) {
-        let (scan_requests_tx, scan_requests_rx) = channel::unbounded();
-        let (path_prefixes_to_scan_tx, path_prefixes_to_scan_rx) = channel::unbounded();
+        let (scan_requests_tx, scan_requests_rx) = async_channel::unbounded();
+        let (path_prefixes_to_scan_tx, path_prefixes_to_scan_rx) = async_channel::unbounded();
         self.scan_requests_tx = scan_requests_tx;
         self.path_prefixes_to_scan_tx = path_prefixes_to_scan_tx;
 
@@ -1137,8 +1137,8 @@ impl LocalWorktree {
 
     fn start_background_scanner(
         &mut self,
-        scan_requests_rx: channel::Receiver<ScanRequest>,
-        path_prefixes_to_scan_rx: channel::Receiver<PathPrefixScanRequest>,
+        scan_requests_rx: async_channel::Receiver<ScanRequest>,
+        path_prefixes_to_scan_rx: async_channel::Receiver<PathPrefixScanRequest>,
         cx: &Context<Worktree>,
     ) {
         let snapshot = self.snapshot();
@@ -3921,8 +3921,8 @@ struct BackgroundScanner {
     fs_case_sensitive: bool,
     status_updates_tx: UnboundedSender<ScanState>,
     executor: BackgroundExecutor,
-    scan_requests_rx: channel::Receiver<ScanRequest>,
-    path_prefixes_to_scan_rx: channel::Receiver<PathPrefixScanRequest>,
+    scan_requests_rx: async_channel::Receiver<ScanRequest>,
+    path_prefixes_to_scan_rx: async_channel::Receiver<PathPrefixScanRequest>,
     next_entry_id: Arc<AtomicUsize>,
     phase: BackgroundScannerPhase,
     watcher: Arc<dyn Watcher>,
@@ -4027,7 +4027,7 @@ impl BackgroundScanner {
             Box::pin(futures::stream::pending())
         };
 
-        let (scan_job_tx, scan_job_rx) = channel::unbounded();
+        let (scan_job_tx, scan_job_rx) = async_channel::unbounded();
         {
             let mut state = self.state.lock().await;
             state.snapshot.scan_id += 1;
@@ -4435,7 +4435,7 @@ impl BackgroundScanner {
 
         self.state.lock().await.snapshot.scan_id += 1;
 
-        let (scan_job_tx, scan_job_rx) = channel::unbounded();
+        let (scan_job_tx, scan_job_rx) = async_channel::unbounded();
         log::debug!(
             "received fs events {:?}",
             relative_paths
@@ -4500,7 +4500,7 @@ impl BackgroundScanner {
                 .await;
             (state.snapshot.clone(), ignore_stack, abs_path)
         };
-        let (scan_job_tx, scan_job_rx) = channel::unbounded();
+        let (scan_job_tx, scan_job_rx) = async_channel::unbounded();
         self.update_ignore_statuses_for_paths(
             scan_job_tx,
             prev_snapshot,
@@ -4512,7 +4512,7 @@ impl BackgroundScanner {
     }
 
     async fn forcibly_load_paths(&self, paths: &[Arc<RelPath>]) -> bool {
-        let (scan_job_tx, scan_job_rx) = channel::unbounded();
+        let (scan_job_tx, scan_job_rx) = async_channel::unbounded();
         {
             let mut state = self.state.lock().await;
             let root_path = state.snapshot.abs_path.clone();
@@ -4547,7 +4547,7 @@ impl BackgroundScanner {
     async fn scan_dirs(
         &self,
         enable_progress_updates: bool,
-        scan_jobs_rx: channel::Receiver<ScanJob>,
+        scan_jobs_rx: async_channel::Receiver<ScanJob>,
     ) {
         if self
             .status_updates_tx
@@ -5049,7 +5049,7 @@ impl BackgroundScanner {
         prev_snapshot: LocalSnapshot,
         ignores_to_update: Vec<(Arc<Path>, IgnoreStack)>,
     ) {
-        let (ignore_queue_tx, ignore_queue_rx) = channel::unbounded();
+        let (ignore_queue_tx, ignore_queue_rx) = async_channel::unbounded();
         {
             for (parent_abs_path, ignore_stack) in ignores_to_update {
                 ignore_queue_tx
