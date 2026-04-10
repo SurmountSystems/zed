@@ -286,7 +286,7 @@ impl AcpTools {
         let mut entries: Vec<_> = self
             .watched_connections
             .values()
-            .map(|connection| SharedString::from(connection.agent_id.0.clone()))
+            .map(|connection| connection.agent_id.0.clone())
             .collect();
         entries.sort();
         entries
@@ -411,7 +411,7 @@ impl AcpTools {
     fn selected_connection_label(&self) -> SharedString {
         self.selected_connection
             .as_ref()
-            .map(|agent_id| SharedString::from(agent_id.0.clone()))
+            .map(|agent_id| agent_id.0.clone())
             .unwrap_or_else(|| SharedString::from("No connection selected"))
     }
 
