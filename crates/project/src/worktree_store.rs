@@ -1158,6 +1158,7 @@ impl WorktreeStore {
         Ok(proto::ProjectEntryResponse {
             entry: entry.as_ref().map(|entry| entry.into()),
             worktree_scan_id: scan_id as u64,
+            trashed_entry: None,
         })
     }
 
@@ -1221,6 +1222,7 @@ impl WorktreeStore {
                 CreatedEntry::Excluded { .. } => None,
             },
             worktree_scan_id: scan_id as u64,
+            trashed_entry: None,
         })
     }
 

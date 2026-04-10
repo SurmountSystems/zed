@@ -851,8 +851,14 @@ impl Worktree {
         cx: &mut Context<Worktree>,
     ) -> Option<Task<Result<Option<TrashedEntry>>>> {
         let task = match self {
-            Worktree::Local(this) => this.delete_entry(entry_id, trash, cx),
-            Worktree::Remote(this) => this.delete_entry(entry_id, trash, cx),
+            Worktree::Local(this) => {
+                dbg!(("LOCAL", trash));
+                this.delete_entry(entry_id, trash, cx)
+            }
+            Worktree::Remote(this) => {
+                dbg!(("REMOTE", trash));
+                this.delete_entry(entry_id, trash, cx)
+            }
         }?;
 
         let entry = match &*self {
@@ -994,6 +1000,7 @@ impl Worktree {
                 CreatedEntry::Excluded { .. } => None,
             },
             worktree_scan_id: scan_id as u64,
+            trashed_entry: None,
         })
     }
 
@@ -1012,11 +1019,17 @@ impl Worktree {
                 ),
             )
         });
-        task.ok_or_else(|| anyhow::anyhow!("invalid entry"))?
+        let trashed_entry = task
+            .ok_or_else(|| anyhow::anyhow!("invalid entry"))?
             .await?;
         Ok(proto::ProjectEntryResponse {
             entry: None,
             worktree_scan_id: scan_id as u64,
+            trashed_entry: trashed_entry.map(|e| proto::TrashedEntry {
+                trash_id: e.id.to_string_lossy().to_string(),
+                file_name: e.name.to_string_lossy().to_string(),
+                original_parent_path: e.original_parent.to_string_lossy().to_string(),
+            }),
         })
     }
 
@@ -2156,6 +2169,7 @@ impl RemoteWorktree {
         Some(cx.spawn(async move |this, cx| {
             let response = response.await?;
             let scan_id = response.worktree_scan_id as usize;
+            let trashed_entry = response.trashed_entry;
 
             this.update(cx, move |this, _| {
                 this.as_remote_mut().unwrap().wait_for_snapshot(scan_id)
@@ -2167,13 +2181,13 @@ impl RemoteWorktree {
                 let snapshot = &mut this.background_snapshot.lock().0;
                 snapshot.delete_entry(entry_id);
                 this.snapshot = snapshot.clone();
+            })?;
 
-                // TODO: How can we actually track the deleted entry when
-                // working in remote? We likely only need to keep this
-                // information on the remote side in order to support restoring
-                // the trashed file.
-                None
-            })
+            Ok(trashed_entry.map(|e| TrashedEntry {
+                id: e.trash_id.into(),
+                name: e.file_name.into(),
+                original_parent: e.original_parent_path.into(),
+            }))
         }))
     }
 

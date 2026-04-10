@@ -1208,7 +1208,8 @@ impl ProjectPanel {
                             .when(!should_hide_rename, |menu| {
                                 menu.separator().action("Rename", Box::new(Rename))
                             })
-                            .when(!is_root && !is_remote, |menu| {
+                            // .when(!is_root && !is_remote, |menu| {
+                            .when(!is_root, |menu| {
                                 menu.action("Trash", Box::new(Trash { skip_prompt: false }))
                             })
                             .when(!is_root, |menu| {
@@ -2213,10 +2214,12 @@ impl ProjectPanel {
     }
 
     fn trash(&mut self, action: &Trash, window: &mut Window, cx: &mut Context<Self>) {
+        dbg!("ProjectPanel::trash");
         self.remove(true, action.skip_prompt, window, cx);
     }
 
     fn delete(&mut self, action: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        dbg!("ProjectPanel::delete");
         self.remove(false, action.skip_prompt, window, cx);
     }
 

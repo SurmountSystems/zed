@@ -2578,6 +2578,7 @@ impl Project {
         trash: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<Result<Option<TrashedEntry>>>> {
+        dbg!("Project::delete_entry");
         let worktree = self.worktree_for_entry(entry_id, cx)?;
         cx.emit(Event::DeletedEntry(worktree.read(cx).id(), entry_id));
         worktree.update(cx, |worktree, cx| {

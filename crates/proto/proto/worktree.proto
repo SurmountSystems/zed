@@ -140,6 +140,14 @@ message ExpandAllForProjectEntryResponse {
 message ProjectEntryResponse {
   optional Entry entry = 1;
   uint64 worktree_scan_id = 2;
+  // TODO!(dino): new message for delete?
+  optional TrashedEntry trashed_entry = 3;
+}
+
+message TrashedEntry {
+  string trash_id = 1;
+  string file_name = 2;
+  string original_parent_path = 3;
 }
 
 message UpdateWorktreeSettings {
