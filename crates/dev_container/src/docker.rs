@@ -80,6 +80,8 @@ pub(crate) struct DockerComposeServiceBuild {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) dockerfile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) args: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) additional_contexts: Option<HashMap<String, String>>,
@@ -194,7 +196,7 @@ impl Docker {
 
     async fn pull_image(&self, image: &String) -> Result<(), DevContainerError> {
         let mut command = Command::new(&self.docker_cli);
-        command.args(&["pull", image]);
+        command.args(&["pull", "--", image]);
 
         let output = command.output().await.map_err(|e| {
             log::error!("Error pulling image: {e}");

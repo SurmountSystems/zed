@@ -4872,9 +4872,20 @@ impl ThreadView {
                 },
             );
 
-        if AgentSettings::get_global(cx).enable_feedback
-            && self.thread.read(cx).connection().telemetry().is_some()
-        {
+        let enable_thread_feedback = util::maybe!({
+            let project = thread.read(cx).project().read(cx);
+            let user_store = project.user_store();
+            if let Some(configuration) = user_store.read(cx).current_organization_configuration() {
+                if !configuration.is_agent_thread_feedback_enabled {
+                    return false;
+                }
+            }
+
+            AgentSettings::get_global(cx).enable_feedback
+                && self.thread.read(cx).connection().telemetry().is_some()
+        });
+
+        if enable_thread_feedback {
             let feedback = self.thread_feedback.feedback;
 
             let tooltip_meta = || {
@@ -5159,6 +5170,7 @@ impl ThreadView {
                         let mut editor =
                             Editor::for_multibuffer(buffer, Some(project.clone()), window, cx);
                         editor.set_breadcrumb_header(thread_title);
+                        editor.disable_mouse_wheel_zoom();
                         editor
                     })),
                     None,
@@ -8467,13 +8479,20 @@ impl ThreadView {
             return;
         };
         thread.update(cx, |thread, cx| {
-            thread.set_speed(
-                thread
-                    .speed()
-                    .map(|speed| speed.toggle())
-                    .unwrap_or(Speed::Fast),
-                cx,
-            );
+            let new_speed = thread
+                .speed()
+                .map(|speed| speed.toggle())
+                .unwrap_or(Speed::Fast);
+            thread.set_speed(new_speed, cx);
+
+            let fs = thread.project().read(cx).fs().clone();
+            update_settings_file(fs, cx, move |settings, _| {
+                if let Some(agent) = settings.agent.as_mut()
+                    && let Some(default_model) = agent.default_model.as_mut()
+                {
+                    default_model.speed = Some(new_speed);
+                }
+            });
         });
     }
 
