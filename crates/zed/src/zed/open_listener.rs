@@ -586,7 +586,7 @@ async fn maybe_prompt_open_behavior(
             for window in cx.windows() {
                 if let Some(multi_workspace) = window.downcast::<MultiWorkspace>() {
                     if let Ok(multi_workspace) = multi_workspace.read(cx) {
-                        for workspace in multi_workspace.workspaces() {
+                        for workspace in multi_workspace.workspaces(cx) {
                             let project = workspace.read(cx).project().read(cx);
                             if project
                                 .visibility_for_paths(&paths_as_pathbufs, false, cx)
