@@ -159,6 +159,11 @@ impl TestAppContext {
         self.test_platform.did_prompt_for_new_path()
     }
 
+    /// Checks whether there have been any path prompts received by the platform.
+    pub fn did_prompt_for_paths(&self) -> bool {
+        self.test_platform.did_prompt_for_paths()
+    }
+
     /// returns a new `TestAppContext` re-using the same executors to interleave tasks.
     pub fn new_app(&self) -> TestAppContext {
         Self::build(self.dispatcher.clone(), self.fn_name)
@@ -325,12 +330,20 @@ impl TestAppContext {
         self.test_platform.read_from_clipboard()
     }
 
-    /// Simulates choosing a File in the platform's "Open" dialog.
+    /// Simulates choosing a File in the platform's "Save" dialog.
     pub fn simulate_new_path_selection(
         &self,
         select_path: impl FnOnce(&std::path::Path) -> Option<std::path::PathBuf>,
     ) {
         self.test_platform.simulate_new_path_selection(select_path);
+    }
+
+    /// Simulates choosing paths in the platform's "Open" dialog.
+    pub fn simulate_paths_selection(
+        &self,
+        select_paths: impl FnOnce(&crate::PathPromptOptions) -> Option<Vec<std::path::PathBuf>>,
+    ) {
+        self.test_platform.simulate_paths_selection(select_paths);
     }
 
     /// Simulates clicking a button in an platform-level alert dialog.

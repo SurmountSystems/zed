@@ -286,12 +286,25 @@ impl TestApp {
         self.platform.did_prompt_for_new_path()
     }
 
-    /// Simulate answering a path selection dialog.
+    /// Check if a path selection prompt is pending.
+    pub fn did_prompt_for_paths(&self) -> bool {
+        self.platform.did_prompt_for_paths()
+    }
+
+    /// Simulate answering a "Save" path selection dialog.
     pub fn simulate_new_path_selection(
         &self,
         select: impl FnOnce(&std::path::Path) -> Option<std::path::PathBuf>,
     ) {
         self.platform.simulate_new_path_selection(select);
+    }
+
+    /// Simulate answering an "Open" path selection dialog.
+    pub fn simulate_paths_selection(
+        &self,
+        select_paths: impl FnOnce(&crate::PathPromptOptions) -> Option<Vec<std::path::PathBuf>>,
+    ) {
+        self.platform.simulate_paths_selection(select_paths);
     }
 
     /// Check if a prompt dialog is pending.
