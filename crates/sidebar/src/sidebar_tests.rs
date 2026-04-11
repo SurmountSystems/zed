@@ -8349,3 +8349,132 @@ async fn test_remote_project_integration_does_not_briefly_render_as_separate_pro
         entries_after_update,
     );
 }
+
+#[gpui::test]
+async fn test_archive_cleans_up_empty_parent_directory(cx: &mut TestAppContext) {
+    // Zed creates worktrees at <worktrees_dir>/<branch>/<project>/.
+    // After `git worktree remove` deletes the inner <project>/ directory,
+    // the intermediate <branch>/ directory should also be removed if empty.
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {
+                "worktrees": {
+                    "dewy-cedar": {
+                        "commondir": "../../",
+                        "HEAD": "ref: refs/heads/dewy-cedar",
+                    },
+                },
+            },
+            "src": {},
+        }),
+    )
+    .await;
+
+    // Real-world nested path: <worktrees_dir>/<branch>/<project>/
+    fs.insert_tree(
+        "/worktrees/project/dewy-cedar/project",
+        serde_json::json!({
+            ".git": "gitdir: /project/.git/worktrees/dewy-cedar",
+            "src": {
+                "main.rs": "fn main() {}",
+            },
+        }),
+    )
+    .await;
+
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: PathBuf::from("/worktrees/project/dewy-cedar/project"),
+            ref_name: Some("refs/heads/dewy-cedar".into()),
+            sha: "abc".into(),
+            is_main: false,
+        },
+    )
+    .await;
+
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project = project::Project::test(
+        fs.clone(),
+        ["/worktrees/project/dewy-cedar/project".as_ref()],
+        cx,
+    )
+    .await;
+
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(worktree_project.clone(), window, cx);
+    });
+
+    // Save a thread for the main project.
+    save_thread_metadata(
+        acp::SessionId::new(Arc::from("main-thread")),
+        "Main Thread".into(),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 2, 0, 0, 0).unwrap(),
+        None,
+        &main_project,
+        cx,
+    );
+
+    // Save a thread for the linked worktree.
+    let wt_thread_id = acp::SessionId::new(Arc::from("worktree-thread"));
+    save_thread_metadata(
+        wt_thread_id.clone(),
+        "Worktree Thread".into(),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 1, 1, 0, 0, 0).unwrap(),
+        None,
+        &worktree_project,
+        cx,
+    );
+    cx.run_until_parked();
+
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    // Archive the worktree thread.
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.archive_thread(&wt_thread_id, window, cx);
+    });
+
+    for _ in 0..10 {
+        cx.run_until_parked();
+    }
+
+    // The worktree directory should be removed from disk.
+    assert!(
+        !fs.is_dir(Path::new("/worktrees/project/dewy-cedar/project"))
+            .await,
+        "worktree directory should be removed from disk"
+    );
+
+    // The intermediate branch directory should also be removed
+    // since it's now empty.
+    assert!(
+        !fs.is_dir(Path::new("/worktrees/project/dewy-cedar")).await,
+        "empty parent directory (branch name) should be cleaned up"
+    );
+
+    // The worktrees base directory should NOT be removed
+    // (it may contain other worktrees).
+    assert!(
+        fs.is_dir(Path::new("/worktrees/project")).await,
+        "worktrees base directory should still exist"
+    );
+}

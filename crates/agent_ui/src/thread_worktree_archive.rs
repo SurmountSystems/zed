@@ -11,6 +11,7 @@ use project::{
     LocalProjectFlags, Project, WorktreeId,
     git_store::{Repository, resolve_git_worktree_to_main_repo},
 };
+use settings::Settings as _;
 use util::ResultExt;
 use workspace::{AppState, MultiWorkspace, Workspace};
 
@@ -261,18 +262,33 @@ async fn remove_root_after_worktree_removal(
     // creates worktrees inside an intermediate directory named after the
     // branch (e.g. `<worktrees_dir>/<branch>/<project>/`). After the inner
     // directory is removed, the `<branch>/` parent may be left behind as
-    // an empty directory. Clean it up if so.
+    // an empty directory. Only clean it up if it's inside Zed's managed
+    // worktrees directory — we don't want to delete user-created directories
+    // that happen to be empty.
     if let Some(parent) = root.root_path.parent() {
-        if parent != root.main_repo_path {
-            remove_dir_if_empty(parent, cx).await;
+        let main_repo_path = root.main_repo_path.clone();
+        let managed_dir = cx.update(|cx| {
+            let setting = &project::project_settings::ProjectSettings::get_global(cx)
+                .git
+                .worktree_directory;
+            project::git_store::worktrees_directory_for_repo(&main_repo_path, setting).ok()
+        });
+        if let Some(managed_dir) = managed_dir {
+            if parent.starts_with(&managed_dir) {
+                remove_empty_dir_if_managed(parent, &managed_dir, cx).await;
+            }
         }
     }
 
     Ok(())
 }
 
-/// Removes a directory only if it exists and is empty.
-async fn remove_dir_if_empty(path: &Path, cx: &mut AsyncApp) {
+/// Removes a directory only if it exists and is empty. Stops at (does not
+/// remove) `managed_root`, which is the base worktrees directory.
+async fn remove_empty_dir_if_managed(path: &Path, managed_root: &Path, cx: &mut AsyncApp) {
+    if path == managed_root || !path.starts_with(managed_root) {
+        return;
+    }
     let Some(app_state) = current_app_state(cx) else {
         return;
     };
