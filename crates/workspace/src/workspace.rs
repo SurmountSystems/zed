@@ -33,8 +33,8 @@ pub use dock::Panel;
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MultiWorkspace,
     MultiWorkspaceEvent, NewThread, NextProject, NextThread, PreviousProject, PreviousThread,
-    ShowFewerThreads, ShowMoreThreads, Sidebar, SidebarEvent, SidebarHandle, SidebarRenderState,
-    SidebarSide, ToggleWorkspaceSidebar, sidebar_side_context_menu,
+    ProjectGroup, ShowFewerThreads, ShowMoreThreads, Sidebar, SidebarEvent, SidebarHandle,
+    SidebarRenderState, SidebarSide, ToggleWorkspaceSidebar, sidebar_side_context_menu,
 };
 pub use path_list::{PathList, SerializedPathList};
 pub use toast_layer::{ToastAction, ToastLayer, ToastView};
@@ -86,7 +86,7 @@ pub use persistence::{
     WorkspaceDb, delete_unloaded_items,
     model::{
         DockStructure, ItemId, MultiWorkspaceState, SerializedMultiWorkspace,
-        SerializedProjectGroupKey, SerializedWorkspaceLocation, SessionWorkspace,
+        SerializedProjectGroup, SerializedWorkspaceLocation, SessionWorkspace,
     },
     read_serialized_multi_workspaces, resolve_worktree_workspaces,
 };
@@ -8780,12 +8780,9 @@ pub async fn apply_restored_multiworkspace_state(
     if !project_group_keys.is_empty() {
         // Resolve linked worktree paths to their main repo paths so
         // stale keys from previous sessions get normalized and deduped.
-        let mut resolved_keys: Vec<ProjectGroupKey> = Vec::new();
-        for key in project_group_keys
-            .iter()
-            .cloned()
-            .map(ProjectGroupKey::from)
-        {
+        let mut resolved_groups: Vec<(project::ProjectGroupId, ProjectGroupKey)> = Vec::new();
+        for serialized in project_group_keys.iter().cloned() {
+            let (id, key) = serialized.into_id_and_key();
             if key.path_list().paths().is_empty() {
                 continue;
             }
@@ -8802,14 +8799,14 @@ pub async fn apply_restored_multiworkspace_state(
                 }
             }
             let resolved = ProjectGroupKey::new(key.host(), PathList::new(&resolved_paths));
-            if !resolved_keys.contains(&resolved) {
-                resolved_keys.push(resolved);
+            if !resolved_groups.iter().any(|(_, k)| *k == resolved) {
+                resolved_groups.push((id, resolved));
             }
         }
 
         window_handle
             .update(cx, |multi_workspace, _window, _cx| {
-                multi_workspace.restore_project_group_keys(resolved_keys);
+                multi_workspace.restore_project_groups(resolved_groups);
             })
             .ok();
     }
@@ -9863,7 +9860,7 @@ async fn open_remote_project_inner(
         });
 
         if let Some(project_group_key) = provisional_project_group_key.clone() {
-            multi_workspace.set_workspace_group_key(&new_workspace, project_group_key);
+            multi_workspace.ensure_workspace_in_group(new_workspace.clone(), project_group_key, cx);
         }
         multi_workspace.activate(new_workspace.clone(), window, cx);
         new_workspace

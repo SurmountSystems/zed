@@ -1963,9 +1963,16 @@ impl RecentProjectsDelegate {
             cx.defer(move |cx| {
                 handle
                     .update(cx, |multi_workspace, window, cx| {
-                        multi_workspace
-                            .remove_project_group(&key_for_remove, window, cx)
-                            .detach_and_log_err(cx);
+                        if let Some(group) = multi_workspace
+                            .project_groups()
+                            .iter()
+                            .find(|g| g.key == key_for_remove)
+                        {
+                            let group_id = group.id;
+                            multi_workspace
+                                .remove_project_group(group_id, window, cx)
+                                .detach_and_log_err(cx);
+                        }
                     })
                     .log_err();
             });

@@ -24,7 +24,8 @@ use menu::{
     Cancel, Confirm, SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious,
 };
 use project::{
-    AgentId, AgentRegistryStore, Event as ProjectEvent, ProjectGroupKey, linked_worktree_short_name,
+    AgentId, AgentRegistryStore, Event as ProjectEvent, ProjectGroupId, ProjectGroupKey,
+    linked_worktree_short_name,
 };
 use recent_projects::sidebar_recent_projects::SidebarRecentProjects;
 use remote::RemoteConnectionOptions;
@@ -46,9 +47,9 @@ use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
     AddFolderToProject, CloseWindow, FocusWorkspaceSidebar, MultiWorkspace, MultiWorkspaceEvent,
-    NextProject, NextThread, Open, PreviousProject, PreviousThread, SerializedProjectGroupKey,
-    ShowFewerThreads, ShowMoreThreads, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
-    ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
+    NextProject, NextThread, Open, PreviousProject, PreviousThread, ProjectGroup, ShowFewerThreads,
+    ShowMoreThreads, Sidebar as WorkspaceSidebar, SidebarSide, Toast, ToggleWorkspaceSidebar,
+    Workspace, notifications::NotificationId, sidebar_side_context_menu,
 };
 
 use zed_actions::OpenRecent;
@@ -96,9 +97,9 @@ struct SerializedSidebar {
     #[serde(default)]
     width: Option<f32>,
     #[serde(default)]
-    collapsed_groups: Vec<SerializedProjectGroupKey>,
+    collapsed_groups: Vec<ProjectGroupId>,
     #[serde(default)]
-    expanded_groups: Vec<(SerializedProjectGroupKey, usize)>,
+    expanded_groups: Vec<(ProjectGroupId, usize)>,
     #[serde(default)]
     active_view: SerializedSidebarView,
 }
@@ -240,6 +241,7 @@ impl ThreadEntry {
 #[derive(Clone)]
 enum ListEntry {
     ProjectHeader {
+        group_id: ProjectGroupId,
         key: ProjectGroupKey,
         label: SharedString,
         highlight_positions: Vec<usize>,
@@ -250,6 +252,7 @@ enum ListEntry {
     },
     Thread(ThreadEntry),
     ViewMore {
+        group_id: ProjectGroupId,
         key: ProjectGroupKey,
         is_fully_expanded: bool,
     },
@@ -275,7 +278,7 @@ impl ListEntry {
     fn reachable_workspaces<'a>(
         &'a self,
         multi_workspace: &'a workspace::MultiWorkspace,
-        cx: &'a App,
+        _cx: &'a App,
     ) -> Vec<Entity<Workspace>> {
         match self {
             ListEntry::Thread(thread) => match &thread.workspace {
@@ -283,10 +286,10 @@ impl ListEntry {
                 ThreadEntryWorkspace::Closed { .. } => Vec::new(),
             },
             ListEntry::DraftThread { workspace, .. } => workspace.iter().cloned().collect(),
-            ListEntry::ProjectHeader { key, .. } => multi_workspace
-                .workspaces_for_project_group(key, cx)
-                .cloned()
-                .collect(),
+            ListEntry::ProjectHeader { group_id, .. } => multi_workspace
+                .workspaces_for_project_group(*group_id)
+                .map(|ws| ws.to_vec())
+                .unwrap_or_default(),
             ListEntry::ViewMore { .. } => Vec::new(),
         }
     }
@@ -454,8 +457,8 @@ pub struct Sidebar {
     /// Tracks which sidebar entry is currently active (highlighted).
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
-    collapsed_groups: HashSet<ProjectGroupKey>,
-    expanded_groups: HashMap<ProjectGroupKey, usize>,
+    collapsed_groups: HashSet<ProjectGroupId>,
+    expanded_groups: HashMap<ProjectGroupId, usize>,
     /// Updated only in response to explicit user actions (clicking a
     /// thread, confirming in the thread switcher, etc.) — never from
     /// background data changes. Used to sort the thread switcher popup.
@@ -505,34 +508,6 @@ impl Sidebar {
                     this.update_entries(cx);
                 }
                 MultiWorkspaceEvent::WorkspaceRemoved(_) => {
-                    this.update_entries(cx);
-                }
-                MultiWorkspaceEvent::WorktreePathAdded {
-                    old_main_paths,
-                    added_path,
-                } => {
-                    let added_path = added_path.clone();
-                    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                        store.change_worktree_paths(
-                            old_main_paths,
-                            |paths| paths.add_path(&added_path, &added_path),
-                            cx,
-                        );
-                    });
-                    this.update_entries(cx);
-                }
-                MultiWorkspaceEvent::WorktreePathRemoved {
-                    old_main_paths,
-                    removed_path,
-                } => {
-                    let removed_path = removed_path.clone();
-                    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                        store.change_worktree_paths(
-                            old_main_paths,
-                            |paths| paths.remove_main_path(&removed_path),
-                            cx,
-                        );
-                    });
                     this.update_entries(cx);
                 }
             },
@@ -927,11 +902,11 @@ impl Sidebar {
             (icon, icon_from_external_svg)
         };
 
-        let groups: Vec<_> = mw.project_groups(cx).collect();
+        let groups: Vec<ProjectGroup> = mw.project_groups().to_vec();
 
         let mut all_paths: Vec<PathBuf> = groups
             .iter()
-            .flat_map(|(key, _)| key.path_list().paths().iter().cloned())
+            .flat_map(|g| g.key.path_list().paths().iter().cloned())
             .collect();
         all_paths.sort();
         all_paths.dedup();
@@ -942,14 +917,18 @@ impl Sidebar {
         let path_detail_map: HashMap<PathBuf, usize> =
             all_paths.into_iter().zip(path_details).collect();
 
-        for (group_key, group_workspaces) in &groups {
+        for group in &groups {
+            let group_key = &group.key;
+            let group_workspaces = &group.workspaces;
+            let group_id = group.id;
+
             if group_key.path_list().paths().is_empty() {
                 continue;
             }
 
             let label = group_key.display_name(&path_detail_map);
 
-            let is_collapsed = self.collapsed_groups.contains(&group_key);
+            let is_collapsed = self.collapsed_groups.contains(&group_id);
             let should_load_threads = !is_collapsed || !query.is_empty();
 
             let is_active = active_workspace
@@ -1190,6 +1169,7 @@ impl Sidebar {
 
                 project_header_indices.push(entries.len());
                 entries.push(ListEntry::ProjectHeader {
+                    group_id,
                     key: group_key.clone(),
                     label,
                     highlight_positions: workspace_highlight_positions,
@@ -1206,6 +1186,7 @@ impl Sidebar {
             } else {
                 project_header_indices.push(entries.len());
                 entries.push(ListEntry::ProjectHeader {
+                    group_id,
                     key: group_key.clone(),
                     label,
                     highlight_positions: Vec::new(),
@@ -1261,7 +1242,7 @@ impl Sidebar {
 
                 let total = threads.len();
 
-                let extra_batches = self.expanded_groups.get(&group_key).copied().unwrap_or(0);
+                let extra_batches = self.expanded_groups.get(&group_id).copied().unwrap_or(0);
                 let threads_to_show =
                     DEFAULT_THREADS_SHOWN + (extra_batches * DEFAULT_THREADS_SHOWN);
                 let count = threads_to_show.min(total);
@@ -1300,6 +1281,7 @@ impl Sidebar {
 
                 if total > DEFAULT_THREADS_SHOWN {
                     entries.push(ListEntry::ViewMore {
+                        group_id,
                         key: group_key.clone(),
                         is_fully_expanded,
                     });
@@ -1388,6 +1370,7 @@ impl Sidebar {
 
         let rendered = match entry {
             ListEntry::ProjectHeader {
+                group_id,
                 key,
                 label,
                 highlight_positions,
@@ -1398,6 +1381,7 @@ impl Sidebar {
             } => self.render_project_header(
                 ix,
                 false,
+                *group_id,
                 key,
                 label,
                 highlight_positions,
@@ -1410,9 +1394,10 @@ impl Sidebar {
             ),
             ListEntry::Thread(thread) => self.render_thread(ix, thread, is_active, is_selected, cx),
             ListEntry::ViewMore {
+                group_id,
                 key,
                 is_fully_expanded,
-            } => self.render_view_more(ix, key, *is_fully_expanded, is_selected, cx),
+            } => self.render_view_more(ix, *group_id, key, *is_fully_expanded, is_selected, cx),
             ListEntry::DraftThread {
                 draft_id,
                 key,
@@ -1485,6 +1470,7 @@ impl Sidebar {
         &self,
         ix: usize,
         is_sticky: bool,
+        group_id: ProjectGroupId,
         key: &ProjectGroupKey,
         label: &SharedString,
         highlight_positions: &[usize],
@@ -1502,16 +1488,16 @@ impl Sidebar {
         let disclosure_id = SharedString::from(format!("disclosure-{ix}"));
         let group_name = SharedString::from(format!("{id_prefix}header-group-{ix}"));
 
-        let is_collapsed = self.collapsed_groups.contains(key);
+        let is_collapsed = self.collapsed_groups.contains(&group_id);
         let (disclosure_icon, disclosure_tooltip) = if is_collapsed {
             (IconName::ChevronRight, "Expand Project")
         } else {
             (IconName::ChevronDown, "Collapse Project")
         };
 
-        let key_for_toggle = key.clone();
-        let key_for_collapse = key.clone();
-        let view_more_expanded = self.expanded_groups.contains_key(key);
+        let key_for_toggle = group_id;
+        let key_for_collapse = group_id;
+        let view_more_expanded = self.expanded_groups.contains_key(&group_id);
 
         let label = if highlight_positions.is_empty() {
             Label::new(label.clone())
@@ -1578,7 +1564,7 @@ impl Sidebar {
                             .tooltip(Tooltip::text(disclosure_tooltip))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.selection = None;
-                                this.toggle_collapse(&key_for_toggle, window, cx);
+                                this.toggle_collapse(key_for_toggle, window, cx);
                             })),
                     )
                     .child(label)
@@ -1626,7 +1612,9 @@ impl Sidebar {
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                         cx.stop_propagation();
                     })
-                    .child(self.render_project_header_ellipsis_menu(ix, id_prefix, key, cx))
+                    .child(
+                        self.render_project_header_ellipsis_menu(ix, id_prefix, group_id, key, cx),
+                    )
                     .when(view_more_expanded && !is_collapsed, |this| {
                         this.child(
                             IconButton::new(
@@ -1637,15 +1625,14 @@ impl Sidebar {
                             )
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Collapse Displayed Threads"))
-                            .on_click(cx.listener({
-                                let key_for_collapse = key_for_collapse.clone();
+                            .on_click(cx.listener(
                                 move |this, _, _window, cx| {
                                     this.selection = None;
                                     this.expanded_groups.remove(&key_for_collapse);
                                     this.serialize(cx);
                                     this.update_entries(cx);
-                                }
-                            })),
+                                },
+                            )),
                         )
                     })
                     .child({
@@ -1667,9 +1654,10 @@ impl Sidebar {
                                 cx,
                             )
                         })
-                        .on_click(cx.listener(
+                        .on_click(cx.listener({
+                            let key = key.clone();
                             move |this, _, window, cx| {
-                                this.collapsed_groups.remove(&key);
+                                this.collapsed_groups.remove(&group_id);
                                 this.selection = None;
                                 // If the active workspace belongs to this
                                 // group, use it (preserves linked worktree
@@ -1693,8 +1681,8 @@ impl Sidebar {
                                 } else {
                                     this.open_workspace_and_create_draft(&key, window, cx);
                                 }
-                            },
-                        ))
+                            }
+                        }))
                     }),
             )
             .map(|this| {
@@ -1731,6 +1719,7 @@ impl Sidebar {
         &self,
         ix: usize,
         id_prefix: &str,
+        group_id: ProjectGroupId,
         project_group_key: &ProjectGroupKey,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1766,7 +1755,6 @@ impl Sidebar {
                             };
                             let name: SharedString = name.to_string_lossy().into_owned().into();
                             let path = path.clone();
-                            let project_group_key = project_group_key.clone();
                             let multi_workspace = multi_workspace.clone();
                             let weak_menu = weak_menu.clone();
                             menu = menu.entry_with_end_slot_on_hover(
@@ -1779,9 +1767,7 @@ impl Sidebar {
                                     multi_workspace
                                         .update(cx, |multi_workspace, cx| {
                                             multi_workspace.remove_folder_from_project_group(
-                                                &project_group_key,
-                                                &path,
-                                                cx,
+                                                group_id, &path, cx,
                                             );
                                         })
                                         .ok();
@@ -1794,16 +1780,13 @@ impl Sidebar {
                             "Add Folder to Project",
                             Some(Box::new(AddFolderToProject)),
                             {
-                                let project_group_key = project_group_key.clone();
                                 let multi_workspace = multi_workspace.clone();
                                 let weak_menu = weak_menu.clone();
                                 move |window, cx| {
                                     multi_workspace
                                         .update(cx, |multi_workspace, cx| {
                                             multi_workspace.prompt_to_add_folders_to_project_group(
-                                                &project_group_key,
-                                                window,
-                                                cx,
+                                                group_id, window, cx,
                                             );
                                         })
                                         .ok();
@@ -1812,14 +1795,13 @@ impl Sidebar {
                             },
                         );
 
-                        let project_group_key = project_group_key.clone();
                         let multi_workspace = multi_workspace.clone();
                         menu.separator()
                             .entry("Remove Project", None, move |window, cx| {
                                 multi_workspace
                                     .update(cx, |multi_workspace, cx| {
                                         multi_workspace
-                                            .remove_project_group(&project_group_key, window, cx)
+                                            .remove_project_group(group_id, window, cx)
                                             .detach_and_log_err(cx);
                                     })
                                     .ok();
@@ -1877,6 +1859,7 @@ impl Sidebar {
         }
 
         let ListEntry::ProjectHeader {
+            group_id,
             key,
             label,
             highlight_positions,
@@ -1895,6 +1878,7 @@ impl Sidebar {
         let header_element = self.render_project_header(
             header_idx,
             true,
+            *group_id,
             key,
             &label,
             &highlight_positions,
@@ -1942,14 +1926,14 @@ impl Sidebar {
 
     fn toggle_collapse(
         &mut self,
-        project_group_key: &ProjectGroupKey,
+        group_id: ProjectGroupId,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.collapsed_groups.contains(project_group_key) {
-            self.collapsed_groups.remove(project_group_key);
+        if self.collapsed_groups.contains(&group_id) {
+            self.collapsed_groups.remove(&group_id);
         } else {
-            self.collapsed_groups.insert(project_group_key.clone());
+            self.collapsed_groups.insert(group_id);
         }
         self.serialize(cx);
         self.update_entries(cx);
@@ -2122,9 +2106,8 @@ impl Sidebar {
         };
 
         match entry {
-            ListEntry::ProjectHeader { key, .. } => {
-                let key = key.clone();
-                self.toggle_collapse(&key, window, cx);
+            ListEntry::ProjectHeader { group_id, .. } => {
+                self.toggle_collapse(*group_id, window, cx);
             }
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
@@ -2150,15 +2133,14 @@ impl Sidebar {
                 }
             }
             ListEntry::ViewMore {
-                key,
+                group_id,
                 is_fully_expanded,
                 ..
             } => {
-                let key = key.clone();
                 if *is_fully_expanded {
-                    self.reset_thread_group_expansion(&key, cx);
+                    self.reset_thread_group_expansion(*group_id, cx);
                 } else {
-                    self.expand_thread_group(&key, cx);
+                    self.expand_thread_group(*group_id, cx);
                 }
             }
             ListEntry::DraftThread {
@@ -2601,9 +2583,9 @@ impl Sidebar {
         let Some(ix) = self.selection else { return };
 
         match self.contents.entries.get(ix) {
-            Some(ListEntry::ProjectHeader { key, .. }) => {
-                if self.collapsed_groups.contains(key) {
-                    self.collapsed_groups.remove(key);
+            Some(ListEntry::ProjectHeader { group_id, .. }) => {
+                if self.collapsed_groups.contains(group_id) {
+                    self.collapsed_groups.remove(group_id);
                     self.update_entries(cx);
                 } else if ix + 1 < self.contents.entries.len() {
                     self.selection = Some(ix + 1);
@@ -2624,9 +2606,9 @@ impl Sidebar {
         let Some(ix) = self.selection else { return };
 
         match self.contents.entries.get(ix) {
-            Some(ListEntry::ProjectHeader { key, .. }) => {
-                if !self.collapsed_groups.contains(key) {
-                    self.collapsed_groups.insert(key.clone());
+            Some(ListEntry::ProjectHeader { group_id, .. }) => {
+                if !self.collapsed_groups.contains(group_id) {
+                    self.collapsed_groups.insert(*group_id);
                     self.update_entries(cx);
                 }
             }
@@ -2634,10 +2616,11 @@ impl Sidebar {
                 ListEntry::Thread(_) | ListEntry::ViewMore { .. } | ListEntry::DraftThread { .. },
             ) => {
                 for i in (0..ix).rev() {
-                    if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(i)
+                    if let Some(ListEntry::ProjectHeader { group_id, .. }) =
+                        self.contents.entries.get(i)
                     {
                         self.selection = Some(i);
-                        self.collapsed_groups.insert(key.clone());
+                        self.collapsed_groups.insert(*group_id);
                         self.update_entries(cx);
                         break;
                     }
@@ -2670,13 +2653,14 @@ impl Sidebar {
         };
 
         if let Some(header_ix) = header_ix {
-            if let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(header_ix)
+            if let Some(ListEntry::ProjectHeader { group_id, .. }) =
+                self.contents.entries.get(header_ix)
             {
-                if self.collapsed_groups.contains(key) {
-                    self.collapsed_groups.remove(key);
+                if self.collapsed_groups.contains(group_id) {
+                    self.collapsed_groups.remove(group_id);
                 } else {
                     self.selection = Some(header_ix);
-                    self.collapsed_groups.insert(key.clone());
+                    self.collapsed_groups.insert(*group_id);
                 }
                 self.update_entries(cx);
             }
@@ -2690,8 +2674,8 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         for entry in &self.contents.entries {
-            if let ListEntry::ProjectHeader { key, .. } = entry {
-                self.collapsed_groups.insert(key.clone());
+            if let ListEntry::ProjectHeader { group_id, .. } = entry {
+                self.collapsed_groups.insert(*group_id);
             }
         }
         self.update_entries(cx);
@@ -3636,12 +3620,12 @@ impl Sidebar {
     fn render_view_more(
         &self,
         ix: usize,
-        key: &ProjectGroupKey,
+        group_id: ProjectGroupId,
+        _key: &ProjectGroupKey,
         is_fully_expanded: bool,
         is_selected: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let key = key.clone();
         let id = SharedString::from(format!("view-more-{}", ix));
 
         let label: SharedString = if is_fully_expanded {
@@ -3657,9 +3641,9 @@ impl Sidebar {
             .on_click(cx.listener(move |this, _, _window, cx| {
                 this.selection = None;
                 if is_fully_expanded {
-                    this.reset_thread_group_expansion(&key, cx);
+                    this.reset_thread_group_expansion(group_id, cx);
                 } else {
-                    this.expand_thread_group(&key, cx);
+                    this.expand_thread_group(group_id, cx);
                 }
             }))
             .into_any_element()
@@ -3867,6 +3851,18 @@ impl Sidebar {
         Some(multi_workspace.project_group_key_for_workspace(multi_workspace.workspace(), cx))
     }
 
+    fn active_project_group_id(&self, cx: &App) -> Option<ProjectGroupId> {
+        let multi_workspace = self.multi_workspace.upgrade()?;
+        let multi_workspace = multi_workspace.read(cx);
+        let active_key =
+            multi_workspace.project_group_key_for_workspace(multi_workspace.workspace(), cx);
+        multi_workspace
+            .project_groups()
+            .iter()
+            .find(|g| g.key == active_key)
+            .map(|g| g.id)
+    }
+
     fn active_project_header_position(&self, cx: &App) -> Option<usize> {
         let active_key = self.active_project_group_key(cx)?;
         self.contents
@@ -3904,14 +3900,16 @@ impl Sidebar {
         };
 
         let header_entry_ix = self.contents.project_header_indices[next_pos];
-        let Some(ListEntry::ProjectHeader { key, .. }) = self.contents.entries.get(header_entry_ix)
+        let Some(ListEntry::ProjectHeader { group_id, key, .. }) =
+            self.contents.entries.get(header_entry_ix)
         else {
             return;
         };
+        let group_id = *group_id;
         let key = key.clone();
 
         // Uncollapse the target group so that threads become visible.
-        self.collapsed_groups.remove(&key);
+        self.collapsed_groups.remove(&group_id);
 
         if let Some(workspace) = self.multi_workspace.upgrade().and_then(|mw| {
             mw.read(cx)
@@ -4014,40 +4012,26 @@ impl Sidebar {
         self.cycle_thread_impl(false, window, cx);
     }
 
-    fn expand_thread_group(&mut self, project_group_key: &ProjectGroupKey, cx: &mut Context<Self>) {
-        let current = self
-            .expanded_groups
-            .get(project_group_key)
-            .copied()
-            .unwrap_or(0);
-        self.expanded_groups
-            .insert(project_group_key.clone(), current + 1);
+    fn expand_thread_group(&mut self, group_id: ProjectGroupId, cx: &mut Context<Self>) {
+        let current = self.expanded_groups.get(&group_id).copied().unwrap_or(0);
+        self.expanded_groups.insert(group_id, current + 1);
         self.serialize(cx);
         self.update_entries(cx);
     }
 
-    fn reset_thread_group_expansion(
-        &mut self,
-        project_group_key: &ProjectGroupKey,
-        cx: &mut Context<Self>,
-    ) {
-        self.expanded_groups.remove(project_group_key);
+    fn reset_thread_group_expansion(&mut self, group_id: ProjectGroupId, cx: &mut Context<Self>) {
+        self.expanded_groups.remove(&group_id);
         self.serialize(cx);
         self.update_entries(cx);
     }
 
-    fn collapse_thread_group(
-        &mut self,
-        project_group_key: &ProjectGroupKey,
-        cx: &mut Context<Self>,
-    ) {
-        match self.expanded_groups.get(project_group_key).copied() {
+    fn collapse_thread_group(&mut self, group_id: ProjectGroupId, cx: &mut Context<Self>) {
+        match self.expanded_groups.get(&group_id).copied() {
             Some(batches) if batches > 1 => {
-                self.expanded_groups
-                    .insert(project_group_key.clone(), batches - 1);
+                self.expanded_groups.insert(group_id, batches - 1);
             }
             Some(_) => {
-                self.expanded_groups.remove(project_group_key);
+                self.expanded_groups.remove(&group_id);
             }
             None => return,
         }
@@ -4061,10 +4045,10 @@ impl Sidebar {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(active_key) = self.active_project_group_key(cx) else {
+        let Some(group_id) = self.active_project_group_id(cx) else {
             return;
         };
-        self.expand_thread_group(&active_key, cx);
+        self.expand_thread_group(group_id, cx);
     }
 
     fn on_show_fewer_threads(
@@ -4073,10 +4057,10 @@ impl Sidebar {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(active_key) = self.active_project_group_key(cx) else {
+        let Some(group_id) = self.active_project_group_id(cx) else {
             return;
         };
-        self.collapse_thread_group(&active_key, cx);
+        self.collapse_thread_group(group_id, cx);
     }
 
     fn on_new_thread(
@@ -4678,16 +4662,11 @@ impl WorkspaceSidebar for Sidebar {
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         let serialized = SerializedSidebar {
             width: Some(f32::from(self.width)),
-            collapsed_groups: self
-                .collapsed_groups
-                .iter()
-                .cloned()
-                .map(SerializedProjectGroupKey::from)
-                .collect(),
+            collapsed_groups: self.collapsed_groups.iter().copied().collect(),
             expanded_groups: self
                 .expanded_groups
                 .iter()
-                .map(|(key, count)| (SerializedProjectGroupKey::from(key.clone()), *count))
+                .map(|(id, count)| (*id, *count))
                 .collect(),
             active_view: match self.view {
                 SidebarView::ThreadList => SerializedSidebarView::ThreadList,
@@ -4707,16 +4686,8 @@ impl WorkspaceSidebar for Sidebar {
             if let Some(width) = serialized.width {
                 self.width = px(width).clamp(MIN_WIDTH, MAX_WIDTH);
             }
-            self.collapsed_groups = serialized
-                .collapsed_groups
-                .into_iter()
-                .map(ProjectGroupKey::from)
-                .collect();
-            self.expanded_groups = serialized
-                .expanded_groups
-                .into_iter()
-                .map(|(s, count)| (ProjectGroupKey::from(s), count))
-                .collect();
+            self.collapsed_groups = serialized.collapsed_groups.into_iter().collect();
+            self.expanded_groups = serialized.expanded_groups.into_iter().collect();
             if serialized.active_view == SerializedSidebarView::Archive {
                 cx.defer_in(window, |this, window, cx| {
                     this.show_archive(window, cx);

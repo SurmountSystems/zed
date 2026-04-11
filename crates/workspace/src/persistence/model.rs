@@ -13,7 +13,9 @@ use db::sqlez::{
 use gpui::{AsyncWindowContext, Entity, WeakEntity, WindowId};
 
 use language::{Toolchain, ToolchainScope};
-use project::{Project, ProjectGroupKey, debugger::breakpoint_store::SourceBreakpoint};
+use project::{
+    Project, ProjectGroupId, ProjectGroupKey, debugger::breakpoint_store::SourceBreakpoint,
+};
 use remote::RemoteConnectionOptions;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -60,31 +62,40 @@ pub struct SessionWorkspace {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SerializedProjectGroupKey {
+pub struct SerializedProjectGroup {
+    #[serde(default)]
+    pub id: Option<ProjectGroupId>,
     pub path_list: SerializedPathList,
     pub(crate) location: SerializedWorkspaceLocation,
 }
 
-impl From<ProjectGroupKey> for SerializedProjectGroupKey {
-    fn from(value: ProjectGroupKey) -> Self {
-        SerializedProjectGroupKey {
-            path_list: value.path_list().serialize(),
-            location: match value.host() {
+impl SerializedProjectGroup {
+    pub fn from_group(id: ProjectGroupId, key: &ProjectGroupKey) -> Self {
+        Self {
+            id: Some(id),
+            path_list: key.path_list().serialize(),
+            location: match key.host() {
                 Some(host) => SerializedWorkspaceLocation::Remote(host),
                 None => SerializedWorkspaceLocation::Local,
             },
         }
     }
-}
 
-impl From<SerializedProjectGroupKey> for ProjectGroupKey {
-    fn from(value: SerializedProjectGroupKey) -> Self {
-        let path_list = PathList::deserialize(&value.path_list);
-        let host = match value.location {
+    pub fn into_id_and_key(self) -> (ProjectGroupId, ProjectGroupKey) {
+        let id = self.id.unwrap_or_else(ProjectGroupId::new);
+        let path_list = PathList::deserialize(&self.path_list);
+        let host = match self.location {
             SerializedWorkspaceLocation::Local => None,
             SerializedWorkspaceLocation::Remote(opts) => Some(opts),
         };
-        ProjectGroupKey::new(host, path_list)
+        (id, ProjectGroupKey::new(host, path_list))
+    }
+}
+
+impl From<SerializedProjectGroup> for ProjectGroupKey {
+    fn from(value: SerializedProjectGroup) -> Self {
+        let (_, key) = value.into_id_and_key();
+        key
     }
 }
 
@@ -93,7 +104,7 @@ impl From<SerializedProjectGroupKey> for ProjectGroupKey {
 pub struct MultiWorkspaceState {
     pub active_workspace_id: Option<WorkspaceId>,
     pub sidebar_open: bool,
-    pub project_group_keys: Vec<SerializedProjectGroupKey>,
+    pub project_group_keys: Vec<SerializedProjectGroup>,
     #[serde(default)]
     pub sidebar_state: Option<String>,
 }

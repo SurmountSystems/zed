@@ -343,11 +343,11 @@ fn visible_entries_as_strings(
                 match entry {
                     ListEntry::ProjectHeader {
                         label,
-                        key,
+                        group_id,
                         highlight_positions: _,
                         ..
                     } => {
-                        let icon = if sidebar.collapsed_groups.contains(key) {
+                        let icon = if sidebar.collapsed_groups.contains(group_id) {
                             ">"
                         } else {
                             "v"
@@ -412,8 +412,15 @@ async fn test_serialization_round_trip(cx: &mut TestAppContext) {
     // Set a custom width, collapse the group, and expand "View More".
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.set_width(Some(px(420.0)), cx);
-        sidebar.toggle_collapse(&project_group_key, window, cx);
-        sidebar.expanded_groups.insert(project_group_key.clone(), 2);
+        let group_id = multi_workspace
+            .read(cx)
+            .project_groups()
+            .iter()
+            .find(|g| g.key == project_group_key)
+            .unwrap()
+            .id;
+        sidebar.toggle_collapse(group_id, window, cx);
+        sidebar.expanded_groups.insert(group_id, 2);
     });
     cx.run_until_parked();
 
@@ -451,8 +458,15 @@ async fn test_serialization_round_trip(cx: &mut TestAppContext) {
     assert_eq!(collapsed1, collapsed2);
     assert_eq!(expanded1, expanded2);
     assert_eq!(width1, px(420.0));
-    assert!(collapsed1.contains(&project_group_key));
-    assert_eq!(expanded1.get(&project_group_key), Some(&2));
+    let group_id = multi_workspace.read_with(cx, |mw, _| {
+        mw.project_groups()
+            .iter()
+            .find(|g| g.key == project_group_key)
+            .unwrap()
+            .id
+    });
+    assert!(collapsed1.contains(&group_id));
+    assert_eq!(expanded1.get(&group_id), Some(&2));
 }
 
 #[gpui::test]
@@ -686,6 +700,13 @@ async fn test_view_more_batched_expansion(cx: &mut TestAppContext) {
     save_n_test_threads(17, &project, cx).await;
 
     let project_group_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    let group_id = multi_workspace.read_with(cx, |mw, _| {
+        mw.project_groups()
+            .iter()
+            .find(|g| g.key == project_group_key)
+            .unwrap()
+            .id
+    });
 
     multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
     cx.run_until_parked();
@@ -710,13 +731,8 @@ async fn test_view_more_batched_expansion(cx: &mut TestAppContext) {
 
     // Expand again by one batch
     sidebar.update_in(cx, |s, _window, cx| {
-        let current = s
-            .expanded_groups
-            .get(&project_group_key)
-            .copied()
-            .unwrap_or(0);
-        s.expanded_groups
-            .insert(project_group_key.clone(), current + 1);
+        let current = s.expanded_groups.get(&group_id).copied().unwrap_or(0);
+        s.expanded_groups.insert(group_id, current + 1);
         s.update_entries(cx);
     });
     cx.run_until_parked();
@@ -728,13 +744,8 @@ async fn test_view_more_batched_expansion(cx: &mut TestAppContext) {
 
     // Expand one more time - should show all 17 threads with Collapse button
     sidebar.update_in(cx, |s, _window, cx| {
-        let current = s
-            .expanded_groups
-            .get(&project_group_key)
-            .copied()
-            .unwrap_or(0);
-        s.expanded_groups
-            .insert(project_group_key.clone(), current + 1);
+        let current = s.expanded_groups.get(&group_id).copied().unwrap_or(0);
+        s.expanded_groups.insert(group_id, current + 1);
         s.update_entries(cx);
     });
     cx.run_until_parked();
@@ -747,7 +758,7 @@ async fn test_view_more_batched_expansion(cx: &mut TestAppContext) {
 
     // Click collapse - should go back to showing 5 threads
     sidebar.update_in(cx, |s, _window, cx| {
-        s.expanded_groups.remove(&project_group_key);
+        s.expanded_groups.remove(&group_id);
         s.update_entries(cx);
     });
     cx.run_until_parked();
@@ -768,6 +779,13 @@ async fn test_collapse_and_expand_group(cx: &mut TestAppContext) {
     save_n_test_threads(1, &project, cx).await;
 
     let project_group_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    let group_id = multi_workspace.read_with(cx, |mw, _| {
+        mw.project_groups()
+            .iter()
+            .find(|g| g.key == project_group_key)
+            .unwrap()
+            .id
+    });
 
     multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
     cx.run_until_parked();
@@ -783,7 +801,7 @@ async fn test_collapse_and_expand_group(cx: &mut TestAppContext) {
 
     // Collapse
     sidebar.update_in(cx, |s, window, cx| {
-        s.toggle_collapse(&project_group_key, window, cx);
+        s.toggle_collapse(group_id, window, cx);
     });
     cx.run_until_parked();
 
@@ -797,7 +815,7 @@ async fn test_collapse_and_expand_group(cx: &mut TestAppContext) {
 
     // Expand
     sidebar.update_in(cx, |s, window, cx| {
-        s.toggle_collapse(&project_group_key, window, cx);
+        s.toggle_collapse(group_id, window, cx);
     });
     cx.run_until_parked();
 
@@ -822,15 +840,17 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
     let expanded_path = PathList::new(&[std::path::PathBuf::from("/expanded")]);
     let collapsed_path = PathList::new(&[std::path::PathBuf::from("/collapsed")]);
 
+    let expanded_group_id = project::ProjectGroupId::new();
+    let collapsed_group_id = project::ProjectGroupId::new();
     sidebar.update_in(cx, |s, _window, _cx| {
-        s.collapsed_groups
-            .insert(project::ProjectGroupKey::new(None, collapsed_path.clone()));
+        s.collapsed_groups.insert(collapsed_group_id);
         s.contents
             .notified_threads
             .insert(acp::SessionId::new(Arc::from("t-5")));
         s.contents.entries = vec![
             // Expanded project header
             ListEntry::ProjectHeader {
+                group_id: expanded_group_id,
                 key: project::ProjectGroupKey::new(None, expanded_path.clone()),
                 label: "expanded-project".into(),
                 highlight_positions: Vec::new(),
@@ -957,11 +977,13 @@ async fn test_visible_entries_as_strings(cx: &mut TestAppContext) {
             }),
             // View More entry
             ListEntry::ViewMore {
+                group_id: expanded_group_id,
                 key: project::ProjectGroupKey::new(None, expanded_path.clone()),
                 is_fully_expanded: false,
             },
             // Collapsed project header
             ListEntry::ProjectHeader {
+                group_id: collapsed_group_id,
                 key: project::ProjectGroupKey::new(None, collapsed_path.clone()),
                 label: "collapsed-project".into(),
                 highlight_positions: Vec::new(),
@@ -2227,9 +2249,16 @@ async fn test_click_clears_selection_and_focus_in_restores_it(cx: &mut TestAppCo
     // visual feedback during mouse interaction instead.
     sidebar.update_in(cx, |sidebar, window, cx| {
         sidebar.selection = None;
-        let path_list = PathList::new(&[std::path::PathBuf::from("/my-project")]);
-        let project_group_key = project::ProjectGroupKey::new(None, path_list);
-        sidebar.toggle_collapse(&project_group_key, window, cx);
+        let group_id = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|e| match e {
+                ListEntry::ProjectHeader { group_id, .. } => Some(*group_id),
+                _ => None,
+            })
+            .unwrap();
+        sidebar.toggle_collapse(group_id, window, cx);
     });
     assert_eq!(sidebar.read_with(cx, |sidebar, _| sidebar.selection), None);
 
@@ -7238,17 +7267,17 @@ async fn test_linked_worktree_workspace_reachable_after_adding_unrelated_project
     // Force a full sidebar rebuild with all groups expanded.
     sidebar.update_in(cx, |sidebar, _window, cx| {
         sidebar.collapsed_groups.clear();
-        let group_keys: Vec<project::ProjectGroupKey> = sidebar
+        let group_ids: Vec<project::ProjectGroupId> = sidebar
             .contents
             .entries
             .iter()
             .filter_map(|entry| match entry {
-                ListEntry::ProjectHeader { key, .. } => Some(key.clone()),
+                ListEntry::ProjectHeader { group_id, .. } => Some(*group_id),
                 _ => None,
             })
             .collect();
-        for group_key in group_keys {
-            sidebar.expanded_groups.insert(group_key, 10_000);
+        for group_id in group_ids {
+            sidebar.expanded_groups.insert(group_id, 10_000);
         }
         sidebar.update_entries(cx);
     });
@@ -7827,10 +7856,10 @@ mod property_test {
                 // Find a workspace for this project group and create a real
                 // thread via its agent panel.
                 let (workspace, project) = multi_workspace.read_with(cx, |mw, cx| {
-                    let key = mw.project_group_keys().nth(project_group_index).unwrap();
+                    let group = mw.project_groups().get(project_group_index).unwrap();
                     let ws = mw
-                        .workspaces_for_project_group(key, cx)
-                        .next()
+                        .workspaces_for_project_group(group.id)
+                        .and_then(|ws| ws.first())
                         .unwrap_or(mw.workspace())
                         .clone();
                     let project = ws.read(cx).project().clone();
@@ -7954,10 +7983,10 @@ mod property_test {
                 }
             }
             Operation::SwitchToProjectGroup { index } => {
-                let workspace = multi_workspace.read_with(cx, |mw, cx| {
-                    let key = mw.project_group_keys().nth(index).unwrap();
-                    mw.workspaces_for_project_group(key, cx)
-                        .next()
+                let workspace = multi_workspace.read_with(cx, |mw, _cx| {
+                    let group = mw.project_groups().get(index).unwrap();
+                    mw.workspaces_for_project_group(group.id)
+                        .and_then(|ws| ws.first())
                         .unwrap_or(mw.workspace())
                         .clone()
                 });
@@ -8021,14 +8050,15 @@ mod property_test {
                     .await;
 
                 // Re-scan the main workspace's project so it discovers the new worktree.
-                let main_workspace = multi_workspace.read_with(cx, |mw, cx| {
-                    let key = mw.project_group_keys().nth(project_group_index).unwrap();
-                    mw.workspaces_for_project_group(key, cx)
-                        .next()
+                let main_workspace = multi_workspace.read_with(cx, |mw, _cx| {
+                    let group = mw.project_groups().get(project_group_index).unwrap();
+                    mw.workspaces_for_project_group(group.id)
+                        .and_then(|ws| ws.first())
                         .unwrap()
                         .clone()
                 });
-                let main_project = main_workspace.read_with(cx, |ws, _| ws.project().clone());
+                let main_project: Entity<project::Project> =
+                    main_workspace.read_with(cx, |ws, _| ws.project().clone());
                 main_project
                     .update(cx, |p, cx| p.git_scans_complete(cx))
                     .await;
@@ -8041,12 +8071,15 @@ mod property_test {
             Operation::AddWorktreeToProject {
                 project_group_index,
             } => {
-                let workspace = multi_workspace.read_with(cx, |mw, cx| {
-                    let key = mw.project_group_keys().nth(project_group_index).unwrap();
-                    mw.workspaces_for_project_group(key, cx).next().cloned()
+                let workspace = multi_workspace.read_with(cx, |mw, _cx| {
+                    let group = mw.project_groups().get(project_group_index).unwrap();
+                    mw.workspaces_for_project_group(group.id)
+                        .and_then(|ws| ws.first())
+                        .cloned()
                 });
                 let Some(workspace) = workspace else { return };
-                let project = workspace.read_with(cx, |ws, _| ws.project().clone());
+                let project: Entity<project::Project> =
+                    workspace.read_with(cx, |ws, _| ws.project().clone());
 
                 let new_path = state.next_workspace_path();
                 state
@@ -8067,23 +8100,28 @@ mod property_test {
             Operation::RemoveWorktreeFromProject {
                 project_group_index,
             } => {
-                let workspace = multi_workspace.read_with(cx, |mw, cx| {
-                    let key = mw.project_group_keys().nth(project_group_index).unwrap();
-                    mw.workspaces_for_project_group(key, cx).next().cloned()
+                let workspace = multi_workspace.read_with(cx, |mw, _cx| {
+                    let group = mw.project_groups().get(project_group_index).unwrap();
+                    mw.workspaces_for_project_group(group.id)
+                        .and_then(|ws| ws.first())
+                        .cloned()
                 });
                 let Some(workspace) = workspace else { return };
-                let project = workspace.read_with(cx, |ws, _| ws.project().clone());
+                let project: Entity<project::Project> =
+                    workspace.read_with(cx, |ws, _| ws.project().clone());
 
-                let worktree_count = project.read_with(cx, |p, cx| p.visible_worktrees(cx).count());
+                let worktree_count = project.read_with(cx, |p: &project::Project, cx| {
+                    p.visible_worktrees(cx).count()
+                });
                 if worktree_count <= 1 {
                     return;
                 }
 
-                let worktree_id = project.read_with(cx, |p, cx| {
+                let worktree_id = project.read_with(cx, |p: &project::Project, cx| {
                     p.visible_worktrees(cx).last().map(|wt| wt.read(cx).id())
                 });
                 if let Some(worktree_id) = worktree_id {
-                    project.update(cx, |project, cx| {
+                    project.update(cx, |project: &mut project::Project, cx| {
                         project.remove_worktree(worktree_id, cx);
                     });
                     cx.run_until_parked();
@@ -8095,17 +8133,17 @@ mod property_test {
     fn update_sidebar(sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext) {
         sidebar.update_in(cx, |sidebar, _window, cx| {
             sidebar.collapsed_groups.clear();
-            let group_keys: Vec<project::ProjectGroupKey> = sidebar
+            let group_ids: Vec<project::ProjectGroupId> = sidebar
                 .contents
                 .entries
                 .iter()
                 .filter_map(|entry| match entry {
-                    ListEntry::ProjectHeader { key, .. } => Some(key.clone()),
+                    ListEntry::ProjectHeader { group_id, .. } => Some(*group_id),
                     _ => None,
                 })
                 .collect();
-            for group_key in group_keys {
-                sidebar.expanded_groups.insert(group_key, 10_000);
+            for group_id in group_ids {
+                sidebar.expanded_groups.insert(group_id, 10_000);
             }
             sidebar.update_entries(cx);
         });

@@ -6116,6 +6116,21 @@ impl Project {
 ///
 /// Paths are mapped to their main worktree path first so we can group
 /// workspaces by main repos.
+/// Stable identity for a project group. Unlike `ProjectGroupKey` (which is
+/// derived from filesystem paths and changes when folders are added/removed),
+/// a `ProjectGroupId` is assigned once when the group is created and never
+/// changes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProjectGroupId(uuid::Uuid);
+
+impl ProjectGroupId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+}
+
+/// A computed descriptor of a project's worktree paths + optional remote host.
+/// Used for matching workspaces to existing groups. Equality is path-based.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct ProjectGroupKey {
     /// The paths of the main worktrees for this project group.

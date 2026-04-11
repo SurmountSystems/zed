@@ -2568,9 +2568,9 @@ mod tests {
         );
 
         // --- Remove the first workspace (index 0, which is not the active one) ---
-        multi_workspace.update_in(cx, |mw, window, cx| {
+        multi_workspace.update_in(cx, |mw, _window, cx| {
             let ws = mw.workspaces().nth(0).unwrap().clone();
-            mw.remove([ws], |_, _, _| unreachable!(), window, cx)
+            mw.remove([ws], |_, _, _| unreachable!(), _window, cx)
                 .detach_and_log_err(cx);
         });
 
@@ -4956,7 +4956,13 @@ mod tests {
         // --- Remove group B (the middle one). ---
         // In the sidebar [C, B, A], "below" B is A.
         multi_workspace.update_in(cx, |mw, window, cx| {
-            mw.remove_project_group(&key_b, window, cx)
+            let group_id = mw
+                .project_groups()
+                .iter()
+                .find(|g| g.key == key_b)
+                .unwrap()
+                .id;
+            mw.remove_project_group(group_id, window, cx)
                 .detach_and_log_err(cx);
         });
         cx.run_until_parked();
@@ -4985,7 +4991,13 @@ mod tests {
         // --- Remove group A (the bottom one in sidebar). ---
         // Nothing below A, so should fall back upward to C.
         multi_workspace.update_in(cx, |mw, window, cx| {
-            mw.remove_project_group(&key_a, window, cx)
+            let group_id = mw
+                .project_groups()
+                .iter()
+                .find(|g| g.key == key_a)
+                .unwrap()
+                .id;
+            mw.remove_project_group(group_id, window, cx)
                 .detach_and_log_err(cx);
         });
         cx.run_until_parked();
@@ -5004,7 +5016,13 @@ mod tests {
         // --- Remove group C (the only one remaining). ---
         // Should create an empty workspace.
         multi_workspace.update_in(cx, |mw, window, cx| {
-            mw.remove_project_group(&key_c, window, cx)
+            let group_id = mw
+                .project_groups()
+                .iter()
+                .find(|g| g.key == key_c)
+                .unwrap()
+                .id;
+            mw.remove_project_group(group_id, window, cx)
                 .detach_and_log_err(cx);
         });
         cx.run_until_parked();

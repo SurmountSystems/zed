@@ -13306,6 +13306,7 @@ dependencies = [
  "unindent",
  "url",
  "util",
+ "uuid",
  "watch",
  "wax",
  "which 6.0.3",
