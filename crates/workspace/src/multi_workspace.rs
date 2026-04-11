@@ -555,77 +555,22 @@ impl MultiWorkspace {
             return;
         }
 
-        // Find which group this workspace is in
-        let group_idx = self
-            .project_groups
-            .iter()
-            .position(|g| g.workspaces.contains(workspace));
-
-        if let Some(idx) = group_idx {
-            let old_key = self.project_groups[idx].key.clone();
-            if old_key == new_key {
+        // Check if the workspace's key already matches its group
+        if let Some(group) = self.group_for_workspace(workspace) {
+            if group.key == new_key {
                 return;
             }
-
-            let old_paths = old_key.path_list().paths().to_vec();
-            let new_paths = new_key.path_list().paths().to_vec();
-            let changed_root_paths = workspace.read(cx).root_paths(cx);
-            let workspace_id = workspace.entity_id();
-
-            // Remove true duplicates from the same group
-            let duplicates: Vec<Entity<Workspace>> = self.project_groups[idx]
-                .workspaces
-                .iter()
-                .filter(|ws| {
-                    ws.entity_id() != workspace_id
-                        && ws.read(cx).root_paths(cx) == changed_root_paths
-                })
-                .cloned()
-                .collect();
-
-            let active = self.active_workspace.clone();
-            if duplicates.contains(&active) {
-                // Active is a duplicate — remove the incoming workspace instead
-                self.project_groups[idx]
-                    .workspaces
-                    .retain(|w| w != workspace);
-                self.detach_workspace(workspace, cx);
-            } else {
-                for ws in &duplicates {
-                    self.project_groups[idx].workspaces.retain(|w| w != ws);
-                    self.detach_workspace(ws, cx);
-                }
-            }
-
-            // Propagate folder adds/removes to sibling workspaces in the same group
-            let siblings: Vec<Entity<Workspace>> = self.project_groups[idx]
-                .workspaces
-                .iter()
-                .filter(|ws| ws.entity_id() != workspace_id)
-                .cloned()
-                .collect();
-
-            for sibling in &siblings {
-                let project = sibling.read(cx).project().clone();
-
-                for added_path in new_paths.iter().filter(|p| !old_paths.contains(p)) {
-                    project
-                        .update(cx, |project, cx| {
-                            project.find_or_create_worktree(added_path, true, cx)
-                        })
-                        .detach_and_log_err(cx);
-                }
-
-                for removed_path in old_paths.iter().filter(|p| !new_paths.contains(p)) {
-                    project.update(cx, |project, cx| {
-                        project.remove_worktree_for_main_worktree_path(removed_path, cx);
-                    });
-                }
-            }
-
-            // Update the group's key in-place — the ID stays the same
-            self.project_groups[idx].key = new_key;
         }
+
+        // Remove the workspace from its current group
+        for group in &mut self.project_groups {
+            group.workspaces.retain(|w| w != workspace);
+        }
+        // Clean up empty groups
+        self.project_groups.retain(|g| !g.workspaces.is_empty());
+
+        // Add the workspace to the group matching its new key (or create one)
+        self.ensure_workspace_in_group(workspace.clone(), new_key, cx);
 
         self.serialize(cx);
         cx.notify();
