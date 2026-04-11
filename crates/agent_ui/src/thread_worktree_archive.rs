@@ -5,6 +5,7 @@ use std::{
 
 use agent_client_protocol as acp;
 use anyhow::{Context as _, Result, anyhow};
+
 use gpui::{App, AsyncApp, Entity, Task};
 use project::{
     LocalProjectFlags, Project, WorktreeId,
@@ -254,7 +255,44 @@ async fn remove_root_after_worktree_removal(
         .map_err(|_| anyhow!("git worktree removal was canceled"))?;
     // Keep _temp_project alive until after the await so the headless project isn't dropped mid-operation
     drop(_temp_project);
-    result
+    result?;
+
+    // `git worktree remove` deletes the worktree directory itself, but Zed
+    // creates worktrees inside an intermediate directory named after the
+    // branch (e.g. `<worktrees_dir>/<branch>/<project>/`). After the inner
+    // directory is removed, the `<branch>/` parent may be left behind as
+    // an empty directory. Clean it up if so.
+    if let Some(parent) = root.root_path.parent() {
+        if parent != root.main_repo_path {
+            remove_dir_if_empty(parent, cx).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Removes a directory only if it exists and is empty.
+async fn remove_dir_if_empty(path: &Path, cx: &mut AsyncApp) {
+    let Some(app_state) = current_app_state(cx) else {
+        return;
+    };
+    let is_empty = match app_state.fs.read_dir(path).await {
+        Ok(mut entries) => futures::StreamExt::next(&mut entries).await.is_none(),
+        Err(_) => return,
+    };
+    if is_empty {
+        app_state
+            .fs
+            .remove_dir(
+                path,
+                fs::RemoveOptions {
+                    recursive: false,
+                    ignore_if_not_exists: true,
+                },
+            )
+            .await
+            .log_err();
+    }
 }
 
 /// Finds a live `Repository` entity for the given path, or creates a temporary
