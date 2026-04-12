@@ -613,15 +613,23 @@ impl DraftId {
     }
 }
 
-enum ActiveView {
+enum BaseView {
     Uninitialized,
     AgentThread {
         conversation_view: Entity<ConversationView>,
     },
-    History {
-        view: Entity<ThreadHistoryView>,
-    },
+}
+
+enum OverlayView {
+    History { view: Entity<ThreadHistoryView> },
     Configuration,
+}
+
+enum VisibleSurface<'a> {
+    Uninitialized,
+    AgentThread(&'a Entity<ConversationView>),
+    History(&'a Entity<ThreadHistoryView>),
+    Configuration(Option<&'a Entity<AgentConfiguration>>),
 }
 
 enum WhichFontSize {
@@ -785,13 +793,17 @@ enum WorktreeCreationArgs {
     },
 }
 
-impl ActiveView {
+impl BaseView {
+    pub fn which_font_size_used(&self) -> WhichFontSize {
+        WhichFontSize::AgentFont
+    }
+}
+
+impl OverlayView {
     pub fn which_font_size_used(&self) -> WhichFontSize {
         match self {
-            ActiveView::Uninitialized
-            | ActiveView::AgentThread { .. }
-            | ActiveView::History { .. } => WhichFontSize::AgentFont,
-            ActiveView::Configuration => WhichFontSize::None,
+            OverlayView::History { .. } => WhichFontSize::AgentFont,
+            OverlayView::Configuration => WhichFontSize::None,
         }
     }
 }
@@ -811,8 +823,8 @@ pub struct AgentPanel {
     configuration: Option<Entity<AgentConfiguration>>,
     configuration_subscription: Option<Subscription>,
     focus_handle: FocusHandle,
-    active_view: ActiveView,
-    previous_view: Option<ActiveView>,
+    base_view: BaseView,
+    overlay_view: Option<OverlayView>,
     background_threads: HashMap<acp::SessionId, Entity<ConversationView>>,
     draft_threads: HashMap<DraftId, Entity<ConversationView>>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -837,7 +849,7 @@ pub struct AgentPanel {
     _active_thread_focus_subscription: Option<Subscription>,
     _worktree_creation_task: Option<Task<()>>,
     show_trust_workspace_message: bool,
-    _active_view_observation: Option<Subscription>,
+    _base_view_observation: Option<Subscription>,
 }
 
 impl AgentPanel {
@@ -1019,7 +1031,7 @@ impl AgentPanel {
 
         let thread_store = ThreadStore::global(cx);
 
-        let active_view = ActiveView::Uninitialized;
+        let base_view = BaseView::Uninitialized;
 
         let weak_panel = cx.entity().downgrade();
 
@@ -1179,7 +1191,8 @@ impl AgentPanel {
 
         let mut panel = Self {
             workspace_id,
-            active_view,
+            base_view,
+            overlay_view: None,
             workspace,
             user_store,
             project: project.clone(),
@@ -1191,7 +1204,6 @@ impl AgentPanel {
             configuration_subscription: None,
             focus_handle: cx.focus_handle(),
             context_server_registry,
-            previous_view: None,
             background_threads: HashMap::default(),
             draft_threads: HashMap::default(),
             new_thread_menu_handle: PopoverMenuHandle::default(),
@@ -1219,7 +1231,7 @@ impl AgentPanel {
             agent_layout_onboarding_dismissed: AtomicBool::new(AgentLayoutOnboarding::dismissed(
                 cx,
             )),
-            _active_view_observation: None,
+            _base_view_observation: None,
         };
 
         // Initial sync of agent servers from extensions
@@ -1315,7 +1327,8 @@ impl AgentPanel {
     /// in the background. The sidebar suppresses the uninitialized state
     /// so no "Draft" entry appears.
     pub fn clear_active_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.set_active_view(ActiveView::Uninitialized, false, window, cx);
+        self.clear_overlay_state();
+        self.set_base_view(BaseView::Uninitialized, false, window, cx);
     }
 
     pub fn new_thread(&mut self, _action: &NewThread, window: &mut Window, cx: &mut Context<Self>) {
@@ -1354,8 +1367,8 @@ impl AgentPanel {
         let Some(conversation_view) = self.draft_threads.get(&id).cloned() else {
             return;
         };
-        self.set_active_view(
-            ActiveView::AgentThread { conversation_view },
+        self.set_base_view(
+            BaseView::AgentThread { conversation_view },
             focus,
             window,
             cx,
@@ -1522,8 +1535,8 @@ impl AgentPanel {
             window,
             cx,
         );
-        self.set_active_view(
-            ActiveView::AgentThread { conversation_view },
+        self.set_base_view(
+            BaseView::AgentThread { conversation_view },
             focus,
             window,
             cx,
@@ -1619,32 +1632,23 @@ impl AgentPanel {
     }
 
     fn open_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay_view, Some(OverlayView::History { .. })) {
+            self.clear_overlay(true, window, cx);
+            return;
+        }
+
         let Some(view) = self.history_for_selected_agent(window, cx) else {
             return;
         };
 
-        if let ActiveView::History { view: active_view } = &self.active_view {
-            if active_view == &view {
-                if let Some(previous_view) = self.previous_view.take() {
-                    self.set_active_view(previous_view, true, window, cx);
-                }
-                return;
-            }
-        }
-
-        self.set_active_view(ActiveView::History { view }, true, window, cx);
+        self.set_overlay(OverlayView::History { view }, true, window, cx);
         cx.notify();
     }
 
     pub fn go_back(&mut self, _: &workspace::GoBack, window: &mut Window, cx: &mut Context<Self>) {
-        match self.active_view {
-            ActiveView::Configuration | ActiveView::History { .. } => {
-                if let Some(previous_view) = self.previous_view.take() {
-                    self.set_active_view(previous_view, true, window, cx);
-                }
-                cx.notify();
-            }
-            _ => {}
+        if self.overlay_view.is_some() {
+            self.clear_overlay(true, window, cx);
+            cx.notify();
         }
     }
 
@@ -1697,7 +1701,7 @@ impl AgentPanel {
     }
 
     fn handle_font_size_action(&mut self, persist: bool, delta: Pixels, cx: &mut Context<Self>) {
-        match self.active_view.which_font_size_used() {
+        match self.visible_font_size() {
             WhichFontSize::AgentFont => {
                 if persist {
                     update_settings_file(self.fs.clone(), cx, move |settings, cx| {
@@ -1757,11 +1761,15 @@ impl AgentPanel {
     }
 
     pub(crate) fn open_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay_view, Some(OverlayView::Configuration)) {
+            self.clear_overlay(true, window, cx);
+            return;
+        }
+
         let agent_server_store = self.project.read(cx).agent_server_store().clone();
         let context_server_store = self.project.read(cx).context_server_store();
         let fs = self.fs.clone();
 
-        self.set_active_view(ActiveView::Configuration, true, window, cx);
         self.configuration = Some(cx.new(|cx| {
             AgentConfiguration::new(
                 fs,
@@ -1782,7 +1790,11 @@ impl AgentPanel {
                 window,
                 Self::handle_agent_configuration_event,
             ));
+        }
 
+        self.set_overlay(OverlayView::Configuration, true, window, cx);
+
+        if let Some(configuration) = self.configuration.as_ref() {
             configuration.focus_handle(cx).focus(window, cx);
         }
     }
@@ -1995,8 +2007,8 @@ impl AgentPanel {
     }
 
     pub fn active_conversation_view(&self) -> Option<&Entity<ConversationView>> {
-        match &self.active_view {
-            ActiveView::AgentThread { conversation_view } => Some(conversation_view),
+        match &self.base_view {
+            BaseView::AgentThread { conversation_view } => Some(conversation_view),
             _ => None,
         }
     }
@@ -2015,8 +2027,8 @@ impl AgentPanel {
     }
 
     pub fn active_agent_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
-        match &self.active_view {
-            ActiveView::AgentThread {
+        match &self.base_view {
+            BaseView::AgentThread {
                 conversation_view, ..
             } => conversation_view
                 .read(cx)
@@ -2082,8 +2094,8 @@ impl AgentPanel {
         }
     }
 
-    fn retain_running_thread(&mut self, old_view: ActiveView, cx: &mut Context<Self>) {
-        let ActiveView::AgentThread { conversation_view } = old_view else {
+    fn retain_running_thread(&mut self, old_view: BaseView, cx: &mut Context<Self>) {
+        let BaseView::AgentThread { conversation_view } = old_view else {
             return;
         };
 
@@ -2144,48 +2156,27 @@ impl AgentPanel {
     }
 
     pub(crate) fn active_native_agent_thread(&self, cx: &App) -> Option<Entity<agent::Thread>> {
-        match &self.active_view {
-            ActiveView::AgentThread {
+        match &self.base_view {
+            BaseView::AgentThread {
                 conversation_view, ..
             } => conversation_view.read(cx).as_native_thread(cx),
             _ => None,
         }
     }
 
-    fn set_active_view(
+    fn set_base_view(
         &mut self,
-        new_view: ActiveView,
+        new_view: BaseView,
         focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let was_in_agent_history = matches!(self.active_view, ActiveView::History { .. });
-        let current_is_uninitialized = matches!(self.active_view, ActiveView::Uninitialized);
-        let current_is_history = matches!(self.active_view, ActiveView::History { .. });
-        let new_is_history = matches!(new_view, ActiveView::History { .. });
+        self.clear_overlay_state();
 
-        let current_is_config = matches!(self.active_view, ActiveView::Configuration);
-        let new_is_config = matches!(new_view, ActiveView::Configuration);
+        let old_view = std::mem::replace(&mut self.base_view, new_view);
+        self.retain_running_thread(old_view, cx);
 
-        let current_is_overlay = current_is_history || current_is_config;
-        let new_is_overlay = new_is_history || new_is_config;
-
-        if current_is_uninitialized || (current_is_overlay && !new_is_overlay) {
-            self.active_view = new_view;
-        } else if !current_is_overlay && new_is_overlay {
-            self.previous_view = Some(std::mem::replace(&mut self.active_view, new_view));
-        } else {
-            let old_view = std::mem::replace(&mut self.active_view, new_view);
-            if !new_is_overlay {
-                if let Some(previous) = self.previous_view.take() {
-                    self.retain_running_thread(previous, cx);
-                }
-            }
-            self.retain_running_thread(old_view, cx);
-        }
-
-        // Keep the toolbar's selected agent in sync with the active thread's agent.
-        if let ActiveView::AgentThread { conversation_view } = &self.active_view {
+        if let BaseView::AgentThread { conversation_view } = &self.base_view {
             let thread_agent = conversation_view.read(cx).agent_key().clone();
             if self.selected_agent != thread_agent {
                 self.selected_agent = thread_agent;
@@ -2193,12 +2184,57 @@ impl AgentPanel {
             }
         }
 
-        // Subscribe to the active ThreadView's events (e.g. FirstSendRequested)
-        // so the panel can intercept the first send for worktree creation.
-        // Re-subscribe whenever the ConnectionView changes, since the inner
-        // ThreadView may have been replaced (e.g. navigating between threads).
-        self._active_view_observation = match &self.active_view {
-            ActiveView::AgentThread { conversation_view } => {
+        self.refresh_base_view_subscriptions(window, cx);
+
+        if focus {
+            self.focus_handle(cx).focus(window, cx);
+        }
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+    }
+
+    fn set_overlay(
+        &mut self,
+        overlay: OverlayView,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_in_history = matches!(self.overlay_view, Some(OverlayView::History { .. }));
+        self.overlay_view = Some(overlay);
+
+        if let Some(OverlayView::History { view }) = &self.overlay_view
+            && !was_in_history
+        {
+            view.update(cx, |view, cx| {
+                view.history()
+                    .update(cx, |history, cx| history.refresh_full_history(cx))
+            });
+        }
+
+        if focus {
+            self.focus_handle(cx).focus(window, cx);
+        }
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+    }
+
+    fn clear_overlay(&mut self, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_overlay_state();
+
+        if focus {
+            self.focus_handle(cx).focus(window, cx);
+        }
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+    }
+
+    fn clear_overlay_state(&mut self) {
+        self.overlay_view = None;
+        self.configuration_subscription = None;
+        self.configuration = None;
+    }
+
+    fn refresh_base_view_subscriptions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._base_view_observation = match &self.base_view {
+            BaseView::AgentThread { conversation_view } => {
                 self._thread_view_subscription =
                     Self::subscribe_to_active_thread_view(conversation_view, window, cx);
                 let focus_handle = conversation_view.focus_handle(cx);
@@ -2219,26 +2255,46 @@ impl AgentPanel {
                     },
                 ))
             }
-            _ => {
+            BaseView::Uninitialized => {
                 self._thread_view_subscription = None;
                 self._active_thread_focus_subscription = None;
                 None
             }
         };
+        self.serialize(cx);
+    }
 
-        if let ActiveView::History { view } = &self.active_view {
-            if !was_in_agent_history {
-                view.update(cx, |view, cx| {
-                    view.history()
-                        .update(cx, |history, cx| history.refresh_full_history(cx))
-                });
+    fn visible_surface(&self) -> VisibleSurface<'_> {
+        if let Some(overlay_view) = &self.overlay_view {
+            return match overlay_view {
+                OverlayView::History { view } => VisibleSurface::History(view),
+                OverlayView::Configuration => {
+                    VisibleSurface::Configuration(self.configuration.as_ref())
+                }
+            };
+        }
+
+        match &self.base_view {
+            BaseView::Uninitialized => VisibleSurface::Uninitialized,
+            BaseView::AgentThread { conversation_view } => {
+                VisibleSurface::AgentThread(conversation_view)
             }
         }
+    }
 
-        if focus {
-            self.focus_handle(cx).focus(window, cx);
-        }
-        cx.emit(AgentPanelEvent::ActiveViewChanged);
+    fn is_overlay_open(&self) -> bool {
+        self.overlay_view.is_some()
+    }
+
+    fn is_history_or_configuration_visible(&self) -> bool {
+        self.is_overlay_open()
+    }
+
+    fn visible_font_size(&self) -> WhichFontSize {
+        self.overlay_view.as_ref().map_or_else(
+            || self.base_view.which_font_size_used(),
+            OverlayView::which_font_size_used,
+        )
     }
 
     fn populate_recently_updated_menu_section(
@@ -2602,8 +2658,8 @@ impl AgentPanel {
         }
 
         if let Some(conversation_view) = self.background_threads.remove(&session_id) {
-            self.set_active_view(
-                ActiveView::AgentThread { conversation_view },
+            self.set_base_view(
+                BaseView::AgentThread { conversation_view },
                 focus,
                 window,
                 cx,
@@ -2611,27 +2667,15 @@ impl AgentPanel {
             return;
         }
 
-        if let ActiveView::AgentThread { conversation_view } = &self.active_view {
+        if let BaseView::AgentThread { conversation_view } = &self.base_view {
             if conversation_view
                 .read(cx)
                 .active_thread()
                 .map(|t| t.read(cx).id.clone())
                 == Some(session_id.clone())
             {
+                self.clear_overlay_state();
                 cx.emit(AgentPanelEvent::ActiveViewChanged);
-                return;
-            }
-        }
-
-        if let Some(ActiveView::AgentThread { conversation_view }) = &self.previous_view {
-            if conversation_view
-                .read(cx)
-                .active_thread()
-                .map(|t| t.read(cx).id.clone())
-                == Some(session_id.clone())
-            {
-                let view = self.previous_view.take().unwrap();
-                self.set_active_view(view, focus, window, cx);
                 return;
             }
         }
@@ -3031,7 +3075,7 @@ impl AgentPanel {
         if let Some((_, status)) = &mut self.worktree_creation_status {
             *status = WorktreeCreationStatus::Error(message);
         }
-        if matches!(self.active_view, ActiveView::Uninitialized) {
+        if matches!(self.base_view, BaseView::Uninitialized) {
             let selected_agent = self.selected_agent.clone();
             self.new_agent_thread(selected_agent, window, cx);
         }
@@ -3491,14 +3535,12 @@ impl AgentPanel {
 
 impl Focusable for AgentPanel {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match &self.active_view {
-            ActiveView::Uninitialized => self.focus_handle.clone(),
-            ActiveView::AgentThread {
-                conversation_view, ..
-            } => conversation_view.focus_handle(cx),
-            ActiveView::History { view } => view.read(cx).focus_handle(cx),
-            ActiveView::Configuration => {
-                if let Some(configuration) = self.configuration.as_ref() {
+        match self.visible_surface() {
+            VisibleSurface::Uninitialized => self.focus_handle.clone(),
+            VisibleSurface::AgentThread(conversation_view) => conversation_view.focus_handle(cx),
+            VisibleSurface::History(view) => view.read(cx).focus_handle(cx),
+            VisibleSurface::Configuration(configuration) => {
+                if let Some(configuration) = configuration {
                     configuration.focus_handle(cx)
                 } else {
                     self.focus_handle.clone()
@@ -3582,7 +3624,7 @@ impl Panel for AgentPanel {
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         if active
-            && matches!(self.active_view, ActiveView::Uninitialized)
+            && matches!(self.base_view, BaseView::Uninitialized)
             && !matches!(
                 self.worktree_creation_status,
                 Some((_, WorktreeCreationStatus::Creating))
@@ -3633,8 +3675,8 @@ impl Panel for AgentPanel {
 
 impl AgentPanel {
     fn render_title_view(&self, _window: &mut Window, cx: &Context<Self>) -> AnyElement {
-        let content = match &self.active_view {
-            ActiveView::AgentThread { conversation_view } => {
+        let content = match self.visible_surface() {
+            VisibleSurface::AgentThread(conversation_view) => {
                 let server_view_ref = conversation_view.read(cx);
                 let is_generating_title = server_view_ref.as_native_thread(cx).is_some()
                     && server_view_ref.root_thread(cx).map_or(false, |tv| {
@@ -3686,9 +3728,11 @@ impl AgentPanel {
                         .into_any_element()
                 }
             }
-            ActiveView::History { .. } => Label::new("History").truncate().into_any_element(),
-            ActiveView::Configuration => Label::new("Settings").truncate().into_any_element(),
-            ActiveView::Uninitialized => Label::new("Agent").truncate().into_any_element(),
+            VisibleSurface::History(_) => Label::new("History").truncate().into_any_element(),
+            VisibleSurface::Configuration(_) => {
+                Label::new("Settings").truncate().into_any_element()
+            }
+            VisibleSurface::Uninitialized => Label::new("Agent").truncate().into_any_element(),
         };
 
         h_flex()
@@ -3719,18 +3763,18 @@ impl AgentPanel {
     ) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
 
-        let conversation_view = match &self.active_view {
-            ActiveView::AgentThread { conversation_view } => Some(conversation_view.clone()),
+        let conversation_view = match &self.base_view {
+            BaseView::AgentThread { conversation_view } => Some(conversation_view.clone()),
             _ => None,
         };
-        let thread_with_messages = match &self.active_view {
-            ActiveView::AgentThread { conversation_view } => {
+        let thread_with_messages = match &self.base_view {
+            BaseView::AgentThread { conversation_view } => {
                 conversation_view.read(cx).has_user_submitted_prompt(cx)
             }
             _ => false,
         };
-        let has_auth_methods = match &self.active_view {
-            ActiveView::AgentThread { conversation_view } => {
+        let has_auth_methods = match &self.base_view {
+            BaseView::AgentThread { conversation_view } => {
                 conversation_view.read(cx).has_auth_methods()
             }
             _ => false,
@@ -3952,13 +3996,11 @@ impl AgentPanel {
                 (None, self.selected_agent.label())
             };
 
-        let active_thread = match &self.active_view {
-            ActiveView::AgentThread { conversation_view } => {
+        let active_thread = match &self.base_view {
+            BaseView::AgentThread { conversation_view } => {
                 conversation_view.read(cx).as_native_thread(cx)
             }
-            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {
-                None
-            }
+            BaseView::Uninitialized => None,
         };
 
         let new_thread_menu_builder: Rc<
@@ -4192,10 +4234,7 @@ impl AgentPanel {
 
         let is_empty_state = !self.active_thread_has_messages(cx);
 
-        let is_in_history_or_config = matches!(
-            &self.active_view,
-            ActiveView::History { .. } | ActiveView::Configuration
-        );
+        let is_in_history_or_config = self.is_history_or_configuration_visible();
 
         let is_full_screen = self.is_zoomed(window, cx);
         let full_screen_button = if is_full_screen {
@@ -4329,11 +4368,10 @@ impl AgentPanel {
                         .size_full()
                         .gap(DynamicSpacing::Base04.rems(cx))
                         .pl(DynamicSpacing::Base04.rems(cx))
-                        .child(match &self.active_view {
-                            ActiveView::History { .. } | ActiveView::Configuration => {
-                                self.render_toolbar_back_button(cx).into_any_element()
-                            }
-                            _ => selected_agent.into_any_element(),
+                        .child(if self.is_overlay_open() {
+                            self.render_toolbar_back_button(cx).into_any_element()
+                        } else {
+                            selected_agent.into_any_element()
                         })
                         .child(self.render_title_view(window, cx)),
                 )
@@ -4417,8 +4455,8 @@ impl AgentPanel {
             return false;
         }
 
-        match &self.active_view {
-            ActiveView::AgentThread { .. } => {
+        match &self.base_view {
+            BaseView::AgentThread { .. } => {
                 if LanguageModelRegistry::global(cx)
                     .read(cx)
                     .default_model()
@@ -4429,7 +4467,7 @@ impl AgentPanel {
                     return false;
                 }
             }
-            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {
+            BaseView::Uninitialized => {
                 return false;
             }
         }
@@ -4455,11 +4493,9 @@ impl AgentPanel {
             return false;
         }
 
-        match &self.active_view {
-            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {
-                false
-            }
-            ActiveView::AgentThread { .. } => {
+        match &self.base_view {
+            BaseView::Uninitialized => false,
+            BaseView::AgentThread { .. } => {
                 let existing_user = self
                     .new_user_onboarding_upsell_dismissed
                     .load(Ordering::Acquire);
@@ -4528,14 +4564,12 @@ impl AgentPanel {
                     && provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
             });
 
-        match &self.active_view {
-            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {
-                false
-            }
-            ActiveView::AgentThread {
+        match &self.base_view {
+            BaseView::Uninitialized => false,
+            BaseView::AgentThread {
                 conversation_view, ..
             } if conversation_view.read(cx).as_native_thread(cx).is_none() => false,
-            ActiveView::AgentThread { conversation_view } => {
+            BaseView::AgentThread { conversation_view } => {
                 let history_is_empty = conversation_view
                     .read(cx)
                     .history()
@@ -4656,13 +4690,13 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match &self.active_view {
-            ActiveView::AgentThread { conversation_view } => {
+        match &self.base_view {
+            BaseView::AgentThread { conversation_view } => {
                 conversation_view.update(cx, |conversation_view, cx| {
                     conversation_view.insert_dragged_files(paths, added_worktrees, window, cx);
                 });
             }
-            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {}
+            BaseView::Uninitialized => {}
         }
     }
 
@@ -4701,9 +4735,9 @@ impl AgentPanel {
     fn key_context(&self) -> KeyContext {
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add("AgentPanel");
-        match &self.active_view {
-            ActiveView::AgentThread { .. } => key_context.add("acp_thread"),
-            ActiveView::Uninitialized | ActiveView::History { .. } | ActiveView::Configuration => {}
+        match &self.base_view {
+            BaseView::AgentThread { .. } => key_context.add("acp_thread"),
+            BaseView::Uninitialized => {}
         }
         key_context
     }
@@ -4754,20 +4788,20 @@ impl Render for AgentPanel {
             .children(self.render_workspace_trust_message(cx))
             .children(self.render_new_user_onboarding(window, cx))
             .children(self.render_agent_layout_onboarding(window, cx))
-            .map(|parent| match &self.active_view {
-                ActiveView::Uninitialized => parent,
-                ActiveView::AgentThread {
-                    conversation_view, ..
-                } => parent
+            .map(|parent| match self.visible_surface() {
+                VisibleSurface::Uninitialized => parent,
+                VisibleSurface::AgentThread(conversation_view) => parent
                     .child(conversation_view.clone())
                     .child(self.render_drag_target(cx)),
-                ActiveView::History { view } => parent.child(view.clone()),
-                ActiveView::Configuration => parent.children(self.configuration.clone()),
+                VisibleSurface::History(view) => parent.child(view.clone()),
+                VisibleSurface::Configuration(configuration) => {
+                    parent.children(configuration.cloned())
+                }
             })
             .children(self.render_worktree_creation_status(cx))
             .children(self.render_trial_end_upsell(window, cx));
 
-        match self.active_view.which_font_size_used() {
+        match self.visible_font_size() {
             WhichFontSize::AgentFont => {
                 WithRemSize::new(ThemeSettings::get_global(cx).agent_ui_font_size(cx))
                     .size_full()
@@ -4884,8 +4918,8 @@ impl AgentPanel {
         let conversation_view = self.create_agent_thread(
             server, None, None, None, None, workspace, project, ext_agent, window, cx,
         );
-        self.set_active_view(
-            ActiveView::AgentThread { conversation_view },
+        self.set_base_view(
+            BaseView::AgentThread { conversation_view },
             true,
             window,
             cx,
@@ -6182,10 +6216,10 @@ mod tests {
         panel.update_in(cx, |panel, window, cx| {
             panel.worktree_creation_status =
                 Some((EntityId::from(0u64), WorktreeCreationStatus::Creating));
-            panel.active_view = ActiveView::Uninitialized;
+            panel.base_view = BaseView::Uninitialized;
             Panel::set_active(panel, true, window, cx);
             assert!(
-                matches!(panel.active_view, ActiveView::Uninitialized),
+                matches!(panel.base_view, BaseView::Uninitialized),
                 "set_active should not create a thread while worktree is being created"
             );
         });
@@ -6196,7 +6230,7 @@ mod tests {
         // new_agent_thread requires full agent server infrastructure.
         panel.update_in(cx, |panel, window, cx| {
             panel.worktree_creation_status = None;
-            panel.active_view = ActiveView::Uninitialized;
+            panel.base_view = BaseView::Uninitialized;
             panel.open_external_thread_with_server(
                 Rc::new(StubAgentServer::default_response()),
                 window,
@@ -6208,7 +6242,7 @@ mod tests {
 
         panel.read_with(cx, |panel, _cx| {
             assert!(
-                !matches!(panel.active_view, ActiveView::Uninitialized),
+                !matches!(panel.base_view, BaseView::Uninitialized),
                 "panel should transition out of Uninitialized once worktree creation is cleared"
             );
         });
