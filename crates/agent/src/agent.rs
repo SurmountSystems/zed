@@ -1493,7 +1493,13 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
-        let id = id.expect("UserMessageId is required");
+        let id = id.unwrap_or_else(|| {
+            log::warn!(
+                "Missing UserMessageId for prompt on session {}; synthesizing one",
+                params.session_id
+            );
+            acp_thread::UserMessageId::new()
+        });
         let session_id = params.session_id.clone();
         log::info!("Received prompt request for session: {}", session_id);
         log::debug!("Prompt blocks count: {}", params.prompt.len());
@@ -2272,6 +2278,25 @@ mod internal_tests {
                 }]
             )])
         );
+    }
+
+    #[gpui::test]
+    async fn test_prompt_without_user_message_id_does_not_panic(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let connection =
+            NativeAgentConnection(cx.update(|cx| {
+                NativeAgent::new(thread_store, Templates::new(), None, fs.clone(), cx)
+            }));
+
+        drop(cx.update(|cx| {
+            connection.prompt(
+                None,
+                acp::PromptRequest::new(acp::SessionId::new("missing-user-message-id"), vec![]),
+                cx,
+            )
+        }));
     }
 
     #[gpui::test]
