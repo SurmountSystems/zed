@@ -6148,6 +6148,126 @@ async fn test_archive_thread_active_entry_management(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_archive_and_activate_treats_active_thread_as_active_without_metadata(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+    let connection = StubAgentConnection::new();
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(&panel, connection, cx);
+    send_message(&panel, cx);
+    let session_id = active_session_id(&panel, cx);
+    cx.run_until_parked();
+
+    let live_thread_id = panel.read_with(cx, |panel, cx| {
+        panel
+            .active_conversation_view()
+            .and_then(|cv| cv.read(cx).parent_id(cx))
+            .expect("panel should have a live thread id")
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.active_entry = Some(ActiveEntry::Thread {
+            identity: ThreadActivation::new(live_thread_id, Some(session_id.clone())),
+            workspace: workspace.clone(),
+        });
+        sidebar.archive_and_activate(
+            &session_id,
+            Some(live_thread_id),
+            None,
+            None,
+            None,
+            window,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _cx| {
+        assert_active_draft(
+            sidebar,
+            &workspace,
+            "archiving the active thread should fall back to a draft even without metadata",
+        );
+    });
+
+    panel.read_with(cx, |panel, _cx| {
+        assert!(
+            panel.active_draft_id().is_some(),
+            "panel should end on a draft after archive fallback without metadata"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_rebuild_contents_clears_stale_pending_remote_activation_by_session(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    let connection = StubAgentConnection::new();
+    connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+        acp::ContentChunk::new("Done".into()),
+    )]);
+    open_thread_with_connection(&panel, connection, cx);
+    send_message(&panel, cx);
+    let session_id = active_session_id(&panel, cx);
+    cx.run_until_parked();
+
+    let live_thread_id = panel.read_with(cx, |panel, cx| {
+        panel
+            .active_conversation_view()
+            .and_then(|cv| cv.read(cx).parent_id(cx))
+            .expect("panel should have a live thread id")
+    });
+    let stale_thread_id = ThreadId::new();
+    assert_ne!(
+        stale_thread_id, live_thread_id,
+        "test needs a stale pending thread id that differs from the live thread"
+    );
+
+    sidebar.update_in(cx, |sidebar, _window, cx| {
+        sidebar.pending_remote_thread_activation = Some(ThreadActivation::new(
+            stale_thread_id,
+            Some(session_id.clone()),
+        ));
+        sidebar.update_entries(cx);
+    });
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, cx| {
+        assert_active_thread(
+            sidebar,
+            &session_id,
+            cx,
+            "live session id should reconcile stale pending remote activation",
+        );
+        assert!(
+            sidebar.pending_remote_thread_activation.is_none(),
+            "stale pending remote activation should clear once the live session is visible"
+        );
+        assert!(
+            matches!(
+                sidebar.active_entry.as_ref(),
+                Some(ActiveEntry::Thread { identity, .. }) if identity.thread_id == live_thread_id
+            ),
+            "active_entry should use the live thread id after reconciliation, got {:?}",
+            sidebar.active_entry,
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_switch_to_workspace_with_archived_thread_shows_draft(cx: &mut TestAppContext) {
     // When a thread is archived while the user is in a different workspace,
     // the archiving code replaces the thread with a tracked draft in its
@@ -8498,7 +8618,7 @@ mod property_test {
             .and_then(|cv| cv.read(cx).parent_id(cx))
         {
             anyhow::ensure!(
-                matches!(entry, ActiveEntry::Thread { thread_id: id, .. } if id == &thread_id),
+                matches!(entry, ActiveEntry::Thread { identity, .. } if identity.thread_id == thread_id),
                 "panel has thread {:?} but active_entry is {:?}",
                 thread_id,
                 entry,

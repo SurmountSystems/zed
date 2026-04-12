@@ -2554,6 +2554,35 @@ impl ThreadView {
             )
     }
 
+    fn collect_subagent_items_for_sessions(
+        entries: &[AgentThreadEntry],
+        awaiting_session_ids: &[acp::SessionId],
+        cx: &App,
+    ) -> Vec<(SharedString, usize)> {
+        let tool_calls_by_session: HashMap<_, _> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_ix, entry)| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return None;
+                };
+                let info = tool_call.subagent_session_info.as_ref()?;
+                let summary_text = tool_call.label.read(cx).source().to_string();
+                let subagent_summary = if summary_text.is_empty() {
+                    SharedString::from("Subagent")
+                } else {
+                    SharedString::from(summary_text)
+                };
+                Some((info.session_id.clone(), (subagent_summary, entry_ix)))
+            })
+            .collect();
+
+        awaiting_session_ids
+            .iter()
+            .filter_map(|session_id| tool_calls_by_session.get(session_id).cloned())
+            .collect()
+    }
+
     fn render_subagents_awaiting_permission(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let awaiting = self.conversation.read(cx).subagents_awaiting_permission(cx);
 
@@ -2561,43 +2590,25 @@ impl ThreadView {
             return None;
         }
 
-        let thread = self.thread.read(cx);
-        let entries = thread.entries();
-        let mut subagent_items: Vec<(SharedString, usize)> = Vec::new();
-
-        // Build a set of ACP session IDs for the awaiting ThreadIds
-        let awaiting_session_ids: HashSet<acp::SessionId> = awaiting
+        let awaiting_session_ids: Vec<_> = awaiting
             .iter()
             .filter_map(|(thread_id, _)| {
-                self.server_view.upgrade().and_then(|sv| {
-                    sv.read(cx)
+                self.server_view.upgrade().and_then(|server_view| {
+                    server_view
+                        .read(cx)
                         .as_connected()
-                        .and_then(|c| c.threads.get(thread_id))
-                        .map(|tv| tv.read(cx).thread.read(cx).session_id().clone())
+                        .and_then(|connected| connected.threads.get(thread_id))
+                        .map(|thread_view| {
+                            thread_view.read(cx).thread.read(cx).session_id().clone()
+                        })
                 })
             })
             .collect();
 
-        for _ in &awaiting {
-            for (entry_ix, entry) in entries.iter().enumerate() {
-                if let AgentThreadEntry::ToolCall(tool_call) = entry {
-                    if let Some(info) = &tool_call.subagent_session_info {
-                        if awaiting_session_ids.contains(&info.session_id) {
-                            let subagent_summary: SharedString = {
-                                let summary_text = tool_call.label.read(cx).source().to_string();
-                                if !summary_text.is_empty() {
-                                    summary_text.into()
-                                } else {
-                                    "Subagent".into()
-                                }
-                            };
-                            subagent_items.push((subagent_summary, entry_ix));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let subagent_items =
+            Self::collect_subagent_items_for_sessions(entries, &awaiting_session_ids, cx);
 
         if subagent_items.is_empty() {
             return None;
