@@ -541,6 +541,12 @@ impl ThreadMetadataStore {
         self.threads.get(&thread_id)
     }
 
+    /// Returns the `ThreadId` associated with an ACP session, including
+    /// reservations made via `reserve_thread_id` that haven't been saved yet.
+    pub fn thread_id_for_session(&self, session_id: &acp::SessionId) -> Option<ThreadId> {
+        self.sessions.get(session_id).copied()
+    }
+
     /// Returns the metadata for a thread identified by its ACP session ID.
     pub fn entry_by_session(&self, session_id: &acp::SessionId) -> Option<&ThreadMetadata> {
         let thread_id = self.sessions.get(session_id)?;

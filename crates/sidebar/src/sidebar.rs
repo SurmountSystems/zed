@@ -146,7 +146,7 @@ impl ActiveEntry {
     fn matches_entry(&self, entry: &ListEntry) -> bool {
         match (self, entry) {
             (ActiveEntry::Thread { session_id, .. }, ListEntry::Thread(thread)) => {
-                thread.metadata.session_id == *session_id
+                thread.metadata.session_id.as_ref() == Some(session_id)
             }
             (
                 ActiveEntry::Draft { id, .. },
@@ -267,7 +267,7 @@ enum ListEntry {
 impl ListEntry {
     fn session_id(&self) -> Option<&acp::SessionId> {
         match self {
-            ListEntry::Thread(thread_entry) => Some(&thread_entry.metadata.session_id),
+            ListEntry::Thread(thread_entry) => thread_entry.metadata.session_id.as_ref(),
             _ => None,
         }
     }
@@ -468,7 +468,7 @@ pub struct Sidebar {
     _thread_switcher_subscriptions: Vec<gpui::Subscription>,
     pending_remote_thread_activation: Option<acp::SessionId>,
     view: SidebarView,
-    restoring_tasks: HashMap<acp::SessionId, Task<()>>,
+    restoring_tasks: HashMap<agent_ui::ThreadId, Task<()>>,
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     project_header_menu_ix: Option<usize>,
     _subscriptions: Vec<gpui::Subscription>,
@@ -900,7 +900,8 @@ impl Sidebar {
             .iter()
             .filter_map(|entry| match entry {
                 ListEntry::Thread(thread) if thread.is_live => {
-                    Some((thread.metadata.session_id.clone(), thread.status))
+                    let sid = thread.metadata.session_id.clone()?;
+                    Some((sid, thread.status))
                 }
                 _ => None,
             })
@@ -967,7 +968,7 @@ impl Sidebar {
             let mut waiting_thread_count: usize = 0;
 
             if should_load_threads {
-                let mut seen_session_ids: HashSet<acp::SessionId> = HashSet::new();
+                let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
                 let thread_store = ThreadMetadataStore::global(cx);
 
                 // Build a lookup from workspace root paths to their workspace
@@ -1021,7 +1022,7 @@ impl Sidebar {
                     .entries_for_main_worktree_path(group_key.path_list())
                     .cloned()
                 {
-                    if !seen_session_ids.insert(row.session_id.clone()) {
+                    if !seen_thread_ids.insert(row.thread_id) {
                         continue;
                     }
                     let workspace = resolve_workspace(&row);
@@ -1037,7 +1038,7 @@ impl Sidebar {
                     .entries_for_path(group_key.path_list())
                     .cloned()
                 {
-                    if !seen_session_ids.insert(row.session_id.clone()) {
+                    if !seen_thread_ids.insert(row.thread_id) {
                         continue;
                     }
                     let workspace = resolve_workspace(&row);
@@ -1063,7 +1064,7 @@ impl Sidebar {
                         .entries_for_path(&worktree_path_list)
                         .cloned()
                     {
-                        if !seen_session_ids.insert(row.session_id.clone()) {
+                        if !seen_thread_ids.insert(row.thread_id) {
                             continue;
                         }
                         threads.push(make_thread_entry(
@@ -1093,41 +1094,54 @@ impl Sidebar {
                 // Merge live info into threads and update notification state
                 // in a single pass.
                 for thread in &mut threads {
-                    if let Some(info) = live_info_by_session.get(&thread.metadata.session_id) {
-                        thread.apply_active_info(info);
+                    if let Some(session_id) = &thread.metadata.session_id {
+                        if let Some(info) = live_info_by_session.get(session_id) {
+                            thread.apply_active_info(info);
+                        }
                     }
 
                     let session_id = &thread.metadata.session_id;
 
-                    let is_active_thread = self.active_entry.as_ref().is_some_and(|entry| {
-                        entry.is_active_thread(session_id)
-                            && active_workspace
-                                .as_ref()
-                                .is_some_and(|active| active == entry.workspace())
+                    let is_active_thread = session_id.as_ref().is_some_and(|sid| {
+                        self.active_entry.as_ref().is_some_and(|entry| {
+                            entry.is_active_thread(sid)
+                                && active_workspace
+                                    .as_ref()
+                                    .is_some_and(|active| active == entry.workspace())
+                        })
                     });
 
                     if thread.status == AgentThreadStatus::Completed
                         && !is_active_thread
-                        && old_statuses.get(session_id) == Some(&AgentThreadStatus::Running)
+                        && session_id.as_ref().and_then(|sid| old_statuses.get(sid))
+                            == Some(&AgentThreadStatus::Running)
                     {
-                        notified_threads.insert(session_id.clone());
+                        if let Some(sid) = session_id {
+                            notified_threads.insert(sid.clone());
+                        }
                     }
 
                     if is_active_thread && !thread.is_background {
-                        notified_threads.remove(session_id);
+                        if let Some(sid) = session_id {
+                            notified_threads.remove(sid);
+                        }
                     }
                 }
 
                 threads.sort_by(|a, b| {
-                    let a_time = self
-                        .thread_last_message_sent_or_queued
-                        .get(&a.metadata.session_id)
+                    let a_time = a
+                        .metadata
+                        .session_id
+                        .as_ref()
+                        .and_then(|sid| self.thread_last_message_sent_or_queued.get(sid))
                         .copied()
                         .or(a.metadata.created_at)
                         .or(Some(a.metadata.updated_at));
-                    let b_time = self
-                        .thread_last_message_sent_or_queued
-                        .get(&b.metadata.session_id)
+                    let b_time = b
+                        .metadata
+                        .session_id
+                        .as_ref()
+                        .and_then(|sid| self.thread_last_message_sent_or_queued.get(sid))
                         .copied()
                         .or(b.metadata.created_at)
                         .or(Some(b.metadata.updated_at));
@@ -1200,7 +1214,9 @@ impl Sidebar {
                 });
 
                 for thread in matched_threads {
-                    current_session_ids.insert(thread.metadata.session_id.clone());
+                    if let Some(sid) = thread.metadata.session_id.clone() {
+                        current_session_ids.insert(sid);
+                    }
                     entries.push(thread.into());
                 }
             } else {
@@ -1277,21 +1293,31 @@ impl Sidebar {
 
                     let session_id = &thread.metadata.session_id;
                     if is_hidden {
+                        let is_notified = session_id
+                            .as_ref()
+                            .is_some_and(|sid| notified_threads.contains(sid));
                         let is_promoted = thread.status == AgentThreadStatus::Running
                             || thread.status == AgentThreadStatus::WaitingForConfirmation
-                            || notified_threads.contains(session_id)
+                            || is_notified
                             || self.active_entry.as_ref().is_some_and(|active| {
                                 active.matches_entry(&ListEntry::Thread(thread.clone()))
                             });
                         if is_promoted {
-                            promoted_threads.insert(session_id.clone());
+                            if let Some(sid) = session_id {
+                                promoted_threads.insert(sid.clone());
+                            }
                         }
-                        if !promoted_threads.contains(session_id) {
+                        let is_in_promoted = session_id
+                            .as_ref()
+                            .is_some_and(|sid| promoted_threads.contains(sid));
+                        if !is_in_promoted {
                             continue;
                         }
                     }
 
-                    current_session_ids.insert(session_id.clone());
+                    if let Some(sid) = session_id {
+                        current_session_ids.insert(sid.clone());
+                    }
                     entries.push(thread.into());
                 }
 
@@ -2230,11 +2256,14 @@ impl Sidebar {
             workspace.reveal_panel::<AgentPanel>(window, cx);
         });
 
-        if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+        if let (Some(agent_panel), Some(session_id)) = (
+            workspace.read(cx).panel::<AgentPanel>(cx),
+            metadata.session_id.clone(),
+        ) {
             agent_panel.update(cx, |panel, cx| {
                 panel.load_agent_thread(
                     Agent::from(metadata.agent_id.clone()),
-                    metadata.session_id.clone(),
+                    session_id,
                     Some(metadata.folder_paths().clone()),
                     Some(metadata.title.clone()),
                     focus,
@@ -2260,10 +2289,12 @@ impl Sidebar {
         // Set active_entry eagerly so the sidebar highlight updates
         // immediately, rather than waiting for a deferred AgentPanel
         // event which can race with ActiveWorkspaceChanged clearing it.
-        self.active_entry = Some(ActiveEntry::Thread {
-            session_id: metadata.session_id.clone(),
-            workspace: workspace.clone(),
-        });
+        if let Some(session_id) = metadata.session_id.clone() {
+            self.active_entry = Some(ActiveEntry::Thread {
+                session_id,
+                workspace: workspace.clone(),
+            });
+        }
         self.record_thread_access(&metadata.session_id);
 
         multi_workspace.update(cx, |multi_workspace, cx| {
@@ -2307,10 +2338,12 @@ impl Sidebar {
                 .and_then(|sidebar| sidebar.downcast::<Self>().ok())
             {
                 target_sidebar.update(cx, |sidebar, cx| {
-                    sidebar.active_entry = Some(ActiveEntry::Thread {
-                        session_id: target_session_id.clone(),
-                        workspace: workspace_for_entry.clone(),
-                    });
+                    if let Some(session_id) = target_session_id.clone() {
+                        sidebar.active_entry = Some(ActiveEntry::Thread {
+                            session_id,
+                            workspace: workspace_for_entry.clone(),
+                        });
+                    }
                     sidebar.record_thread_access(&target_session_id);
                     sidebar.update_entries(cx);
                 });
@@ -2359,7 +2392,7 @@ impl Sidebar {
         // Mark the pending thread activation so rebuild_contents
         // preserves the Thread active_entry during loading (prevents
         // spurious draft flash).
-        self.pending_remote_thread_activation = Some(pending_session_id.clone());
+        self.pending_remote_thread_activation = pending_session_id.clone();
 
         let host = project_group_key.host();
         let provisional_key = Some(project_group_key.clone());
@@ -2385,7 +2418,7 @@ impl Sidebar {
 
             if result.is_err() {
                 this.update(cx, |this, _cx| {
-                    if this.pending_remote_thread_activation.as_ref() == Some(&pending_session_id) {
+                    if this.pending_remote_thread_activation == pending_session_id {
                         this.pending_remote_thread_activation = None;
                     }
                 })
@@ -2427,15 +2460,14 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let session_id = metadata.session_id.clone();
+        let thread_id = metadata.thread_id;
         let weak_archive_view = match &self.view {
             SidebarView::Archive(view) => Some(view.downgrade()),
             _ => None,
         };
 
         if metadata.folder_paths().paths().is_empty() {
-            ThreadMetadataStore::global(cx)
-                .update(cx, |store, cx| store.unarchive(&session_id, cx));
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| store.unarchive(thread_id, cx));
 
             let active_workspace = self
                 .multi_workspace
@@ -2462,19 +2494,18 @@ impl Sidebar {
         let store = ThreadMetadataStore::global(cx);
         let task = store
             .read(cx)
-            .get_archived_worktrees_for_thread(session_id.0.to_string(), cx);
+            .get_archived_worktrees_for_thread(thread_id, cx);
         let path_list = metadata.folder_paths().clone();
 
-        let task_session_id = session_id.clone();
         let restore_task = cx.spawn_in(window, async move |this, cx| {
             let result: anyhow::Result<()> = async {
                 let archived_worktrees = task.await?;
 
                 if archived_worktrees.is_empty() {
                     this.update_in(cx, |this, window, cx| {
-                        this.restoring_tasks.remove(&session_id);
+                        this.restoring_tasks.remove(&thread_id);
                         ThreadMetadataStore::global(cx)
-                            .update(cx, |store, cx| store.unarchive(&session_id, cx));
+                            .update(cx, |store, cx| store.unarchive(thread_id, cx));
 
                         if let Some(workspace) =
                             this.find_current_workspace_for_path_list(&path_list, cx)
@@ -2513,11 +2544,11 @@ impl Sidebar {
                         Err(error) => {
                             log::error!("Failed to restore worktree: {error:#}");
                             this.update_in(cx, |this, _window, cx| {
-                                this.restoring_tasks.remove(&session_id);
+                                this.restoring_tasks.remove(&thread_id);
                                 if let Some(weak_archive_view) = &weak_archive_view {
                                     weak_archive_view
                                         .update(cx, |view, cx| {
-                                            view.clear_restoring(&session_id, cx);
+                                            view.clear_restoring(&thread_id, cx);
                                         })
                                         .ok();
                                 }
@@ -2547,28 +2578,24 @@ impl Sidebar {
                 if !path_replacements.is_empty() {
                     cx.update(|_window, cx| {
                         store.update(cx, |store, cx| {
-                            store.update_restored_worktree_paths(
-                                &session_id,
-                                &path_replacements,
-                                cx,
-                            );
+                            store.update_restored_worktree_paths(thread_id, &path_replacements, cx);
                         });
                     })?;
 
                     let updated_metadata =
-                        cx.update(|_window, cx| store.read(cx).entry(&session_id).cloned())?;
+                        cx.update(|_window, cx| store.read(cx).entry(thread_id).cloned())?;
 
                     if let Some(updated_metadata) = updated_metadata {
                         let new_paths = updated_metadata.folder_paths().clone();
 
                         cx.update(|_window, cx| {
                             store.update(cx, |store, cx| {
-                                store.unarchive(&updated_metadata.session_id, cx);
+                                store.unarchive(updated_metadata.thread_id, cx);
                             });
                         })?;
 
                         this.update_in(cx, |this, window, cx| {
-                            this.restoring_tasks.remove(&session_id);
+                            this.restoring_tasks.remove(&thread_id);
                             let key = ProjectGroupKey::new(None, new_paths.clone());
                             this.open_workspace_and_activate_thread(
                                 updated_metadata,
@@ -2589,7 +2616,7 @@ impl Sidebar {
                 log::error!("{error:#}");
             }
         });
-        self.restoring_tasks.insert(task_session_id, restore_task);
+        self.restoring_tasks.insert(thread_id, restore_task);
     }
 
     fn expand_selected_entry(
@@ -2730,10 +2757,9 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let metadata = ThreadMetadataStore::global(cx)
-            .read(cx)
-            .entry(session_id)
-            .cloned();
+        let store = ThreadMetadataStore::global(cx);
+        let thread_id = store.read(cx).thread_id_for_session(session_id);
+        let metadata = store.read(cx).entry_by_session(session_id).cloned();
         let thread_folder_paths = metadata.as_ref().map(|m| m.folder_paths().clone());
 
         // Compute which linked worktree roots should be archived from disk if
@@ -2767,11 +2793,13 @@ impl Sidebar {
                         thread_worktree_archive::build_root_plan(path, &workspaces, cx)
                     })
                     .filter(|plan| {
-                        !thread_worktree_archive::path_is_referenced_by_other_unarchived_threads(
-                            session_id,
-                            &plan.root_path,
-                            cx,
-                        )
+                        thread_id.map_or(true, |tid| {
+                            !thread_worktree_archive::path_is_referenced_by_other_unarchived_threads(
+                                tid,
+                                &plan.root_path,
+                                cx,
+                            )
+                        })
                     })
                     .collect::<Vec<_>>()
             })
@@ -2783,14 +2811,14 @@ impl Sidebar {
         // (for activation) and its workspace paths (for the workspace
         // removal fallback).
         let current_pos = self.contents.entries.iter().position(
-            |entry| matches!(entry, ListEntry::Thread(t) if &t.metadata.session_id == session_id),
+            |entry| matches!(entry, ListEntry::Thread(t) if t.metadata.session_id.as_ref() == Some(session_id)),
         );
         let neighbor = current_pos.and_then(|pos| {
             self.contents.entries[pos + 1..]
                 .iter()
                 .chain(self.contents.entries[..pos].iter().rev())
                 .find_map(|entry| match entry {
-                    ListEntry::Thread(t) if t.metadata.session_id != *session_id => {
+                    ListEntry::Thread(t) if t.metadata.session_id.as_ref() != Some(session_id) => {
                         let workspace_paths = match &t.workspace {
                             ThreadEntryWorkspace::Open(ws) => {
                                 PathList::new(&ws.read(cx).root_paths(cx))
@@ -2815,7 +2843,7 @@ impl Sidebar {
             let remaining = ThreadMetadataStore::global(cx)
                 .read(cx)
                 .entries_for_path(folder_paths)
-                .filter(|t| t.session_id != *session_id)
+                .filter(|t| t.session_id.as_ref() != Some(session_id))
                 .count();
 
             if remaining > 0 {
@@ -2921,9 +2949,14 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-            store.archive(session_id, in_flight_archive, cx);
-        });
+        let thread_id = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .thread_id_for_session(session_id);
+        if let Some(thread_id) = thread_id {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.archive(thread_id, in_flight_archive, cx);
+            });
+        }
 
         let is_active = self
             .active_entry
@@ -3011,14 +3044,17 @@ impl Sidebar {
             return None;
         }
 
+        let thread_id = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .thread_id_for_session(session_id)?;
+
         let (cancel_tx, cancel_rx) = smol::channel::bounded::<()>(1);
-        let session_id = session_id.clone();
         let task = cx.spawn(async move |_this, cx| {
             match Self::archive_worktree_roots(roots, cancel_rx, cx).await {
                 Ok(ArchiveWorktreeOutcome::Success) => {
                     cx.update(|cx| {
                         ThreadMetadataStore::global(cx).update(cx, |store, _cx| {
-                            store.cleanup_completed_archive(&session_id);
+                            store.cleanup_completed_archive(thread_id);
                         });
                     });
                 }
@@ -3027,7 +3063,7 @@ impl Sidebar {
                     log::error!("Failed to archive worktree: {error:#}");
                     cx.update(|cx| {
                         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                            store.unarchive(&session_id, cx);
+                            store.unarchive(thread_id, cx);
                         });
                     });
                 }
@@ -3120,8 +3156,9 @@ impl Sidebar {
                     }
                     AgentThreadStatus::Completed | AgentThreadStatus::Error => {}
                 }
-                let session_id = thread.metadata.session_id.clone();
-                self.archive_thread(&session_id, window, cx);
+                if let Some(session_id) = thread.metadata.session_id.clone() {
+                    self.archive_thread(&session_id, window, cx);
+                }
             }
             Some(ListEntry::DraftThread {
                 draft_id: Some(draft_id),
@@ -3136,9 +3173,10 @@ impl Sidebar {
         }
     }
 
-    fn record_thread_access(&mut self, session_id: &acp::SessionId) {
-        self.thread_last_accessed
-            .insert(session_id.clone(), Utc::now());
+    fn record_thread_access(&mut self, session_id: &Option<acp::SessionId>) {
+        if let Some(sid) = session_id {
+            self.thread_last_accessed.insert(sid.clone(), Utc::now());
+        }
     }
 
     fn record_thread_message_sent(&mut self, session_id: &acp::SessionId) {
@@ -3160,6 +3198,7 @@ impl Sidebar {
                     None
                 }
                 ListEntry::Thread(thread) => {
+                    let session_id = thread.metadata.session_id.clone()?;
                     let workspace = match &thread.workspace {
                         ThreadEntryWorkspace::Open(workspace) => Some(workspace.clone()),
                         ThreadEntryWorkspace::Closed { .. } => {
@@ -3174,19 +3213,17 @@ impl Sidebar {
                             })
                         }
                     }?;
-                    let notified = self
-                        .contents
-                        .is_thread_notified(&thread.metadata.session_id);
+                    let notified = self.contents.is_thread_notified(&session_id);
                     let timestamp: SharedString = format_history_entry_timestamp(
                         self.thread_last_message_sent_or_queued
-                            .get(&thread.metadata.session_id)
+                            .get(&session_id)
                             .copied()
                             .or(thread.metadata.created_at)
                             .unwrap_or(thread.metadata.updated_at),
                     )
                     .into();
                     Some(ThreadSwitcherEntry {
-                        session_id: thread.metadata.session_id.clone(),
+                        session_id,
                         title: thread.metadata.title.clone(),
                         icon: thread.icon,
                         icon_from_external_svg: thread.icon_from_external_svg.clone(),
@@ -3314,10 +3351,12 @@ impl Sidebar {
                             mw.activate(workspace.clone(), window, cx);
                         });
                     }
-                    this.active_entry = Some(ActiveEntry::Thread {
-                        session_id: metadata.session_id.clone(),
-                        workspace: workspace.clone(),
-                    });
+                    if let Some(session_id) = metadata.session_id.clone() {
+                        this.active_entry = Some(ActiveEntry::Thread {
+                            session_id,
+                            workspace: workspace.clone(),
+                        });
+                    }
                     this.update_entries(cx);
                     Self::load_agent_thread_in_workspace(workspace, metadata, false, window, cx);
                     let focus = thread_switcher.focus_handle(cx);
@@ -3334,10 +3373,12 @@ impl Sidebar {
                         });
                     }
                     this.record_thread_access(&metadata.session_id);
-                    this.active_entry = Some(ActiveEntry::Thread {
-                        session_id: metadata.session_id.clone(),
-                        workspace: workspace.clone(),
-                    });
+                    if let Some(session_id) = metadata.session_id.clone() {
+                        this.active_entry = Some(ActiveEntry::Thread {
+                            session_id,
+                            workspace: workspace.clone(),
+                        });
+                    }
                     this.update_entries(cx);
                     Self::load_agent_thread_in_workspace(workspace, metadata, false, window, cx);
                     this.dismiss_thread_switcher(cx);
@@ -3354,9 +3395,11 @@ impl Sidebar {
                         }
                     }
                     if let Some(metadata) = &original_metadata {
-                        if let Some(original_ws) = &original_workspace {
+                        if let (Some(session_id), Some(original_ws)) =
+                            (metadata.session_id.clone(), &original_workspace)
+                        {
                             this.active_entry = Some(ActiveEntry::Thread {
-                                session_id: metadata.session_id.clone(),
+                                session_id,
                                 workspace: original_ws.clone(),
                             });
                         }
@@ -3408,10 +3451,12 @@ impl Sidebar {
                     mw.activate(workspace.clone(), window, cx);
                 });
             }
-            self.active_entry = Some(ActiveEntry::Thread {
-                session_id: metadata.session_id.clone(),
-                workspace: workspace.clone(),
-            });
+            if let Some(session_id) = metadata.session_id.clone() {
+                self.active_entry = Some(ActiveEntry::Thread {
+                    session_id,
+                    workspace: workspace.clone(),
+                });
+            }
             self.update_entries(cx);
             Self::load_agent_thread_in_workspace(&workspace, &metadata, false, window, cx);
         }
@@ -3427,9 +3472,11 @@ impl Sidebar {
         is_focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let has_notification = self
-            .contents
-            .is_thread_notified(&thread.metadata.session_id);
+        let has_notification = thread
+            .metadata
+            .session_id
+            .as_ref()
+            .is_some_and(|sid| self.contents.is_thread_notified(sid));
 
         let title: SharedString = thread.metadata.title.clone();
         let metadata = thread.metadata.clone();
@@ -3453,8 +3500,11 @@ impl Sidebar {
             .blend(color.panel_background.opacity(0.25));
 
         let timestamp = format_history_entry_timestamp(
-            self.thread_last_message_sent_or_queued
-                .get(&thread.metadata.session_id)
+            thread
+                .metadata
+                .session_id
+                .as_ref()
+                .and_then(|sid| self.thread_last_message_sent_or_queued.get(sid))
                 .copied()
                 .or(thread.metadata.created_at)
                 .unwrap_or(thread.metadata.updated_at),
@@ -3513,7 +3563,9 @@ impl Sidebar {
                         .on_click({
                             let session_id = session_id_for_delete.clone();
                             cx.listener(move |this, _, _window, cx| {
-                                this.stop_thread(&session_id, cx);
+                                if let Some(ref session_id) = session_id {
+                                    this.stop_thread(session_id, cx);
+                                }
                             })
                         }),
                 )
@@ -3537,7 +3589,9 @@ impl Sidebar {
                         .on_click({
                             let session_id = session_id_for_delete.clone();
                             cx.listener(move |this, _, window, cx| {
-                                this.archive_thread(&session_id, window, cx);
+                                if let Some(ref session_id) = session_id {
+                                    this.archive_thread(session_id, window, cx);
+                                }
                             })
                         }),
                 )
@@ -4608,8 +4662,8 @@ impl Sidebar {
                 ThreadsArchiveViewEvent::Unarchive { thread } => {
                     this.activate_archived_thread(thread.clone(), window, cx);
                 }
-                ThreadsArchiveViewEvent::CancelRestore { session_id } => {
-                    this.restoring_tasks.remove(session_id);
+                ThreadsArchiveViewEvent::CancelRestore { thread_id } => {
+                    this.restoring_tasks.remove(thread_id);
                 }
             },
         );

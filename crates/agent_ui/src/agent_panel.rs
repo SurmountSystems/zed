@@ -6629,7 +6629,7 @@ mod tests {
         for (label, session_id) in [("thread B", &session_id_b), ("thread A", &session_id_a)] {
             let metadata_paths = metadata_store.read_with(&cx, |store, _cx| {
                 let metadata = store
-                    .entry(session_id)
+                    .entry_by_session(session_id)
                     .unwrap_or_else(|| panic!("{label} thread metadata should exist"));
                 metadata.folder_paths().clone()
             });
