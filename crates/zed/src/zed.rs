@@ -2444,7 +2444,6 @@ mod tests {
             .update(cx, |multi_workspace, window, cx| {
                 let mut tasks = multi_workspace
                     .workspaces()
-                    .into_iter()
                     .map(|workspace| {
                         workspace.update(cx, |workspace, cx| {
                             workspace.flush_serialization(window, cx)
@@ -2592,7 +2591,7 @@ mod tests {
         cx.run_until_parked();
         multi_workspace_1
             .update(cx, |multi_workspace, _window, cx| {
-                assert_eq!(multi_workspace.workspaces().len(), 2);
+                assert_eq!(multi_workspace.workspaces().count(), 2);
                 assert!(multi_workspace.sidebar_open());
                 let workspace = multi_workspace.workspace().read(cx);
                 assert_eq!(
@@ -5702,7 +5701,7 @@ mod tests {
 
         let workspace1 = window
             .read_with(cx, |multi_workspace, _| {
-                multi_workspace.workspaces().into_iter().next().unwrap()
+                multi_workspace.workspaces().next().unwrap().clone()
             })
             .unwrap();
 
@@ -5721,7 +5720,7 @@ mod tests {
         // Verify setup: 3 workspaces, workspace 0 active, still 1 window
         window
             .read_with(cx, |multi_workspace, _| {
-                assert_eq!(multi_workspace.workspaces().len(), 3);
+                assert_eq!(multi_workspace.workspaces().count(), 3);
                 assert_eq!(multi_workspace.workspace(), &workspace1);
             })
             .unwrap();
@@ -6215,7 +6214,7 @@ mod tests {
         // still be active rather than whichever workspace happened to restore last.
         window_a
             .update(cx, |multi_workspace, window, cx| {
-                let workspace = multi_workspace.workspaces().into_iter().next().unwrap();
+                let workspace = multi_workspace.workspaces().next().unwrap().clone();
                 multi_workspace.activate(workspace, window, cx);
             })
             .unwrap();
@@ -6331,7 +6330,7 @@ mod tests {
                         ProjectGroupKey::new(None, PathList::new(&[dir1])),
                     ]
                 );
-                assert_eq!(mw.workspaces().len(), 1);
+                assert_eq!(mw.workspaces().count(), 1);
             })
             .unwrap();
 
@@ -6342,7 +6341,7 @@ mod tests {
                     mw.project_group_keys(),
                     vec![ProjectGroupKey::new(None, PathList::new(&[dir3]))]
                 );
-                assert_eq!(mw.workspaces().len(), 1);
+                assert_eq!(mw.workspaces().count(), 1);
             })
             .unwrap();
     }

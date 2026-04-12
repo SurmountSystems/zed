@@ -528,24 +528,11 @@ impl MultiWorkspace {
         cx.subscribe_in(&project, window, {
             let workspace = workspace.downgrade();
             move |this, _project, event, _window, cx| match event {
-                project::Event::WorktreeRemoved(_)
+                project::Event::WorktreeAdded(_)
+                | project::Event::WorktreeRemoved(_)
                 | project::Event::WorktreeUpdatedRootRepoCommonDir(_) => {
                     if let Some(workspace) = workspace.upgrade() {
                         this.handle_workspace_key_change(&workspace, cx);
-                    }
-                }
-                project::Event::WorktreeAdded(worktree_id) => {
-                    if let Some(workspace) = workspace.upgrade() {
-                        let project = workspace.read(cx).project().clone();
-                        let project = project.read(cx);
-                        let added_worktree = project.worktree_for_id(*worktree_id, cx);
-                        let is_remote_without_repo_info = added_worktree.is_some_and(|wt| {
-                            let wt = wt.read(cx);
-                            wt.is_remote() && wt.snapshot().root_repo_common_dir().is_none()
-                        });
-                        if !is_remote_without_repo_info {
-                            this.handle_workspace_key_change(&workspace, cx);
-                        }
                     }
                 }
                 _ => {}

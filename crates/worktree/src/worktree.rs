@@ -576,9 +576,16 @@ impl Worktree {
             cx.spawn(async move |this, cx| {
                 while (snapshot_updated_rx.recv().await).is_some() {
                     this.update(cx, |this, cx| {
-                        let mut entries_changed = false;
                         let this = this.as_remote_mut().unwrap();
+
+                        // The watch channel delivers an initial signal before
+                        // any real updates arrive. Skip these spurious wakeups.
+                        if this.background_snapshot.lock().1.is_empty() {
+                            return;
+                        }
+
                         let old_root_repo_common_dir = this.snapshot.root_repo_common_dir.clone();
+                        let mut entries_changed = false;
                         {
                             let mut lock = this.background_snapshot.lock();
                             this.snapshot = lock.0.clone();
@@ -597,8 +604,7 @@ impl Worktree {
                         let is_first_update = !this.received_initial_update;
                         this.received_initial_update = true;
                         if this.snapshot.root_repo_common_dir != old_root_repo_common_dir
-                            || (is_first_update
-                                && this.snapshot.root_repo_common_dir.is_none())
+                            || (is_first_update && this.snapshot.root_repo_common_dir.is_none())
                         {
                             cx.emit(Event::UpdatedRootRepoCommonDir);
                         }

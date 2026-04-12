@@ -2067,6 +2067,40 @@ impl Project {
         project
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn add_test_remote_worktree(
+        &mut self,
+        abs_path: &str,
+        cx: &mut Context<Self>,
+    ) -> Entity<Worktree> {
+        use rpc::NoopProtoClient;
+        use util::paths::PathStyle;
+
+        let root_name = std::path::Path::new(abs_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let client = AnyProtoClient::new(NoopProtoClient::new());
+        let worktree = Worktree::remote(
+            0,
+            ReplicaId::new(1),
+            proto::WorktreeMetadata {
+                id: 100 + self.visible_worktrees(cx).count() as u64,
+                root_name,
+                visible: true,
+                abs_path: abs_path.to_string(),
+                root_repo_common_dir: None,
+            },
+            client,
+            PathStyle::Posix,
+            cx,
+        );
+        self.worktree_store
+            .update(cx, |store, cx| store.add(&worktree, cx));
+        worktree
+    }
+
     #[inline]
     pub fn dap_store(&self) -> Entity<DapStore> {
         self.dap_store.clone()
@@ -2354,6 +2388,12 @@ impl Project {
     pub fn project_group_key(&self, cx: &App) -> ProjectGroupKey {
         let roots = self
             .visible_worktrees(cx)
+            .filter(|worktree| {
+                let worktree = worktree.read(cx);
+                // Remote worktrees that haven't received their first update
+                // don't have enough data to contribute to the group key yet.
+                !worktree.is_remote() || worktree.root_entry().is_some()
+            })
             .map(|worktree| {
                 let snapshot = worktree.read(cx).snapshot();
                 snapshot

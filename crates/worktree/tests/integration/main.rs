@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use postage::stream::Stream;
 use pretty_assertions::assert_eq;
 use rand::prelude::*;
-use rpc::{AnyProtoClient, ProtoClient, proto};
+use rpc::{AnyProtoClient, NoopProtoClient, proto};
 use worktree::{Entry, EntryKind, Event, PathChange, Worktree, WorktreeModelHandle};
 
 use serde_json::json;
@@ -29,43 +29,6 @@ use util::{
     rel_path::{RelPath, rel_path},
     test::TempTree,
 };
-
-struct NoopProtoClient {
-    handler_set: parking_lot::Mutex<rpc::ProtoMessageHandlerSet>,
-}
-
-impl NoopProtoClient {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            handler_set: parking_lot::Mutex::new(rpc::ProtoMessageHandlerSet::default()),
-        })
-    }
-}
-
-impl ProtoClient for NoopProtoClient {
-    fn request(
-        &self,
-        _: proto::Envelope,
-        _: &'static str,
-    ) -> futures::future::BoxFuture<'static, Result<proto::Envelope>> {
-        unimplemented!()
-    }
-    fn send(&self, _: proto::Envelope, _: &'static str) -> Result<()> {
-        Ok(())
-    }
-    fn send_response(&self, _: proto::Envelope, _: &'static str) -> Result<()> {
-        Ok(())
-    }
-    fn message_handler_set(&self) -> &parking_lot::Mutex<rpc::ProtoMessageHandlerSet> {
-        &self.handler_set
-    }
-    fn is_via_collab(&self) -> bool {
-        false
-    }
-    fn has_wsl_interop(&self) -> bool {
-        false
-    }
-}
 
 #[gpui::test]
 async fn test_traversal(cx: &mut TestAppContext) {
@@ -3565,7 +3528,10 @@ async fn test_remote_worktree_with_git_emits_root_repo_event_when_repo_info_arri
         "UpdatedRootRepoCommonDir should fire when repo info arrives (None -> Some)"
     );
     assert_eq!(
-        fired.iter().filter(|e| **e == "UpdatedRootRepoCommonDir").count(),
+        fired
+            .iter()
+            .filter(|e| **e == "UpdatedRootRepoCommonDir")
+            .count(),
         1,
         "should fire exactly once, not duplicate"
     );

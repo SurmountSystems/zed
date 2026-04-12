@@ -6460,7 +6460,6 @@ mod tests {
                 // Check the newest workspace's panel for the correct agent.
                 let new_workspace = multi_workspace
                     .workspaces()
-                    .into_iter()
                     .find(|ws| ws.entity_id() != workspace.entity_id())
                     .expect("should find the new workspace");
                 let new_panel = new_workspace
