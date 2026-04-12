@@ -23,7 +23,7 @@ use workspace::{ModalView, MultiWorkspace, Workspace};
 use crate::{
     Agent, AgentPanel,
     agent_connection_store::AgentConnectionStore,
-    thread_metadata_store::{ThreadMetadata, ThreadMetadataStore, ThreadWorktreePaths},
+    thread_metadata_store::{ThreadId, ThreadMetadata, ThreadMetadataStore, ThreadWorktreePaths},
 };
 
 pub struct AcpThreadImportOnboarding;
@@ -206,10 +206,11 @@ impl ThreadImportModal {
             .filter(|agent_id| !self.unchecked_agents.contains(agent_id))
             .collect::<Vec<_>>();
 
-        let existing_sessions = ThreadMetadataStore::global(cx)
+        let existing_sessions: HashSet<acp::SessionId> = ThreadMetadataStore::global(cx)
             .read(cx)
-            .entry_ids()
-            .collect::<HashSet<_>>();
+            .entries()
+            .filter_map(|m| m.session_id.clone())
+            .collect();
 
         let task = find_threads_to_import(agent_ids, existing_sessions, stores, cx);
         cx.spawn(async move |this, cx| {
@@ -520,7 +521,8 @@ fn collect_importable_threads(
                 continue;
             };
             to_insert.push(ThreadMetadata {
-                session_id: session.session_id,
+                thread_id: ThreadId::new(),
+                session_id: Some(session.session_id),
                 agent_id: agent_id.clone(),
                 title: session
                     .title
@@ -584,7 +586,7 @@ mod tests {
         let result = collect_importable_threads(sessions_by_agent, existing);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].session_id.0.as_ref(), "new-1");
+        assert_eq!(result[0].session_id.as_ref().unwrap().0.as_ref(), "new-1");
         assert_eq!(result[0].title.as_ref(), "Brand New");
     }
 
@@ -605,7 +607,10 @@ mod tests {
         let result = collect_importable_threads(sessions_by_agent, existing);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].session_id.0.as_ref(), "has-dirs");
+        assert_eq!(
+            result[0].session_id.as_ref().unwrap().0.as_ref(),
+            "has-dirs"
+        );
     }
 
     #[test]
@@ -657,11 +662,11 @@ mod tests {
         assert_eq!(result.len(), 2);
         let s1 = result
             .iter()
-            .find(|t| t.session_id.0.as_ref() == "s1")
+            .find(|t| t.session_id.as_ref().map(|s| s.0.as_ref()) == Some("s1"))
             .unwrap();
         let s2 = result
             .iter()
-            .find(|t| t.session_id.0.as_ref() == "s2")
+            .find(|t| t.session_id.as_ref().map(|s| s.0.as_ref()) == Some("s2"))
             .unwrap();
         assert_eq!(s1.agent_id.as_ref(), "agent-a");
         assert_eq!(s2.agent_id.as_ref(), "agent-b");
@@ -700,7 +705,10 @@ mod tests {
         let result = collect_importable_threads(sessions_by_agent, existing);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].session_id.0.as_ref(), "shared-session");
+        assert_eq!(
+            result[0].session_id.as_ref().unwrap().0.as_ref(),
+            "shared-session"
+        );
         assert_eq!(
             result[0].agent_id.as_ref(),
             "agent-a",

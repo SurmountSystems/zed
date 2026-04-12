@@ -68,6 +68,7 @@ use crate::agent_configuration::{ConfigureContextServerModal, ManageProfilesModa
 pub use crate::agent_panel::{AgentPanel, AgentPanelEvent, DraftId, WorktreeCreationStatus};
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
+pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::ConversationView;
 pub use external_source_prompt::ExternalSourcePrompt;

@@ -128,3 +128,12 @@ pub fn active_session_id(panel: &Entity<AgentPanel>, cx: &VisualTestContext) -> 
         thread.read(cx).session_id().clone()
     })
 }
+
+pub fn active_thread_id(
+    panel: &Entity<AgentPanel>,
+    cx: &VisualTestContext,
+) -> crate::thread_metadata_store::ThreadId {
+    panel.read_with(cx, |panel, cx| {
+        panel.active_thread_view(cx).unwrap().read(cx).id
+    })
+}
