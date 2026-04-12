@@ -46,7 +46,7 @@ use util::ResultExt as _;
 use util::path_list::PathList;
 use workspace::{
     AddFolderToProject, CloseWindow, FocusWorkspaceSidebar, MultiWorkspace, MultiWorkspaceEvent,
-    NextProject, NextThread, Open, PreviousProject, PreviousThread, SerializedProjectGroupKey,
+    NextProject, NextThread, Open, PreviousProject, PreviousThread, SerializedProjectGroup,
     ShowFewerThreads, ShowMoreThreads, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
     ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
 };
@@ -96,9 +96,9 @@ struct SerializedSidebar {
     #[serde(default)]
     width: Option<f32>,
     #[serde(default)]
-    collapsed_groups: Vec<SerializedProjectGroupKey>,
+    collapsed_groups: Vec<SerializedProjectGroup>,
     #[serde(default)]
-    expanded_groups: Vec<(SerializedProjectGroupKey, usize)>,
+    expanded_groups: Vec<(SerializedProjectGroup, usize)>,
     #[serde(default)]
     active_view: SerializedSidebarView,
 }
@@ -285,8 +285,7 @@ impl ListEntry {
             ListEntry::DraftThread { workspace, .. } => workspace.iter().cloned().collect(),
             ListEntry::ProjectHeader { key, .. } => multi_workspace
                 .workspaces_for_project_group(key, cx)
-                .cloned()
-                .collect(),
+                .unwrap_or_default(),
             ListEntry::ViewMore { .. } => Vec::new(),
         }
     }
@@ -505,34 +504,6 @@ impl Sidebar {
                     this.update_entries(cx);
                 }
                 MultiWorkspaceEvent::WorkspaceRemoved(_) => {
-                    this.update_entries(cx);
-                }
-                MultiWorkspaceEvent::WorktreePathAdded {
-                    old_main_paths,
-                    added_path,
-                } => {
-                    let added_path = added_path.clone();
-                    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                        store.change_worktree_paths(
-                            old_main_paths,
-                            |paths| paths.add_path(&added_path, &added_path),
-                            cx,
-                        );
-                    });
-                    this.update_entries(cx);
-                }
-                MultiWorkspaceEvent::WorktreePathRemoved {
-                    old_main_paths,
-                    removed_path,
-                } => {
-                    let removed_path = removed_path.clone();
-                    ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                        store.change_worktree_paths(
-                            old_main_paths,
-                            |paths| paths.remove_main_path(&removed_path),
-                            cx,
-                        );
-                    });
                     this.update_entries(cx);
                 }
             },
@@ -900,7 +871,8 @@ impl Sidebar {
             .iter()
             .filter_map(|entry| match entry {
                 ListEntry::Thread(thread) if thread.is_live => {
-                    Some((thread.metadata.session_id.clone(), thread.status))
+                    let sid = thread.metadata.session_id.clone();
+                    Some((sid, thread.status))
                 }
                 _ => None,
             })
@@ -927,11 +899,11 @@ impl Sidebar {
             (icon, icon_from_external_svg)
         };
 
-        let groups: Vec<_> = mw.project_groups(cx).collect();
+        let groups = mw.project_groups(cx);
 
         let mut all_paths: Vec<PathBuf> = groups
             .iter()
-            .flat_map(|(key, _)| key.path_list().paths().iter().cloned())
+            .flat_map(|group| group.key.path_list().paths().iter().cloned())
             .collect();
         all_paths.sort();
         all_paths.dedup();
@@ -942,14 +914,16 @@ impl Sidebar {
         let path_detail_map: HashMap<PathBuf, usize> =
             all_paths.into_iter().zip(path_details).collect();
 
-        for (group_key, group_workspaces) in &groups {
+        for group in &groups {
+            let group_key = &group.key;
+            let group_workspaces = &group.workspaces;
             if group_key.path_list().paths().is_empty() {
                 continue;
             }
 
             let label = group_key.display_name(&path_detail_map);
 
-            let is_collapsed = self.collapsed_groups.contains(&group_key);
+            let is_collapsed = self.collapsed_groups.contains(group_key);
             let should_load_threads = !is_collapsed || !query.is_empty();
 
             let is_active = active_workspace
@@ -1093,12 +1067,12 @@ impl Sidebar {
                 // Merge live info into threads and update notification state
                 // in a single pass.
                 for thread in &mut threads {
-                    if let Some(info) = live_info_by_session.get(&thread.metadata.session_id) {
+                    let sid = &thread.metadata.session_id;
+                    if let Some(info) = live_info_by_session.get(sid) {
                         thread.apply_active_info(info);
                     }
 
                     let session_id = &thread.metadata.session_id;
-
                     let is_active_thread = self.active_entry.as_ref().is_some_and(|entry| {
                         entry.is_active_thread(session_id)
                             && active_workspace
@@ -1801,7 +1775,7 @@ impl Sidebar {
                                     multi_workspace
                                         .update(cx, |multi_workspace, cx| {
                                             multi_workspace.prompt_to_add_folders_to_project_group(
-                                                &project_group_key,
+                                                project_group_key.clone(),
                                                 window,
                                                 cx,
                                             );
@@ -3594,7 +3568,7 @@ impl Sidebar {
 
         let window_project_groups: Vec<ProjectGroupKey> = multi_workspace
             .as_ref()
-            .map(|mw| mw.read(cx).project_group_keys().cloned().collect())
+            .map(|mw| mw.read(cx).project_group_keys())
             .unwrap_or_default();
 
         let popover_handle = self.recent_projects_popover_handle.clone();
@@ -4681,13 +4655,17 @@ impl WorkspaceSidebar for Sidebar {
             collapsed_groups: self
                 .collapsed_groups
                 .iter()
-                .cloned()
-                .map(SerializedProjectGroupKey::from)
+                .map(|key| SerializedProjectGroup::from_group(key, false, None))
                 .collect(),
             expanded_groups: self
                 .expanded_groups
                 .iter()
-                .map(|(key, count)| (SerializedProjectGroupKey::from(key.clone()), *count))
+                .map(|(key, count)| {
+                    (
+                        SerializedProjectGroup::from_group(key, true, Some(*count)),
+                        *count,
+                    )
+                })
                 .collect(),
             active_view: match self.view {
                 SidebarView::ThreadList => SerializedSidebarView::ThreadList,
@@ -4905,7 +4883,7 @@ pub fn dump_workspace_info(
     writeln!(output, "MultiWorkspace: {} workspace(s)", workspaces.len()).ok();
 
     if let Some(mw) = &multi_workspace {
-        let keys: Vec<_> = mw.read(cx).project_group_keys().cloned().collect();
+        let keys: Vec<_> = mw.read(cx).project_group_keys();
         writeln!(output, "Project group keys ({}):", keys.len()).ok();
         for key in keys {
             writeln!(output, "  - {key:?}").ok();
