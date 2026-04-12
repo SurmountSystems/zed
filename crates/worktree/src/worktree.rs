@@ -165,6 +165,7 @@ pub struct RemoteWorktree {
     replica_id: ReplicaId,
     visible: bool,
     disconnected: bool,
+    received_initial_update: bool,
 }
 
 #[derive(Clone)]
@@ -550,6 +551,7 @@ impl Worktree {
                 snapshot_subscriptions: Default::default(),
                 visible: worktree.visible,
                 disconnected: false,
+                received_initial_update: false,
             };
 
             // Apply updates to a separate snapshot in a background task, then
@@ -592,7 +594,12 @@ impl Worktree {
                         if entries_changed {
                             cx.emit(Event::UpdatedEntries(Arc::default()));
                         }
-                        if this.snapshot.root_repo_common_dir != old_root_repo_common_dir {
+                        let is_first_update = !this.received_initial_update;
+                        this.received_initial_update = true;
+                        if this.snapshot.root_repo_common_dir != old_root_repo_common_dir
+                            || (is_first_update
+                                && this.snapshot.root_repo_common_dir.is_none())
+                        {
                             cx.emit(Event::UpdatedRootRepoCommonDir);
                         }
                         cx.notify();
