@@ -344,6 +344,7 @@ pub struct Repository {
     initial_graph_data: HashMap<(LogSource, LogOrder), InitialGitGraphData>,
     graph_commit_data_handler: GraphCommitHandlerState,
     commit_data: HashMap<Oid, CommitDataState>,
+    _worker_task: Task<()>,
 }
 
 impl std::ops::Deref for Repository {
@@ -4136,7 +4137,8 @@ impl Repository {
                 .map_err(|err| err.to_string())
             })
             .shared();
-        let (job_sender, job_queue) = Repository::spawn_local_git_worker(state.clone(), cx);
+        let (job_sender, job_queue, worker_task) =
+            Repository::spawn_local_git_worker(state.clone(), cx);
         let state = cx
             .spawn(async move |_, _| {
                 let state = state.await?;
@@ -4171,6 +4173,7 @@ impl Repository {
             latest_askpass_id: 0,
             job_sender,
             job_queue,
+            _worker_task: worker_task,
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             graph_commit_data_handler: GraphCommitHandlerState::Closed,
@@ -4194,7 +4197,8 @@ impl Repository {
             path_style,
         );
         let repository_state = RemoteRepositoryState { project_id, client };
-        let (job_sender, job_queue) = Self::spawn_remote_git_worker(repository_state.clone(), cx);
+        let (job_sender, job_queue, worker_task) =
+            Self::spawn_remote_git_worker(repository_state.clone(), cx);
         let repository_state = Task::ready(Ok(RepositoryState::Remote(repository_state))).shared();
         Self {
             snapshot,
@@ -4207,6 +4211,7 @@ impl Repository {
             askpass_delegates: Default::default(),
             latest_askpass_id: 0,
             job_queue,
+            _worker_task: worker_task,
             initial_graph_data: Default::default(),
             commit_data: Default::default(),
             graph_commit_data_handler: GraphCommitHandlerState::Closed,
@@ -6810,7 +6815,11 @@ impl Repository {
     fn spawn_local_git_worker(
         state: Shared<Task<Result<LocalRepositoryState, String>>>,
         cx: &mut Context<Self>,
-    ) -> (mpsc::UnboundedSender<GitJob>, WeakEntity<GitJobQueue>) {
+    ) -> (
+        mpsc::UnboundedSender<GitJob>,
+        WeakEntity<GitJobQueue>,
+        Task<()>,
+    ) {
         let (job_tx, mut job_rx) = mpsc::unbounded::<GitJob>();
         let job_queue = cx.new(|_| GitJobQueue {
             jobs: VecDeque::new(),
@@ -6818,8 +6827,10 @@ impl Repository {
         });
         let weak_queue = job_queue.downgrade();
 
-        cx.spawn(async move |_, cx| {
-            let state = state.await.map_err(|err| anyhow::anyhow!(err))?;
+        let task = cx.spawn(async move |_, cx| {
+            let Some(state) = state.await.log_err() else {
+                return;
+            };
             if let Some(git_hosting_provider_registry) =
                 cx.update(|cx| GitHostingProviderRegistry::try_global(cx))
             {
@@ -6855,17 +6866,19 @@ impl Repository {
                     break;
                 }
             }
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
 
-        (job_tx, weak_queue)
+        (job_tx, weak_queue, task)
     }
 
     fn spawn_remote_git_worker(
         state: RemoteRepositoryState,
         cx: &mut Context<Self>,
-    ) -> (mpsc::UnboundedSender<GitJob>, WeakEntity<GitJobQueue>) {
+    ) -> (
+        mpsc::UnboundedSender<GitJob>,
+        WeakEntity<GitJobQueue>,
+        Task<()>,
+    ) {
         let (job_tx, mut job_rx) = mpsc::unbounded::<GitJob>();
         let job_queue = cx.new(|_| GitJobQueue {
             jobs: VecDeque::new(),
@@ -6873,7 +6886,7 @@ impl Repository {
         });
         let weak_queue = job_queue.downgrade();
 
-        cx.spawn(async move |_, cx| {
+        let task = cx.spawn(async move |_, cx| {
             let state = RepositoryState::Remote(state);
             loop {
                 job_queue.update(cx, |queue, cx| {
@@ -6900,11 +6913,9 @@ impl Repository {
                     break;
                 }
             }
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        });
 
-        (job_tx, weak_queue)
+        (job_tx, weak_queue, task)
     }
 
     fn load_staged_text(
