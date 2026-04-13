@@ -5,7 +5,6 @@ use gpui::{App, IntoElement, Rems, RenderOnce, Size, Styled, Window, svg};
 use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoStaticStr};
 
-use crate::Color;
 use crate::prelude::*;
 use crate::traits::transformable::Transformable;
 
@@ -17,11 +16,11 @@ pub enum VectorName {
     AcpGrid,
     AcpLogo,
     AcpLogoSerif,
-    AiGrid,
-    DebuggerGrid,
+    BusinessStamp,
     Grid,
     ProTrialStamp,
     ProUserStamp,
+    StudentStamp,
     ZedLogo,
     ZedXCopilot,
 }
