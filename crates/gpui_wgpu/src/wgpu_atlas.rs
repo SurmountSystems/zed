@@ -112,7 +112,7 @@ impl PlatformAtlas for WgpuAtlas {
             let tile = lock
                 .allocate(size, key.texture_kind())
                 .context("failed to allocate")?;
-            lock.upload_texture(tile.texture_id, tile.bounds, &bytes);
+            lock.upload_texture(tile.texture_id, tile.bounds, bytes);
             lock.tiles_by_key.insert(key.clone(), tile.clone());
             Ok(Some(tile))
         }
@@ -236,15 +236,17 @@ impl WgpuAtlasState {
         }
     }
 
-    fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
-        let data = self
-            .storage
-            .get(id)
-            .map(|texture| swizzle_upload_data(bytes, texture.format))
-            .unwrap_or_else(|| bytes.to_vec());
-
-        self.pending_uploads
-            .push(PendingUpload { id, bounds, data });
+    fn upload_texture(
+        &mut self,
+        id: AtlasTextureId,
+        bounds: Bounds<DevicePixels>,
+        bytes: Cow<'_, [u8]>,
+    ) {
+        if let Some(texture) = self.storage.get(id) {
+            let data = swizzle_upload_data(bytes, texture.format);
+            self.pending_uploads
+                .push(PendingUpload { id, bounds, data });
+        }
     }
 
     fn flush_uploads(&mut self) {
@@ -374,16 +376,21 @@ impl WgpuAtlasTexture {
     }
 }
 
-fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
+fn swizzle_upload_data(bytes: Cow<'_, [u8]>, format: wgpu::TextureFormat) -> Vec<u8> {
     match format {
         wgpu::TextureFormat::Rgba8Unorm => {
-            let mut data = bytes.to_vec();
+            debug_assert_eq!(
+                bytes.len() % 4,
+                0,
+                "upload data must be a multiple of 4 bytes"
+            );
+            let mut data = bytes.into_owned();
             for pixel in data.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
             }
             data
         }
-        _ => bytes.to_vec(),
+        _ => bytes.into_owned(),
     }
 }
 
@@ -456,7 +463,7 @@ mod tests {
     fn swizzle_upload_data_preserves_bgra_uploads() {
         let input = vec![0x10, 0x20, 0x30, 0x40];
         assert_eq!(
-            swizzle_upload_data(&input, wgpu::TextureFormat::Bgra8Unorm),
+            swizzle_upload_data(Cow::Borrowed(&input), wgpu::TextureFormat::Bgra8Unorm),
             input
         );
     }
@@ -465,7 +472,7 @@ mod tests {
     fn swizzle_upload_data_converts_bgra_to_rgba() {
         let input = vec![0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0xDD];
         assert_eq!(
-            swizzle_upload_data(&input, wgpu::TextureFormat::Rgba8Unorm),
+            swizzle_upload_data(Cow::Borrowed(&input), wgpu::TextureFormat::Rgba8Unorm),
             vec![0x30, 0x20, 0x10, 0x40, 0xCC, 0xBB, 0xAA, 0xDD]
         );
     }
