@@ -105,7 +105,8 @@ impl WgpuContext {
         );
 
         let device_lost = Arc::new(AtomicBool::new(false));
-        let (device, queue, dual_source_blending) = Self::create_device(&adapter).await?;
+        let (device, queue, dual_source_blending, color_texture_format) =
+            Self::create_device(&adapter).await?;
 
         Ok(Self {
             instance,
@@ -113,6 +114,7 @@ impl WgpuContext {
             device: Arc::new(device),
             queue: Arc::new(queue),
             dual_source_blending,
+            color_texture_format,
             device_lost,
         })
     }
