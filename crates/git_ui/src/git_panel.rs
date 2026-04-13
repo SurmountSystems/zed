@@ -3,7 +3,7 @@ use crate::commit_modal::CommitModal;
 use crate::commit_tooltip::CommitTooltip;
 use crate::commit_view::CommitView;
 use crate::git_panel_settings::GitPanelScrollbarAccessor;
-use crate::project_diff::{self, Diff, ProjectDiff};
+use crate::project_diff::{self, BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::{branch_picker, picker_prompt, render_remote_button};
 use crate::{
@@ -4704,25 +4704,42 @@ impl GitPanel {
         let children = match (self.git_access, &self.active_repository) {
             (GitAccess::No, Some(repository)) => self.render_unsafe_repo_ui(repository, cx),
             (_, None) => self.render_uninitialized_ui(cx),
-            (_, Some(_)) => self.render_no_changes_ui(),
+            (_, Some(_)) => self.render_no_changes_ui(cx),
         };
 
-        h_flex().h_full().flex_grow().justify_center().child(
-            v_flex()
-                .gap_2()
-                .max_w_full()
-                .px_4()
-                .text_ui_sm(cx)
-                .whitespace_normal()
-                .text_center()
-                .mx_auto()
-                .text_color(Color::Placeholder.color(cx))
-                .children(children),
-        )
+        v_flex()
+            .gap_1p5()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .text_color(Color::Placeholder.color(cx))
+            .children(children)
     }
 
-    fn render_no_changes_ui(&self) -> Vec<AnyElement> {
-        vec!["No changes to commit".into_any_element()]
+    fn render_no_changes_ui(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let mut elements: Vec<AnyElement> = vec!["No changes to commit".into_any_element()];
+
+        if self.changes_count == 0 && !self.is_on_main_branch(cx) {
+            elements.push(
+                panel_filled_button("View Branch Diff")
+                    .tooltip(move |_, cx| {
+                        Tooltip::with_meta(
+                            "Branch Diff",
+                            Some(&BranchDiff),
+                            "Show diff between working directory and default branch",
+                            cx,
+                        )
+                    })
+                    .on_click(move |_, _, cx| {
+                        cx.defer(move |cx| {
+                            cx.dispatch_action(&BranchDiff);
+                        })
+                    })
+                    .into_any_element(),
+            );
+        }
+
+        elements
     }
 
     fn render_unsafe_repo_ui(
@@ -4742,7 +4759,12 @@ impl GitPanel {
         );
 
         vec![
-            message.into_any_element(),
+            div()
+                .self_stretch()
+                .px_4()
+                .text_center()
+                .child(Label::new(message).color(Color::Muted))
+                .into_any_element(),
             self.render_unsafe_repo_buttons(directory, cx)
                 .into_any_element(),
         ]
@@ -4794,6 +4816,19 @@ impl GitPanel {
         } else {
             vec![]
         }
+    }
+
+    fn is_on_main_branch(&self, cx: &Context<Self>) -> bool {
+        let Some(repo) = self.active_repository.as_ref() else {
+            return false;
+        };
+
+        let Some(branch) = repo.read(cx).branch.as_ref() else {
+            return false;
+        };
+
+        let branch_name = branch.name();
+        matches!(branch_name, "main" | "master")
     }
 
     fn render_buffer_header_controls(
