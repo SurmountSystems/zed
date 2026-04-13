@@ -1071,7 +1071,7 @@ impl NativeAgent {
 
                         acp_thread.update(cx, |acp_thread, cx| {
                             acp_thread.push_user_content_block_with_indent(
-                                id.clone(),
+                                Some(id.clone()),
                                 block.clone(),
                                 true,
                                 cx,
@@ -1186,7 +1186,7 @@ impl NativeAgentConnection {
                                 acp_thread.update(cx, |thread, cx| {
                                     for content in message.content {
                                         thread.push_user_content_block(
-                                            message.id.clone(),
+                                            Some(message.id.clone()),
                                             content.into(),
                                             cx,
                                         );

@@ -1414,7 +1414,7 @@ impl AcpThread {
                     .and_then(|entry| entry.user_message())
                     .is_some_and(|message| message.chunks.contains(&content));
                 if !already_in_user_message {
-                    self.push_user_content_block(UserMessageId::new(), content, cx);
+                    self.push_user_content_block(None, content, cx);
                 }
             }
             acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
@@ -1466,7 +1466,7 @@ impl AcpThread {
 
     pub fn push_user_content_block(
         &mut self,
-        message_id: UserMessageId,
+        message_id: Option<UserMessageId>,
         chunk: acp::ContentBlock,
         cx: &mut Context<Self>,
     ) {
@@ -1475,7 +1475,7 @@ impl AcpThread {
 
     pub fn push_user_content_block_with_indent(
         &mut self,
-        message_id: UserMessageId,
+        message_id: Option<UserMessageId>,
         chunk: acp::ContentBlock,
         indented: bool,
         cx: &mut Context<Self>,
@@ -1495,7 +1495,9 @@ impl AcpThread {
             && *existing_indented == indented
         {
             Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
-            *id = message_id;
+            if let Some(new_id) = message_id {
+                *id = new_id;
+            }
             content.append(chunk.clone(), &language_registry, path_style, cx);
             chunks.push(chunk);
             let idx = entries_len - 1;
@@ -1504,7 +1506,7 @@ impl AcpThread {
             let content = ContentBlock::new(chunk.clone(), &language_registry, path_style, cx);
             self.push_entry(
                 AgentThreadEntry::UserMessage(UserMessage {
-                    id: message_id,
+                    id: message_id.unwrap_or_else(UserMessageId::new),
                     content,
                     chunks: vec![chunk],
                     checkpoint: None,
@@ -3337,7 +3339,7 @@ mod tests {
 
         // Test creating a new user message
         thread.update(cx, |thread, cx| {
-            thread.push_user_content_block(UserMessageId::new(), "Hello, ".into(), cx);
+            thread.push_user_content_block(None, "Hello, ".into(), cx);
         });
 
         thread.update(cx, |thread, cx| {
@@ -3352,7 +3354,7 @@ mod tests {
         // Test appending to existing user message
         let message_1_id = UserMessageId::new();
         thread.update(cx, |thread, cx| {
-            thread.push_user_content_block(message_1_id.clone(), "world!".into(), cx);
+            thread.push_user_content_block(Some(message_1_id.clone()), "world!".into(), cx);
         });
 
         thread.update(cx, |thread, cx| {
@@ -3372,7 +3374,11 @@ mod tests {
 
         let message_2_id = UserMessageId::new();
         thread.update(cx, |thread, cx| {
-            thread.push_user_content_block(message_2_id.clone(), "New user message".into(), cx);
+            thread.push_user_content_block(
+                Some(message_2_id.clone()),
+                "New user message".into(),
+                cx,
+            );
         });
 
         thread.update(cx, |thread, cx| {
