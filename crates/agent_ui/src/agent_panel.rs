@@ -2241,7 +2241,6 @@ impl AgentPanel {
             })
             .collect();
         for id in draft_ids {
-            dbg!(&id);
             self.retained_threads.remove(&id);
             ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                 store.delete(id, cx);
