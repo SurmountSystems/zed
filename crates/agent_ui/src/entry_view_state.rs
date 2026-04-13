@@ -72,7 +72,6 @@ impl EntryViewState {
 
         match thread_entry {
             AgentThreadEntry::UserMessage(message) => {
-                let has_id = message.id.is_some();
                 let is_subagent = thread.read(cx).parent_session_id().is_some();
                 let chunks = message.chunks.clone();
                 if let Some(Entry::UserMessage(editor)) = self.entries.get_mut(index) {
@@ -101,7 +100,7 @@ impl EntryViewState {
                             window,
                             cx,
                         );
-                        if !has_id || is_subagent {
+                        if is_subagent {
                             editor.set_read_only(true, cx);
                         }
                         editor.set_message(chunks, window, cx);

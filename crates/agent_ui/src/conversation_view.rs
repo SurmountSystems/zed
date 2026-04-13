@@ -1972,12 +1972,7 @@ impl ConversationView {
                 .read(cx)
                 .entries()
                 .iter()
-                .any(|entry| {
-                    matches!(
-                        entry,
-                        AgentThreadEntry::UserMessage(user_message) if user_message.id.is_some()
-                    )
-                })
+                .any(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
         })
     }
 
@@ -4899,7 +4894,7 @@ pub(crate) mod tests {
             let AgentThreadEntry::UserMessage(user_message) = &thread.entries()[2] else {
                 panic!();
             };
-            user_message.id.clone().unwrap()
+            user_message.id.clone()
         });
 
         conversation_view.read_with(cx, |view, cx| {

@@ -2166,7 +2166,7 @@ mod tests {
         // Pushing content makes entries non-empty, so the event handler
         // should now update metadata with the real session_id.
         thread.update_in(&mut vcx, |thread, _window, cx| {
-            thread.push_user_content_block(None, "Hello".into(), cx);
+            thread.push_user_content_block(acp_thread::UserMessageId::new(), "Hello".into(), cx);
         });
         vcx.run_until_parked();
 
@@ -2195,7 +2195,7 @@ mod tests {
         let thread = panel.read_with(&vcx, |panel, cx| panel.active_agent_thread(cx).unwrap());
 
         thread.update_in(&mut vcx, |thread, _window, cx| {
-            thread.push_user_content_block(None, "Hello".into(), cx);
+            thread.push_user_content_block(acp_thread::UserMessageId::new(), "Hello".into(), cx);
         });
         vcx.run_until_parked();
 
@@ -2238,7 +2238,7 @@ mod tests {
             panel.active_agent_thread(cx).unwrap()
         });
         thread_no_wt.update_in(&mut vcx_no_wt, |thread, _window, cx| {
-            thread.push_user_content_block(None, "content".into(), cx);
+            thread.push_user_content_block(acp_thread::UserMessageId::new(), "content".into(), cx);
             thread.set_title("No Project Thread".into(), cx).detach();
         });
         vcx_no_wt.run_until_parked();
@@ -2255,7 +2255,7 @@ mod tests {
         let thread_wt =
             panel_wt.read_with(&vcx_wt, |panel, cx| panel.active_agent_thread(cx).unwrap());
         thread_wt.update_in(&mut vcx_wt, |thread, _window, cx| {
-            thread.push_user_content_block(None, "content".into(), cx);
+            thread.push_user_content_block(acp_thread::UserMessageId::new(), "content".into(), cx);
             thread.set_title("Project Thread".into(), cx).detach();
         });
         vcx_wt.run_until_parked();
@@ -2305,7 +2305,7 @@ mod tests {
         let regular_session_id = regular_thread.read_with(&vcx, |t, _| t.session_id().clone());
 
         regular_thread.update_in(&mut vcx, |thread, _window, cx| {
-            thread.push_user_content_block(None, "content".into(), cx);
+            thread.push_user_content_block(acp_thread::UserMessageId::new(), "content".into(), cx);
             thread.set_title("Regular Thread".into(), cx).detach();
         });
         vcx.run_until_parked();
