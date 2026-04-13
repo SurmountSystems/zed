@@ -1453,24 +1453,22 @@ impl AgentPanel {
     }
 
     pub fn draft_thread_ids(&self, cx: &App) -> Vec<ThreadId> {
-        let is_draft = |cv: &Entity<ConversationView>| -> bool {
-            let cv = cv.read(cx);
-            match cv.root_thread(cx) {
-                Some(tv) => tv.read(cx).is_draft(cx),
-                None => false,
-            }
+        let is_draft = |thread_id: ThreadId| -> bool {
+            ThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(thread_id).map(|s| s.is_draft()))
+                .unwrap_or(false)
         };
 
         let mut ids: Vec<ThreadId> = self
             .retained_threads
             .iter()
-            .filter(|(_, cv)| is_draft(cv))
+            .filter(|(id, _)| is_draft(**id))
             .map(|(id, _)| *id)
             .collect();
 
         if let BaseView::AgentThread { conversation_view } = &self.base_view {
             let thread_id = conversation_view.read(cx).thread_id;
-            if is_draft(conversation_view) && !ids.contains(&thread_id) {
+            if is_draft(thread_id) && !ids.contains(&thread_id) {
                 ids.push(thread_id);
             }
         }
