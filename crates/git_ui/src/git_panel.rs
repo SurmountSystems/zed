@@ -114,9 +114,6 @@ actions!(
         ToggleSortByPath,
         /// Toggles showing entries in tree vs flat view.
         ToggleTreeView,
-        /// Updates git's configuration, adding a directory to the list of safe
-        /// directories.
-        AddSafeDirectory,
         /// Expands the selected entry to show its children.
         ExpandSelectedEntry,
         /// Collapses the selected entry to hide its children.
@@ -3167,12 +3164,7 @@ impl GitPanel {
     /// worktree to the `safe.directory` config, ensuring that, even if the user
     /// that's running the application is not the owner of `.git/`, it can still
     /// read the repository's contents.
-    fn add_safe_directory(
-        &mut self,
-        _: &AddSafeDirectory,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn add_safe_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active_repository) = &self.active_repository else {
             return;
         };
@@ -4743,18 +4735,20 @@ impl GitPanel {
         });
 
         let message = format!(
-            "Detected dubious ownership in repository at {}. This happens when the .git/ directory is not owned by the current user. If you want to learn more about safe directories, visit git's documentation.",
+            "Detected dubious ownership in repository at {}. \
+            This happens when the .git/ directory is not owned by the current user. \
+            If you want to learn more about safe directories, visit git's documentation.",
             directory.display()
         );
 
         vec![
             message.into_any_element(),
-            self.render_unsafe_repo_buttons(directory)
+            self.render_unsafe_repo_buttons(directory, cx)
                 .into_any_element(),
         ]
     }
 
-    fn render_unsafe_repo_buttons(&self, directory: Arc<Path>) -> Div {
+    fn render_unsafe_repo_buttons(&self, directory: Arc<Path>, cx: &mut Context<Self>) -> Div {
         h_flex()
             .max_w_full()
             .gap_2()
@@ -4762,16 +4756,14 @@ impl GitPanel {
             .child(
                 panel_filled_button("Trust Directory")
                 .end_icon(Icon::new(IconName::Check).size(IconSize::Small))
-                .tooltip(Tooltip::for_action_title_in(
-                    format!("git config --global --add safe.directory {}", directory.display()),
-                    &AddSafeDirectory,
-                    &self.focus_handle,
+                .tooltip(Tooltip::text(
+                    format!("git config --global --add safe.directory {}", directory.display())
                 ))
-                .on_click(move |_, _, cx| {
-                    cx.defer(move |cx| {
-                        cx.dispatch_action(&AddSafeDirectory);
+                .on_click(
+                    cx.listener(|this, _, window, cx| {
+                        this.add_safe_directory(window, cx);
                     })
-                })
+                )
         )
         .child(
             panel_filled_button("Learn More")
@@ -5805,7 +5797,6 @@ impl Render for GitPanel {
             })
             .on_action(cx.listener(Self::toggle_sort_by_path))
             .on_action(cx.listener(Self::toggle_tree_view))
-            .on_action(cx.listener(Self::add_safe_directory))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
