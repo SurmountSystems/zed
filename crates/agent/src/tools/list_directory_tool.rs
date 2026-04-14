@@ -7,11 +7,11 @@ use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::ToolKind;
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{App, Entity, SharedString, Task};
+use parking_lot::Mutex;
 use project::{Project, ProjectPath, WorktreeSettings};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
-use parking_lot::Mutex;
 use std::fmt::Write;
 use std::sync::Arc;
 use util::markdown::MarkdownInlineCode;
@@ -49,7 +49,9 @@ pub struct ListDirectoryTool {
 
 impl ListDirectoryTool {
     pub fn new(project: Entity<Project>) -> Self {
-        Self { project: Mutex::new(project) }
+        Self {
+            project: Mutex::new(project),
+        }
     }
 
     fn build_directory_output(
@@ -134,8 +136,8 @@ impl AgentTool for ListDirectoryTool {
     }
 
     fn set_project(&self, project: Entity<Project>) {
-            *self.project.lock() = project;
-        }
+        *self.project.lock() = project;
+    }
 
     fn initial_title(
         &self,

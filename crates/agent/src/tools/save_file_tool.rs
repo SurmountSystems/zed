@@ -22,7 +22,6 @@ use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision, decide_permission_for_path,
 };
 
-
 /// Saves files that have unsaved changes.
 ///
 /// Use this tool when you need to edit files but they have unsaved changes that must be saved first.
@@ -39,7 +38,9 @@ pub struct SaveFileTool {
 
 impl SaveFileTool {
     pub fn new(project: Entity<Project>) -> Self {
-        Self { project: Mutex::new(project) }
+        Self {
+            project: Mutex::new(project),
+        }
     }
 }
 

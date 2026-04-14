@@ -22,7 +22,6 @@ use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision, decide_permission_for_path,
 };
 
-
 /// Discards unsaved changes in open buffers by reloading file contents from disk.
 ///
 /// Use this tool when:
@@ -42,7 +41,9 @@ pub struct RestoreFileFromDiskTool {
 
 impl RestoreFileFromDiskTool {
     pub fn new(project: Entity<Project>) -> Self {
-        Self { project: Mutex::new(project) }
+        Self {
+            project: Mutex::new(project),
+        }
     }
 }
 

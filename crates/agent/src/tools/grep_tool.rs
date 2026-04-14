@@ -5,6 +5,7 @@ use anyhow::Result;
 use futures::{FutureExt as _, StreamExt};
 use gpui::{App, Entity, SharedString, Task};
 use language::{OffsetRangeExt, ParseStatus, Point};
+use parking_lot::Mutex;
 use project::{
     Project, SearchResults, WorktreeSettings,
     search::{SearchQuery, SearchResult},
@@ -12,7 +13,6 @@ use project::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
-use parking_lot::Mutex;
 use std::{cmp, fmt::Write, sync::Arc};
 use util::RangeExt;
 use util::markdown::MarkdownInlineCode;
@@ -74,7 +74,9 @@ pub struct GrepTool {
 
 impl GrepTool {
     pub fn new(project: Entity<Project>) -> Self {
-        Self { project: Mutex::new(project) }
+        Self {
+            project: Mutex::new(project),
+        }
     }
 }
 
@@ -89,8 +91,8 @@ impl AgentTool for GrepTool {
     }
 
     fn set_project(&self, project: Entity<Project>) {
-            *self.project.lock() = project;
-        }
+        *self.project.lock() = project;
+    }
 
     fn initial_title(
         &self,

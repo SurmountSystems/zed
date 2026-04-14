@@ -7,10 +7,10 @@ use crate::{AgentTool, ToolInput};
 use agent_client_protocol::ToolKind;
 use futures::FutureExt as _;
 use gpui::{App, AppContext as _, Entity, SharedString, Task};
+use parking_lot::Mutex;
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use parking_lot::Mutex;
 use std::{path::PathBuf, sync::Arc};
 use util::markdown::MarkdownEscaped;
 
@@ -35,7 +35,9 @@ pub struct OpenTool {
 
 impl OpenTool {
     pub fn new(project: Entity<Project>) -> Self {
-        Self { project: Mutex::new(project) }
+        Self {
+            project: Mutex::new(project),
+        }
     }
 }
 
@@ -50,8 +52,8 @@ impl AgentTool for OpenTool {
     }
 
     fn set_project(&self, project: Entity<Project>) {
-            *self.project.lock() = project;
-        }
+        *self.project.lock() = project;
+    }
 
     fn initial_title(
         &self,

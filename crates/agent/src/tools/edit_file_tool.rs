@@ -15,12 +15,12 @@ use indoc::formatdoc;
 use language::language_settings::{self, FormatOnSave};
 use language::{LanguageRegistry, ToPoint};
 use language_model::{CompletionIntent, LanguageModelToolResultContent};
+use parking_lot::Mutex;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{Project, ProjectPath};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use ui::SharedString;
 use util::ResultExt;
@@ -206,8 +206,8 @@ impl AgentTool for EditFileTool {
                             .read(cx)
                             .short_full_path_for_project_path(&project_path, cx)
                     })
-                .unwrap_or(input.path.to_string_lossy().into_owned())
-                .into()
+                    .unwrap_or(input.path.to_string_lossy().into_owned())
+                    .into()
             }
             Err(raw_input) => {
                 if let Some(input) =

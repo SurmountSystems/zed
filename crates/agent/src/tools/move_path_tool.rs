@@ -10,11 +10,11 @@ use agent_client_protocol::ToolKind;
 use agent_settings::AgentSettings;
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
+use parking_lot::Mutex;
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
-use parking_lot::Mutex;
 use std::{path::Path, sync::Arc};
 use util::markdown::MarkdownInlineCode;
 
@@ -54,7 +54,9 @@ pub struct MovePathTool {
 
 impl MovePathTool {
     pub fn new(project: Entity<Project>) -> Self {
-        Self { project: Mutex::new(project) }
+        Self {
+            project: Mutex::new(project),
+        }
     }
 }
 
@@ -69,8 +71,8 @@ impl AgentTool for MovePathTool {
     }
 
     fn set_project(&self, project: Entity<Project>) {
-            *self.project.lock() = project;
-        }
+        *self.project.lock() = project;
+    }
 
     fn initial_title(
         &self,

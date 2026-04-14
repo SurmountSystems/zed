@@ -6,11 +6,11 @@ use agent_client_protocol::ToolKind;
 use agent_settings::AgentSettings;
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
+use parking_lot::Mutex;
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use util::markdown::MarkdownInlineCode;
 

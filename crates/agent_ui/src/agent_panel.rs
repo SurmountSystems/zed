@@ -86,8 +86,8 @@ use ui::{
 use util::{ResultExt as _, debug_panic};
 use workspace::{
     CollaboratorId, DraggedSelection, DraggedTab, MultiWorkspace, MultiWorkspaceEvent, PathList,
-    SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, Workspace,
-    WorkspaceActivationCause, WorkspaceId,
+    SerializedPathList, ToggleWorkspaceSidebar, ToggleZoom, Workspace, WorkspaceActivationCause,
+    WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
@@ -1010,9 +1010,7 @@ impl AgentPanel {
         let language_registry = project.read(cx).languages().clone();
         let client = workspace.client().clone();
         let workspace_id = workspace.database_id();
-        let multi_workspace = workspace
-            .multi_workspace()
-            .and_then(|weak| weak.upgrade());
+        let multi_workspace = workspace.multi_workspace().and_then(|weak| weak.upgrade());
         let workspace = workspace.weak_handle();
 
         let context_server_registry =
@@ -1179,11 +1177,7 @@ impl AgentPanel {
         });
 
         let multi_workspace_subscription = multi_workspace.map(|multi_workspace| {
-            cx.subscribe_in(
-                &multi_workspace,
-                window,
-                Self::handle_multi_workspace_event,
-            )
+            cx.subscribe_in(&multi_workspace, window, Self::handle_multi_workspace_event)
         });
 
         let mut panel = Self {
@@ -2061,7 +2055,10 @@ impl AgentPanel {
         }
     }
 
-    pub fn take_active_conversation_view(&mut self, cx: &mut Context<Self>) -> Option<Entity<ConversationView>> {
+    pub fn take_active_conversation_view(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ConversationView>> {
         let BaseView::AgentThread { conversation_view } =
             std::mem::replace(&mut self.base_view, BaseView::Uninitialized)
         else {
@@ -2471,13 +2468,17 @@ impl AgentPanel {
         let panel_id = cx.entity().entity_id();
         let should_reveal_panel = {
             let workspace = old_workspace.read(cx);
-            [workspace.left_dock(), workspace.bottom_dock(), workspace.right_dock()]
-                .into_iter()
-                .any(|dock| {
-                    dock.read(cx)
-                        .visible_panel()
-                        .is_some_and(|visible_panel| visible_panel.panel_id() == panel_id)
-                })
+            [
+                workspace.left_dock(),
+                workspace.bottom_dock(),
+                workspace.right_dock(),
+            ]
+            .into_iter()
+            .any(|dock| {
+                dock.read(cx)
+                    .visible_panel()
+                    .is_some_and(|visible_panel| visible_panel.panel_id() == panel_id)
+            })
         };
 
         let Some(conversation_view) = self.take_active_conversation_view(cx) else {
@@ -2489,8 +2490,8 @@ impl AgentPanel {
 
         let new_workspace = new_workspace.clone();
         cx.spawn_in(window, async move |_, cx| {
-            let panel = if let Some(panel) = new_workspace
-                .update_in(cx, |workspace, _window, cx| workspace.panel::<Self>(cx))?
+            let panel = if let Some(panel) =
+                new_workspace.update_in(cx, |workspace, _window, cx| workspace.panel::<Self>(cx))?
             {
                 panel
             } else {
@@ -8062,7 +8063,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_worktree_switch_hands_off_conversation_to_destination_panel(cx: &mut TestAppContext) {
+    async fn test_worktree_switch_hands_off_conversation_to_destination_panel(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -8081,7 +8084,9 @@ mod tests {
             cx.add_window(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
 
         let workspace_a = multi_workspace
-            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
             .unwrap();
 
         let workspace_b = multi_workspace
@@ -8136,9 +8141,8 @@ mod tests {
             panel.active_conversation_view().unwrap().entity_id()
         });
 
-        let original_thread_id = panel_a.read_with(cx, |panel, cx| {
-            panel.active_thread_id(cx).unwrap()
-        });
+        let original_thread_id =
+            panel_a.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
 
         // Mutate transient UI state to verify preservation.
         panel_a.update(cx, |panel, cx| {
@@ -8176,7 +8180,8 @@ mod tests {
                 "same ConversationView entity should have been moved, not cloned"
             );
             assert_eq!(
-                conversation_view.read(cx).thread_id, original_thread_id,
+                conversation_view.read(cx).thread_id,
+                original_thread_id,
                 "thread identity should be preserved"
             );
 
@@ -8198,9 +8203,18 @@ mod tests {
             let conversation_view = panel.active_conversation_view().unwrap();
             if let Some(thread_view) = conversation_view.read(cx).active_thread() {
                 let thread_view = thread_view.read(cx);
-                assert!(thread_view.plan_expanded, "plan_expanded should be preserved");
-                assert!(thread_view.edits_expanded, "edits_expanded should be preserved");
-                assert!(!thread_view.queue_expanded, "queue_expanded should be preserved as false");
+                assert!(
+                    thread_view.plan_expanded,
+                    "plan_expanded should be preserved"
+                );
+                assert!(
+                    thread_view.edits_expanded,
+                    "edits_expanded should be preserved"
+                );
+                assert!(
+                    !thread_view.queue_expanded,
+                    "queue_expanded should be preserved as false"
+                );
             }
         });
 
@@ -8219,9 +8233,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_non_worktree_switch_does_not_hand_off_conversation(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_non_worktree_switch_does_not_hand_off_conversation(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -8238,7 +8250,9 @@ mod tests {
             cx.add_window(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
 
         let workspace_a = multi_workspace
-            .read_with(cx, |multi_workspace, _cx| multi_workspace.workspace().clone())
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
             .unwrap();
 
         let workspace_b = multi_workspace

@@ -149,11 +149,12 @@ impl AgentTool for SpawnAgentTool {
                 } else {
                     self.environment.create_subagent(input.label, cx)
                 };
-                let subagent = subagent.map_err(|err: anyhow::Error| SpawnAgentToolOutput::Error {
-                    session_id: None,
-                    error: err.to_string(),
-                    session_info: None,
-                })?;
+                let subagent =
+                    subagent.map_err(|err: anyhow::Error| SpawnAgentToolOutput::Error {
+                        session_id: None,
+                        error: err.to_string(),
+                        session_info: None,
+                    })?;
                 let session_info = SubagentSessionInfo {
                     session_id: subagent.id(),
                     message_start_index: subagent.num_entries(cx),

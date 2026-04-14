@@ -1198,8 +1198,9 @@ impl NativeAgentConnection {
         project: Entity<Project>,
         cx: &mut App,
     ) -> Result<()> {
-        self.0
-            .update(cx, |this, cx| this.rebind_session_to_project(session_id, project, cx))
+        self.0.update(cx, |this, cx| {
+            this.rebind_session_to_project(session_id, project, cx)
+        })
     }
 
     fn run_turn(
@@ -1539,8 +1540,9 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         project: Entity<Project>,
         cx: &mut App,
     ) -> Result<()> {
-        self.0
-            .update(cx, |this, cx| this.rebind_session_to_project(session_id, project, cx))
+        self.0.update(cx, |this, cx| {
+            this.rebind_session_to_project(session_id, project, cx)
+        })
     }
 
     fn auth_methods(&self) -> &[acp::AuthMethod] {
@@ -3148,16 +3150,12 @@ mod internal_tests {
         })
     }
 
-
-
     #[gpui::test]
     async fn test_rebind_last_session_cleans_up_old_project_state(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/project_a", json!({ "a.txt": "" }))
-            .await;
-        fs.insert_tree("/project_b", json!({ "b.txt": "" }))
-            .await;
+        fs.insert_tree("/project_a", json!({ "a.txt": "" })).await;
+        fs.insert_tree("/project_b", json!({ "b.txt": "" })).await;
 
         let project_a = Project::test(fs.clone(), [Path::new("/project_a")], cx).await;
         let project_b = Project::test(fs.clone(), [Path::new("/project_b")], cx).await;
@@ -3211,15 +3209,11 @@ mod internal_tests {
     }
 
     #[gpui::test]
-    async fn test_rebind_keeps_project_state_when_other_sessions_remain(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_rebind_keeps_project_state_when_other_sessions_remain(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree("/project_a", json!({ "a.txt": "" }))
-            .await;
-        fs.insert_tree("/project_b", json!({ "b.txt": "" }))
-            .await;
+        fs.insert_tree("/project_a", json!({ "a.txt": "" })).await;
+        fs.insert_tree("/project_b", json!({ "b.txt": "" })).await;
 
         let project_a = Project::test(fs.clone(), [Path::new("/project_a")], cx).await;
         let project_b = Project::test(fs.clone(), [Path::new("/project_b")], cx).await;

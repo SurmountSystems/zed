@@ -5,11 +5,11 @@ use anyhow::{Result, anyhow};
 use futures::FutureExt as _;
 use gpui::{App, AppContext, Entity, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
+use parking_lot::Mutex;
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
-use parking_lot::Mutex;
 use std::{cmp, path::PathBuf, sync::Arc};
 use util::paths::PathMatcher;
 
@@ -95,7 +95,9 @@ pub struct FindPathTool {
 
 impl FindPathTool {
     pub fn new(project: Entity<Project>) -> Self {
-        Self { project: Mutex::new(project) }
+        Self {
+            project: Mutex::new(project),
+        }
     }
 }
 
@@ -110,8 +112,8 @@ impl AgentTool for FindPathTool {
     }
 
     fn set_project(&self, project: Entity<Project>) {
-            *self.project.lock() = project;
-        }
+        *self.project.lock() = project;
+    }
 
     fn initial_title(
         &self,

@@ -10,12 +10,12 @@ use agent_client_protocol::ToolKind;
 use agent_settings::AgentSettings;
 use futures::FutureExt as _;
 use gpui::{App, Entity, Task};
+use parking_lot::Mutex;
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use std::path::Path;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use util::markdown::MarkdownInlineCode;
 
