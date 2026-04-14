@@ -98,9 +98,8 @@ impl AgentTool for TerminalTool {
                 .map_err(|e| format!("Failed to receive tool input: {e}"))?;
 
             let (working_dir, authorize) = cx.update(|cx| {
-                let project = self.project.clone();
                 let working_dir =
-                    working_dir(&input, &project, cx).map_err(|err| err.to_string())?;
+                    working_dir(&input, &self.project, cx).map_err(|err| err.to_string())?;
 
                 let decision = decide_permission_from_settings(
                     Self::NAME,

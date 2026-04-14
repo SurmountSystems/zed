@@ -3,7 +3,6 @@ use super::tool_permissions::{
     resolve_project_path,
 };
 use crate::{AgentTool, ToolInput};
-
 use agent_client_protocol::ToolKind;
 use futures::FutureExt as _;
 use gpui::{App, AppContext as _, Entity, SharedString, Task};
@@ -47,6 +46,7 @@ impl AgentTool for OpenTool {
     fn kind() -> ToolKind {
         ToolKind::Execute
     }
+
     fn initial_title(
         &self,
         input: Result<Self::Input, serde_json::Value>,

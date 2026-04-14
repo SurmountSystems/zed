@@ -90,10 +90,10 @@ impl AgentTool for ReadFileTool {
         input: Result<Self::Input, serde_json::Value>,
         cx: &mut App,
     ) -> SharedString {
-        let project = self.project.clone();
         if let Ok(input) = input
-            && let Some(project_path) = project.read(cx).find_project_path(&input.path, cx)
-            && let Some(path) = project
+            && let Some(project_path) = self.project.read(cx).find_project_path(&input.path, cx)
+            && let Some(path) = self
+                .project
                 .read(cx)
                 .short_full_path_for_project_path(&project_path, cx)
         {
@@ -213,7 +213,7 @@ impl AgentTool for ReadFileTool {
             if is_image {
                 let image_entity: Entity<ImageItem> = cx
                     .update(|cx| {
-                        project.update(cx, |project, cx| {
+                        self.project.update(cx, |project, cx| {
                             project.open_image(project_path.clone(), cx)
                         })
                     })

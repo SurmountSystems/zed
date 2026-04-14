@@ -191,31 +191,29 @@ impl AgentTool for EditFileTool {
         cx: &mut App,
     ) -> SharedString {
         match input {
-            Ok(input) => {
-                let project = self.project.clone();
-                project
-                    .read(cx)
-                    .find_project_path(&input.path, cx)
-                    .and_then(|project_path| {
-                        project
-                            .read(cx)
-                            .short_full_path_for_project_path(&project_path, cx)
-                    })
-                    .unwrap_or(input.path.to_string_lossy().into_owned())
-                    .into()
-            }
+            Ok(input) => self
+                .project
+                .read(cx)
+                .find_project_path(&input.path, cx)
+                .and_then(|project_path| {
+                    self.project
+                        .read(cx)
+                        .short_full_path_for_project_path(&project_path, cx)
+                })
+                .unwrap_or(input.path.to_string_lossy().into_owned())
+                .into(),
             Err(raw_input) => {
                 if let Some(input) =
                     serde_json::from_value::<EditFileToolPartialInput>(raw_input).ok()
                 {
                     let path = input.path.trim();
                     if !path.is_empty() {
-                        let project = self.project.clone();
-                        return project
+                        return self
+                            .project
                             .read(cx)
                             .find_project_path(&input.path, cx)
                             .and_then(|project_path| {
-                                project
+                                self.project
                                     .read(cx)
                                     .short_full_path_for_project_path(&project_path, cx)
                             })

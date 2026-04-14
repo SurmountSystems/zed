@@ -303,22 +303,20 @@ impl StreamingEditFileTool {
             .read_with(cx, |thread, _cx| !thread.is_subagent())
             .unwrap_or_default();
         if should_update_agent_location {
-            let project = self.project.clone();
-            project.update(cx, |project, cx| {
+            self.project.update(cx, |project, cx| {
                 project.set_agent_location(Some(AgentLocation { buffer, position }), cx);
             });
         }
     }
 
     async fn ensure_buffer_saved(&self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
-        let project = self.project.clone();
         let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
             let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
             settings.format_on_save != FormatOnSave::Off
         });
 
         if format_on_save_enabled {
-            project
+            self.project
                 .update(cx, |project, cx| {
                     project.format(
                         HashSet::from_iter([buffer.clone()]),
@@ -332,7 +330,7 @@ impl StreamingEditFileTool {
                 .log_err();
         }
 
-        project
+        self.project
             .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
             .await
             .log_err();
@@ -477,18 +475,19 @@ impl AgentTool for StreamingEditFileTool {
     fn kind() -> acp::ToolKind {
         acp::ToolKind::Edit
     }
+
     fn initial_title(
         &self,
         input: Result<Self::Input, serde_json::Value>,
         cx: &mut App,
     ) -> SharedString {
-        let project = self.project.clone();
         match input {
-            Ok(input) => project
+            Ok(input) => self
+                .project
                 .read(cx)
                 .find_project_path(&input.path, cx)
                 .and_then(|project_path| {
-                    project
+                    self.project
                         .read(cx)
                         .short_full_path_for_project_path(&project_path, cx)
                 })
@@ -501,11 +500,12 @@ impl AgentTool for StreamingEditFileTool {
                     let path = input.path.unwrap_or_default();
                     let path = path.trim();
                     if !path.is_empty() {
-                        return project
+                        return self
+                            .project
                             .read(cx)
                             .find_project_path(&path, cx)
                             .and_then(|project_path| {
-                                project
+                                self.project
                                     .read(cx)
                                     .short_full_path_for_project_path(&project_path, cx)
                             })
@@ -656,10 +656,9 @@ impl EditSession {
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
     ) -> Result<Self, String> {
-        let project = tool.project.clone();
-        let project_path = cx.update(|cx| resolve_path(mode, &path, &project, cx))?;
+        let project_path = cx.update(|cx| resolve_path(mode, &path, &tool.project, cx))?;
 
-        let Some(abs_path) = cx.update(|cx| project.read(cx).absolute_path(&project_path, cx))
+        let Some(abs_path) = cx.update(|cx| tool.project.read(cx).absolute_path(&project_path, cx))
         else {
             return Err(format!(
                 "Worktree at '{}' does not exist",
@@ -675,7 +674,8 @@ impl EditSession {
             .await
             .map_err(|e| e.to_string())?;
 
-        let buffer = project
+        let buffer = tool
+            .project
             .update(cx, |project, cx| project.open_buffer(project_path, cx))
             .await
             .map_err(|e| e.to_string())?;
