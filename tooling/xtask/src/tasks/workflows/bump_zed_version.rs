@@ -31,7 +31,7 @@ pub fn bump_zed_version() -> Workflow {
 fn plan_version_bump(bump_type: &WorkflowInput, patch_channel: &WorkflowInput) -> NamedJob {
     fn compute_matrix(bump_type: &WorkflowInput, patch_channel: &WorkflowInput) -> Step<Run> {
         named::bash(indoc::indoc! {r#"
-            matrix=$(script/bump-zed-version plan "$BUMP_TYPE" "$PATCH_CHANNEL")
+            matrix=$(script/plan-zed-version-bump "$BUMP_TYPE" "$PATCH_CHANNEL")
             echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
         "#})
         .id("compute-matrix")

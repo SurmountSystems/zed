@@ -32,7 +32,7 @@ jobs:
     - id: compute-matrix
       name: bump_zed_version::plan_version_bump::compute_matrix
       run: |
-        matrix=$(script/bump-zed-version plan "$BUMP_TYPE" "$PATCH_CHANNEL")
+        matrix=$(script/plan-zed-version-bump "$BUMP_TYPE" "$PATCH_CHANNEL")
         echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
       env:
         BUMP_TYPE: ${{ inputs.bump_type }}
@@ -64,7 +64,40 @@ jobs:
         ref: ${{ matrix.checkout_ref }}
         token: ${{ steps.generate-token.outputs.token }}
     - name: bump_zed_version::execute_version_bump::run_version_bump
-      run: script/bump-zed-version execute "$TARGET_BRANCH" "$BUMP" "$NEW_CHANNEL"
+      run: |
+        # Only preview requires a new branch
+        if [ "$NEW_CHANNEL" = "preview" ]; then
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+        fi
+
+        if [ -n "$BUMP" ]; then
+          which cargo-set-version > /dev/null || cargo install cargo-edit -f --no-default-features --features "set-version"
+          cargo set-version -p zed --bump "$BUMP" 2>&1
+        fi
+
+        if [ -n "$NEW_CHANNEL" ]; then
+          printf '%s' "$NEW_CHANNEL" > crates/zed/RELEASE_CHANNEL
+        fi
+
+        version=$(script/get-crate-version zed)
+        channel=$(cat crates/zed/RELEASE_CHANNEL)
+
+        if [ "$TARGET_BRANCH" = "main" ]; then
+          title="Bump Zed to v${version}"
+        else
+          title="Bump Zed ${channel} to v${version}"
+        fi
+        pr_branch="bump-zed-to-${version}"
+
+        git checkout -b "$pr_branch"
+        git commit -am "$title"
+        git push origin "$pr_branch"
+
+        gh pr create \
+          --title "$title" \
+          --body "Release Notes:\n\n- N/A" \
+          --base "$TARGET_BRANCH" \
+          --head "$pr_branch"
       env:
         GIT_COMMITTER_NAME: Zed Zippy
         GIT_COMMITTER_EMAIL: 234243425+zed-zippy[bot]@users.noreply.github.com
