@@ -23,7 +23,13 @@ For quick switching without opening the sidebar, use the thread switcher: press 
 
 ### Archive {#archive}
 
-The archive holds threads you've hidden or are no longer actively working in. Toggle the archive with {#kb agents_sidebar::ToggleArchive} or by clicking the archive icon in the sidebar bottom bar.
+The archive holds all your threads. Toggle the archive with {#kb agents_sidebar::ToggleArchive} or by clicking the archive icon in the sidebar bottom bar.
+
+To archive a thread, hover over it in the sidebar and click the archive icon that appears. You can also select a thread and press {#kb agent::RemoveSelectedThread}. Running threads cannot be archived until they finish.
+
+To restore an archived thread, open the archive and click the thread you want to bring back. Zed unarchives it, moves it back to the thread list, and opens it in the Agent Panel. If the thread was running in a git worktree that was deleted when archived, Zed restores the worktree automatically.
+
+To permanently delete a thread, open the archive, hover over the thread, and click the trash icon. This removes the thread's conversation history and cleans up any associated worktree data. Deleted threads cannot be recovered.
 
 You can search your archived threads; search will fuzzy match on thread titles.
 
@@ -37,7 +43,7 @@ Start a new thread with {#action agent::NewThread}. Each thread runs independent
 
 To start a new thread scoped to the currently selected project in the sidebar, use {#action agents_sidebar::NewThreadInGroup}.
 
-Each thread can use a different agent. Select the agent from the model selector in that thread's Agent Panel. You might run Zed's built-in agent in one thread and an [external agent](./external-agents.md) like Claude or Codex in another.
+Each thread can use a different agent. Click the new thread menu in the Agent Panel toolbar to choose between Zed Agent and any installed [external agents](./external-agents.md). You might run Zed's built-in agent in one thread and an external agent like Claude Code or Codex in another.
 
 ## Multiple Projects {#multiple-projects}
 
@@ -49,15 +55,17 @@ Within a project, you can add multiple folders from a local or remote project. U
 
 If two threads might edit the same files, start one in a new git worktree to give it an isolated checkout.
 
-In the Agent Panel toolbar, click the worktree selector and choose **New Git Worktree**. You can also cycle between options with {#kb agent::CycleStartThreadIn}. When you send the first message, Zed creates a new worktree from the current branch.
+In the Agent Panel toolbar, click the worktree selector to choose which worktree you want the agent to run in, or create a new one. You can also cycle between the current worktree and a new worktree with {#kb agent::CycleStartThreadIn}.
 
-After the agent finishes, review the diff, merge the changes through your normal git workflow, and delete the worktree when done.
+To change the default for new threads, set `new_thread_location` in your agent settings to `"local_project"` or `"new_worktree"`.
+
+After the agent finishes, review the diff and merge the changes through your normal git workflow. If the thread was running in a linked worktree and no other active threads use it, archiving the thread saves the worktree's git state and removes it from disk. Restoring the thread from the archive restores the worktree.
 
 > **Note:** Starting a thread in a new worktree requires the project to be in a git repository.
 
 ## Default Layout {#layout}
 
-New installs place the Agent Panel and Threads Sidebar on the left. The Project Panel, Git Panel, and other panels move to the right, keeping the thread list and conversation next to each other. To rearrange panels, right-click any panel icon in the status bar.
+From version 0.233.0 onward, the Agent Panel and Threads Sidebar are on the left. The Project Panel, Git Panel, and other panels move to the right, keeping the thread list and conversation next to each other. To rearrange panels, right-click any panel icon.
 
 ## See Also {#see-also}
 
