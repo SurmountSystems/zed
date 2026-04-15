@@ -32,94 +32,8 @@ jobs:
     - id: compute-matrix
       name: bump_zed_version::plan_version_bump::compute_matrix
       run: |
-        RELEASE_API="https://cloud.zed.dev/releases"
-
-        # Validate inputs
-        case "$BUMP_TYPE" in
-          major|minor|patch) ;;
-          *)
-            echo "::error::Invalid bump_type: '$BUMP_TYPE' (must be major, minor, or patch)"
-            exit 1
-            ;;
-        esac
-
-        if [ "$BUMP_TYPE" = "patch" ]; then
-          case "$PATCH_CHANNEL" in
-            preview|stable|both) ;;
-            *)
-              echo "::error::Invalid patch_channel: '$PATCH_CHANNEL' (must be preview, stable, or both)"
-              exit 1
-              ;;
-          esac
-        fi
-
-        # Resolve the current preview and stable versions from the release API
-        # so we don't rely on arithmetic that breaks across major version bumps.
-        version_branch_for_channel() {
-          local channel="$1"
-          local version
-          version=$(curl -fsSL "${RELEASE_API}/${channel}/latest/asset?asset=zed&os=macos&arch=aarch64" | jq -r '.version')
-          if [ -z "$version" ] || [ "$version" = "null" ]; then
-            echo "::error::Failed to resolve latest ${channel} version from API" >&2
-            return 1
-          fi
-          local major minor
-          major=$(echo "$version" | cut -d. -f1)
-          minor=$(echo "$version" | cut -d. -f2)
-          echo "v${major}.${minor}.x"
-        }
-
-        preview_branch=$(version_branch_for_channel preview)
-        stable_branch=$(version_branch_for_channel stable)
-        echo "Resolved preview branch: $preview_branch"
-        echo "Resolved stable branch:  $stable_branch"
-
-        # Read current version from main
-        version=$(script/get-crate-version zed)
-        major=$(echo "$version" | cut -d. -f1)
-        minor=$(echo "$version" | cut -d. -f2)
-
-        # Verify main is in dev/nightly state
-        channel=$(cat crates/zed/RELEASE_CHANNEL)
-        if [ "$channel" != "dev" ] && [ "$channel" != "nightly" ]; then
-          echo "::error::RELEASE_CHANNEL on main must be 'dev' or 'nightly', found: '$channel'"
-          exit 1
-        fi
-
-        if [ "$BUMP_TYPE" = "patch" ]; then
-          matrix="[]"
-          if [ "$PATCH_CHANNEL" = "preview" ] || [ "$PATCH_CHANNEL" = "both" ]; then
-            matrix=$(echo "$matrix" | jq -c \
-              --arg checkout_ref "$preview_branch" \
-              --arg target_branch "$preview_branch" \
-              '. + [{"task": "bump-patch", "checkout_ref": $checkout_ref, "target_branch": $target_branch, "bump": "patch"}]')
-          fi
-          if [ "$PATCH_CHANNEL" = "stable" ] || [ "$PATCH_CHANNEL" = "both" ]; then
-            matrix=$(echo "$matrix" | jq -c \
-              --arg checkout_ref "$stable_branch" \
-              --arg target_branch "$stable_branch" \
-              '. + [{"task": "bump-patch", "checkout_ref": $checkout_ref, "target_branch": $target_branch, "bump": "patch"}]')
-          fi
-        else
-          # For major/minor bumps: bump main, create new preview branch, promote old preview to stable
-          # The new preview branch is derived from the version currently on main.
-          # The current preview branch (from the API) gets promoted to stable.
-          new_preview_branch="v${major}.${minor}.x"
-
-          matrix=$(jq -nc \
-            --arg bump "$BUMP_TYPE" \
-            --arg new_preview_branch "$new_preview_branch" \
-            --arg old_preview_branch "$preview_branch" \
-            '[
-              {"task": "bump-main", "checkout_ref": "main", "target_branch": "main", "bump": $bump},
-              {"task": "create-preview-branch", "checkout_ref": "main", "target_branch": $new_preview_branch, "bump": ""},
-              {"task": "promote-stable", "checkout_ref": $old_preview_branch, "target_branch": $old_preview_branch, "bump": ""}
-            ]')
-        fi
-
+        matrix=$(cargo run -p xtask -- bump-version-plan --bump-type "$BUMP_TYPE" --patch-channel "$PATCH_CHANNEL")
         echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-        echo "Computed matrix:"
-        echo "$matrix" | jq .
       env:
         BUMP_TYPE: ${{ inputs.bump_type }}
         PATCH_CHANNEL: ${{ inputs.patch_channel }}
@@ -151,99 +65,60 @@ jobs:
         token: ${{ steps.generate-token.outputs.token }}
     - name: bump_zed_version::execute_version_bump::run_version_bump
       run: |
-        echo "Task: $TASK"
-        echo "Checkout ref: $CHECKOUT_REF"
-        echo "Target branch: $TARGET_BRANCH"
-        echo "Bump type: $BUMP"
+        # Create the target branch from current HEAD when bootstrapping a new version branch
+        if [ "$CREATE_BRANCH" = "true" ]; then
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+        fi
 
-        install_cargo_set_version() {
+        # Bump the crate version if requested
+        if [ -n "$BUMP" ]; then
           which cargo-set-version > /dev/null || cargo install cargo-edit -f --no-default-features --features "set-version"
-        }
+          cargo set-version -p zed --bump "$BUMP" 2>&1
+        fi
 
-        case "$TASK" in
-          bump-main)
-            install_cargo_set_version
-            new_version="$(cargo set-version -p zed --bump "$BUMP" 2>&1 | sed 's/.* //')"
+        # Switch the release channel if requested
+        if [ -n "$NEW_CHANNEL" ]; then
+          printf '%s' "$NEW_CHANNEL" > crates/zed/RELEASE_CHANNEL
+        fi
 
-            pr_branch="bump-zed-to-${new_version}"
-            git checkout -b "$pr_branch"
-            git commit -am "Bump Zed to v${new_version}"
-            git push origin "$pr_branch"
+        # Read resulting version and channel for PR metadata
+        version=$(script/get-crate-version zed)
+        channel=$(cat crates/zed/RELEASE_CHANNEL)
 
-            printf "Bump Zed version to v%s on main.\n\nRelease Notes:\n\n- N/A" "$new_version" | \
-              gh pr create \
-                --title "Bump Zed to v${new_version}" \
-                --body-file - \
-                --base "$TARGET_BRANCH" \
-                --head "$pr_branch"
-            ;;
+        # Build the PR title: version bumps say "Bump Zed to …",
+        # channel-only changes say "{branch} {channel}".
+        if [ -n "$BUMP" ]; then
+          if [ "$TARGET_BRANCH" = "main" ]; then
+            title="Bump Zed to v${version}"
+          else
+            title="Bump Zed to v${version} (${channel})"
+          fi
+          pr_branch="bump-zed-to-${version}"
+        else
+          title="${TARGET_BRANCH} ${channel}"
+          pr_branch="${TARGET_BRANCH}-${channel}"
+        fi
 
-          create-preview-branch)
-            # Push the new version branch from main's current HEAD
-            git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+        git checkout -b "$pr_branch"
+        git commit -am "$title"
+        git push origin "$pr_branch"
 
-            pr_branch="set-channel-${TARGET_BRANCH}-preview"
-            git checkout -b "$pr_branch"
-            printf 'preview' > crates/zed/RELEASE_CHANNEL
-            git commit -am "${TARGET_BRANCH} preview"
-            git push origin "$pr_branch"
-
-            printf "Set RELEASE_CHANNEL to preview on %s.\n\nRelease Notes:\n\n- N/A" "$TARGET_BRANCH" | \
-              gh pr create \
-                --title "${TARGET_BRANCH} preview" \
-                --body-file - \
-                --base "$TARGET_BRANCH" \
-                --head "$pr_branch"
-            ;;
-
-          promote-stable)
-            pr_branch="promote-${TARGET_BRANCH}-to-stable"
-            git checkout -b "$pr_branch"
-            printf 'stable' > crates/zed/RELEASE_CHANNEL
-            git commit -am "${TARGET_BRANCH} stable"
-            git push origin "$pr_branch"
-
-            printf "Promote %s to stable.\n\nRelease Notes:\n\n- N/A" "$TARGET_BRANCH" | \
-              gh pr create \
-                --title "${TARGET_BRANCH} stable" \
-                --body-file - \
-                --base "$TARGET_BRANCH" \
-                --head "$pr_branch"
-            ;;
-
-          bump-patch)
-            install_cargo_set_version
-            new_version="$(cargo set-version -p zed --bump patch 2>&1 | sed 's/.* //')"
-            channel=$(cat crates/zed/RELEASE_CHANNEL)
-
-            pr_branch="bump-${TARGET_BRANCH}-to-${new_version}"
-            git checkout -b "$pr_branch"
-            git commit -am "Bump Zed to v${new_version} (${channel})"
-            git push origin "$pr_branch"
-
-            printf "Bump Zed to v%s on %s (%s).\n\nRelease Notes:\n\n- N/A" "$new_version" "$TARGET_BRANCH" "$channel" | \
-              gh pr create \
-                --title "Bump Zed to v${new_version} (${channel})" \
-                --body-file - \
-                --base "$TARGET_BRANCH" \
-                --head "$pr_branch"
-            ;;
-
-          *)
-            echo "::error::Unknown task: $TASK"
-            exit 1
-            ;;
-        esac
+        printf "%s\n\nRelease Notes:\n\n- N/A" "$title" | \
+          gh pr create \
+            --title "$title" \
+            --body-file - \
+            --base "$TARGET_BRANCH" \
+            --head "$pr_branch"
       env:
         GIT_COMMITTER_NAME: Zed Zippy
         GIT_COMMITTER_EMAIL: 234243425+zed-zippy[bot]@users.noreply.github.com
         GIT_AUTHOR_NAME: Zed Zippy
         GIT_AUTHOR_EMAIL: 234243425+zed-zippy[bot]@users.noreply.github.com
         GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
-        TASK: ${{ matrix.task }}
-        CHECKOUT_REF: ${{ matrix.checkout_ref }}
         TARGET_BRANCH: ${{ matrix.target_branch }}
         BUMP: ${{ matrix.bump }}
+        NEW_CHANNEL: ${{ matrix.new_channel }}
+        CREATE_BRANCH: ${{ matrix.create_branch }}
 concurrency:
   group: bump-zed-version
 defaults:
