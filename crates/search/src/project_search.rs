@@ -496,6 +496,19 @@ impl ProjectSearch {
                             })
                             .ok()?;
                     }
+                    project_search
+                        .update(cx, |project_search, cx| {
+                            project_search.excerpts.update(cx, |excerpts, cx| {
+                                for path in excerpts
+                                    .existing_excerpts()
+                                    .into_iter()
+                                    .filter(|path| !seen_paths.contains(path))
+                                {
+                                    excerpts.remove_excerpts(path, cx);
+                                }
+                            });
+                        })
+                        .ok()?;
                     continue;
                 }
 
@@ -535,22 +548,10 @@ impl ProjectSearch {
                     project_search.no_results = Some(project_search.match_ranges.is_empty());
                     project_search.limit_reached = limit_reached;
                     project_search.pending_search.take();
-                    if incremental {
-                        if seen_paths.is_empty() {
-                            project_search
-                                .excerpts
-                                .update(cx, |excerpts, cx| excerpts.clear(cx));
-                        } else {
-                            project_search.excerpts.update(cx, |excerpts, cx| {
-                                for path in excerpts
-                                    .existing_excerpts()
-                                    .into_iter()
-                                    .filter(|path| !seen_paths.contains(path))
-                                {
-                                    excerpts.remove_excerpts(path, cx);
-                                }
-                            });
-                        }
+                    if incremental && seen_paths.is_empty() {
+                        project_search
+                            .excerpts
+                            .update(cx, |excerpts, cx| excerpts.clear(cx));
                     }
                     cx.notify();
                 })
@@ -5824,6 +5825,50 @@ pub mod tests {
         assert_all_highlights_match_query(search_view, "targeted", cx);
         assert_eq!(read_match_count(search_view, cx), 1);
         assert_eq!(take_updated_files(&events), vec!["big.txt"]);
+    }
+
+    #[gpui::test]
+    async fn test_incremental_search_clears_stale_excerpts_on_query_change(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "alpha.rs": "fn alpha() {}\nfn alpha_bravo() {}",
+                "bravo.rs": "fn bravo() { alpha() }",
+                "charlie.rs": "fn charlie() { alpha(); bravo() }",
+                "delta.rs": "fn delta_unique_word() {}",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .unwrap();
+        let search = cx.new(|cx| ProjectSearch::new(project.clone(), cx));
+        let search_view = cx.add_window(|window, cx| {
+            ProjectSearchView::new(workspace.downgrade(), search.clone(), window, cx, None)
+        });
+        let (events, _subscription) = subscribe_to_excerpt_events(&search, cx);
+
+        // Search for "alpha" — matches in alpha.rs, bravo.rs, charlie.rs.
+        perform_search(search_view, "alpha", cx);
+        let alpha_files = take_updated_files(&events);
+        assert_eq!(alpha_files, vec!["alpha.rs", "bravo.rs", "charlie.rs"]);
+        assert!(read_match_count(search_view, cx) > 0);
+
+        // Incremental search for "delta_unique_word" — only delta.rs should match.
+        // Before the fix, stale excerpts from "alpha" search would linger.
+        perform_incremental_search(search_view, "delta_unique_word", cx);
+        let delta_files = take_updated_files(&events);
+        assert_eq!(delta_files, vec!["delta.rs"]);
+        assert_eq!(read_match_count(search_view, cx), 1);
+        assert_eq!(read_match_texts(search_view, cx), vec!["delta_unique_word"]);
     }
 
     #[gpui::test]
