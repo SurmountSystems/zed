@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat >&2 <<EOF
+Usage:
+  trigger-zed-version-bump major
+  trigger-zed-version-bump minor
+  trigger-zed-version-bump patch [preview|stable|both]
+EOF
+  exit 1
+}
+
+bump_type="${1:-}"
+case "$bump_type" in
+  major|minor) ;;
+  patch) ;;
+  *) usage ;;
+esac
+
+patch_channel="both"
+if [ "$bump_type" = "patch" ]; then
+  patch_channel="${2:-both}"
+  case "$patch_channel" in
+    preview|stable|both) ;;
+    *) usage ;;
+  esac
+elif [ $# -gt 1 ]; then
+  echo "error: $bump_type bumps don't take a channel argument" >&2
+  usage
+fi
+
+if [ "$bump_type" = "major" ] || [ "$bump_type" = "minor" ]; then
+  day_of_week=$(date +%u)
+  if [ "$day_of_week" != "3" ]; then
+    day_name=$(date +%A)
+    read -rp "Today is ${day_name}, not Zednesday. Continue with ${bump_type} bump? [y/N] " confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+      echo "Aborted."
+      exit 0
+    fi
+  fi
+fi
+
+echo "Triggering ${bump_type} version bump (patch_channel=${patch_channel})…"
+
+gh workflow run "bump_zed_version.yml" \
+  -f bump_type="$bump_type" \
+  -f patch_channel="$patch_channel"
+
+echo "Follow along at: https://github.com/zed-industries/zed/actions/workflows/bump_zed_version.yml"
