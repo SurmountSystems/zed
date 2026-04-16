@@ -882,10 +882,7 @@ impl TitleBar {
                                             .child(
                                                 Label::new("/").size(LabelSize::Small).color(
                                                     Color::Custom(
-                                                        cx.theme()
-                                                            .colors()
-                                                            .text_muted
-                                                            .opacity(0.4),
+                                                        cx.theme().colors().text_muted.opacity(0.4),
                                                     ),
                                                 ),
                                             )
@@ -936,26 +933,25 @@ impl TitleBar {
                                 ))
                             })
                             .trigger_with_tooltip(
-                                ButtonLike::new("create_branch_trigger")
-                                    .child(
-                                        h_flex()
-                                            .gap_1()
-                                            .rounded_sm()
-                                            .border_1()
-                                            .border_color(border_color)
-                                            .px_1()
-                                            .py_0p5()
-                                            .child(
-                                                Icon::new(IconName::GitBranch)
-                                                    .size(IconSize::XSmall)
-                                                    .color(Color::Muted),
-                                            )
-                                            .child(
-                                                Label::new("Establish a Branch")
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Muted),
-                                            ),
-                                    ),
+                                ButtonLike::new("create_branch_trigger").child(
+                                    h_flex()
+                                        .gap_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(border_color)
+                                        .px_1()
+                                        .py_0p5()
+                                        .child(
+                                            Icon::new(IconName::GitBranch)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .child(
+                                            Label::new("Establish a Branch")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                ),
                                 move |_window, cx| {
                                     Tooltip::with_meta(
                                         "Establish a Branch",
