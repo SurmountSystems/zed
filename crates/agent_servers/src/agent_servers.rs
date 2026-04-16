@@ -12,9 +12,7 @@ use http_client::read_no_proxy_from_env;
 use project::{AgentId, Project, agent_server_store::AgentServerStore};
 
 use acp_thread::AgentConnection;
-use agent_client_protocol::schema::{
-    ModelId, SessionConfigId, SessionConfigValueId, SessionModeId,
-};
+use agent_client_protocol::schema as acp_schema;
 use anyhow::Result;
 use gpui::{App, AppContext, Entity, Task};
 use settings::SettingsStore;
@@ -51,19 +49,31 @@ pub trait AgentServer: Send {
 
     fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
 
-    fn default_mode(&self, _cx: &App) -> Option<SessionModeId> {
+    fn default_mode(&self, _cx: &App) -> Option<acp_schema::SessionModeId> {
         None
     }
 
-    fn set_default_mode(&self, _mode_id: Option<SessionModeId>, _fs: Arc<dyn Fs>, _cx: &mut App) {}
+    fn set_default_mode(
+        &self,
+        _mode_id: Option<acp_schema::SessionModeId>,
+        _fs: Arc<dyn Fs>,
+        _cx: &mut App,
+    ) {
+    }
 
-    fn default_model(&self, _cx: &App) -> Option<ModelId> {
+    fn default_model(&self, _cx: &App) -> Option<acp_schema::ModelId> {
         None
     }
 
-    fn set_default_model(&self, _model_id: Option<ModelId>, _fs: Arc<dyn Fs>, _cx: &mut App) {}
+    fn set_default_model(
+        &self,
+        _model_id: Option<acp_schema::ModelId>,
+        _fs: Arc<dyn Fs>,
+        _cx: &mut App,
+    ) {
+    }
 
-    fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<ModelId> {
+    fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<acp_schema::ModelId> {
         HashSet::default()
     }
 
@@ -84,7 +94,7 @@ pub trait AgentServer: Send {
         &self,
         _config_id: &SessionConfigId,
         _cx: &mut App,
-    ) -> HashSet<SessionConfigValueId> {
+    ) -> HashSet<acp_schema::SessionConfigValueId> {
         HashSet::default()
     }
 
@@ -100,7 +110,7 @@ pub trait AgentServer: Send {
 
     fn toggle_favorite_model(
         &self,
-        _model_id: ModelId,
+        _model_id: acp_schema::ModelId,
         _should_be_favorite: bool,
         _fs: Arc<dyn Fs>,
         _cx: &App,
