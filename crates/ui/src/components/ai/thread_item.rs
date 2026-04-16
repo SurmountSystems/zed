@@ -337,46 +337,10 @@ impl RenderOnce for ThreadItem {
         let has_any_metadata =
             has_project_name || has_worktree || has_branch || has_diff_stats || has_timestamp;
 
-        let unified_tooltip = {
-            let status = tooltip_status;
-
-            Tooltip::element(move |_, _| {
-                v_flex()
-                    .min_w_0()
-                    .gap_1()
-                    .when(status == AgentThreadStatus::Error, |this| {
-                        this.child(
-                            h_flex()
-                                .gap_1()
-                                .child(
-                                    Icon::new(IconName::Close)
-                                        .size(IconSize::Small)
-                                        .color(Color::Error),
-                                )
-                                .child(Label::new("Thread has an Error").size(LabelSize::Small)),
-                        )
-                    })
-                    .when(
-                        status == AgentThreadStatus::WaitingForConfirmation,
-                        |this| {
-                            this.child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Icon::new(IconName::Warning)
-                                            .size(IconSize::Small)
-                                            .color(Color::Warning),
-                                    )
-                                    .child(
-                                        Label::new("Waiting for Confirmation")
-                                            .size(LabelSize::Small),
-                                    ),
-                            )
-                        },
-                    )
-                    .into_any_element()
-            })
-        };
+        let show_tooltip = matches!(
+            tooltip_status,
+            AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
+        );
 
         v_flex()
             .id(self.id.clone())
@@ -394,7 +358,6 @@ impl RenderOnce for ThreadItem {
             .when(self.selected, |s| s.bg(color.element_active))
             .hover(|s| s.bg(hover_color))
             .on_hover(self.on_hover)
-            .tooltip(unified_tooltip)
             .child(
                 h_flex()
                     .min_w_0()
@@ -499,6 +462,47 @@ impl RenderOnce for ThreadItem {
                             )
                         }),
                 )
+            })
+            .when(show_tooltip, |this| {
+                let status = tooltip_status;
+                this.tooltip(Tooltip::element(move |_, _| {
+                    v_flex()
+                        .min_w_0()
+                        .gap_1()
+                        .when(status == AgentThreadStatus::Error, |this| {
+                            this.child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Icon::new(IconName::Close)
+                                            .size(IconSize::Small)
+                                            .color(Color::Error),
+                                    )
+                                    .child(
+                                        Label::new("Thread has an Error").size(LabelSize::Small),
+                                    ),
+                            )
+                        })
+                        .when(
+                            status == AgentThreadStatus::WaitingForConfirmation,
+                            |this| {
+                                this.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Icon::new(IconName::Warning)
+                                                .size(IconSize::Small)
+                                                .color(Color::Warning),
+                                        )
+                                        .child(
+                                            Label::new("Waiting for Confirmation")
+                                                .size(LabelSize::Small),
+                                        ),
+                                )
+                            },
+                        )
+                        .into_any_element()
+                }))
             })
             .when_some(self.on_click, |this, on_click| this.on_click(on_click))
     }
