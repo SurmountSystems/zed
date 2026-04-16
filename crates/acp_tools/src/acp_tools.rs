@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fmt::Display, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    fmt::Display,
+    sync::Arc,
+};
 
 use agent_client_protocol::schema as acp;
 use collections::HashMap;
@@ -19,10 +23,13 @@ use workspace::{
 
 pub type RequestId = serde_json::Value;
 
-#[derive(Clone)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StreamMessageDirection {
     Incoming,
     Outgoing,
+    /// Lines captured from the agent's stderr. These are not part of the
+    /// JSON-RPC protocol, but agents often emit useful diagnostics there.
+    Stderr,
 }
 
 #[derive(Clone)]
@@ -40,6 +47,8 @@ pub enum StreamMessageContent {
         method: Arc<str>,
         params: Option<serde_json::Value>,
     },
+    /// A raw stderr line from the agent process.
+    Stderr { line: Arc<str> },
 }
 
 #[derive(Clone)]
@@ -49,7 +58,21 @@ pub struct StreamMessage {
 }
 
 impl StreamMessage {
-    pub fn from_json_line(direction: StreamMessageDirection, line: &str) -> Option<Self> {
+    /// Build a `StreamMessage` from a raw line captured off the transport.
+    ///
+    /// For `Stderr`, the line is wrapped as-is (no JSON parsing). For
+    /// `Incoming`/`Outgoing`, the line is parsed as JSON-RPC; returns `None`
+    /// if it doesn't look like a valid JSON-RPC message.
+    pub fn from_raw_line(direction: StreamMessageDirection, line: &str) -> Option<Self> {
+        if direction == StreamMessageDirection::Stderr {
+            return Some(StreamMessage {
+                direction,
+                message: StreamMessageContent::Stderr {
+                    line: Arc::from(line),
+                },
+            });
+        }
+
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
         let obj = value.as_object()?;
 
@@ -110,17 +133,28 @@ struct GlobalAcpConnectionRegistry(Entity<AcpConnectionRegistry>);
 
 impl Global for GlobalAcpConnectionRegistry {}
 
-/// A raw JSON-RPC line captured from the transport, tagged with direction.
-/// Deserialization into [`StreamMessage`] is deferred until a subscriber is listening.
+/// A raw line captured from the transport (or from stderr), tagged with direction.
+/// Deserialization into [`StreamMessage`] happens eagerly on arrival so that
+/// the registry's ring buffer can be replayed to late subscribers.
 pub struct RawStreamLine {
     pub direction: StreamMessageDirection,
     pub line: Arc<str>,
 }
 
+/// Maximum number of messages retained in the registry's backlog.
+///
+/// Mirrors `MAX_STORED_LOG_ENTRIES` in the LSP log store, so that opening the
+/// ACP logs panel after a session has been running for a while still shows
+/// meaningful history.
+const MAX_BACKLOG_MESSAGES: usize = 2000;
+
 #[derive(Default)]
 pub struct AcpConnectionRegistry {
     active_agent_id: Option<AgentId>,
     generation: u64,
+    /// Bounded ring buffer of every message observed on the current connection.
+    /// When a new connection is set, this is cleared.
+    backlog: VecDeque<StreamMessage>,
     subscribers: Vec<smol::channel::Sender<StreamMessage>>,
     _broadcast_task: Option<Task<()>>,
 }
@@ -144,19 +178,21 @@ impl AcpConnectionRegistry {
     ) {
         self.active_agent_id = Some(agent_id);
         self.generation += 1;
+        self.backlog.clear();
         self.subscribers.clear();
 
         self._broadcast_task = Some(cx.spawn(async move |this, cx| {
             while let Ok(raw) = raw_rx.recv().await {
                 this.update(cx, |this, _cx| {
-                    if this.subscribers.is_empty() {
-                        return;
-                    }
-
-                    let Some(message) = StreamMessage::from_json_line(raw.direction, &raw.line)
+                    let Some(message) = StreamMessage::from_raw_line(raw.direction, &raw.line)
                     else {
                         return;
                     };
+
+                    if this.backlog.len() == MAX_BACKLOG_MESSAGES {
+                        this.backlog.pop_front();
+                    }
+                    this.backlog.push_back(message.clone());
 
                     this.subscribers.retain(|sender| !sender.is_closed());
                     for sender in &this.subscribers {
@@ -179,10 +215,17 @@ impl AcpConnectionRegistry {
         cx.notify();
     }
 
-    pub fn subscribe(&mut self) -> smol::channel::Receiver<StreamMessage> {
+    /// Subscribe to messages on the current connection.
+    ///
+    /// Returns the existing backlog (already-observed messages) together with
+    /// a receiver for new messages. The caller is responsible for flushing the
+    /// backlog into its local state before draining the receiver, so that no
+    /// messages are dropped between the snapshot and live subscription.
+    pub fn subscribe(&mut self) -> (Vec<StreamMessage>, smol::channel::Receiver<StreamMessage>) {
+        let backlog = self.backlog.iter().cloned().collect();
         let (sender, receiver) = smol::channel::unbounded();
         self.subscribers.push(sender);
-        receiver
+        (backlog, receiver)
     }
 }
 
@@ -243,7 +286,7 @@ impl AcpTools {
             }
         }
 
-        let messages_rx = self
+        let (backlog, messages_rx) = self
             .connection_registry
             .update(cx, |registry, _cx| registry.subscribe());
 
@@ -265,6 +308,10 @@ impl AcpTools {
             outgoing_request_methods: HashMap::default(),
             _task: task,
         });
+
+        for message in backlog {
+            self.push_stream_message(message, cx);
+        }
     }
 
     fn push_stream_message(&mut self, stream_message: StreamMessage, cx: &mut Context<Self>) {
@@ -279,6 +326,8 @@ impl AcpTools {
                 let method_map = match stream_message.direction {
                     StreamMessageDirection::Incoming => &mut connection.incoming_request_methods,
                     StreamMessageDirection::Outgoing => &mut connection.outgoing_request_methods,
+                    // Stderr lines never carry request/response correlation.
+                    StreamMessageDirection::Stderr => return,
                 };
 
                 method_map.insert(id.clone(), method.clone());
@@ -288,6 +337,7 @@ impl AcpTools {
                 let method_map = match stream_message.direction {
                     StreamMessageDirection::Incoming => &mut connection.outgoing_request_methods,
                     StreamMessageDirection::Outgoing => &mut connection.incoming_request_methods,
+                    StreamMessageDirection::Stderr => return,
                 };
 
                 if let Some(method) = method_map.remove(&id) {
@@ -303,6 +353,17 @@ impl AcpTools {
             }
             StreamMessageContent::Notification { method, params } => {
                 (None, method.into(), MessageType::Notification, Ok(params))
+            }
+            StreamMessageContent::Stderr { line } => {
+                // Stderr is rendered as plain text inline with JSON-RPC traffic,
+                // using `stderr` as the pseudo-method name so it shows up in the
+                // header the same way real methods do.
+                (
+                    None,
+                    "stderr".into(),
+                    MessageType::Stderr,
+                    Ok(Some(serde_json::Value::String(line.to_string()))),
+                )
             }
         };
 
@@ -349,6 +410,7 @@ impl AcpTools {
                     "_direction": match message.direction {
                         StreamMessageDirection::Incoming => "incoming",
                         StreamMessageDirection::Outgoing => "outgoing",
+                        StreamMessageDirection::Stderr => "stderr",
                     },
                     "_type": message.message_type.to_string().to_lowercase(),
                     "id": message.request_id,
@@ -435,6 +497,9 @@ impl AcpTools {
                             .size(IconSize::Small),
                         StreamMessageDirection::Outgoing => Icon::new(IconName::ArrowUp)
                             .color(Color::Success)
+                            .size(IconSize::Small),
+                        StreamMessageDirection::Stderr => Icon::new(IconName::Warning)
+                            .color(Color::Warning)
                             .size(IconSize::Small),
                     })
                     .child(
@@ -567,6 +632,7 @@ enum MessageType {
     Request,
     Response,
     Notification,
+    Stderr,
 }
 
 impl Display for MessageType {
@@ -575,6 +641,7 @@ impl Display for MessageType {
             MessageType::Request => write!(f, "Request"),
             MessageType::Response => write!(f, "Response"),
             MessageType::Notification => write!(f, "Notification"),
+            MessageType::Stderr => write!(f, "Stderr"),
         }
     }
 }

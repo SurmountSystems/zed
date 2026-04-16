@@ -354,16 +354,15 @@ impl AcpConnection {
         // closures to the !Send foreground thread.
         let (dispatch_tx, dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
 
-        // Build a tapped transport that intercepts raw JSON-RPC lines for
-        // the ACP logs panel. Raw lines are sent without parsing — deserialization
-        // is deferred until a subscriber is actually listening.
+        // Build a tapped transport that intercepts raw JSON-RPC lines, plus
+        // stderr lines, for the ACP logs panel.
         let (stream_tap_tx, stream_tap_rx) = smol::channel::unbounded::<RawStreamLine>();
 
         let incoming_lines = futures::io::BufReader::new(stdout).lines();
         let tapped_incoming = incoming_lines.inspect({
             let tap_tx = stream_tap_tx.clone();
-            move |result| {
-                if let Ok(line) = result {
+            move |result| match result {
+                Ok(line) => {
                     tap_tx
                         .try_send(RawStreamLine {
                             direction: StreamMessageDirection::Incoming,
@@ -371,11 +370,17 @@ impl AcpConnection {
                         })
                         .log_err();
                 }
+                Err(err) => {
+                    // I/O errors on the transport are fatal for the SDK, but
+                    // without logging them the ACP logs panel shows no trace
+                    // of why the connection died.
+                    log::warn!("ACP transport read error: {err}");
+                }
             }
         });
 
         let tapped_outgoing = futures::sink::unfold(
-            (Box::pin(stdin), stream_tap_tx),
+            (Box::pin(stdin), stream_tap_tx.clone()),
             async move |(mut writer, tap_tx), line: String| {
                 use futures::AsyncWriteExt;
                 tap_tx
@@ -482,16 +487,26 @@ impl AcpConnection {
             }
         });
 
-        let stderr_task = cx.background_spawn(async move {
-            let mut stderr = BufReader::new(stderr);
-            let mut line = String::new();
-            while let Ok(n) = stderr.read_line(&mut line).await
-                && n > 0
-            {
-                log::warn!("agent stderr: {}", line.trim());
-                line.clear();
+        let stderr_task = cx.background_spawn({
+            let tap_tx = stream_tap_tx.clone();
+            async move {
+                let mut stderr = BufReader::new(stderr);
+                let mut line = String::new();
+                while let Ok(n) = stderr.read_line(&mut line).await
+                    && n > 0
+                {
+                    let trimmed = line.trim_end_matches(['\n', '\r']);
+                    log::warn!("agent stderr: {trimmed}");
+                    tap_tx
+                        .try_send(RawStreamLine {
+                            direction: StreamMessageDirection::Stderr,
+                            line: Arc::from(trimmed),
+                        })
+                        .log_err();
+                    line.clear();
+                }
+                Ok(())
             }
-            Ok(())
         });
 
         let wait_task = cx.spawn({
