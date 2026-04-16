@@ -24,7 +24,7 @@ use gpui::{AppContext as _, Entity, Global, Subscription, Task};
 pub use project::WorktreePaths;
 use project::{AgentId, linked_worktree_short_name};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
-use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
+use ui::{App, Context, SharedString};
 use util::{ResultExt as _, debug_panic};
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
@@ -314,19 +314,36 @@ impl ThreadMetadata {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeDisplayKind {
+    Main,
+    Linked,
+}
+
+/// Intermediate data produced by [`worktree_display_info_from_paths`].
+/// Callers convert this into the UI-layer types (`ThreadItemWorktreeInfo`,
+/// `branch_name`) when building a `ThreadItem`.
+#[derive(Clone, Debug)]
+pub struct WorktreeDisplayInfo {
+    pub name: SharedString,
+    pub full_path: SharedString,
+    pub kind: WorktreeDisplayKind,
+    pub branch_name: Option<SharedString>,
+}
+
 /// Derives worktree display info from a thread's stored path list.
 ///
 /// For each path in the thread's `folder_paths`, produces a
-/// [`ThreadItemWorktreeInfo`] with a short display name, full path, and whether
+/// [`WorktreeDisplayInfo`] with a short display name, full path, and whether
 /// the worktree is the main checkout or a linked git worktree. When
 /// multiple main paths exist and a linked worktree's short name alone
 /// wouldn't identify which main project it belongs to, the main project
 /// name is prefixed for disambiguation (e.g. `project:feature`).
-pub fn worktree_info_from_thread_paths<S: std::hash::BuildHasher>(
+pub fn worktree_display_info_from_paths<S: std::hash::BuildHasher>(
     worktree_paths: &WorktreePaths,
     branch_names: &std::collections::HashMap<PathBuf, SharedString, S>,
-) -> Vec<ThreadItemWorktreeInfo> {
-    let mut infos: Vec<ThreadItemWorktreeInfo> = Vec::new();
+) -> Vec<WorktreeDisplayInfo> {
+    let mut infos: Vec<WorktreeDisplayInfo> = Vec::new();
     let mut linked_short_names: Vec<(SharedString, SharedString)> = Vec::new();
     let mut unique_main_count = HashSet::default();
 
@@ -341,37 +358,31 @@ pub fn worktree_info_from_thread_paths<S: std::hash::BuildHasher>(
                 .map(|n| SharedString::from(n.to_string_lossy().to_string()))
                 .unwrap_or_default();
             linked_short_names.push((short_name.clone(), project_name));
-            infos.push(ThreadItemWorktreeInfo {
+            infos.push(WorktreeDisplayInfo {
                 name: short_name,
                 full_path: SharedString::from(folder_path.display().to_string()),
-                highlight_positions: Vec::new(),
-                kind: WorktreeKind::Linked,
+                kind: WorktreeDisplayKind::Linked,
                 branch_name: branch_names.get(folder_path).cloned(),
             });
         } else {
             let Some(name) = folder_path.file_name() else {
                 continue;
             };
-            infos.push(ThreadItemWorktreeInfo {
+            infos.push(WorktreeDisplayInfo {
                 name: SharedString::from(name.to_string_lossy().to_string()),
                 full_path: SharedString::from(folder_path.display().to_string()),
-                highlight_positions: Vec::new(),
-                kind: WorktreeKind::Main,
+                kind: WorktreeDisplayKind::Main,
                 branch_name: branch_names.get(folder_path).cloned(),
             });
         }
     }
 
-    // When the group has multiple main worktree paths and the thread's
-    // folder paths don't all share the same short name, prefix each
-    // linked worktree chip with its main project name so the user knows
-    // which project it belongs to.
     let all_same_name = infos.len() > 1 && infos.iter().all(|i| i.name == infos[0].name);
 
     if unique_main_count.len() > 1 && !all_same_name {
         for (info, (_short_name, project_name)) in infos
             .iter_mut()
-            .filter(|i| i.kind == WorktreeKind::Linked)
+            .filter(|i| i.kind == WorktreeDisplayKind::Linked)
             .zip(linked_short_names.iter())
         {
             info.name = SharedString::from(format!("{}:{}", project_name, info.name));
