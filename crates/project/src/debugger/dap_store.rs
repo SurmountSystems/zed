@@ -9,6 +9,7 @@ use remote::Interactive;
 use crate::{
     InlayHint, InlayHintLabel, ProjectEnvironment, ResolveState,
     debugger::session::SessionQuirks,
+    environment::DirectoryEnvironment,
     project_settings::{DapBinary, ProjectSettings},
     worktree_store::WorktreeStore,
 };
@@ -28,7 +29,7 @@ use fs::{Fs, RemoveOptions};
 use futures::{
     StreamExt, TryStreamExt as _,
     channel::mpsc::{self, UnboundedSender},
-    future::{Shared, join_all},
+    future::join_all,
 };
 use gpui::{App, AppContext, AsyncApp, Context, Entity, EventEmitter, SharedString, Task};
 use http_client::HttpClient;
@@ -273,7 +274,7 @@ impl DapStore {
 
                 let delegate = self.delegate(worktree, console, cx);
 
-                let worktree = worktree.clone();
+                let worktree_id = worktree.read(cx).id();
                 cx.spawn(async move |this, cx| {
                     let mut binary = adapter
                         .get_binary(
@@ -286,21 +287,19 @@ impl DapStore {
                         )
                         .await?;
 
-                    let env = this
+                    let mut env = this
                         .update(cx, |this, cx| {
                             this.as_local()
                                 .unwrap()
                                 .environment
                                 .update(cx, |environment, cx| {
-                                    environment.worktree_environment(worktree, cx)
+                                    environment.worktree_environment(worktree_id, cx)
                                 })
                         })?
+                        .get()
                         .await;
-
-                    if let Some(mut env) = env {
-                        env.extend(std::mem::take(&mut binary.envs));
-                        binary.envs = env;
-                    }
+                    env.extend(std::mem::take(&mut binary.envs));
+                    binary.envs = env;
 
                     Ok(binary)
                 })
@@ -610,9 +609,9 @@ impl DapStore {
             local_store.node_runtime.clone(),
             local_store.http_client.clone(),
             local_store.toolchain_store.clone(),
-            local_store
-                .environment
-                .update(cx, |env, cx| env.worktree_environment(worktree.clone(), cx)),
+            local_store.environment.update(cx, |env, cx| {
+                env.worktree_environment(worktree.read(cx).id(), cx)
+            }),
             local_store.is_headless,
         ))
     }
@@ -943,7 +942,7 @@ pub struct DapAdapterDelegate {
     node_runtime: NodeRuntime,
     http_client: Arc<dyn HttpClient>,
     toolchain_store: Arc<dyn LanguageToolchainStore>,
-    load_shell_env_task: Shared<Task<Option<HashMap<String, String>>>>,
+    shell_env: DirectoryEnvironment,
     is_headless: bool,
 }
 
@@ -955,7 +954,7 @@ impl DapAdapterDelegate {
         node_runtime: NodeRuntime,
         http_client: Arc<dyn HttpClient>,
         toolchain_store: Arc<dyn LanguageToolchainStore>,
-        load_shell_env_task: Shared<Task<Option<HashMap<String, String>>>>,
+        shell_env: DirectoryEnvironment,
         is_headless: bool,
     ) -> Self {
         Self {
@@ -965,7 +964,7 @@ impl DapAdapterDelegate {
             http_client,
             node_runtime,
             toolchain_store,
-            load_shell_env_task,
+            shell_env,
             is_headless,
         }
     }
@@ -1013,8 +1012,7 @@ impl dap::adapters::DapDelegate for DapAdapterDelegate {
     }
 
     async fn shell_env(&self) -> HashMap<String, String> {
-        let task = self.load_shell_env_task.clone();
-        task.await.unwrap_or_default()
+        self.shell_env.get().await
     }
 
     fn toolchain_store(&self) -> Arc<dyn LanguageToolchainStore> {

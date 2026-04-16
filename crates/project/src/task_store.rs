@@ -325,8 +325,9 @@ fn local_task_context_for_location(
     cx.spawn(async move |cx| {
         let project_env = environment
             .update(cx, |environment, cx| {
-                environment.buffer_environment(&location.buffer, &worktree_store, cx)
+                environment.buffer_environment(&location.buffer, cx)
             })
+            .get()
             .await;
 
         let mut task_variables = cx
@@ -348,7 +349,7 @@ fn local_task_context_for_location(
         task_variables.sweep();
 
         Some(TaskContext {
-            project_env: project_env.unwrap_or_default(),
+            project_env,
             cwd: worktree_abs_path.map(|p| p.to_path_buf()),
             task_variables,
         })
@@ -451,7 +452,7 @@ fn combine_task_variables(
     fs: Option<Arc<dyn Fs>>,
     worktree_store: Entity<WorktreeStore>,
     location: Location,
-    project_env: Option<HashMap<String, String>>,
+    project_env: HashMap<String, String>,
     baseline: BasicContextProvider,
     toolchain_store: Arc<dyn LanguageToolchainStore>,
     cx: &mut App,
@@ -472,7 +473,7 @@ fn combine_task_variables(
                         worktree_root,
                         file_location: &location,
                     },
-                    project_env.clone(),
+                    Some(project_env.clone()),
                     toolchain_store.clone(),
                     cx,
                 )
@@ -491,7 +492,7 @@ fn combine_task_variables(
                             worktree_root,
                             file_location: &location,
                         },
-                        project_env,
+                        Some(project_env),
                         toolchain_store,
                         cx,
                     )

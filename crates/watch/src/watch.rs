@@ -46,6 +46,7 @@ struct State<T> {
     closed: bool,
 }
 
+#[derive(Clone)]
 pub struct Sender<T> {
     state: Arc<RwLock<State<T>>>,
 }

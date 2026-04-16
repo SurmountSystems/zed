@@ -2770,10 +2770,10 @@ impl AcpThread {
                     env.directory_environment(dir.as_path().into(), cx)
                 })
             }),
-            None => Task::ready(None).shared(),
+            None => DirectoryEnvironment::empty(),
         };
         let env = cx.spawn(async move |_, _| {
-            let mut env = env.await.unwrap_or_default();
+            let mut env = env.get().await.unwrap_or_default();
             // Disables paging for `git` and hopefully other commands
             env.insert("PAGER".into(), "".into());
             for var in extra_env {

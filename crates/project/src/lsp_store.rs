@@ -32,7 +32,7 @@ use crate::{
     ManifestProvidersStore, Project, ProjectItem, ProjectPath, ProjectTransaction,
     PulledDiagnostics, ResolveState, Symbol,
     buffer_store::{BufferStore, BufferStoreEvent},
-    environment::ProjectEnvironment,
+    environment::{DirectoryEnvironment, ProjectEnvironment},
     lsp_command::{self, *},
     lsp_store::{
         self,
@@ -10733,13 +10733,13 @@ impl LspStore {
         &self,
         buffer: &Entity<Buffer>,
         cx: &mut Context<Self>,
-    ) -> Shared<Task<Option<HashMap<String, String>>>> {
+    ) -> Task<Option<HashMap<String, String>>> {
         if let Some(environment) = &self.as_local().map(|local| local.environment.clone()) {
-            environment.update(cx, |env, cx| {
-                env.buffer_environment(buffer, &self.worktree_store, cx)
-            })
+            let directory_environment =
+                environment.update(cx, |env, cx| env.buffer_environment(buffer, cx));
+            cx.background_spawn(async move { Some(directory_environment.get().await) })
         } else {
-            Task::ready(None).shared()
+            Task::ready(None)
         }
     }
 
@@ -14307,7 +14307,7 @@ pub struct LocalLspAdapterDelegate {
     fs: Arc<dyn Fs>,
     http_client: Arc<dyn HttpClient>,
     language_registry: Arc<LanguageRegistry>,
-    load_shell_env_task: Shared<Task<Option<HashMap<String, String>>>>,
+    shell_env: DirectoryEnvironment,
 }
 
 impl LocalLspAdapterDelegate {
@@ -14320,16 +14320,20 @@ impl LocalLspAdapterDelegate {
         fs: Arc<dyn Fs>,
         cx: &mut App,
     ) -> Arc<Self> {
-        let load_shell_env_task =
-            environment.update(cx, |env, cx| env.worktree_environment(worktree.clone(), cx));
+        // TODO kb do that when the env is retrieved? Where to get the `worktree` then?
+        let shell_env = environment.update(cx, |env, cx| {
+            env.worktree_environment(worktree.read(cx).id(), cx)
+        });
 
+        // before trust: shell_env.get() returns HashMap::default()
+        // after trust: shell_env.get() returns the worktree environment
         Arc::new(Self {
             lsp_store,
             worktree: worktree.read(cx).snapshot(),
             fs,
             http_client,
             language_registry,
-            load_shell_env_task,
+            shell_env,
         })
     }
 
@@ -14377,8 +14381,7 @@ impl LspAdapterDelegate for LocalLspAdapterDelegate {
     }
 
     async fn shell_env(&self) -> HashMap<String, String> {
-        let task = self.load_shell_env_task.clone();
-        task.await.unwrap_or_default()
+        self.shell_env.get().await
     }
 
     async fn npm_package_installed_version(

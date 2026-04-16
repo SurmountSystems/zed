@@ -212,8 +212,8 @@ pub async fn create_terminal_entity(
                     env.directory_environment(dir.clone().into(), cx)
                 })
             })
+            .get()
             .await
-            .unwrap_or_default()
     } else {
         Default::default()
     };

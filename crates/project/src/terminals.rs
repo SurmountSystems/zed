@@ -2,7 +2,6 @@ use anyhow::Result;
 use collections::HashMap;
 use gpui::{App, AppContext as _, Context, Entity, Task, WeakEntity};
 
-use futures::{FutureExt, future::Shared};
 use itertools::Itertools as _;
 use language::LanguageName;
 use remote::RemoteClient;
@@ -585,10 +584,11 @@ impl Project {
         path: Option<Arc<Path>>,
         remote_client: Option<Entity<RemoteClient>>,
         cx: &mut App,
-    ) -> Shared<Task<Option<HashMap<String, String>>>> {
+    ) -> Task<Option<HashMap<String, String>>> {
         if let Some(path) = &path {
             let shell = Shell::Program(shell.to_string());
-            self.environment
+            let env = self
+                .environment
                 .update(cx, |project_env, cx| match &remote_client {
                     Some(remote_client) => project_env.remote_directory_environment(
                         &shell,
@@ -597,9 +597,10 @@ impl Project {
                         cx,
                     ),
                     None => project_env.local_directory_environment(&shell, path.clone(), cx),
-                })
+                });
+            cx.background_spawn(async move { Some(env.get().await) })
         } else {
-            Task::ready(None).shared()
+            Task::ready(None)
         }
     }
 }

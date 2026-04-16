@@ -374,14 +374,15 @@ impl LocalRepositoryState {
         cx: &mut AsyncApp,
     ) -> anyhow::Result<Self> {
         let environment = project_environment
-                .update(cx, |project_environment, cx| {
-                    project_environment.local_directory_environment(&Shell::System, work_directory_abs_path.clone(), cx)
-                })?
-                .await
-                .unwrap_or_else(|| {
-                    log::error!("failed to get working directory environment for repository {work_directory_abs_path:?}");
-                    HashMap::default()
-                });
+            .update(cx, |project_environment, cx| {
+                project_environment.local_directory_environment(
+                    &Shell::System,
+                    work_directory_abs_path.clone(),
+                    cx,
+                )
+            })?
+            .get()
+            .await;
         let search_paths = environment.get("PATH").map(|val| val.to_owned());
         let backend = cx
             .background_spawn({

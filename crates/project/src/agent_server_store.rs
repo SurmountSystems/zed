@@ -1173,8 +1173,8 @@ impl ExternalAgentServer for LocalExtensionArchiveAgent {
                 .update(cx, |project_environment, cx| {
                     project_environment.default_environment(cx)
                 })?
-                .await
-                .unwrap_or_default();
+                .get()
+                .await;
 
             // Merge manifest env and extra env
             env.extend(base_env);
@@ -1363,10 +1363,9 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
         cx.spawn(async move |cx| {
             let mut env = project_environment
                 .update(cx, |project_environment, cx| {
-                    project_environment.default_environment(cx)
+                    project_environment.default_environment(cx).get()
                 })?
-                .await
-                .unwrap_or_default();
+                .await;
 
             let dir = paths::external_agents_dir()
                 .join("registry")
@@ -1545,8 +1544,8 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
                 .update(cx, |project_environment, cx| {
                     project_environment.default_environment(cx)
                 })?
-                .await
-                .unwrap_or_default();
+                .get()
+                .await;
 
             let prefix_dir = paths::external_agents_dir()
                 .join("registry")
@@ -1611,8 +1610,8 @@ impl ExternalAgentServer for LocalCustomAgent {
                 .update(cx, |project_environment, cx| {
                     project_environment.default_environment(cx)
                 })?
-                .await
-                .unwrap_or_default();
+                .get()
+                .await;
             env.extend(command.env.unwrap_or_default());
             env.extend(extra_env);
             command.env = Some(env);

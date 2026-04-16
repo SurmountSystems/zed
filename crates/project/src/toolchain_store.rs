@@ -545,12 +545,13 @@ impl LocalToolchainStore {
                         cx,
                     )
                 })
+                .get()
                 .await;
 
             cx.background_spawn(async move {
                 Some((
                     toolchains
-                        .list(worktree_root, relative_path.path.clone(), project_env)
+                        .list(worktree_root, relative_path.path.clone(), Some(project_env))
                         .await,
                     relative_path.path,
                 ))
@@ -601,9 +602,12 @@ impl LocalToolchainStore {
                         cx,
                     )
                 })
+                .get()
                 .await;
-            cx.background_spawn(async move { toolchain_lister.resolve(path, project_env).await })
-                .await
+            cx.background_spawn(
+                async move { toolchain_lister.resolve(path, Some(project_env)).await },
+            )
+            .await
         })
     }
 }

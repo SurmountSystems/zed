@@ -123,7 +123,7 @@ impl DevContainerContext {
         let Ok(task) = self.environment.update(cx, |this, cx| {
             this.local_directory_environment(&Shell::System, self.project_directory.clone(), cx)
         }) else {
-            return HashMap::default();
+            return DirectoryEnvironment::empty();
         };
         task.await
             .map(|env| env.into_iter().collect::<std::collections::HashMap<_, _>>())
