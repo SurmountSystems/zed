@@ -92,7 +92,7 @@ pub trait AgentServer: Send {
 
     fn favorite_config_option_value_ids(
         &self,
-        _config_id: &SessionConfigId,
+        _config_id: &acp_schema::SessionConfigId,
         _cx: &mut App,
     ) -> HashSet<acp_schema::SessionConfigValueId> {
         HashSet::default()
@@ -100,8 +100,8 @@ pub trait AgentServer: Send {
 
     fn toggle_favorite_config_option_value(
         &self,
-        _config_id: SessionConfigId,
-        _value_id: SessionConfigValueId,
+        _config_id: acp_schema::SessionConfigId,
+        _value_id: acp_schema::SessionConfigValueId,
         _should_be_favorite: bool,
         _fs: Arc<dyn Fs>,
         _cx: &App,
