@@ -617,7 +617,6 @@ impl AcpConnection {
         agent_capabilities: acp::AgentCapabilities,
         agent_server_store: WeakEntity<AgentServerStore>,
         io_task: Task<()>,
-        dispatch_task: Task<()>,
         _cx: &mut App,
     ) -> Self {
         Self {
@@ -635,7 +634,7 @@ impl AcpConnection {
             child: None,
             session_list: None,
             _io_task: io_task,
-            _dispatch_task: dispatch_task,
+            _dispatch_task: Task::ready(()),
             _wait_task: Task::ready(Ok(())),
             _stderr_task: Task::ready(Ok(())),
         }
@@ -1550,68 +1549,6 @@ mod tests {
         assert_eq!(task.label, "Login");
     }
 
-    struct FakeAcpAgent {
-        load_session_count: Arc<AtomicUsize>,
-        close_session_count: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait(?Send)]
-    impl acp::Agent for FakeAcpAgent {
-        async fn initialize(
-            &self,
-            args: acp::InitializeRequest,
-        ) -> acp::Result<acp::InitializeResponse> {
-            Ok(
-                acp::InitializeResponse::new(args.protocol_version).agent_capabilities(
-                    acp::AgentCapabilities::default()
-                        .load_session(true)
-                        .session_capabilities(
-                            acp::SessionCapabilities::default()
-                                .close(acp::SessionCloseCapabilities::new()),
-                        ),
-                ),
-            )
-        }
-
-        async fn authenticate(
-            &self,
-            _: acp::AuthenticateRequest,
-        ) -> acp::Result<acp::AuthenticateResponse> {
-            Ok(Default::default())
-        }
-
-        async fn new_session(
-            &self,
-            _: acp::NewSessionRequest,
-        ) -> acp::Result<acp::NewSessionResponse> {
-            Ok(acp::NewSessionResponse::new(acp::SessionId::new("unused")))
-        }
-
-        async fn prompt(&self, _: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
-            Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
-        }
-
-        async fn cancel(&self, _: acp::CancelNotification) -> acp::Result<()> {
-            Ok(())
-        }
-
-        async fn load_session(
-            &self,
-            _: acp::LoadSessionRequest,
-        ) -> acp::Result<acp::LoadSessionResponse> {
-            self.load_session_count.fetch_add(1, Ordering::SeqCst);
-            Ok(acp::LoadSessionResponse::new())
-        }
-
-        async fn close_session(
-            &self,
-            _: acp::CloseSessionRequest,
-        ) -> acp::Result<acp::CloseSessionResponse> {
-            self.close_session_count.fetch_add(1, Ordering::SeqCst);
-            Ok(acp::CloseSessionResponse::new())
-        }
-    }
-
     async fn connect_fake_agent(
         cx: &mut gpui::TestAppContext,
     ) -> (
@@ -1633,50 +1570,100 @@ mod tests {
         let load_count = Arc::new(AtomicUsize::new(0));
         let close_count = Arc::new(AtomicUsize::new(0));
 
-        let (c2a_reader, c2a_writer) = piper::pipe(4096);
-        let (a2c_reader, a2c_writer) = piper::pipe(4096);
+        let (client_transport, agent_transport) = agent_client_protocol::Channel::duplex();
 
         let sessions: Rc<RefCell<HashMap<acp::SessionId, AcpSession>>> =
             Rc::new(RefCell::new(HashMap::default()));
-        let session_list_container: Rc<RefCell<Option<Rc<AcpSessionList>>>> =
-            Rc::new(RefCell::new(None));
 
-        let foreground = cx.foreground_executor().clone();
+        // Build the fake agent side. It handles the requests issued by
+        // `AcpConnection` during the test and tracks load/close counts.
+        let agent_future = Agent
+            .builder()
+            .name("fake-agent")
+            .on_receive_request(
+                async move |req: acp::InitializeRequest, responder, _cx| {
+                    responder.respond(
+                        acp::InitializeResponse::new(req.protocol_version).agent_capabilities(
+                            acp::AgentCapabilities::default()
+                                .load_session(true)
+                                .session_capabilities(
+                                    acp::SessionCapabilities::default()
+                                        .close(acp::SessionCloseCapabilities::new()),
+                                ),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: acp::AuthenticateRequest, responder, _cx| {
+                    responder.respond(Default::default())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: acp::NewSessionRequest, responder, _cx| {
+                    responder.respond(acp::NewSessionResponse::new(acp::SessionId::new("unused")))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |_req: acp::PromptRequest, responder, _cx| {
+                    responder.respond(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let load_count = load_count.clone();
+                    async move |_req: acp::LoadSessionRequest, responder, _cx| {
+                        load_count.fetch_add(1, Ordering::SeqCst);
+                        responder.respond(acp::LoadSessionResponse::new())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let close_count = close_count.clone();
+                    async move |_req: acp::CloseSessionRequest, responder, _cx| {
+                        close_count.fetch_add(1, Ordering::SeqCst);
+                        responder.respond(acp::CloseSessionResponse::new())
+                    }
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_notification(
+                async move |_notif: acp::CancelNotification, _cx| Ok(()),
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_to(agent_transport);
 
-        let client_delegate = ClientDelegate {
-            sessions: sessions.clone(),
-            session_list: session_list_container,
-            cx: cx.to_async(),
-        };
+        let agent_io_task = cx.background_spawn(agent_future);
 
-        let (client_conn, client_io_task) =
-            acp::ClientSideConnection::new(client_delegate, c2a_writer, a2c_reader, {
-                let foreground = foreground.clone();
-                move |fut| {
-                    foreground.spawn(fut).detach();
-                }
-            });
+        // Build the client side and capture the `ConnectionTo<Agent>` handle.
+        let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+        let client_future = Client.builder().name("zed-test").connect_with(
+            client_transport,
+            move |connection: ConnectionTo<Agent>| async move {
+                connection_tx.send(connection).ok();
+                futures::future::pending::<Result<(), acp::Error>>().await
+            },
+        );
 
-        let fake_agent = FakeAcpAgent {
-            load_session_count: load_count.clone(),
-            close_session_count: close_count.clone(),
-        };
+        let client_io_task = cx.background_spawn(async move {
+            client_future.await.ok();
+        });
 
-        let (_, agent_io_task) =
-            acp::AgentSideConnection::new(fake_agent, a2c_writer, c2a_reader, {
-                let foreground = foreground.clone();
-                move |fut| {
-                    foreground.spawn(fut).detach();
-                }
-            });
-
-        let client_io_task = cx.background_spawn(client_io_task);
-        let agent_io_task = cx.background_spawn(agent_io_task);
-
-        let response = client_conn
-            .initialize(acp::InitializeRequest::new(acp::ProtocolVersion::V1))
+        let client_conn: ConnectionTo<Agent> = connection_rx
             .await
-            .expect("failed to initialize ACP connection");
+            .expect("failed to receive ACP connection handle");
+
+        let response = into_foreground_future(
+            client_conn.send_request(acp::InitializeRequest::new(acp::ProtocolVersion::V1)),
+        )
+        .await
+        .expect("failed to initialize ACP connection");
 
         let agent_capabilities = response.agent_capabilities;
 
@@ -1685,7 +1672,7 @@ mod tests {
 
         let connection = cx.update(|cx| {
             AcpConnection::new_for_test(
-                Rc::new(client_conn),
+                client_conn,
                 sessions,
                 agent_capabilities,
                 agent_server_store,

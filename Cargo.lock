@@ -223,7 +223,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol-core"
 version = "0.1.0"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=9fa32bb04e301f4be968a372eb5085dc3a86ef3c#9fa32bb04e301f4be968a372eb5085dc3a86ef3c"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=4444454f6c7735bf224ee5d7d2193b2ebeaeeb60#4444454f6c7735bf224ee5d7d2193b2ebeaeeb60"
 dependencies = [
  "agent-client-protocol-derive",
  "agent-client-protocol-schema",
@@ -247,7 +247,7 @@ dependencies = [
 [[package]]
 name = "agent-client-protocol-derive"
 version = "0.1.0"
-source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=9fa32bb04e301f4be968a372eb5085dc3a86ef3c#9fa32bb04e301f4be968a372eb5085dc3a86ef3c"
+source = "git+https://github.com/agentclientprotocol/rust-sdk?rev=4444454f6c7735bf224ee5d7d2193b2ebeaeeb60#4444454f6c7735bf224ee5d7d2193b2ebeaeeb60"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -293,7 +293,6 @@ dependencies = [
  "libc",
  "log",
  "nix 0.29.0",
- "piper",
  "project",
  "release_channel",
  "remote",
