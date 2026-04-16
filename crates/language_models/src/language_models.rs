@@ -4,8 +4,12 @@ use ::settings::{Settings, SettingsStore};
 use client::{Client, UserStore};
 use collections::HashSet;
 use credentials_provider::CredentialsProvider;
-use gpui::{App, Context, Entity};
-use language_model::{LanguageModelProviderId, LanguageModelRegistry};
+use futures::future;
+use gpui::{App, AppContext as _, Context, Entity};
+use language_model::{
+    AuthenticateError, ConfiguredModel, LanguageModelProviderId, LanguageModelRegistry,
+    ZED_CLOUD_PROVIDER_ID,
+};
 use provider::deepseek::DeepSeekLanguageModelProvider;
 
 pub mod extension;
@@ -116,6 +120,21 @@ pub fn init(user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
             cx,
         );
     });
+    authenticate_all_providers(registry.clone(), cx);
+
+    cx.subscribe(
+        &registry,
+        |registry, event: &language_model::Event, cx| match event {
+            language_model::Event::ProviderStateChanged(_)
+            | language_model::Event::AddedProvider(_)
+            | language_model::Event::RemovedProvider(_) => {
+                update_environment_fallback_model(&registry, cx);
+            }
+            _ => {}
+        },
+    )
+    .detach();
+
     let registry = registry.downgrade();
     cx.observe_global::<SettingsStore>(move |cx| {
         let Some(registry) = registry.upgrade() else {
@@ -141,6 +160,110 @@ pub fn init(user_store: Entity<UserStore>, client: Arc<Client>, cx: &mut App) {
         }
     })
     .detach();
+}
+
+/// Authenticates all providers in the [`LanguageModelRegistry`].
+///
+/// We do this so that we can populate the language selector with all of the
+/// models from the configured providers, and so that we have a fallback model
+/// to use when the user hasn't explicitly configured one.
+fn authenticate_all_providers(registry: Entity<LanguageModelRegistry>, cx: &mut App) {
+    let providers_to_authenticate = registry
+        .read(cx)
+        .providers()
+        .iter()
+        .map(|provider| (provider.id(), provider.name(), provider.authenticate(cx)))
+        .collect::<Vec<_>>();
+
+    let mut tasks = Vec::with_capacity(providers_to_authenticate.len());
+
+    for (provider_id, provider_name, authenticate_task) in providers_to_authenticate {
+        tasks.push(cx.background_spawn(async move {
+            if let Err(err) = authenticate_task.await {
+                if matches!(err, AuthenticateError::CredentialsNotFound) {
+                    // Since we're authenticating these providers in the
+                    // background for the purposes of populating the
+                    // language selector, we don't care about providers
+                    // where the credentials are not found.
+                } else {
+                    // Some providers have noisy failure states that we
+                    // don't want to spam the logs with every time the
+                    // language model selector is initialized.
+                    //
+                    // Ideally these should have more clear failure modes
+                    // that we know are safe to ignore here, like what we do
+                    // with `CredentialsNotFound` above.
+                    match provider_id.0.as_ref() {
+                        "lmstudio" | "ollama" => {
+                            // LM Studio and Ollama both make fetch requests to the local APIs to determine if they are "authenticated".
+                            //
+                            // These fail noisily, so we don't log them.
+                        }
+                        "copilot_chat" => {
+                            // Copilot Chat returns an error if Copilot is not enabled, so we don't log those errors.
+                        }
+                        _ => {
+                            log::error!(
+                                "Failed to authenticate provider: {}: {err}",
+                                provider_name.0
+                            );
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    let all_authenticated_future = future::join_all(tasks);
+
+    cx.spawn(async move |cx| {
+        all_authenticated_future.await;
+        cx.update(|cx| update_environment_fallback_model(&registry, cx));
+    })
+    .detach();
+}
+
+/// Recomputes and sets the [`LanguageModelRegistry`]'s environment fallback
+/// model based on currently authenticated providers.
+///
+/// Prefers the Zed cloud provider so that, once the user is signed in, we
+/// always pick a Zed-hosted model over models from other authenticated
+/// providers in the environment. If the Zed cloud provider is authenticated
+/// but hasn't finished loading its models yet, we don't fall back to another
+/// provider to avoid flickering between providers during sign in.
+fn update_environment_fallback_model(registry: &Entity<LanguageModelRegistry>, cx: &mut App) {
+    let fallback_model = {
+        let registry = registry.read(cx);
+        let cloud_provider = registry.provider(&ZED_CLOUD_PROVIDER_ID);
+        if cloud_provider
+            .as_ref()
+            .is_some_and(|provider| provider.is_authenticated(cx))
+        {
+            cloud_provider.and_then(|provider| {
+                let model = provider
+                    .default_model(cx)
+                    .or_else(|| provider.recommended_models(cx).first().cloned())?;
+                Some(ConfiguredModel { provider, model })
+            })
+        } else {
+            registry
+                .providers()
+                .iter()
+                .filter(|provider| provider.is_authenticated(cx))
+                .find_map(|provider| {
+                    let model = provider
+                        .default_model(cx)
+                        .or_else(|| provider.recommended_models(cx).first().cloned())?;
+                    Some(ConfiguredModel {
+                        provider: provider.clone(),
+                        model,
+                    })
+                })
+        }
+    };
+    registry.update(cx, |registry, cx| {
+        registry.set_environment_fallback_model(fallback_model, cx);
+    });
 }
 
 fn register_openai_compatible_providers(
