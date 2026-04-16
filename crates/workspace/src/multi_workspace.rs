@@ -930,10 +930,16 @@ impl MultiWorkspace {
                 return Ok(());
             }
 
-            cx.update(|cx| {
+            let result = cx.update(|cx| {
                 Workspace::new_local(paths, app_state, None, None, None, OpenMode::NewWindow, cx)
             })
             .await?;
+
+            result.window
+                .update(cx, |_, window, _cx| {
+                    window.activate_window();
+                })
+                .log_err();
 
             Ok(())
         })
