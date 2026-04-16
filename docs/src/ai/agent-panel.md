@@ -34,9 +34,15 @@ The sections below cover what you can do from here.
 
 By default, the Agent Panel uses Zed's first-party agent.
 
-To choose another agent, go to the plus button in the top-right of the Agent Panel and pick one of the [external agents](./external-agents.md) installed out of the box.
+To choose another agent, click the thread menu in the top-left of the Agent Panel and pick one of the [external agents](./external-agents.md).
 
-Manage multiple threads at once with the [Threads Sidebar](./parallel-agents.md#threads-sidebar).
+### Managing Multiple Threads {#multiple-threads}
+
+You can run multiple agent threads at once, each working independently with its own agent, context window, and conversation history. Open the Threads Sidebar with {#kb multi_workspace::ToggleWorkspaceSidebar} to see all your threads grouped by project. Click any thread to switch to it, or use the thread switcher ({#kb agents_sidebar::ToggleThreadSwitcher}) to cycle between recent threads without opening the sidebar.
+
+Threads you're no longer working on can be archived by hovering over them in the sidebar and clicking the archive icon. The archive holds all your threads and you can restore them at any time.
+
+For more details on the Threads Sidebar, worktree isolation, and managing multiple projects, see [Parallel Agents](./parallel-agents.md).
 
 ### Editing Messages {#editing-messages}
 

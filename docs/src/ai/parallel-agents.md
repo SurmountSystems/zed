@@ -35,7 +35,7 @@ You can search your archived threads; search will fuzzy match on thread titles.
 
 ### Importing External Agent Threads {#importing-threads}
 
-When the archive is open, an **Import ACP Threads** button appears in the sidebar bottom bar. Click it to open the import modal, which lists your installed external agents. Select the agents whose threads you want to import and confirm. Zed finds threads from those agents, whether they were started in Zed or in another client, and adds them to your thread archive.
+If you have external agents installed, Zed will detect whether you have existing threads and invite you to import them into Zed. Every time you open the archive, you should see an icon button in the sidebar bottom bar that allows you to import threads at any time. Clicking on it will open a modal, where you can select the agents whose threads you want to import.
 
 ## Running Multiple Threads {#running-multiple-threads}
 
@@ -55,13 +55,9 @@ Within a project, you can add multiple folders from a local or remote project. U
 
 If two threads might edit the same files, start one in a new git worktree to give it an isolated checkout.
 
-In the Agent Panel toolbar, click the worktree selector to choose which worktree you want the agent to run in, or create a new one. You can also cycle between the current worktree and a new worktree with {#kb agent::CycleStartThreadIn}.
-
-To change the default for new threads, set `new_thread_location` in your agent settings to `"local_project"` or `"new_worktree"`.
+In the Agent Panel toolbar, click the worktree selector to choose which worktree you want the agent to run in, or create a new one. New worktrees start in detached HEAD state, and Zed will attempt to check out the branch you selected. If that branch is already in use by another worktree, the new worktree stays in detached HEAD.
 
 After the agent finishes, review the diff and merge the changes through your normal git workflow. If the thread was running in a linked worktree and no other active threads use it, archiving the thread saves the worktree's git state and removes it from disk. Restoring the thread from the archive restores the worktree.
-
-> **Note:** Starting a thread in a new worktree requires the project to be in a git repository.
 
 ## Default Layout {#layout}
 
