@@ -353,6 +353,8 @@ pub enum NewWorktreeBranchTarget {
         #[serde(default)]
         from_ref: Option<String>,
     },
+    /// Resolve each repository's default branch independently at creation time.
+    DefaultBranch,
 }
 
 /// Creates a new git worktree and switches the workspace to it.
@@ -372,7 +374,7 @@ pub struct CreateWorktree {
 #[action(namespace = agent)]
 #[serde(deny_unknown_fields)]
 pub struct SwitchWorktree {
-    pub path: PathBuf,
+    pub paths: Vec<PathBuf>,
     pub display_name: String,
 }
 

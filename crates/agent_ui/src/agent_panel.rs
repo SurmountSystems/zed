@@ -674,9 +674,15 @@ enum WorktreeCreationArgs {
         branch_target: NewWorktreeBranchTarget,
     },
     Linked {
-        worktree_path: PathBuf,
+        worktree_paths: Vec<PathBuf>,
         display_name: String,
     },
+}
+
+#[derive(Clone, Debug)]
+enum RepoBaseRefs {
+    Uniform(Option<String>),
+    PerRepo(HashMap<EntityId, String>),
 }
 
 struct PreviousWorkspaceState {
@@ -2752,6 +2758,7 @@ impl AgentPanel {
             NewWorktreeBranchTarget::CreateBranch { name, from_ref } => {
                 (Some(name.clone()), from_ref.clone())
             }
+            NewWorktreeBranchTarget::DefaultBranch => (None, None),
         }
     }
 
@@ -2812,7 +2819,7 @@ impl AgentPanel {
         worktree_name: Option<String>,
         existing_worktree_names: &[String],
         existing_worktree_paths: &HashSet<PathBuf>,
-        base_ref: Option<String>,
+        base_refs: &RepoBaseRefs,
         worktree_directory_setting: &str,
         rng: &mut impl rand::Rng,
         cx: &mut Context<Self>,
@@ -2835,15 +2842,18 @@ impl AgentPanel {
         });
 
         for repo in git_repos {
+            let repo_entity_id = repo.entity_id();
             let (work_dir, new_path, receiver) = repo.update(cx, |repo, _cx| {
                 let new_path =
                     repo.path_for_new_linked_worktree(&worktree_name, worktree_directory_setting)?;
                 if existing_worktree_paths.contains(&new_path) {
                     anyhow::bail!("A worktree already exists at {}", new_path.display());
                 }
-                let target = git::repository::CreateWorktreeTarget::Detached {
-                    base_sha: base_ref.clone(),
+                let base_sha = match base_refs {
+                    RepoBaseRefs::Uniform(base) => base.clone(),
+                    RepoBaseRefs::PerRepo(map) => map.get(&repo_entity_id).cloned(),
                 };
+                let target = git::repository::CreateWorktreeTarget::Detached { base_sha };
                 let receiver = repo.create_worktree(target, new_path.clone());
                 let work_dir = repo.work_directory_abs_path.clone();
                 anyhow::Ok((work_dir, new_path, receiver))
@@ -3160,7 +3170,7 @@ impl AgentPanel {
         self.handle_worktree_requested(
             content_blocks,
             WorktreeCreationArgs::Linked {
-                worktree_path: action.path.clone(),
+                worktree_paths: action.paths.clone(),
                 display_name: action.display_name.clone(),
             },
             previous_workspace_state,
@@ -3312,6 +3322,35 @@ impl AgentPanel {
                     let (branch_to_checkout, base_ref) =
                         Self::resolve_worktree_branch_target(&branch_target);
 
+                    let (base_refs, per_repo_branches) =
+                        if matches!(branch_target, NewWorktreeBranchTarget::DefaultBranch) {
+                            let default_branch_receivers: Vec<_> =
+                                this.update_in(cx, |_this, _window, cx| {
+                                    git_repos
+                                        .iter()
+                                        .map(|repo| {
+                                            let entity_id = repo.entity_id();
+                                            let receiver = repo
+                                                .update(cx, |repo, _| repo.default_branch(false));
+                                            (entity_id, receiver)
+                                        })
+                                        .collect()
+                                })?;
+
+                            let mut per_repo_map = HashMap::default();
+                            for (entity_id, receiver) in default_branch_receivers {
+                                if let Ok(Ok(Some(branch))) = receiver.await {
+                                    per_repo_map.insert(entity_id, branch.to_string());
+                                }
+                            }
+                            (
+                                RepoBaseRefs::PerRepo(per_repo_map.clone()),
+                                Some(per_repo_map),
+                            )
+                        } else {
+                            (RepoBaseRefs::Uniform(base_ref), None)
+                        };
+
                     let (creation_infos, path_remapping) =
                         match this.update_in(cx, |_this, _window, cx| {
                             Self::start_worktree_creations(
@@ -3319,7 +3358,7 @@ impl AgentPanel {
                                 worktree_name,
                                 &existing_worktree_names,
                                 &existing_worktree_paths,
-                                base_ref,
+                                &base_refs,
                                 &worktree_directory_setting,
                                 &mut rng,
                                 cx,
@@ -3363,7 +3402,19 @@ impl AgentPanel {
                             }
                         };
 
-                    if let Some(ref branch_name) = branch_to_checkout {
+                    if let Some(ref per_repo) = per_repo_branches {
+                        for (repo, worktree_path) in &repo_paths {
+                            if let Some(branch_name) = per_repo.get(&repo.entity_id()) {
+                                Self::try_checkout_branch_in_worktree(
+                                    repo,
+                                    branch_name,
+                                    worktree_path,
+                                    cx,
+                                )
+                                .await;
+                            }
+                        }
+                    } else if let Some(ref branch_name) = branch_to_checkout {
                         for (repo, worktree_path) in &repo_paths {
                             Self::try_checkout_branch_in_worktree(
                                 repo,
@@ -3380,12 +3431,19 @@ impl AgentPanel {
                     all_paths.extend(non_git_paths.iter().cloned());
                     (all_paths, path_remapping, has_non_git)
                 }
-                WorktreeCreationArgs::Linked { worktree_path, .. } => {
+                WorktreeCreationArgs::Linked { worktree_paths, .. } => {
                     let path_remapping: Vec<(PathBuf, PathBuf)> = git_repo_work_dirs
                         .iter()
-                        .map(|work_dir| (work_dir.clone(), worktree_path.clone()))
+                        .filter_map(|work_dir| {
+                            let work_dir_name = work_dir.file_name();
+                            let matching_path = worktree_paths
+                                .iter()
+                                .find(|wt_path| wt_path.file_name() == work_dir_name)
+                                .or_else(|| worktree_paths.first());
+                            matching_path.map(|wt_path| (work_dir.clone(), wt_path.clone()))
+                        })
                         .collect();
-                    let mut all_paths = vec![worktree_path];
+                    let mut all_paths = worktree_paths;
                     let has_non_git = !non_git_paths.is_empty();
                     all_paths.extend(non_git_paths.iter().cloned());
                     (all_paths, path_remapping, has_non_git)
@@ -6421,6 +6479,10 @@ mod tests {
         let resolved =
             AgentPanel::resolve_worktree_branch_target(&NewWorktreeBranchTarget::CurrentBranch);
         assert_eq!(resolved, (None, None));
+
+        let resolved =
+            AgentPanel::resolve_worktree_branch_target(&NewWorktreeBranchTarget::DefaultBranch);
+        assert_eq!(resolved, (None, None));
     }
 
     #[gpui::test]
@@ -7657,7 +7719,7 @@ mod tests {
             panel.handle_worktree_requested(
                 content,
                 WorktreeCreationArgs::Linked {
-                    worktree_path: linked_path,
+                    worktree_paths: vec![linked_path],
                     display_name: "test-worktree".to_string(),
                 },
                 PreviousWorkspaceState::empty(),
@@ -7856,7 +7918,7 @@ mod tests {
             panel.handle_worktree_requested(
                 content,
                 WorktreeCreationArgs::Linked {
-                    worktree_path: linked_path.clone(),
+                    worktree_paths: vec![linked_path.clone()],
                     display_name: "feature".to_string(),
                 },
                 previous_state,
