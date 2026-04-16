@@ -6163,4 +6163,29 @@ fn test_resolving_max_anchor_for_buffer(cx: &mut TestAppContext) {
             .to_point(&snapshot);
         assert_eq!(point, Point::new(10, 0));
     })
+
+    #[gpui::test]
+    fn test_is_valid_with_oob_anchor() {
+        let buffer_a = cx.new(|cx| Buffer::local(indoc!{"
+            aaa
+            aaa
+            aaa
+            aaa
+            aaa
+        "}, cx));
+        let buffer_b = cx.new(|cx| Buffer::local(indoc!{"
+            bbb
+        "}, cx));
+        let multibuffer = cx.new(|cx| {
+            let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
+            let buffer_a_snapshot = buffer_a.read(cx).snapshot();
+            let a_range = buffer_a_snapshot.anchor_range_outside(Point::new(2, 0)..Point::new(2, 3));
+            multibuffer.set_excerpt_ranges_for_path(PathKey::sorted(0), buffer_a, buffer_a_snapshot, vec![ExcerptRange::new(a_range)], cx);
+            multibuffer.set_excerpt_ranges_for_path(PathKey::sorted)
+            multibuffer
+
+        })
+        // multibuffer with one excerpt for buffer A and one for buffer B
+        //
+    }
 }
