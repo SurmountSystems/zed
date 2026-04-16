@@ -47,7 +47,7 @@ pub struct LanguageModelRegistry {
     default_model: Option<ConfiguredModel>,
     /// This model is automatically configured by a user's environment after
     /// authenticating all providers. It's only used when `default_model` is not set.
-    environment_fallback_model: Option<ConfiguredModel>,
+    available_fallback_model: Option<ConfiguredModel>,
     inline_assistant_model: Option<ConfiguredModel>,
     commit_message_model: Option<ConfiguredModel>,
     thread_summary_model: Option<ConfiguredModel>,
@@ -364,13 +364,13 @@ impl LanguageModelRegistry {
         cx: &mut Context<Self>,
     ) {
         if self.default_model.is_none() {
-            match (self.environment_fallback_model.as_ref(), model.as_ref()) {
+            match (self.available_fallback_model.as_ref(), model.as_ref()) {
                 (Some(old), Some(new)) if old.is_same_as(new) => {}
                 (None, None) => {}
                 _ => cx.emit(Event::DefaultModelChanged),
             }
         }
-        self.environment_fallback_model = model;
+        self.available_fallback_model = model;
     }
 
     pub fn set_inline_assistant_model(
@@ -420,7 +420,7 @@ impl LanguageModelRegistry {
 
         self.default_model
             .clone()
-            .or_else(|| self.environment_fallback_model.clone())
+            .or_else(|| self.available_fallback_model.clone())
     }
 
     pub fn default_fast_model(&self, cx: &App) -> Option<ConfiguredModel> {
