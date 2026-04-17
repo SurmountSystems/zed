@@ -81,11 +81,7 @@ impl WorktreePicker {
                 .map(|branch| branch.name().to_string())
         });
 
-        let repository = if has_multiple_repositories {
-            None
-        } else {
-            project.read(cx).active_repository(cx)
-        };
+        let repository = project.read(cx).active_repository(cx);
 
         let all_worktrees_request = repository
             .clone()
@@ -286,11 +282,7 @@ impl WorktreePickerDelegate {
     }
 
     fn all_repo_worktrees(&self) -> &[GitWorktree] {
-        if self.has_multiple_repositories {
-            &[]
-        } else {
-            &self.all_worktrees
-        }
+        &self.all_worktrees
     }
 
     fn can_delete_worktree(&self, worktree: &GitWorktree) -> bool {
