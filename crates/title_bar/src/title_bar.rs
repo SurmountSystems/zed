@@ -390,9 +390,17 @@ impl TitleBar {
             }),
         );
         subscriptions.push(cx.observe(&user_store, |_a, _, cx| cx.notify()));
+        if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
+            subscriptions.push(cx.subscribe(
+                &workspace_entity,
+                |_, _, event: &workspace::Event, cx| {
+                    if matches!(event, workspace::Event::WorktreeCreationChanged) {
+                        cx.notify();
+                    }
+                },
+            ));
+        }
         subscriptions.push(cx.observe_button_layout_changed(window, |_, _, cx| cx.notify()));
-        subscriptions
-            .push(cx.observe_global::<workspace::ActiveWorktreeCreation>(|_, cx| cx.notify()));
         if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
             subscriptions.push(cx.subscribe(&trusted_worktrees, |_, _, _, cx| {
                 cx.notify();
@@ -865,18 +873,25 @@ impl TitleBar {
 
         let worktree_label: SharedString = linked_worktree_name.unwrap_or_else(|| "main".into());
 
-        let creation_in_progress = cx
-            .try_global::<workspace::ActiveWorktreeCreation>()
-            .and_then(|creation| creation.label.clone());
+        let (creation_in_progress, is_switch) = self
+            .workspace
+            .upgrade()
+            .map(|ws| {
+                let creation = ws.read(cx).active_worktree_creation();
+                (creation.label.clone(), creation.is_switch)
+            })
+            .unwrap_or((None, false));
         let is_creating = creation_in_progress.is_some();
 
         let display_label: SharedString = if let Some(ref name) = creation_in_progress {
-            format!("Creating {}…", name).into()
+            if is_switch {
+                format!("Loading {}…", name).into()
+            } else {
+                format!("Creating {}…", name).into()
+            }
         } else {
             worktree_label.clone()
         };
-
-        let worktree_tooltip_label = worktree_label.clone();
 
         let worktree_button = {
             let project = self.project.clone();
@@ -902,7 +917,7 @@ impl TitleBar {
                         Tooltip::with_meta(
                             "Worktree Picker",
                             Some(&zed_actions::git::Worktree),
-                            format!("Currently In Use: {}", worktree_tooltip_label),
+                            format!("Currently In Use: {}", worktree_label),
                             cx,
                         )
                     },
@@ -911,12 +926,12 @@ impl TitleBar {
         };
 
         let branch_tooltip_label = branch_name.clone();
+        let (branch_icon, branch_icon_color) = if settings.show_branch_status_icon {
+            icon_info
+        } else {
+            (IconName::GitBranch, Color::Muted)
+        };
 
-        // todo dl: remove this setting?!
-        // .when(settings.show_branch_icon, |this| {
-        //     let (icon, icon_color) = icon_info;
-        //     this.child(Icon::new(icon).size(IconSize::XSmall).color(icon_color))
-        // })
         let git_picker_button = PopoverMenu::new("branch-menu")
             .menu(move |window, cx| {
                 Some(git_ui::git_picker::popover(
@@ -934,9 +949,9 @@ impl TitleBar {
                     .label_size(LabelSize::Small)
                     .color(Color::Muted)
                     .start_icon(
-                        Icon::new(IconName::GitBranch)
+                        Icon::new(branch_icon)
                             .size(IconSize::XSmall)
-                            .color(Color::Muted),
+                            .color(branch_icon_color),
                     ),
                 move |_window, cx| {
                     let meta = if is_detached_head {

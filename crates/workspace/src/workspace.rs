@@ -1111,15 +1111,22 @@ struct GlobalAppState(Arc<AppState>);
 
 impl Global for GlobalAppState {}
 
-/// Shared state for displaying worktree creation progress in the title bar.
-/// Written by the agent panel when creating/switching worktrees,
-/// read by the title bar to show a loading indicator on the worktree button.
+/// Tracks worktree creation progress for the workspace.
+/// Read by the title bar to show a loading indicator on the worktree button.
 #[derive(Default)]
 pub struct ActiveWorktreeCreation {
     pub label: Option<SharedString>,
+    pub is_switch: bool,
 }
 
-impl Global for ActiveWorktreeCreation {}
+/// Captured workspace state used when switching between worktrees.
+/// Stores the layout and open files so they can be restored in the new workspace.
+pub struct PreviousWorkspaceState {
+    pub dock_structure: DockStructure,
+    pub open_file_paths: Vec<PathBuf>,
+    pub active_file_path: Option<PathBuf>,
+    pub focused_dock: Option<DockPosition>,
+}
 
 pub struct WorkspaceStore {
     workspaces: HashSet<(gpui::AnyWindowHandle, WeakEntity<Workspace>)>,
@@ -1281,6 +1288,7 @@ pub enum Event {
     ModalOpened,
     Activate,
     PanelAdded(AnyView),
+    WorktreeCreationChanged,
 }
 
 #[derive(Debug, Clone)]
@@ -1389,6 +1397,8 @@ pub struct Workspace {
     _panels_task: Option<Task<Result<()>>>,
     sidebar_focus_handle: Option<FocusHandle>,
     multi_workspace: Option<WeakEntity<MultiWorkspace>>,
+    active_worktree_creation: ActiveWorktreeCreation,
+    pre_picker_focused_dock: Option<DockPosition>,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -1817,6 +1827,8 @@ impl Workspace {
             removing: false,
             sidebar_focus_handle: None,
             multi_workspace,
+            active_worktree_creation: ActiveWorktreeCreation::default(),
+            pre_picker_focused_dock: None,
             open_in_dev_container: false,
             _dev_container_task: None,
         }
@@ -2187,6 +2199,79 @@ impl Workspace {
                 dock.serialized_dock = Some(data);
                 dock.restore_state(window, cx);
             });
+        }
+    }
+
+    /// Returns which dock currently has focus, or `None` if focus is in the
+    /// center pane or elsewhere. Does NOT fall back to any global state.
+    pub fn focused_dock_position(&self, window: &Window, cx: &App) -> Option<DockPosition> {
+        [
+            (DockPosition::Left, &self.left_dock),
+            (DockPosition::Right, &self.right_dock),
+            (DockPosition::Bottom, &self.bottom_dock),
+        ]
+        .into_iter()
+        .find(|(_, dock)| {
+            dock.read(cx).is_open() && dock.focus_handle(cx).contains_focused(window, cx)
+        })
+        .map(|(position, _)| position)
+    }
+
+    pub fn active_worktree_creation(&self) -> &ActiveWorktreeCreation {
+        &self.active_worktree_creation
+    }
+
+    pub fn set_active_worktree_creation(
+        &mut self,
+        label: Option<SharedString>,
+        is_switch: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_worktree_creation.label = label;
+        self.active_worktree_creation.is_switch = is_switch;
+        cx.emit(Event::WorktreeCreationChanged);
+        cx.notify();
+    }
+
+    pub fn pre_picker_focused_dock(&self) -> Option<DockPosition> {
+        self.pre_picker_focused_dock
+    }
+
+    pub fn set_pre_picker_focused_dock(&mut self, position: Option<DockPosition>) {
+        self.pre_picker_focused_dock = position;
+    }
+
+    /// Captures the current workspace state for restoring after a worktree switch.
+    /// This includes dock layout, open file paths, and the active file path.
+    pub fn capture_state_for_worktree_switch(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> PreviousWorkspaceState {
+        let dock_structure = self.capture_dock_state(window, cx);
+        let open_file_paths = self.open_item_abs_paths(cx);
+        let active_file_path = self
+            .active_item(cx)
+            .and_then(|item| item.project_path(cx))
+            .and_then(|pp| self.project().read(cx).absolute_path(&pp, cx));
+
+        let focused_dock = [
+            (DockPosition::Left, &self.left_dock),
+            (DockPosition::Right, &self.right_dock),
+            (DockPosition::Bottom, &self.bottom_dock),
+        ]
+        .into_iter()
+        .find(|(_, dock)| {
+            dock.read(cx).is_open() && dock.focus_handle(cx).contains_focused(window, cx)
+        })
+        .map(|(position, _)| position)
+        .or_else(|| self.pre_picker_focused_dock);
+
+        PreviousWorkspaceState {
+            dock_structure,
+            open_file_paths,
+            active_file_path,
+            focused_dock,
         }
     }
 

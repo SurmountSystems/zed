@@ -48,7 +48,9 @@ pub(crate) mod remote_output;
 pub mod repository_selector;
 pub mod stash_picker;
 pub mod text_diff_view;
+pub mod worktree_names;
 pub mod worktree_picker;
+pub mod worktree_service;
 
 pub use conflict_view::MergeConflictIndicator;
 
@@ -68,7 +70,13 @@ pub fn init(cx: &mut App) {
         repository_selector::register(workspace);
         git_picker::register(workspace);
 
+        workspace.register_action(worktree_service::handle_create_worktree);
+        workspace.register_action(worktree_service::handle_switch_worktree);
+
         workspace.register_action(|workspace, _: &zed_actions::git::Worktree, window, cx| {
+            let focused_dock = workspace.focused_dock_position(window, cx);
+            workspace.set_pre_picker_focused_dock(focused_dock);
+
             let project = workspace.project().clone();
             let workspace_handle = workspace.weak_handle();
             workspace.toggle_modal(window, cx, |window, cx| {
@@ -79,7 +87,7 @@ pub fn init(cx: &mut App) {
         workspace.register_action(
             |workspace, action: &zed_actions::OpenWorktreeInNewWindow, window, cx| {
                 let path = action.path.clone();
-                let is_remote = workspace.project().read(cx).is_via_collab();
+                let is_remote = !workspace.project().read(cx).is_local();
 
                 if is_remote {
                     let connection_options =
