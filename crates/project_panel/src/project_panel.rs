@@ -1208,7 +1208,6 @@ impl ProjectPanel {
                             .when(!should_hide_rename, |menu| {
                                 menu.separator().action("Rename", Box::new(Rename))
                             })
-                            // .when(!is_root && !is_remote, |menu| {
                             .when(!is_root, |menu| {
                                 menu.action("Trash", Box::new(Trash { skip_prompt: false }))
                             })
@@ -2213,15 +2212,11 @@ impl ProjectPanel {
         self.rename_impl(None, window, cx);
     }
 
-    // TODO!(dino): Ensure that the listener in remote is enabled, right now is
-    // disabled.
     fn trash(&mut self, action: &Trash, window: &mut Window, cx: &mut Context<Self>) {
-        dbg!("ProjectPanel::trash");
         self.remove(true, action.skip_prompt, window, cx);
     }
 
     fn delete(&mut self, action: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        dbg!("ProjectPanel::delete");
         self.remove(false, action.skip_prompt, window, cx);
     }
 
@@ -2319,6 +2314,9 @@ impl ProjectPanel {
         });
     }
 
+    // TODO!(yara|dino) this should be split up, trashing and deleting are
+    // fundamentally different. Adding to the existing differences trashing will
+    // no longer need a confirmation with the introduction of undo
     fn remove(
         &mut self,
         trash: bool,
@@ -2426,20 +2424,29 @@ impl ProjectPanel {
                 let mut changes = Vec::new();
 
                 for (entry_id, worktree_id, _) in file_paths {
-                    let trashed_entry = panel
-                        .update(cx, |panel, cx| {
-                            panel
-                                .project
-                                .update(cx, |project, cx| project.delete_entry(entry_id, trash, cx))
-                                .context("no such entry")
-                        })??
-                        .await?;
+                    if trash {
+                        let trash_id = panel
+                            .update(cx, |panel, cx| {
+                                panel
+                                    .project
+                                    .update(cx, |project, cx| project.trash_entry(entry_id, cx))
+                                    .context("no such entry")
+                            })??
+                            .await?;
 
-                    // Keep track of trashed change so that we can then record
-                    // all of the changes at once, such that undoing and redoing
-                    // restores or trashes all files in batch.
-                    if trash && let Some(trashed_entry) = trashed_entry {
-                        changes.push(Change::Trashed(worktree_id, trashed_entry));
+                        // Keep track of trashed change so that we can then record
+                        // all of the changes at once, such that undoing and redoing
+                        // restores or trashes all files in batch.
+                        changes.push(Change::Trashed(worktree_id, trash_id))
+                    } else {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel
+                                    .project
+                                    .update(cx, |project, cx| project.delete_entry(entry_id, cx))
+                                    .context("no such entry")
+                            })??
+                            .await?;
                     }
                 }
                 panel.update_in(cx, |panel, window, cx| {
@@ -6683,9 +6690,7 @@ impl Render for ProjectPanel {
                         .on_action(cx.listener(Self::paste))
                         .on_action(cx.listener(Self::duplicate))
                         .on_action(cx.listener(Self::restore_file))
-                        .when(!project.is_remote(), |el| {
-                            el.on_action(cx.listener(Self::trash))
-                        })
+                        .on_action(cx.listener(Self::trash))
                 })
                 .when(
                     project.is_local() || project.is_via_wsl_with_host_interop(cx),

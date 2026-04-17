@@ -396,7 +396,6 @@ impl From<MTime> for proto::Timestamp {
     }
 }
 
-// TODO!(yara) for protocol get out u64 via keydata().ffi()
 slotmap::new_key_type! { pub struct TrashId; }
 
 impl TrashId {
