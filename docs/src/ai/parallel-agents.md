@@ -25,7 +25,7 @@ For quick switching without opening the sidebar, use the thread switcher: press 
 
 ### Threads History {#threads-history}
 
-Threads History holds all your threads. Toggle it with {#kb agents_sidebar::ToggleArchive} or by clicking the View All Threads icon in the sidebar bottom bar.
+Threads History holds all your threads. Toggle it with {#kb agents_sidebar::ToggleThreadHistory} or by clicking the View All Threads icon in the sidebar bottom bar.
 
 To move a thread to the Threads History view, hover over it in the sidebar and click the archive icon that appears. You can also select a thread and press {#kb agent::RemoveSelectedThread}. Running threads cannot be moved to history until they finish.
 
