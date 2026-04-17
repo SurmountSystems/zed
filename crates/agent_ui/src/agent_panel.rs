@@ -6952,42 +6952,26 @@ mod tests {
         });
 
         // Signal worktree creation completion on the destination workspace.
-        // panel_b has no active thread view, so the text should land in
-        // pending_worktree_draft instead of being applied directly.
+        // panel_b has no active thread view, but the subscriber calls
+        // ensure_thread_initialized which synchronously creates a draft
+        // thread and then apply_pending_worktree_draft applies the text
+        // immediately.
         workspace_b.update(cx, |workspace, cx| {
             workspace.set_active_worktree_creation(None, false, cx);
         });
         cx.run_until_parked();
 
-        // The text should be stashed locally on panel_b, waiting for a thread.
-        panel_b.read_with(cx, |panel, _cx| {
-            assert_eq!(
-                panel.pending_worktree_draft.as_deref(),
-                Some("Pending draft"),
-                "draft should be stashed on the panel when no thread view exists"
-            );
-        });
-
-        // Now open a thread on panel_b. Once connected, the observation on the
-        // conversation view fires apply_pending_worktree_draft automatically.
-        panel_b.update_in(cx, |panel, window, cx| {
-            panel.open_external_thread_with_server(
-                Rc::new(StubAgentServer::default_response()),
-                window,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-
-        // The pending draft should now be applied to panel_b's message editor.
+        // The pending draft should have been consumed: ensure_thread_initialized
+        // created a draft thread and apply_pending_worktree_draft inserted the
+        // text into the editor in one synchronous pass.
         panel_b.read_with(cx, |panel, cx| {
             assert!(
                 panel.pending_worktree_draft.is_none(),
-                "pending_worktree_draft should be consumed after thread is initialized"
+                "pending_worktree_draft should be consumed after ensure_thread_initialized"
             );
             let thread_view = panel
                 .active_thread_view(cx)
-                .expect("panel_b should now have an active thread view");
+                .expect("panel_b should have a draft thread view after ensure_thread_initialized");
             let text = thread_view.read(cx).message_editor.read(cx).text(cx);
             assert_eq!(
                 text, "Pending draft",
