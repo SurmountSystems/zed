@@ -1,6 +1,6 @@
 ---
 title: Parallel Agents - Zed
-description: Run multiple agent threads concurrently using the Threads Sidebar, manage them across projects, and isolate work using git worktrees.
+description: Run multiple agent threads concurrently using the Threads Sidebar, manage them across projects, and isolate work using Git worktrees.
 ---
 
 # Parallel Agents
@@ -8,6 +8,8 @@ description: Run multiple agent threads concurrently using the Threads Sidebar, 
 Parallel Agents lets you run multiple agent threads at once, each working independently with its own agent, context window, and conversation history. The Threads Sidebar is where you start, manage, and switch between them.
 
 Open the Threads Sidebar with {#kb multi_workspace::ToggleWorkspaceSidebar}.
+
+> **Note:** From version 0.233.0 onward, the Agent Panel and Threads Sidebar are on the left by default. The Project Panel, Git Panel, and other panels move to the right, keeping the thread list and conversation next to each other. To rearrange panels, right-click any panel icon.
 
 ## Threads Sidebar {#threads-sidebar}
 
@@ -21,21 +23,21 @@ Click any thread in the sidebar to switch to it. The Agent Panel updates to show
 
 For quick switching without opening the sidebar, use the thread switcher: press {#kb agents_sidebar::ToggleThreadSwitcher} to cycle forward through recent threads, or hold `Shift` while pressing that binding to go backward. This works from both the Agent Panel and the Threads Sidebar.
 
-### Archive {#archive}
+### Threads History {#threads-history}
 
-The archive holds all your threads. Toggle the archive with {#kb agents_sidebar::ToggleArchive} or by clicking the archive icon in the sidebar bottom bar.
+Threads History holds all your threads. Toggle it with {#kb agents_sidebar::ToggleArchive} or by clicking the View All Threads icon in the sidebar bottom bar.
 
-To archive a thread, hover over it in the sidebar and click the archive icon that appears. You can also select a thread and press {#kb agent::RemoveSelectedThread}. Running threads cannot be archived until they finish.
+To move a thread to the Threads History view, hover over it in the sidebar and click the archive icon that appears. You can also select a thread and press {#kb agent::RemoveSelectedThread}. Running threads cannot be moved to history until they finish.
 
-To restore an archived thread, open the archive and click the thread you want to bring back. Zed unarchives it, moves it back to the thread list, and opens it in the Agent Panel. If the thread was running in a git worktree that was deleted when archived, Zed restores the worktree automatically.
+To restore a thread, open Threads History and click the thread you want to bring back. Zed moves it back to the thread list and opens it in the Agent Panel. If the thread was running in a Git worktree that was removed, Zed restores the worktree automatically.
 
-To permanently delete a thread, open the archive, hover over the thread, and click the trash icon. This removes the thread's conversation history and cleans up any associated worktree data. Deleted threads cannot be recovered.
+To permanently delete a thread, open Threads History, hover over the thread, and click the trash icon. This removes the thread's conversation history and cleans up any associated worktree data. Deleted threads cannot be recovered.
 
-You can search your archived threads; search will fuzzy match on thread titles.
+You can search your threads in history; search will fuzzy match on thread titles.
 
 ### Importing External Agent Threads {#importing-threads}
 
-If you have external agents installed, Zed will detect whether you have existing threads and invite you to import them into Zed. Every time you open the archive, you should see an icon button in the sidebar bottom bar that allows you to import threads at any time. Clicking on it will open a modal, where you can select the agents whose threads you want to import.
+If you have external agents installed, Zed will detect whether you have existing threads and invite you to import them into Zed. Every time you open Threads History, you should see an icon button in the sidebar bottom bar that allows you to import threads at any time. Clicking on it will open a modal, where you can select the agents whose threads you want to import.
 
 ## Running Multiple Threads {#running-multiple-threads}
 
@@ -53,15 +55,11 @@ Within a project, you can add multiple folders from a local or remote project. U
 
 ## Worktree Isolation {#worktree-isolation}
 
-If two threads might edit the same files, start one in a new git worktree to give it an isolated checkout.
+If two threads might edit the same files, start one in a new Git worktree to give it an isolated checkout.
 
 In the Agent Panel toolbar, click the worktree selector to choose which worktree you want the agent to run in, or create a new one. New worktrees start in detached HEAD state, and Zed will attempt to check out the branch you selected. If that branch is already in use by another worktree, the new worktree stays in detached HEAD.
 
-After the agent finishes, review the diff and merge the changes through your normal git workflow. If the thread was running in a linked worktree and no other active threads use it, archiving the thread saves the worktree's git state and removes it from disk. Restoring the thread from the archive restores the worktree.
-
-## Default Layout {#layout}
-
-From version 0.233.0 onward, the Agent Panel and Threads Sidebar are on the left. The Project Panel, Git Panel, and other panels move to the right, keeping the thread list and conversation next to each other. To rearrange panels, right-click any panel icon.
+After the agent finishes, review the diff and merge the changes through your normal Git workflow. If the thread was running in a linked worktree and no other active threads use it, moving the thread to Threads History saves the worktree's Git state and removes it from disk. Restoring the thread from history restores the worktree.
 
 ## See Also {#see-also}
 
