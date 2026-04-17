@@ -944,12 +944,20 @@ impl PickerDelegate for WorktreePickerDelegate {
                         )
                     })
                     .when(!is_current, |this| {
+                        let focus_handle = focus_handle.clone();
                         this.child(
-                            Button::new("open-in-new-window", "Open in New Window").on_click(
-                                |_, window, cx| {
+                            Button::new("open-in-new-window", "Open in New Window")
+                                .key_binding(
+                                    KeyBinding::for_action_in(
+                                        &menu::SecondaryConfirm,
+                                        &focus_handle,
+                                        cx,
+                                    )
+                                    .map(|kb| kb.size(rems_from_px(12.))),
+                                )
+                                .on_click(|_, window, cx| {
                                     window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)
-                                },
-                            ),
+                                }),
                         )
                     })
                     .child(
