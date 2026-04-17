@@ -3,18 +3,19 @@ use std::{
     sync::Arc,
 };
 
-use agent_client_protocol as acp;
 use anyhow::{Context as _, Result, anyhow};
-use git::repository::{AskPassDelegate, CommitOptions, ResetMode};
 use gpui::{App, AsyncApp, Entity, Task};
 use project::{
     LocalProjectFlags, Project, WorktreeId,
-    git_store::{Repository, resolve_git_worktree_to_main_repo},
+    git_store::{Repository, resolve_git_worktree_to_main_repo, worktrees_directory_for_repo},
+    project_settings::ProjectSettings,
 };
+use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use settings::Settings;
 use util::ResultExt;
 use workspace::{AppState, MultiWorkspace, Workspace};
 
-use crate::thread_metadata_store::{ArchivedGitWorktree, ThreadMetadataStore};
+use crate::thread_metadata_store::{ArchivedGitWorktree, ThreadId, ThreadMetadataStore};
 
 /// The plan for archiving a single git worktree root.
 ///
@@ -40,18 +41,17 @@ pub struct RootPlan {
     /// Multiple projects can reference the same path when the user has the
     /// worktree open in more than one workspace.
     pub affected_projects: Vec<AffectedProject>,
-    /// The `Repository` entity for this worktree, used to run git commands
-    /// (create WIP commits, stage files, reset) during
-    /// [`persist_worktree_state`]. `None` when the `GitStore` hasn't created
-    /// a `Repository` for this worktree yet — in that case,
-    /// `persist_worktree_state` falls back to creating a temporary headless
-    /// project to obtain one.
-    pub worktree_repo: Option<Entity<Repository>>,
+    /// The `Repository` entity for this linked worktree, used to run git
+    /// commands (create WIP commits, stage files, reset) during
+    /// [`persist_worktree_state`].
+    pub worktree_repo: Entity<Repository>,
     /// The branch the worktree was on, so it can be restored later.
-    /// `None` if the worktree was in detached HEAD state or if no
-    /// `Repository` entity was available at planning time (in which case
-    /// `persist_worktree_state` reads it from the repo snapshot instead).
+    /// `None` if the worktree was in detached HEAD state.
     pub branch_name: Option<String>,
+    /// Remote connection options for the project that owns this worktree,
+    /// used to create temporary remote projects when the main repo isn't
+    /// loaded in any open workspace.
+    pub remote_connection: Option<RemoteConnectionOptions>,
 }
 
 /// A `Project` that references a worktree being archived, paired with the
@@ -72,15 +72,14 @@ fn archived_worktree_ref_name(id: i64) -> String {
     format!("refs/archived-worktrees/{}", id)
 }
 
-/// The result of a successful [`persist_worktree_state`] call.
+/// Resolves the Zed-managed worktrees base directory for a given repo.
 ///
-/// Carries exactly the information needed to roll back the persist via
-/// [`rollback_persist`]: the DB row ID (to delete the record and the
-/// corresponding `refs/archived-worktrees/<id>` git ref) and the staged
-/// commit hash (to `git reset` back past both WIP commits).
-pub struct PersistOutcome {
-    pub archived_worktree_id: i64,
-    pub staged_commit_hash: String,
+/// This intentionally reads the *global* `git.worktree_directory` setting
+/// rather than any project-local override, because Zed always uses the
+/// global value when creating worktrees and the archive check must match.
+fn worktrees_base_for_repo(main_repo_path: &Path, cx: &App) -> Option<PathBuf> {
+    let setting = &ProjectSettings::get_global(cx).git.worktree_directory;
+    worktrees_directory_for_repo(main_repo_path, setting).log_err()
 }
 
 /// Builds a [`RootPlan`] for archiving the git worktree at `path`.
@@ -98,24 +97,30 @@ pub struct PersistOutcome {
 ///    linked worktree — needed for both git ref creation and
 ///    `git worktree remove`.
 ///
-/// When no `Repository` entity is available (e.g. the `GitStore` hasn't
-/// finished scanning), the function falls back to deriving `main_repo_path`
-/// from the worktree snapshot's `root_repo_common_dir`. In that case
-/// `worktree_repo` is `None` and [`persist_worktree_state`] will create a
-/// temporary headless project to obtain one.
-///
-/// Returns `None` if no open project has this path as a visible worktree.
+/// Returns `None` if the path is not a linked worktree (main worktrees
+/// cannot be archived to disk) or if no open project has it loaded.
 pub fn build_root_plan(
     path: &Path,
+    remote_connection: Option<&RemoteConnectionOptions>,
     workspaces: &[Entity<Workspace>],
     cx: &App,
 ) -> Option<RootPlan> {
     let path = path.to_path_buf();
 
+    let matches_target_connection = |project: &Entity<Project>, cx: &App| {
+        same_remote_connection_identity(
+            project.read(cx).remote_connection_options(cx).as_ref(),
+            remote_connection,
+        )
+    };
+
     let affected_projects = workspaces
         .iter()
         .filter_map(|workspace| {
             let project = workspace.read(cx).project().clone();
+            if !matches_target_connection(&project, cx) {
+                return None;
+            }
             let worktree = project
                 .read(cx)
                 .visible_worktrees(cx)
@@ -134,6 +139,7 @@ pub fn build_root_plan(
 
     let linked_repo = workspaces
         .iter()
+        .filter(|workspace| matches_target_connection(workspace.read(cx).project(), cx))
         .flat_map(|workspace| {
             workspace
                 .read(cx)
@@ -151,64 +157,32 @@ pub fn build_root_plan(
             .then_some((snapshot, repo))
         });
 
-    let matching_worktree_snapshot = workspaces.iter().find_map(|workspace| {
-        workspace
-            .read(cx)
-            .project()
-            .read(cx)
-            .visible_worktrees(cx)
-            .find(|worktree| worktree.read(cx).abs_path().as_ref() == path.as_path())
-            .map(|worktree| worktree.read(cx).snapshot())
-    });
+    // Only linked worktrees can be archived to disk via `git worktree remove`.
+    // Main worktrees must be left alone — git refuses to remove them.
+    let (linked_snapshot, repo) = linked_repo?;
+    let main_repo_path = linked_snapshot.original_repo_abs_path.to_path_buf();
 
-    let (main_repo_path, worktree_repo, branch_name) =
-        if let Some((linked_snapshot, repo)) = linked_repo {
-            (
-                linked_snapshot.original_repo_abs_path.to_path_buf(),
-                Some(repo),
-                linked_snapshot
-                    .branch
-                    .as_ref()
-                    .map(|branch| branch.name().to_string()),
-            )
-        } else {
-            let main_repo_path = matching_worktree_snapshot
-                .as_ref()?
-                .root_repo_common_dir()
-                .and_then(|dir| dir.parent())?
-                .to_path_buf();
-            (main_repo_path, None, None)
-        };
+    // Only archive worktrees that live inside the Zed-managed worktrees
+    // directory (configured via `git.worktree_directory`). Worktrees the
+    // user created outside that directory should be left untouched.
+    let worktrees_base = worktrees_base_for_repo(&main_repo_path, cx)?;
+    if !path.starts_with(&worktrees_base) {
+        return None;
+    }
+
+    let branch_name = linked_snapshot
+        .branch
+        .as_ref()
+        .map(|branch| branch.name().to_string());
 
     Some(RootPlan {
         root_path: path,
         main_repo_path,
         affected_projects,
-        worktree_repo,
+        worktree_repo: repo,
         branch_name,
+        remote_connection: remote_connection.cloned(),
     })
-}
-
-/// Returns `true` if any unarchived thread other than `current_session_id`
-/// references `path` in its folder paths. Used to determine whether a
-/// worktree can safely be removed from disk.
-pub fn path_is_referenced_by_other_unarchived_threads(
-    current_session_id: &acp::SessionId,
-    path: &Path,
-    cx: &App,
-) -> bool {
-    ThreadMetadataStore::global(cx)
-        .read(cx)
-        .entries()
-        .filter(|thread| thread.session_id != *current_session_id)
-        .filter(|thread| !thread.archived)
-        .any(|thread| {
-            thread
-                .folder_paths
-                .paths()
-                .iter()
-                .any(|other_path| other_path.as_path() == path)
-        })
 }
 
 /// Removes a worktree from all affected projects and deletes it from disk
@@ -253,26 +227,110 @@ async fn remove_root_after_worktree_removal(
         }
     }
 
-    let (repo, _temp_project) = find_or_create_repository(&root.main_repo_path, cx).await?;
+    let (repo, project) =
+        find_or_create_repository(&root.main_repo_path, root.remote_connection.as_ref(), cx)
+            .await?;
+
+    // `Repository::remove_worktree` with `force = true` deletes the working
+    // directory before running `git worktree remove --force`, so there's no
+    // need to touch the filesystem here. For remote projects that cleanup
+    // runs on the headless server via the `GitRemoveWorktree` RPC, which is
+    // the only code path with access to the remote machine's filesystem.
     let receiver = repo.update(cx, |repo: &mut Repository, _cx| {
-        repo.remove_worktree(root.root_path.clone(), false)
+        repo.remove_worktree(root.root_path.clone(), true)
     });
     let result = receiver
         .await
-        .map_err(|_| anyhow!("git worktree removal was canceled"))?;
-    // Keep _temp_project alive until after the await so the headless project isn't dropped mid-operation
-    drop(_temp_project);
-    result
+        .map_err(|_| anyhow!("git worktree metadata cleanup was canceled"))?;
+    // `project` may be a live workspace project or a temporary one created
+    // by `find_or_create_repository`. In the temporary case we must keep it
+    // alive until the repo removes the worktree
+    drop(project);
+    result.context("git worktree metadata cleanup failed")?;
+
+    // Empty-parent cleanup uses local std::fs — skip for remote projects.
+    if root.remote_connection.is_none() {
+        remove_empty_parent_dirs_up_to_worktrees_base(
+            root.root_path.clone(),
+            root.main_repo_path.clone(),
+            cx,
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+/// After `git worktree remove` deletes the worktree directory, clean up any
+/// empty parent directories between it and the Zed-managed worktrees base
+/// directory (configured via `git.worktree_directory`). The base directory
+/// itself is never removed.
+///
+/// If the base directory is not an ancestor of `root_path`, no parent
+/// directories are removed.
+async fn remove_empty_parent_dirs_up_to_worktrees_base(
+    root_path: PathBuf,
+    main_repo_path: PathBuf,
+    cx: &mut AsyncApp,
+) {
+    let worktrees_base = cx.update(|cx| worktrees_base_for_repo(&main_repo_path, cx));
+
+    if let Some(worktrees_base) = worktrees_base {
+        cx.background_executor()
+            .spawn(async move {
+                remove_empty_ancestors(&root_path, &worktrees_base);
+            })
+            .await;
+    }
+}
+
+/// Removes empty directories between `child_path` and `base_path`.
+///
+/// Walks upward from `child_path`, removing each empty parent directory,
+/// stopping before `base_path` itself is removed. If `base_path` is not
+/// an ancestor of `child_path`, nothing is removed. If any directory is
+/// non-empty (i.e. `std::fs::remove_dir` fails), the walk stops.
+fn remove_empty_ancestors(child_path: &Path, base_path: &Path) {
+    let mut current = child_path;
+    while let Some(parent) = current.parent() {
+        if parent == base_path {
+            break;
+        }
+        if !parent.starts_with(base_path) {
+            break;
+        }
+        match std::fs::remove_dir(parent) {
+            Ok(()) => {
+                log::info!("Removed empty parent directory: {}", parent.display());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Already removed by a concurrent process; keep walking upward.
+            }
+            Err(err) => {
+                log::error!(
+                    "Failed to remove parent directory {}: {err}",
+                    parent.display()
+                );
+                break;
+            }
+        }
+        current = parent;
+    }
 }
 
 /// Finds a live `Repository` entity for the given path, or creates a temporary
-/// `Project::local` to obtain one.
+/// project to obtain one.
 ///
 /// `Repository` entities can only be obtained through a `Project` because
 /// `GitStore` (which creates and manages `Repository` entities) is owned by
 /// `Project`. When no open workspace contains the repo we need, we spin up a
-/// headless `Project::local` just to get a `Repository` handle. The caller
-/// keeps the returned `Option<Entity<Project>>` alive for the duration of the
+/// headless project just to get a `Repository` handle. For local paths this is
+/// a `Project::local`; for remote paths we build a `Project::remote` through
+/// the connection pool (reusing the existing SSH transport), which requires
+/// the caller to pass the matching `RemoteConnectionOptions` so we only match
+/// and fall back onto projects that share the same remote identity. The
+/// caller keeps the returned `Entity<Project>` alive for the duration of the
 /// git operations, then drops it.
 ///
 /// Future improvement: decoupling `GitStore` from `Project` so that
@@ -280,46 +338,91 @@ async fn remove_root_after_worktree_removal(
 /// temporary-project workaround.
 async fn find_or_create_repository(
     repo_path: &Path,
+    remote_connection: Option<&RemoteConnectionOptions>,
     cx: &mut AsyncApp,
-) -> Result<(Entity<Repository>, Option<Entity<Project>>)> {
+) -> Result<(Entity<Repository>, Entity<Project>)> {
     let repo_path_owned = repo_path.to_path_buf();
+    let remote_connection_owned = remote_connection.cloned();
+
+    // First, try to find a live repository in any open workspace whose
+    // remote connection matches (so a local `/project` and a remote
+    // `/project` are not confused).
     let live_repo = cx.update(|cx| {
         all_open_workspaces(cx)
             .into_iter()
-            .flat_map(|workspace| {
-                workspace
-                    .read(cx)
-                    .project()
-                    .read(cx)
-                    .repositories(cx)
-                    .values()
-                    .cloned()
-                    .collect::<Vec<_>>()
+            .filter_map(|workspace| {
+                let project = workspace.read(cx).project().clone();
+                let project_connection = project.read(cx).remote_connection_options(cx);
+                if !same_remote_connection_identity(
+                    project_connection.as_ref(),
+                    remote_connection_owned.as_ref(),
+                ) {
+                    return None;
+                }
+                Some((
+                    project
+                        .read(cx)
+                        .repositories(cx)
+                        .values()
+                        .find(|repo| {
+                            repo.read(cx).snapshot().work_directory_abs_path.as_ref()
+                                == repo_path_owned.as_path()
+                        })
+                        .cloned()?,
+                    project.clone(),
+                ))
             })
-            .find(|repo| {
-                repo.read(cx).snapshot().work_directory_abs_path.as_ref()
-                    == repo_path_owned.as_path()
-            })
+            .next()
     });
 
-    if let Some(repo) = live_repo {
-        return Ok((repo, None));
+    if let Some((repo, project)) = live_repo {
+        return Ok((repo, project));
     }
 
     let app_state =
         current_app_state(cx).context("no app state available for temporary project")?;
-    let temp_project = cx.update(|cx| {
-        Project::local(
-            app_state.client.clone(),
-            app_state.node_runtime.clone(),
-            app_state.user_store.clone(),
-            app_state.languages.clone(),
-            app_state.fs.clone(),
-            None,
-            LocalProjectFlags::default(),
-            cx,
-        )
-    });
+
+    // For remote paths, create a fresh RemoteClient through the connection
+    // pool (reusing the existing SSH transport) and build a temporary
+    // remote project. Each RemoteClient gets its own server-side headless
+    // project, so there are no RPC routing conflicts with other projects.
+    let temp_project = if let Some(connection) = remote_connection_owned {
+        let remote_client = cx
+            .update(|cx| {
+                if !remote::has_active_connection(&connection, cx) {
+                    anyhow::bail!("cannot open repository on disconnected remote machine");
+                }
+                Ok(remote_connection::connect_reusing_pool(connection, cx))
+            })?
+            .await?
+            .context("remote connection was canceled")?;
+
+        cx.update(|cx| {
+            Project::remote(
+                remote_client,
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                false,
+                cx,
+            )
+        })
+    } else {
+        cx.update(|cx| {
+            Project::local(
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                app_state.user_store.clone(),
+                app_state.languages.clone(),
+                app_state.fs.clone(),
+                None,
+                LocalProjectFlags::default(),
+                cx,
+            )
+        })
+    };
 
     let repo_path_for_worktree = repo_path.to_path_buf();
     let create_worktree = temp_project.update(cx, |project, cx| {
@@ -347,7 +450,7 @@ async fn find_or_create_repository(
     barrier
         .await
         .map_err(|_| anyhow!("temporary repository barrier canceled"))?;
-    Ok((repo, Some(temp_project)))
+    Ok((repo, temp_project))
 }
 
 /// Re-adds the worktree to every affected project after a failed
@@ -363,128 +466,35 @@ async fn rollback_root(root: &RootPlan, cx: &mut AsyncApp) {
 
 /// Saves the worktree's full git state so it can be restored later.
 ///
-/// This is a multi-step operation:
-/// 1. Records the original HEAD SHA.
-/// 2. Creates WIP commit #1 ("staged") capturing the current index.
-/// 3. Stages everything including untracked files, then creates WIP commit
-///    #2 ("unstaged") capturing the full working directory.
-/// 4. Creates a DB record (`ArchivedGitWorktree`) with all the SHAs, the
-///    branch name, and both paths.
-/// 5. Links every thread that references this worktree to the DB record.
-/// 6. Creates a git ref (`refs/archived-worktrees/<id>`) on the main repo
-///    pointing at the unstaged commit, preventing git from
-///    garbage-collecting the WIP commits after the worktree is deleted.
+/// This creates two detached commits (via [`create_archive_checkpoint`] on
+/// the `GitRepository` trait) that capture the staged and unstaged state
+/// without moving any branch ref. The commits are:
+///   - "WIP staged": a tree matching the current index, parented on HEAD
+///   - "WIP unstaged": a tree with all files (including untracked),
+///     parented on the staged commit
 ///
-/// Each step has rollback logic: if step N fails, steps 1..N-1 are undone.
-/// On success, returns a [`PersistOutcome`] that can be passed to
-/// [`rollback_persist`] if a later step in the archival pipeline fails.
-pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Result<PersistOutcome> {
-    let (worktree_repo, _temp_worktree_project) = match &root.worktree_repo {
-        Some(worktree_repo) => (worktree_repo.clone(), None),
-        None => find_or_create_repository(&root.root_path, cx).await?,
-    };
+/// After creating the commits, this function:
+///   1. Records the commit SHAs, branch name, and paths in a DB record.
+///   2. Links every thread referencing this worktree to that record.
+///   3. Creates a git ref on the main repo to prevent GC of the commits.
+///
+/// On success, returns the archived worktree DB row ID for rollback.
+pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Result<i64> {
+    let worktree_repo = root.worktree_repo.clone();
 
-    // Read original HEAD SHA before creating any WIP commits
     let original_commit_hash = worktree_repo
         .update(cx, |repo, _cx| repo.head_sha())
         .await
         .map_err(|_| anyhow!("head_sha canceled"))?
         .context("failed to read original HEAD SHA")?
-        .context("HEAD SHA is None before WIP commits")?;
+        .context("HEAD SHA is None")?;
 
-    // Create WIP commit #1 (staged state)
-    let askpass = AskPassDelegate::new(cx, |_, _, _| {});
-    let commit_rx = worktree_repo.update(cx, |repo, cx| {
-        repo.commit(
-            "WIP staged".into(),
-            None,
-            CommitOptions {
-                allow_empty: true,
-                ..Default::default()
-            },
-            askpass,
-            cx,
-        )
-    });
-    commit_rx
+    // Create two detached WIP commits without moving the branch.
+    let checkpoint_rx = worktree_repo.update(cx, |repo, _cx| repo.create_archive_checkpoint());
+    let (staged_commit_hash, unstaged_commit_hash) = checkpoint_rx
         .await
-        .map_err(|_| anyhow!("WIP staged commit canceled"))??;
-
-    // Read SHA after staged commit
-    let staged_sha_result = worktree_repo
-        .update(cx, |repo, _cx| repo.head_sha())
-        .await
-        .map_err(|_| anyhow!("head_sha canceled"))
-        .and_then(|r| r.context("failed to read HEAD SHA after staged commit"))
-        .and_then(|opt| opt.context("HEAD SHA is None after staged commit"));
-    let staged_commit_hash = match staged_sha_result {
-        Ok(sha) => sha,
-        Err(error) => {
-            let rx = worktree_repo.update(cx, |repo, cx| {
-                repo.reset("HEAD~1".to_string(), ResetMode::Mixed, cx)
-            });
-            rx.await.ok().and_then(|r| r.log_err());
-            return Err(error);
-        }
-    };
-
-    // Stage all files including untracked
-    let stage_rx = worktree_repo.update(cx, |repo, _cx| repo.stage_all_including_untracked());
-    if let Err(error) = stage_rx
-        .await
-        .map_err(|_| anyhow!("stage all canceled"))
-        .and_then(|inner| inner)
-    {
-        let rx = worktree_repo.update(cx, |repo, cx| {
-            repo.reset("HEAD~1".to_string(), ResetMode::Mixed, cx)
-        });
-        rx.await.ok().and_then(|r| r.log_err());
-        return Err(error.context("failed to stage all files including untracked"));
-    }
-
-    // Create WIP commit #2 (unstaged/untracked state)
-    let askpass = AskPassDelegate::new(cx, |_, _, _| {});
-    let commit_rx = worktree_repo.update(cx, |repo, cx| {
-        repo.commit(
-            "WIP unstaged".into(),
-            None,
-            CommitOptions {
-                allow_empty: true,
-                ..Default::default()
-            },
-            askpass,
-            cx,
-        )
-    });
-    if let Err(error) = commit_rx
-        .await
-        .map_err(|_| anyhow!("WIP unstaged commit canceled"))
-        .and_then(|inner| inner)
-    {
-        let rx = worktree_repo.update(cx, |repo, cx| {
-            repo.reset("HEAD~1".to_string(), ResetMode::Mixed, cx)
-        });
-        rx.await.ok().and_then(|r| r.log_err());
-        return Err(error);
-    }
-
-    // Read HEAD SHA after WIP commits
-    let head_sha_result = worktree_repo
-        .update(cx, |repo, _cx| repo.head_sha())
-        .await
-        .map_err(|_| anyhow!("head_sha canceled"))
-        .and_then(|r| r.context("failed to read HEAD SHA after WIP commits"))
-        .and_then(|opt| opt.context("HEAD SHA is None after WIP commits"));
-    let unstaged_commit_hash = match head_sha_result {
-        Ok(sha) => sha,
-        Err(error) => {
-            let rx = worktree_repo.update(cx, |repo, cx| {
-                repo.reset(format!("{}~1", staged_commit_hash), ResetMode::Mixed, cx)
-            });
-            rx.await.ok().and_then(|r| r.log_err());
-            return Err(error);
-        }
-    };
+        .map_err(|_| anyhow!("create_archive_checkpoint canceled"))?
+        .context("failed to create archive checkpoint")?;
 
     // Create DB record
     let store = cx.update(|cx| ThreadMetadataStore::global(cx));
@@ -516,37 +526,29 @@ pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Resul
     let archived_worktree_id = match db_result {
         Ok(id) => id,
         Err(error) => {
-            let rx = worktree_repo.update(cx, |repo, cx| {
-                repo.reset(format!("{}~1", staged_commit_hash), ResetMode::Mixed, cx)
-            });
-            rx.await.ok().and_then(|r| r.log_err());
             return Err(error);
         }
     };
 
     // Link all threads on this worktree to the archived record
-    let session_ids: Vec<acp::SessionId> = store.read_with(cx, |store, _cx| {
+    let thread_ids: Vec<ThreadId> = store.read_with(cx, |store, _cx| {
         store
             .entries()
             .filter(|thread| {
                 thread
-                    .folder_paths
+                    .folder_paths()
                     .paths()
                     .iter()
                     .any(|p| p.as_path() == root.root_path)
             })
-            .map(|thread| thread.session_id.clone())
+            .map(|thread| thread.thread_id)
             .collect()
     });
 
-    for session_id in &session_ids {
+    for thread_id in &thread_ids {
         let link_result = store
             .read_with(cx, |store, cx| {
-                store.link_thread_to_archived_worktree(
-                    session_id.0.to_string(),
-                    archived_worktree_id,
-                    cx,
-                )
+                store.link_thread_to_archived_worktree(*thread_id, archived_worktree_id, cx)
             })
             .await;
         if let Err(error) = link_result {
@@ -557,76 +559,51 @@ pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Resul
                 .await
             {
                 log::error!(
-                    "Failed to delete archived worktree DB record during link rollback: {delete_error:#}"
+                    "Failed to delete archived worktree DB record during link rollback: \
+                     {delete_error:#}"
                 );
             }
-            let rx = worktree_repo.update(cx, |repo, cx| {
-                repo.reset(format!("{}~1", staged_commit_hash), ResetMode::Mixed, cx)
-            });
-            rx.await.ok().and_then(|r| r.log_err());
             return Err(error.context("failed to link thread to archived worktree"));
         }
     }
 
-    // Create git ref on main repo (non-fatal)
+    // Create git ref on main repo to prevent GC of the detached commits.
+    // This is fatal: without the ref, git gc will eventually collect the
+    // WIP commits and a later restore will silently fail.
     let ref_name = archived_worktree_ref_name(archived_worktree_id);
-    let main_repo_result = find_or_create_repository(&root.main_repo_path, cx).await;
-    match main_repo_result {
-        Ok((main_repo, _temp_project)) => {
-            let rx = main_repo.update(cx, |repo, _cx| {
-                repo.update_ref(ref_name.clone(), unstaged_commit_hash.clone())
-            });
-            if let Err(error) = rx
-                .await
-                .map_err(|_| anyhow!("update_ref canceled"))
-                .and_then(|r| r)
-            {
-                log::warn!(
-                    "Failed to create ref {} on main repo (non-fatal): {error}",
-                    ref_name
-                );
-            }
-            // Keep _temp_project alive until after the await so the headless project isn't dropped mid-operation
-            drop(_temp_project);
-        }
-        Err(error) => {
-            log::warn!(
-                "Could not find main repo to create ref {} (non-fatal): {error}",
-                ref_name
-            );
-        }
-    }
+    let (main_repo, _temp_project) =
+        find_or_create_repository(&root.main_repo_path, root.remote_connection.as_ref(), cx)
+            .await
+            .context("could not open main repo to create archive ref")?;
+    let rx = main_repo.update(cx, |repo, _cx| {
+        repo.update_ref(ref_name.clone(), unstaged_commit_hash.clone())
+    });
+    rx.await
+        .map_err(|_| anyhow!("update_ref canceled"))
+        .and_then(|r| r)
+        .with_context(|| format!("failed to create ref {ref_name} on main repo"))?;
+    // See note in `remove_root_after_worktree_removal`: this may be a live
+    // or temporary project; dropping only matters in the temporary case.
+    drop(_temp_project);
 
-    Ok(PersistOutcome {
-        archived_worktree_id,
-        staged_commit_hash,
-    })
+    Ok(archived_worktree_id)
 }
 
-/// Undoes a successful [`persist_worktree_state`] by resetting the WIP
-/// commits, deleting the git ref on the main repo, and removing the DB
-/// record.
-pub async fn rollback_persist(outcome: &PersistOutcome, root: &RootPlan, cx: &mut AsyncApp) {
-    // Undo WIP commits on the worktree repo
-    if let Some(worktree_repo) = &root.worktree_repo {
-        let rx = worktree_repo.update(cx, |repo, cx| {
-            repo.reset(
-                format!("{}~1", outcome.staged_commit_hash),
-                ResetMode::Mixed,
-                cx,
-            )
-        });
-        rx.await.ok().and_then(|r| r.log_err());
-    }
-
+/// Undoes a successful [`persist_worktree_state`] by deleting the git ref
+/// on the main repo and removing the DB record. Since the WIP commits are
+/// detached (they don't move any branch), no git reset is needed — the
+/// commits will be garbage-collected once the ref is removed.
+pub async fn rollback_persist(archived_worktree_id: i64, root: &RootPlan, cx: &mut AsyncApp) {
     // Delete the git ref on main repo
     if let Ok((main_repo, _temp_project)) =
-        find_or_create_repository(&root.main_repo_path, cx).await
+        find_or_create_repository(&root.main_repo_path, root.remote_connection.as_ref(), cx).await
     {
-        let ref_name = archived_worktree_ref_name(outcome.archived_worktree_id);
+        let ref_name = archived_worktree_ref_name(archived_worktree_id);
         let rx = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
         rx.await.ok().and_then(|r| r.log_err());
-        // Keep _temp_project alive until after the await so the headless project isn't dropped mid-operation
+        // See note in `remove_root_after_worktree_removal`: this may be a
+        // live or temporary project; dropping only matters in the temporary
+        // case.
         drop(_temp_project);
     }
 
@@ -634,7 +611,7 @@ pub async fn rollback_persist(outcome: &PersistOutcome, root: &RootPlan, cx: &mu
     let store = cx.update(|cx| ThreadMetadataStore::global(cx));
     if let Err(error) = store
         .read_with(cx, |store, cx| {
-            store.delete_archived_worktree(outcome.archived_worktree_id, cx)
+            store.delete_archived_worktree(archived_worktree_id, cx)
         })
         .await
     {
@@ -644,188 +621,184 @@ pub async fn rollback_persist(outcome: &PersistOutcome, root: &RootPlan, cx: &mu
 
 /// Restores a previously archived worktree back to disk from its DB record.
 ///
-/// Re-creates the git worktree (or adopts an existing directory), resets
-/// past the two WIP commits to recover the original working directory
-/// state, verifies HEAD matches the expected commit, and restores the
-/// original branch if one was recorded.
+/// Creates the git worktree at the original commit (the branch never moved
+/// during archival since WIP commits are detached), switches to the branch,
+/// then uses [`restore_archive_checkpoint`] to reconstruct the staged/
+/// unstaged state from the WIP commit trees.
 pub async fn restore_worktree_via_git(
     row: &ArchivedGitWorktree,
+    remote_connection: Option<&RemoteConnectionOptions>,
     cx: &mut AsyncApp,
 ) -> Result<PathBuf> {
-    let (main_repo, _temp_project) = find_or_create_repository(&row.main_repo_path, cx).await?;
+    let (main_repo, _temp_project) =
+        find_or_create_repository(&row.main_repo_path, remote_connection, cx).await?;
 
-    // Check if worktree path already exists on disk
     let worktree_path = &row.worktree_path;
     let app_state = current_app_state(cx).context("no app state available")?;
     let already_exists = app_state.fs.metadata(worktree_path).await?.is_some();
 
-    if already_exists {
+    let created_new_worktree = if already_exists {
         let is_git_worktree =
             resolve_git_worktree_to_main_repo(app_state.fs.as_ref(), worktree_path)
                 .await
                 .is_some();
 
-        if is_git_worktree {
-            // Already a git worktree — another thread on the same worktree
-            // already restored it. Reuse as-is.
-            return Ok(worktree_path.clone());
+        if !is_git_worktree {
+            let rx = main_repo.update(cx, |repo, _cx| repo.repair_worktrees());
+            rx.await
+                .map_err(|_| anyhow!("worktree repair was canceled"))?
+                .context("failed to repair worktrees")?;
         }
-
-        // Path exists but isn't a git worktree. Ask git to adopt it.
-        let rx = main_repo.update(cx, |repo, _cx| repo.repair_worktrees());
-        rx.await
-            .map_err(|_| anyhow!("worktree repair was canceled"))?
-            .context("failed to repair worktrees")?;
+        false
     } else {
-        // Create detached worktree at the unstaged commit
+        // Create worktree at the original commit — the branch still points
+        // here because archival used detached commits.
         let rx = main_repo.update(cx, |repo, _cx| {
-            repo.create_worktree_detached(worktree_path.clone(), row.unstaged_commit_hash.clone())
+            repo.create_worktree_detached(worktree_path.clone(), row.original_commit_hash.clone())
         });
         rx.await
             .map_err(|_| anyhow!("worktree creation was canceled"))?
             .context("failed to create worktree")?;
-    }
-
-    // Get the worktree's repo entity
-    let (wt_repo, _temp_wt_project) = find_or_create_repository(worktree_path, cx).await?;
-
-    // Reset past the WIP commits to recover original state
-    let mixed_reset_ok = {
-        let rx = wt_repo.update(cx, |repo, cx| {
-            repo.reset(row.staged_commit_hash.clone(), ResetMode::Mixed, cx)
-        });
-        match rx.await {
-            Ok(Ok(())) => true,
-            Ok(Err(error)) => {
-                log::error!("Mixed reset to staged commit failed: {error:#}");
-                false
-            }
-            Err(_) => {
-                log::error!("Mixed reset to staged commit was canceled");
-                false
-            }
-        }
+        true
     };
 
-    let soft_reset_ok = if mixed_reset_ok {
-        let rx = wt_repo.update(cx, |repo, cx| {
-            repo.reset(row.original_commit_hash.clone(), ResetMode::Soft, cx)
-        });
-        match rx.await {
-            Ok(Ok(())) => true,
-            Ok(Err(error)) => {
-                log::error!("Soft reset to original commit failed: {error:#}");
-                false
+    let (wt_repo, _temp_wt_project) =
+        match find_or_create_repository(worktree_path, remote_connection, cx).await {
+            Ok(result) => result,
+            Err(error) => {
+                remove_new_worktree_on_error(created_new_worktree, &main_repo, worktree_path, cx)
+                    .await;
+                return Err(error);
             }
-            Err(_) => {
-                log::error!("Soft reset to original commit was canceled");
-                false
-            }
-        }
-    } else {
-        false
-    };
+        };
 
-    // If either WIP reset failed, fall back to a mixed reset directly to
-    // original_commit_hash so we at least land on the right commit.
-    if !mixed_reset_ok || !soft_reset_ok {
-        log::warn!(
-            "WIP reset(s) failed (mixed_ok={mixed_reset_ok}, soft_ok={soft_reset_ok}); \
-             falling back to mixed reset to original commit {}",
-            row.original_commit_hash
-        );
-        let rx = wt_repo.update(cx, |repo, cx| {
-            repo.reset(row.original_commit_hash.clone(), ResetMode::Mixed, cx)
-        });
-        match rx.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return Err(error.context(format!(
-                    "fallback reset to original commit {} also failed",
-                    row.original_commit_hash
-                )));
-            }
-            Err(_) => {
-                return Err(anyhow!(
-                    "fallback reset to original commit {} was canceled",
-                    row.original_commit_hash
-                ));
-            }
-        }
-    }
-
-    // Verify HEAD is at original_commit_hash
-    let current_head = wt_repo
-        .update(cx, |repo, _cx| repo.head_sha())
-        .await
-        .map_err(|_| anyhow!("post-restore head_sha was canceled"))?
-        .context("failed to read HEAD after restore")?
-        .context("HEAD is None after restore")?;
-
-    if current_head != row.original_commit_hash {
-        anyhow::bail!(
-            "After restore, HEAD is at {current_head} but expected {}. \
-             The worktree may be in an inconsistent state.",
-            row.original_commit_hash
-        );
-    }
-
-    // Restore the branch
     if let Some(branch_name) = &row.branch_name {
-        // Check if the branch exists and points at original_commit_hash.
-        // If it does, switch to it. If not, create a new branch there.
-        let rx = wt_repo.update(cx, |repo, _cx| repo.change_branch(branch_name.clone()));
-        if matches!(rx.await, Ok(Ok(()))) {
-            // Verify the branch actually points at original_commit_hash after switching
-            let head_after_switch = wt_repo
-                .update(cx, |repo, _cx| repo.head_sha())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten();
+        // Attempt to check out the branch the worktree was previously on.
+        let checkout_result = wt_repo
+            .update(cx, |repo, _cx| repo.change_branch(branch_name.clone()))
+            .await;
 
-            if head_after_switch.as_deref() != Some(&row.original_commit_hash) {
-                // Branch exists but doesn't point at the right commit.
-                // Switch back to detached HEAD at original_commit_hash.
-                log::warn!(
-                    "Branch '{}' exists but points at {:?}, not {}. Creating fresh branch.",
-                    branch_name,
-                    head_after_switch,
-                    row.original_commit_hash
-                );
-                let rx = wt_repo.update(cx, |repo, cx| {
-                    repo.reset(row.original_commit_hash.clone(), ResetMode::Mixed, cx)
-                });
-                rx.await.ok().and_then(|r| r.log_err());
-                // Delete the old branch and create fresh
-                let rx = wt_repo.update(cx, |repo, _cx| {
-                    repo.create_branch(branch_name.clone(), None)
-                });
-                rx.await.ok().and_then(|r| r.log_err());
+        match checkout_result.map_err(|e| anyhow!("{e}")).flatten() {
+            Ok(()) => {
+                // Branch checkout succeeded. Check whether the branch has moved since
+                // we archived the worktree, by comparing HEAD to the expected SHA.
+                let head_sha = wt_repo
+                    .update(cx, |repo, _cx| repo.head_sha())
+                    .await
+                    .map_err(|e| anyhow!("{e}"))
+                    .and_then(|r| r);
+
+                match head_sha {
+                    Ok(Some(sha)) if sha == row.original_commit_hash => {
+                        // Branch still points at the original commit; we're all done!
+                    }
+                    Ok(Some(sha)) => {
+                        // The branch has moved. We don't want to restore the worktree to
+                        // a different filesystem state, so checkout the original commit
+                        // in detached HEAD state.
+                        log::info!(
+                            "Branch '{branch_name}' has moved since archival (now at {sha}); \
+                             restoring worktree in detached HEAD at {}",
+                            row.original_commit_hash
+                        );
+                        let detach_result = main_repo
+                            .update(cx, |repo, _cx| {
+                                repo.checkout_branch_in_worktree(
+                                    row.original_commit_hash.clone(),
+                                    row.worktree_path.clone(),
+                                    false,
+                                )
+                            })
+                            .await;
+
+                        if let Err(error) = detach_result.map_err(|e| anyhow!("{e}")).flatten() {
+                            log::warn!(
+                                "Failed to detach HEAD at {}: {error:#}",
+                                row.original_commit_hash
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        log::warn!(
+                            "head_sha unexpectedly returned None after checking out \"{branch_name}\"; \
+                             proceeding in current HEAD state."
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Failed to read HEAD after checking out \"{branch_name}\": {error:#}"
+                        );
+                    }
+                }
             }
-        } else {
-            // Branch doesn't exist or can't be switched to — create it.
-            let rx = wt_repo.update(cx, |repo, _cx| {
-                repo.create_branch(branch_name.clone(), None)
-            });
-            if let Ok(Err(error)) | Err(error) = rx.await.map_err(|e| anyhow::anyhow!("{e}")) {
-                log::warn!(
-                    "Could not create branch '{}': {error} — \
-                     restored worktree is in detached HEAD state.",
-                    branch_name
+            Err(checkout_error) => {
+                // We weren't able to check out the branch, most likely because it was deleted.
+                // This is fine; users will often delete old branches! We'll try to recreate it.
+                log::debug!(
+                    "change_branch('{branch_name}') failed: {checkout_error:#}, trying create_branch"
                 );
+                let create_result = wt_repo
+                    .update(cx, |repo, _cx| {
+                        repo.create_branch(branch_name.clone(), None)
+                    })
+                    .await;
+
+                if let Err(error) = create_result.map_err(|e| anyhow!("{e}")).flatten() {
+                    log::warn!(
+                        "Failed to create branch '{branch_name}': {error:#}; \
+                         restored worktree will be in detached HEAD state."
+                    );
+                }
             }
         }
+    }
+
+    // Restore the staged/unstaged state from the WIP commit trees.
+    // read-tree --reset -u applies the unstaged tree (including deletions)
+    // to the working directory, then a bare read-tree sets the index to
+    // the staged tree without touching the working directory.
+    let restore_rx = wt_repo.update(cx, |repo, _cx| {
+        repo.restore_archive_checkpoint(
+            row.staged_commit_hash.clone(),
+            row.unstaged_commit_hash.clone(),
+        )
+    });
+    if let Err(error) = restore_rx
+        .await
+        .map_err(|_| anyhow!("restore_archive_checkpoint canceled"))
+        .and_then(|r| r)
+    {
+        remove_new_worktree_on_error(created_new_worktree, &main_repo, worktree_path, cx).await;
+        return Err(error.context("failed to restore archive checkpoint"));
     }
 
     Ok(worktree_path.clone())
 }
 
+async fn remove_new_worktree_on_error(
+    created_new_worktree: bool,
+    main_repo: &Entity<Repository>,
+    worktree_path: &PathBuf,
+    cx: &mut AsyncApp,
+) {
+    if created_new_worktree {
+        let rx = main_repo.update(cx, |repo, _cx| {
+            repo.remove_worktree(worktree_path.clone(), true)
+        });
+        rx.await.ok().and_then(|r| r.log_err());
+    }
+}
+
 /// Deletes the git ref and DB records for a single archived worktree.
 /// Used when an archived worktree is no longer referenced by any thread.
-pub async fn cleanup_archived_worktree_record(row: &ArchivedGitWorktree, cx: &mut AsyncApp) {
+pub async fn cleanup_archived_worktree_record(
+    row: &ArchivedGitWorktree,
+    remote_connection: Option<&RemoteConnectionOptions>,
+    cx: &mut AsyncApp,
+) {
     // Delete the git ref from the main repo
-    if let Ok((main_repo, _temp_project)) = find_or_create_repository(&row.main_repo_path, cx).await
+    if let Ok((main_repo, _temp_project)) =
+        find_or_create_repository(&row.main_repo_path, remote_connection, cx).await
     {
         let ref_name = archived_worktree_ref_name(row.id);
         let rx = main_repo.update(cx, |repo, _cx| repo.delete_ref(ref_name));
@@ -834,7 +807,9 @@ pub async fn cleanup_archived_worktree_record(row: &ArchivedGitWorktree, cx: &mu
             Ok(Err(error)) => log::warn!("Failed to delete archive ref: {error}"),
             Err(_) => log::warn!("Archive ref deletion was canceled"),
         }
-        // Keep _temp_project alive until after the await so the headless project isn't dropped mid-operation
+        // See note in `remove_root_after_worktree_removal`: this may be a
+        // live or temporary project; dropping only matters in the temporary
+        // case.
         drop(_temp_project);
     }
 
@@ -851,21 +826,23 @@ pub async fn cleanup_archived_worktree_record(row: &ArchivedGitWorktree, cx: &mu
 /// This unlinks the thread from all its archived worktrees and, for any
 /// archived worktree that is no longer referenced by any other thread,
 /// deletes the git ref and DB records.
-pub async fn cleanup_thread_archived_worktrees(session_id: &acp::SessionId, cx: &mut AsyncApp) {
+pub async fn cleanup_thread_archived_worktrees(thread_id: ThreadId, cx: &mut AsyncApp) {
     let store = cx.update(|cx| ThreadMetadataStore::global(cx));
+    let remote_connection = store.read_with(cx, |store, _cx| {
+        store
+            .entry(thread_id)
+            .and_then(|t| t.remote_connection.clone())
+    });
 
     let archived_worktrees = store
         .read_with(cx, |store, cx| {
-            store.get_archived_worktrees_for_thread(session_id.0.to_string(), cx)
+            store.get_archived_worktrees_for_thread(thread_id, cx)
         })
         .await;
     let archived_worktrees = match archived_worktrees {
         Ok(rows) => rows,
         Err(error) => {
-            log::error!(
-                "Failed to fetch archived worktrees for thread {}: {error:#}",
-                session_id.0
-            );
+            log::error!("Failed to fetch archived worktrees for thread {thread_id:?}: {error:#}");
             return;
         }
     };
@@ -876,14 +853,11 @@ pub async fn cleanup_thread_archived_worktrees(session_id: &acp::SessionId, cx: 
 
     if let Err(error) = store
         .read_with(cx, |store, cx| {
-            store.unlink_thread_from_all_archived_worktrees(session_id.0.to_string(), cx)
+            store.unlink_thread_from_all_archived_worktrees(thread_id, cx)
         })
         .await
     {
-        log::error!(
-            "Failed to unlink thread {} from archived worktrees: {error:#}",
-            session_id.0
-        );
+        log::error!("Failed to unlink thread {thread_id:?} from archived worktrees: {error:#}");
         return;
     }
 
@@ -896,7 +870,7 @@ pub async fn cleanup_thread_archived_worktrees(session_id: &acp::SessionId, cx: 
         match still_referenced {
             Ok(true) => {}
             Ok(false) => {
-                cleanup_archived_worktree_record(row, cx).await;
+                cleanup_archived_worktree_record(row, remote_connection.as_ref(), cx).await;
             }
             Err(error) => {
                 log::error!(
@@ -929,4 +903,712 @@ fn current_app_state(cx: &mut AsyncApp) -> Option<Arc<AppState>> {
             .next()
             .map(|workspace| workspace.read(cx).app_state().clone())
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::{FakeFs, Fs as _};
+    use git::repository::Worktree as GitWorktree;
+    use gpui::{BorrowAppContext, TestAppContext};
+    use project::Project;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use tempfile::TempDir;
+    use workspace::MultiWorkspace;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+        });
+    }
+
+    #[test]
+    fn test_remove_empty_ancestors_single_empty_parent() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("worktrees");
+        let branch_dir = base.join("my-branch");
+        let child = branch_dir.join("zed");
+
+        std::fs::create_dir_all(&child).unwrap();
+        // Simulate git worktree remove having deleted the child.
+        std::fs::remove_dir(&child).unwrap();
+
+        assert!(branch_dir.exists());
+        remove_empty_ancestors(&child, &base);
+        assert!(!branch_dir.exists(), "empty parent should be removed");
+        assert!(base.exists(), "base directory should be preserved");
+    }
+
+    #[test]
+    fn test_remove_empty_ancestors_nested_empty_parents() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("worktrees");
+        // Branch name with slash creates nested dirs: fix/thing/zed
+        let child = base.join("fix").join("thing").join("zed");
+
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::remove_dir(&child).unwrap();
+
+        assert!(base.join("fix").join("thing").exists());
+        remove_empty_ancestors(&child, &base);
+        assert!(!base.join("fix").join("thing").exists());
+        assert!(
+            !base.join("fix").exists(),
+            "all empty ancestors should be removed"
+        );
+        assert!(base.exists(), "base directory should be preserved");
+    }
+
+    #[test]
+    fn test_remove_empty_ancestors_stops_at_non_empty_parent() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("worktrees");
+        let branch_dir = base.join("my-branch");
+        let child = branch_dir.join("zed");
+        let sibling = branch_dir.join("other-file.txt");
+
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(&sibling, "content").unwrap();
+        std::fs::remove_dir(&child).unwrap();
+
+        remove_empty_ancestors(&child, &base);
+        assert!(branch_dir.exists(), "non-empty parent should be preserved");
+        assert!(sibling.exists());
+    }
+
+    #[test]
+    fn test_remove_empty_ancestors_not_an_ancestor() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("worktrees");
+        let unrelated = tmp.path().join("other-place").join("branch").join("zed");
+
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+        std::fs::remove_dir(&unrelated).unwrap();
+
+        let parent = unrelated.parent().unwrap();
+        assert!(parent.exists());
+        remove_empty_ancestors(&unrelated, &base);
+        assert!(parent.exists(), "should not remove dirs outside base");
+    }
+
+    #[test]
+    fn test_remove_empty_ancestors_child_is_direct_child_of_base() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("worktrees");
+        let child = base.join("zed");
+
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::remove_dir(&child).unwrap();
+
+        remove_empty_ancestors(&child, &base);
+        assert!(base.exists(), "base directory should be preserved");
+    }
+
+    #[test]
+    fn test_remove_empty_ancestors_partially_non_empty_chain() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("worktrees");
+        // Structure: base/a/b/c/zed where a/ has another child besides b/
+        let child = base.join("a").join("b").join("c").join("zed");
+        let other_in_a = base.join("a").join("other-branch");
+
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&other_in_a).unwrap();
+        std::fs::remove_dir(&child).unwrap();
+
+        remove_empty_ancestors(&child, &base);
+        assert!(
+            !base.join("a").join("b").join("c").exists(),
+            "c/ should be removed (empty)"
+        );
+        assert!(
+            !base.join("a").join("b").exists(),
+            "b/ should be removed (empty)"
+        );
+        assert!(
+            base.join("a").exists(),
+            "a/ should be preserved (has other-branch sibling)"
+        );
+        assert!(other_in_a.exists());
+    }
+
+    #[gpui::test]
+    async fn test_build_root_plan_returns_none_for_main_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+
+        cx.run_until_parked();
+
+        // The main worktree should NOT produce a root plan.
+        workspace.read_with(cx, |_workspace, cx| {
+            let plan = build_root_plan(
+                Path::new("/project"),
+                None,
+                std::slice::from_ref(&workspace),
+                cx,
+            );
+            assert!(
+                plan.is_none(),
+                "build_root_plan should return None for a main worktree",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_build_root_plan_returns_some_for_linked_worktree(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["main", "feature"]);
+
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: PathBuf::from("/worktrees/project/feature/project"),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                Path::new("/project"),
+                Path::new("/worktrees/project/feature/project"),
+            ],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |_workspace, cx| {
+            // The linked worktree SHOULD produce a root plan.
+            let plan = build_root_plan(
+                Path::new("/worktrees/project/feature/project"),
+                None,
+                std::slice::from_ref(&workspace),
+                cx,
+            );
+            assert!(
+                plan.is_some(),
+                "build_root_plan should return Some for a linked worktree",
+            );
+            let plan = plan.unwrap();
+            assert_eq!(
+                plan.root_path,
+                PathBuf::from("/worktrees/project/feature/project")
+            );
+            assert_eq!(plan.main_repo_path, PathBuf::from("/project"));
+
+            // The main worktree should still return None.
+            let main_plan = build_root_plan(
+                Path::new("/project"),
+                None,
+                std::slice::from_ref(&workspace),
+                cx,
+            );
+            assert!(
+                main_plan.is_none(),
+                "build_root_plan should return None for the main worktree \
+                 even when a linked worktree exists",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_build_root_plan_returns_none_for_external_linked_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["main", "feature"]);
+
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: PathBuf::from("/external-worktree"),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [Path::new("/project"), Path::new("/external-worktree")],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |_workspace, cx| {
+            let plan = build_root_plan(
+                Path::new("/external-worktree"),
+                None,
+                std::slice::from_ref(&workspace),
+                cx,
+            );
+            assert!(
+                plan.is_none(),
+                "build_root_plan should return None for a linked worktree \
+                 outside the Zed-managed worktrees directory",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_build_root_plan_with_custom_worktree_directory(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        // Override the worktree_directory setting to a non-default location.
+        // With main repo at /project and setting "../custom-worktrees", the
+        // resolved base is /custom-worktrees/project.
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |s| {
+                    s.git.get_or_insert(Default::default()).worktree_directory =
+                        Some("../custom-worktrees".to_string());
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["main", "feature", "feature2"]);
+
+        // Worktree inside the custom managed directory.
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: PathBuf::from("/custom-worktrees/project/feature/project"),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        // Worktree outside the custom managed directory (at the default
+        // `../worktrees` location, which is not what the setting says).
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: PathBuf::from("/worktrees/project/feature2/project"),
+                ref_name: Some("refs/heads/feature2".into()),
+                sha: "def456".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                Path::new("/project"),
+                Path::new("/custom-worktrees/project/feature/project"),
+                Path::new("/worktrees/project/feature2/project"),
+            ],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |_workspace, cx| {
+            // Worktree inside the custom managed directory SHOULD be archivable.
+            let plan = build_root_plan(
+                Path::new("/custom-worktrees/project/feature/project"),
+                None,
+                std::slice::from_ref(&workspace),
+                cx,
+            );
+            assert!(
+                plan.is_some(),
+                "build_root_plan should return Some for a worktree inside \
+                 the custom worktree_directory",
+            );
+
+            // Worktree at the default location SHOULD NOT be archivable
+            // because the setting points elsewhere.
+            let plan = build_root_plan(
+                Path::new("/worktrees/project/feature2/project"),
+                None,
+                std::slice::from_ref(&workspace),
+                cx,
+            );
+            assert!(
+                plan.is_none(),
+                "build_root_plan should return None for a worktree outside \
+                 the custom worktree_directory, even if it would match the default",
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_remove_root_deletes_directory_and_git_metadata(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["main", "feature"]);
+
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: PathBuf::from("/worktrees/project/feature/project"),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                Path::new("/project"),
+                Path::new("/worktrees/project/feature/project"),
+            ],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+
+        cx.run_until_parked();
+
+        // Build the root plan while the worktree is still loaded.
+        let root = workspace
+            .read_with(cx, |_workspace, cx| {
+                build_root_plan(
+                    Path::new("/worktrees/project/feature/project"),
+                    None,
+                    std::slice::from_ref(&workspace),
+                    cx,
+                )
+            })
+            .expect("should produce a root plan for the linked worktree");
+
+        assert!(
+            fs.is_dir(Path::new("/worktrees/project/feature/project"))
+                .await
+        );
+
+        // Remove the root.
+        let task = cx.update(|cx| cx.spawn(async move |cx| remove_root(root, cx).await));
+        task.await.expect("remove_root should succeed");
+
+        cx.run_until_parked();
+
+        // The FakeFs directory should be gone.
+        assert!(
+            !fs.is_dir(Path::new("/worktrees/project/feature/project"))
+                .await,
+            "linked worktree directory should be removed from FakeFs"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_remove_root_succeeds_when_directory_already_gone(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["main", "feature"]);
+
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: PathBuf::from("/worktrees/project/feature/project"),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                Path::new("/project"),
+                Path::new("/worktrees/project/feature/project"),
+            ],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+
+        cx.run_until_parked();
+
+        let root = workspace
+            .read_with(cx, |_workspace, cx| {
+                build_root_plan(
+                    Path::new("/worktrees/project/feature/project"),
+                    None,
+                    std::slice::from_ref(&workspace),
+                    cx,
+                )
+            })
+            .expect("should produce a root plan for the linked worktree");
+
+        // Manually remove the worktree directory from FakeFs before calling
+        // remove_root, simulating the directory being deleted externally.
+        fs.as_ref()
+            .remove_dir(
+                Path::new("/worktrees/project/feature/project"),
+                fs::RemoveOptions {
+                    recursive: true,
+                    ignore_if_not_exists: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !fs.as_ref()
+                .is_dir(Path::new("/worktrees/project/feature/project"))
+                .await
+        );
+
+        // remove_root should still succeed — fs.remove_dir with
+        // ignore_if_not_exists handles NotFound, and git worktree remove
+        // handles a missing working tree directory.
+        let task = cx.update(|cx| cx.spawn(async move |cx| remove_root(root, cx).await));
+        task.await
+            .expect("remove_root should succeed even when directory is already gone");
+    }
+
+    #[gpui::test]
+    async fn test_remove_root_returns_error_and_rolls_back_on_remove_dir_failure(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/project",
+            json!({
+                ".git": {},
+                "src": { "main.rs": "fn main() {}" }
+            }),
+        )
+        .await;
+        fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+        fs.insert_branches(Path::new("/project/.git"), &["main", "feature"]);
+
+        fs.add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            true,
+            GitWorktree {
+                path: PathBuf::from("/worktrees/project/feature/project"),
+                ref_name: Some("refs/heads/feature".into()),
+                sha: "abc123".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+
+        let project = Project::test(
+            fs.clone(),
+            [
+                Path::new("/project"),
+                Path::new("/worktrees/project/feature/project"),
+            ],
+            cx,
+        )
+        .await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+
+        cx.run_until_parked();
+
+        let root = workspace
+            .read_with(cx, |_workspace, cx| {
+                build_root_plan(
+                    Path::new("/worktrees/project/feature/project"),
+                    None,
+                    std::slice::from_ref(&workspace),
+                    cx,
+                )
+            })
+            .expect("should produce a root plan for the linked worktree");
+
+        // Replace the worktree directory with a file so that fs.remove_dir
+        // fails with a "not a directory" error.
+        let worktree_path = Path::new("/worktrees/project/feature/project");
+        fs.remove_dir(
+            worktree_path,
+            fs::RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: false,
+            },
+        )
+        .await
+        .unwrap();
+        fs.create_file(worktree_path, fs::CreateOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            fs.is_file(worktree_path).await,
+            "path should now be a file, not a directory"
+        );
+
+        let task = cx.update(|cx| cx.spawn(async move |cx| remove_root(root, cx).await));
+        let result = task.await;
+
+        assert!(
+            result.is_err(),
+            "remove_root should return an error when fs.remove_dir fails"
+        );
+        let error_message = format!("{:#}", result.unwrap_err());
+        assert!(
+            error_message.contains("failed to delete worktree directory"),
+            "error should mention the directory deletion failure, got: {error_message}"
+        );
+
+        cx.run_until_parked();
+
+        // After rollback, the worktree should be re-added to the project.
+        let has_worktree = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .any(|wt| wt.read(cx).abs_path().as_ref() == worktree_path)
+        });
+        assert!(
+            has_worktree,
+            "rollback should have re-added the worktree to the project"
+        );
+    }
 }

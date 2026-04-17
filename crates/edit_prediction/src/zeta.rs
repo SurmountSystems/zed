@@ -43,6 +43,7 @@ pub fn request_prediction_with_zeta(
         related_files,
         events,
         debug_tx,
+        mode,
         trigger,
         project,
         diagnostic_search_range,
@@ -85,7 +86,6 @@ pub fn request_prediction_with_zeta(
     } else {
         None
     };
-
     let client = store.client.clone();
     let llm_token = store.llm_token.clone();
     let organization_id = store
@@ -120,7 +120,6 @@ pub fn request_prediction_with_zeta(
                 diagnostic_search_range,
                 excerpt_path,
                 cursor_offset,
-                preferred_experiment,
                 is_open_source,
                 can_collect_data,
                 repo_url,
@@ -274,11 +273,13 @@ pub fn request_prediction_with_zeta(
                     // Use V3 endpoint - server handles model/version selection and suffix stripping
                     let (response, usage) = EditPredictionStore::send_v3_request(
                         prompt_input.clone(),
+                        preferred_experiment.clone(),
                         client,
                         llm_token,
                         organization_id,
                         app_version,
                         trigger,
+                        mode,
                     )
                     .await?;
 
@@ -383,11 +384,26 @@ pub fn request_prediction_with_zeta(
             }));
         };
 
-        if can_collect_data {
+        let result = EditPredictionResult::new(
+            id,
+            &edited_buffer,
+            &edited_buffer_snapshot,
+            edits.into(),
+            cursor_position,
+            inputs,
+            model_version,
+            request_duration,
+            cx,
+        )
+        .await;
+
+        if can_collect_data && let Ok(prediction) = &result.prediction {
             let weak_this = this.clone();
-            let id = id.clone();
+            let request_id = prediction.id.clone();
             let edited_buffer = edited_buffer.clone();
             let edited_buffer_snapshot = edited_buffer_snapshot.clone();
+            let editable_range_in_buffer = editable_range_in_buffer.clone();
+            let edit_preview = prediction.edit_preview.clone();
             let example_task = capture_data.and_then(|stored_events| {
                 cx.update(|cx| {
                     crate::capture_example(
@@ -410,11 +426,12 @@ pub fn request_prediction_with_zeta(
                 weak_this
                     .update(cx, |this, cx| {
                         this.enqueue_settled_prediction(
-                            id.clone(),
+                            request_id.clone(),
                             &project,
                             &edited_buffer,
                             &edited_buffer_snapshot,
                             editable_range_in_buffer,
+                            &edit_preview,
                             example_spec,
                             request_duration,
                             cx,
@@ -425,20 +442,7 @@ pub fn request_prediction_with_zeta(
             .detach();
         }
 
-        Ok(Some(
-            EditPredictionResult::new(
-                id,
-                &edited_buffer,
-                &edited_buffer_snapshot,
-                edits.into(),
-                cursor_position,
-                inputs,
-                model_version,
-                request_duration,
-                cx,
-            )
-            .await,
-        ))
+        Ok(Some(result))
     })
 }
 
@@ -531,7 +535,6 @@ pub fn zeta2_prompt_input(
     diagnostic_search_range: Range<Point>,
     excerpt_path: Arc<Path>,
     cursor_offset: usize,
-    preferred_experiment: Option<String>,
     is_open_source: bool,
     can_collect_data: bool,
     repo_url: Option<String>,
@@ -563,7 +566,6 @@ pub fn zeta2_prompt_input(
         active_buffer_diagnostics,
         excerpt_ranges,
         syntax_ranges: Some(syntax_ranges),
-        experiment: preferred_experiment,
         in_open_source_repo: is_open_source,
         can_collect_data,
         repo_url,
