@@ -164,6 +164,7 @@ impl BranchList {
 
         picker.update(cx, |picker, _| {
             picker.delegate.focus_handle = picker_focus_handle.clone();
+            picker.delegate.show_footer = !embedded;
         });
 
         let mut subscriptions = Vec::new();
@@ -386,6 +387,7 @@ pub struct BranchListDelegate {
     state: PickerState,
     focus_handle: FocusHandle,
     restore_selected_branch: Option<SharedString>,
+    show_footer: bool,
 }
 
 #[derive(Debug)]
@@ -452,6 +454,7 @@ impl BranchListDelegate {
             state: PickerState::List,
             focus_handle: cx.focus_handle(),
             restore_selected_branch: None,
+            show_footer: false,
         }
     }
 
@@ -1172,7 +1175,7 @@ impl PickerDelegate for BranchListDelegate {
     }
 
     fn render_footer(&self, _: &mut Window, cx: &mut Context<Picker<Self>>) -> Option<AnyElement> {
-        if self.editor_position() == PickerEditorPosition::End {
+        if !self.show_footer || self.editor_position() == PickerEditorPosition::End {
             return None;
         }
         let focus_handle = self.focus_handle.clone();
