@@ -885,21 +885,15 @@ impl TitleBar {
                     Some(cx.new(|cx| WorktreePicker::new(project.clone(), window, cx)))
                 })
                 .trigger_with_tooltip(
-                    ButtonLike::new("worktree_picker_trigger")
+                    Button::new("worktree_picker_trigger", display_label)
                         .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                        .child(
-                            h_flex()
-                                .gap_0p5()
-                                .child(
-                                    Icon::new(IconName::GitWorktree)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                                .child(
-                                    Label::new(display_label)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                ),
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .loading(is_creating)
+                        .start_icon(
+                            Icon::new(IconName::GitWorktree)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
                         ),
                     move |_window, cx| {
                         Tooltip::with_meta(
@@ -915,6 +909,11 @@ impl TitleBar {
 
         let branch_tooltip_label = branch_name.clone();
 
+        // todo dl: remove this setting?!
+        // .when(settings.show_branch_icon, |this| {
+        //     let (icon, icon_color) = icon_info;
+        //     this.child(Icon::new(icon).size(IconSize::XSmall).color(icon_color))
+        // })
         let git_picker_button = PopoverMenu::new("branch-menu")
             .menu(move |window, cx| {
                 Some(git_ui::git_picker::popover(
@@ -927,26 +926,14 @@ impl TitleBar {
                 ))
             })
             .trigger_with_tooltip(
-                ButtonLike::new("project_branch_trigger")
+                Button::new("project_branch_trigger", branch_name)
                     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                    .child(
-                        h_flex()
-                            .gap_0p5()
-                            // todo dl: remove this setting?!
-                            // .when(settings.show_branch_icon, |this| {
-                            //     let (icon, icon_color) = icon_info;
-                            //     this.child(Icon::new(icon).size(IconSize::XSmall).color(icon_color))
-                            // })
-                            .child(
-                                Icon::new(IconName::GitBranch)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                Label::new(branch_name)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
+                    .label_size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .start_icon(
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
                     ),
                 move |_window, cx| {
                     let meta = if is_detached_head {
@@ -961,12 +948,13 @@ impl TitleBar {
 
         Some(
             h_flex()
-                .gap_0p5()
+                .gap_px()
                 .child(worktree_button)
                 .child(
                     Label::new("/")
                         .size(LabelSize::Small)
-                        .color(Color::Custom(cx.theme().colors().text_muted.opacity(0.4))),
+                        .color(Color::Muted)
+                        .alpha(0.25),
                 )
                 .child(git_picker_button)
                 .into_any_element(),
