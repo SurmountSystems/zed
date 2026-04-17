@@ -70,8 +70,9 @@ pub fn init(cx: &mut App) {
 
         workspace.register_action(|workspace, _: &zed_actions::git::Worktree, window, cx| {
             let project = workspace.project().clone();
+            let workspace_handle = workspace.weak_handle();
             workspace.toggle_modal(window, cx, |window, cx| {
-                worktree_picker::WorktreePicker::new_modal(project, window, cx)
+                worktree_picker::WorktreePicker::new_modal(project, workspace_handle, window, cx)
             });
         });
 

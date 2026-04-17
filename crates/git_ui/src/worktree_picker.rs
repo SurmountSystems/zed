@@ -7,8 +7,8 @@ use fuzzy::StringMatchCandidate;
 use git::repository::Worktree as GitWorktree;
 use gpui::{
     Action, AnyElement, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, Window, actions,
-    rems,
+    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity,
+    Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
 use project::Project;
@@ -20,6 +20,8 @@ use ui::{
 use util::ResultExt as _;
 use util::paths::PathExt;
 use workspace::{ModalView, MultiWorkspace, Workspace, notifications::DetachAndPromptErr};
+
+use crate::git_panel::show_error_toast;
 use zed_actions::{
     CreateWorktree, NewWorktreeBranchTarget, OpenWorktreeInNewWindow, SwitchWorktree,
 };
@@ -33,20 +35,27 @@ pub struct WorktreePicker {
 }
 
 impl WorktreePicker {
-    pub fn new(project: Entity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_inner(project, false, window, cx)
+    pub fn new(
+        project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_inner(project, workspace, false, window, cx)
     }
 
     pub fn new_modal(
         project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_inner(project, true, window, cx)
+        Self::new_inner(project, workspace, true, window, cx)
     }
 
     fn new_inner(
         project: Entity<Project>,
+        workspace: WeakEntity<Workspace>,
         show_footer: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -88,6 +97,7 @@ impl WorktreePicker {
             project_worktree_paths,
             selected_index: 0,
             project,
+            workspace,
             current_branch_name,
             default_branch_name: None,
             has_multiple_repositories,
@@ -237,6 +247,7 @@ pub struct WorktreePickerDelegate {
     project_worktree_paths: HashSet<PathBuf>,
     selected_index: usize,
     project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
     current_branch_name: Option<String>,
     default_branch_name: Option<String>,
     has_multiple_repositories: bool,
@@ -295,13 +306,29 @@ impl WorktreePickerDelegate {
             return;
         };
         let path = worktree.path.clone();
+        let workspace = self.workspace.clone();
 
         cx.spawn_in(window, async move |picker, cx| {
-            let receiver = repo.update(cx, |repo, _| repo.remove_worktree(path.clone(), false));
-            receiver
-                .await
-                .map_err(|_| anyhow::anyhow!("worktree removal was cancelled"))?
-                .map_err(|e| anyhow::anyhow!("failed to remove worktree: {e}"))?;
+            let result = repo
+                .update(cx, |repo, _| repo.remove_worktree(path.clone(), false))
+                .await?;
+
+            if let Err(error) = result {
+                log::error!("Failed to remove worktree: {}", error);
+
+                if let Some(workspace) = workspace.upgrade() {
+                    cx.update(|_window, cx| {
+                        show_error_toast(
+                            workspace,
+                            format!("worktree remove {}", path.display()),
+                            error,
+                            cx,
+                        )
+                    })?;
+                }
+
+                return Ok(());
+            }
 
             picker.update_in(cx, |picker, _window, cx| {
                 picker.delegate.matches.retain(|e| {

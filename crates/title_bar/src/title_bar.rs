@@ -880,9 +880,12 @@ impl TitleBar {
 
         let worktree_button = {
             let project = self.project.clone();
+            let workspace_handle = workspace.downgrade();
             PopoverMenu::new("worktree-picker-menu")
                 .menu(move |window, cx| {
-                    Some(cx.new(|cx| WorktreePicker::new(project.clone(), window, cx)))
+                    Some(cx.new(|cx| {
+                        WorktreePicker::new(project.clone(), workspace_handle.clone(), window, cx)
+                    }))
                 })
                 .trigger_with_tooltip(
                     Button::new("worktree_picker_trigger", display_label)
