@@ -20,8 +20,8 @@ use chrono::{DateTime, Utc};
 use editor::Editor;
 use gpui::{
     Action as _, AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EntityId, FocusHandle,
-    Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task, WeakEntity,
-    Window, WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
+    Focusable, KeyContext, ListState, Pixels, Render, SharedString, Task, WeakEntity, Window,
+    WindowHandle, linear_color_stop, linear_gradient, list, prelude::*, px,
 };
 use menu::{
     Cancel, Confirm, SelectChild, SelectFirst, SelectLast, SelectNext, SelectParent, SelectPrevious,
@@ -40,9 +40,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use theme::ActiveTheme;
 use ui::{
-    AgentThreadStatus, CommonAnimationExt, ContextMenu, Divider, GradientFade, HighlightedLabel,
-    KeyBinding, PopoverMenu, PopoverMenuHandle, Tab, ThreadItem, ThreadItemWorktreeInfo, TintColor,
-    Tooltip, WithScrollbar, prelude::*, render_modifiers,
+    AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, Divider, GradientFade,
+    HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, Tab, ThreadItem,
+    ThreadItemWorktreeInfo, TintColor, Tooltip, WithScrollbar, prelude::*,
 };
 use util::ResultExt as _;
 use util::path_list::PathList;
@@ -111,6 +111,19 @@ enum SidebarView {
 enum ArchiveWorktreeOutcome {
     Success,
     Cancelled,
+}
+
+#[derive(Clone)]
+struct WorkspaceMenuFolderDetail {
+    worktree_name: SharedString,
+}
+
+#[derive(Clone)]
+struct WorkspaceMenuEntry {
+    workspace: Entity<Workspace>,
+    folders: Vec<WorkspaceMenuFolderDetail>,
+    sort_label: SharedString,
+    is_active: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -322,6 +335,96 @@ fn root_repository_snapshots(
 
 fn workspace_path_list(workspace: &Entity<Workspace>, cx: &App) -> PathList {
     PathList::new(&workspace.read(cx).root_paths(cx))
+}
+
+fn workspace_menu_details(
+    workspace: &Entity<Workspace>,
+    cx: &App,
+) -> (Vec<WorkspaceMenuFolderDetail>, SharedString) {
+    let project = workspace.read(cx).project().clone();
+    let worktree_paths = project.read(cx).worktree_paths(cx);
+    let mut seen: HashSet<SharedString> = HashSet::new();
+    let folders: Vec<WorkspaceMenuFolderDetail> = worktree_paths
+        .ordered_pairs()
+        .filter_map(|(main_path, folder_path)| {
+            let worktree_name = if main_path == folder_path {
+                SharedString::from("main")
+            } else {
+                project::linked_worktree_short_name(main_path, folder_path)
+                    .unwrap_or_else(|| SharedString::from(folder_path.display().to_string()))
+            };
+            if !seen.insert(worktree_name.clone()) {
+                return None;
+            }
+            Some(WorkspaceMenuFolderDetail { worktree_name })
+        })
+        .collect();
+
+    let sort_parts: Vec<String> = folders
+        .iter()
+        .map(|folder| folder.worktree_name.to_string())
+        .collect();
+
+    let sort_label = if sort_parts.is_empty() {
+        SharedString::from("Open Workspace")
+    } else {
+        SharedString::from(sort_parts.join(" "))
+    };
+
+    (folders, sort_label)
+}
+
+fn focus_workspace(
+    sidebar: &mut Sidebar,
+    workspace: &Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut Context<Sidebar>,
+) {
+    if let Some(multi_workspace) = sidebar.multi_workspace.upgrade() {
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.activate(workspace.clone(), window, cx);
+            multi_workspace.focus_active_workspace(window, cx);
+        });
+    }
+    sidebar.selection = None;
+    sidebar.active_entry = None;
+}
+
+fn workspace_menu_entries(
+    sidebar: &Sidebar,
+    project_group_key: &ProjectGroupKey,
+    cx: &App,
+) -> Vec<WorkspaceMenuEntry> {
+    let Some(multi_workspace) = sidebar.multi_workspace.upgrade() else {
+        return Vec::new();
+    };
+
+    let Some(workspaces) = multi_workspace
+        .read(cx)
+        .workspaces_for_project_group(project_group_key, cx)
+    else {
+        return Vec::new();
+    };
+
+    let mut entries: Vec<_> = workspaces
+        .into_iter()
+        .map(|workspace| {
+            let (folders, sort_label) = workspace_menu_details(&workspace, cx);
+            WorkspaceMenuEntry {
+                folders,
+                sort_label,
+                is_active: sidebar.is_active_workspace(&workspace, cx),
+                workspace,
+            }
+        })
+        .collect();
+
+    entries.sort_by(|a, b| {
+        b.is_active
+            .cmp(&a.is_active)
+            .then_with(|| a.sort_label.to_string().cmp(&b.sort_label.to_string()))
+    });
+    entries
 }
 
 /// Shows a [`RemoteConnectionModal`] on the given workspace and establishes
@@ -1617,8 +1720,8 @@ impl Sidebar {
         ix: usize,
         id_prefix: &str,
         project_group_key: &ProjectGroupKey,
-        is_active: bool,
-        has_threads: bool,
+        _is_active: bool,
+        _has_threads: bool,
         group_name: &SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1663,12 +1766,18 @@ impl Sidebar {
                 let multi_workspace = multi_workspace.clone();
                 let project_group_key = project_group_key.clone();
                 let this_for_menu = this.clone();
+                let workspace_entries = this_for_menu
+                    .upgrade()
+                    .map(|sidebar| {
+                        workspace_menu_entries(&sidebar.read(cx), &project_group_key, cx)
+                    })
+                    .unwrap_or_default();
 
                 let menu =
                     ContextMenu::build_persistent(window, cx, move |menu, _window, menu_cx| {
                         let weak_menu = menu_cx.weak_entity();
 
-                        let menu = menu.when(show_multi_project_entries, |this| {
+                        let mut menu = menu.when(show_multi_project_entries, |this| {
                             this.entry(
                                 "Open Project in New Window",
                                 Some(Box::new(workspace::MoveProjectToNewWindow)),
@@ -1692,66 +1801,96 @@ impl Sidebar {
                             )
                         });
 
-                        let menu = menu
-                            .custom_entry(
-                                {
-                                    move |_window, cx| {
-                                        let action = h_flex()
-                                            .opacity(0.6)
-                                            .children(render_modifiers(
-                                                &Modifiers::secondary_key(),
-                                                PlatformStyle::platform(),
-                                                None,
-                                                Some(TextSize::Default.rems(cx).into()),
-                                                false,
-                                            ))
-                                            .child(Label::new("-click").color(Color::Muted));
+                        for entry in workspace_entries.clone() {
+                            let workspace = entry.workspace.clone();
+                            let folders = entry.folders.clone();
+                            let this = this_for_menu.clone();
+                            let focus_this = this_for_menu.clone();
+                            let workspace_for_focus = workspace.clone();
 
-                                        let label = if has_threads {
-                                            "Focus Last Workspace"
-                                        } else {
-                                            "Focus Workspace"
-                                        };
+                            menu = menu.custom_entry(
+                                move |_window, _cx| {
+                                    h_flex()
+                                        .w_full()
+                                        .justify_between()
+                                        .gap_4()
+                                        .child(h_flex().min_w_0().gap_3().children(
+                                            folders.iter().map(|folder| {
+                                                let worktree_name = folder.worktree_name.clone();
 
-                                        h_flex()
-                                            .w_full()
-                                            .justify_between()
-                                            .gap_4()
-                                            .child(
-                                                Label::new(label)
-                                                    .when(is_active, |s| s.color(Color::Disabled)),
-                                            )
-                                            .child(action)
-                                            .into_any_element()
-                                    }
+                                                h_flex()
+                                                    .min_w_0()
+                                                    .gap_1()
+                                                    .child(
+                                                        Icon::new(IconName::GitWorktree)
+                                                            .size(IconSize::XSmall)
+                                                            .color(Color::Muted),
+                                                    )
+                                                    .child(
+                                                        Label::new(worktree_name)
+                                                            .size(LabelSize::Small)
+                                                            .truncate(),
+                                                    )
+                                            }),
+                                        ))
+                                        .child(
+                                            h_flex()
+                                                .cursor_pointer()
+                                                .on_mouse_down(gpui::MouseButton::Left, {
+                                                    let focus_this = focus_this.clone();
+                                                    let workspace_for_focus =
+                                                        workspace_for_focus.clone();
+                                                    move |_, window, cx| {
+                                                        focus_this
+                                                            .update(cx, |sidebar, cx| {
+                                                                focus_workspace(
+                                                                    sidebar,
+                                                                    &workspace_for_focus,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            })
+                                                            .ok();
+                                                        cx.stop_propagation();
+                                                    }
+                                                })
+                                                .child(
+                                                    Icon::new(IconName::Focus)
+                                                        .size(IconSize::Small)
+                                                        .color(Color::Muted),
+                                                ),
+                                        )
+                                        .into_any_element()
                                 },
-                                {
-                                    let project_group_key = project_group_key.clone();
-                                    let this = this_for_menu.clone();
-                                    move |window, cx| {
-                                        if is_active {
-                                            return;
-                                        }
-                                        this.update(cx, |sidebar, cx| {
-                                            if let Some(workspace) =
-                                                sidebar.workspace_for_group(&project_group_key, cx)
-                                            {
-                                                sidebar.activate_workspace(&workspace, window, cx);
-                                            } else {
-                                                sidebar.open_workspace_for_group(
-                                                    &project_group_key,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }
-                                            sidebar.selection = None;
-                                            sidebar.active_entry = None;
-                                        })
-                                        .ok();
-                                    }
+                                move |window, cx| {
+                                    this.update(cx, |sidebar, cx| {
+                                        sidebar.activate_workspace(&workspace, window, cx);
+                                        sidebar.selection = None;
+                                        sidebar.active_entry = None;
+                                    })
+                                    .ok();
                                 },
-                            )
-                            .selectable(!is_active);
+                            );
+                        }
+
+                        if workspace_entries.is_empty() {
+                            let project_group_key = project_group_key.clone();
+                            let this = this_for_menu.clone();
+                            menu = menu.item(ContextMenuEntry::new("Open Workspace").handler(
+                                move |window, cx| {
+                                    this.update(cx, |sidebar, cx| {
+                                        sidebar.open_workspace_for_group(
+                                            &project_group_key,
+                                            window,
+                                            cx,
+                                        );
+                                        sidebar.selection = None;
+                                        sidebar.active_entry = None;
+                                    })
+                                    .ok();
+                                },
+                            ));
+                        }
 
                         let project_group_key = project_group_key.clone();
                         let multi_workspace = multi_workspace.clone();

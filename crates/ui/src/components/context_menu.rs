@@ -180,6 +180,23 @@ impl ContextMenuEntry {
         self
     }
 
+    pub fn end_slot(
+        mut self,
+        icon: IconName,
+        title: impl Into<SharedString>,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.end_slot_icon = Some(icon);
+        self.end_slot_title = Some(title.into());
+        self.end_slot_handler = Some(Rc::new(move |_, window, cx| handler(window, cx)));
+        self
+    }
+
+    pub fn show_end_slot_on_hover(mut self) -> Self {
+        self.show_end_slot_on_hover = true;
+        self
+    }
+
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self

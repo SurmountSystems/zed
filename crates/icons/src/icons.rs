@@ -80,6 +80,7 @@ pub enum IconName {
     CountdownTimer,
     Crosshair,
     CursorIBeam,
+    Focus,
     Dash,
     DatabaseZap,
     Debug,
