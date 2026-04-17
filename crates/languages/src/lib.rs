@@ -24,7 +24,7 @@ mod go;
 mod json;
 mod package_json;
 mod python;
-mod rust;
+pub mod rust;
 mod tailwind;
 mod tailwindcss;
 mod typescript;

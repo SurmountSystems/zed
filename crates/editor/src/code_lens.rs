@@ -202,7 +202,20 @@ pub(super) fn try_handle_client_command(
         .lsp_store()
         .read(cx)
         .language_server_adapter_for_id(action.server_id)
-        .and_then(|adapter| adapter.adapter.client_command(&command.command, arguments))
+        .and_then(|adapter| adapter.adapter.client_command(&command.command, arguments));
+    let client_command = client_command
+        .or_else(|| {
+            // In SSH remote, the adapter can't be found by server ID because the language
+            // server runs on the remote host. Fall back to searching all registered adapters
+            // for the buffer's language.
+            let language_name = language_name_for_action(action, editor, cx)?;
+            project
+                .read(cx)
+                .languages()
+                .lsp_adapters(&language_name)
+                .iter()
+                .find_map(|adapter| adapter.adapter.client_command(&command.command, arguments))
+        })
         .or_else(|| match command.command.as_str() {
             "editor.action.showReferences"
             | "editor.action.goToLocations"
@@ -221,6 +234,18 @@ pub(super) fn try_handle_client_command(
     }
 }
 
+fn language_name_for_action(
+    action: &CodeAction,
+    editor: &Editor,
+    cx: &Context<Editor>,
+) -> Option<language::LanguageName> {
+    let buffer = editor
+        .buffer()
+        .read(cx)
+        .buffer(action.range.start.buffer_id)?;
+    buffer.read(cx).language().map(|language| language.name())
+}
+
 fn schedule_task(
     task_template: task::TaskTemplate,
     action: &CodeAction,
@@ -233,12 +258,7 @@ fn schedule_task(
         cwd: task_template.cwd.as_ref().map(std::path::PathBuf::from),
         ..TaskContext::default()
     };
-    let language_name = editor
-        .buffer()
-        .read(cx)
-        .as_singleton()
-        .and_then(|buffer| buffer.read(cx).language())
-        .map(|language| language.name());
+    let language_name = language_name_for_action(action, editor, cx);
     let task_source_kind = match language_name {
         Some(language_name) => TaskSourceKind::Lsp {
             server: action.server_id,

@@ -104,6 +104,7 @@ gpui_tokio.workspace = true
 indoc.workspace = true
 language = { workspace = true, features = ["test-support"] }
 language_model = { workspace = true, features = ["test-support"] }
+languages.workspace = true
 livekit_client =  { workspace = true, features = ["test-support"] }
 lsp = { workspace = true, features = ["test-support"] }
 menu.workspace = true

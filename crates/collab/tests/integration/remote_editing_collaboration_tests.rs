@@ -4,7 +4,10 @@ use collections::{HashMap, HashSet};
 
 use dap::{Capabilities, adapters::DebugTaskDefinition, transport::RequestHandling};
 use debugger_ui::debugger_panel::DebugPanel;
-use editor::{Editor, EditorMode, MultiBuffer};
+use editor::{
+    Editor, EditorMode, MultiBuffer,
+    actions::{ConfirmCodeAction, ToggleCodeActions},
+};
 use extension::ExtensionHostProxy;
 use fs::{FakeFs, Fs as _, RemoveOptions};
 use futures::StreamExt as _;
@@ -1365,4 +1368,153 @@ async fn test_ssh_remote_worktree_trust(cx_a: &mut TestAppContext, server_cx: &m
         !has_restricted_after,
         "should have no restricted worktrees after trusting both"
     );
+}
+
+#[gpui::test]
+async fn test_ssh_remote_code_lens_client_command(
+    cx_a: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    cx_a.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+    server_cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+    });
+
+    let (opts, server_ssh, _) = RemoteClient::fake_server(cx_a, server_cx);
+    let remote_fs = FakeFs::new(server_cx.executor());
+    remote_fs
+        .insert_tree(
+            path!("/code"),
+            json!({
+                "main.rs": "fn main() {}"
+            }),
+        )
+        .await;
+
+    let server_languages = Arc::new(LanguageRegistry::new(server_cx.executor()));
+    server_languages.add(rust_lang());
+    let mut fake_language_servers = server_languages.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "rust-analyzer",
+            capabilities: lsp::ServerCapabilities {
+                code_lens_provider: Some(lsp::CodeLensOptions {
+                    resolve_provider: None,
+                }),
+                ..lsp::ServerCapabilities::default()
+            },
+            ..FakeLspAdapter::default()
+        },
+    );
+
+    server_cx.update(HeadlessProject::init);
+    let _headless_project = server_cx.new(|cx| {
+        HeadlessProject::new(
+            HeadlessAppState {
+                session: server_ssh,
+                fs: remote_fs.clone(),
+                http_client: Arc::new(BlockedHttpClient),
+                node_runtime: NodeRuntime::unavailable(),
+                languages: server_languages,
+                extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            false,
+            cx,
+        )
+    });
+
+    let client_ssh = RemoteClient::connect_mock(opts, cx_a).await;
+    let mut server = TestServer::start(cx_a.executor().clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+
+    client_a.language_registry().add(rust_lang());
+    client_a
+        .language_registry()
+        .register_lsp_adapter("Rust".into(), Arc::new(languages::rust::RustLspAdapter));
+
+    let (project_a, worktree_id) = client_a
+        .build_ssh_project(path!("/code"), client_ssh, false, cx_a)
+        .await;
+
+    let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
+    let editor_a = workspace_a
+        .update_in(cx_a, |workspace, window, cx| {
+            workspace.open_path((worktree_id, rel_path("main.rs")), None, true, window, cx)
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+
+    cx_a.run_until_parked();
+    let fake_server = fake_language_servers.next().await.unwrap();
+
+    fake_server.set_request_handler::<lsp::request::CodeLensRequest, _, _>(|_, _| async move {
+        Ok(Some(vec![lsp::CodeLens {
+            range: lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 7)),
+            command: Some(lsp::Command {
+                title: "\u{25b6}\u{fe0e} Run Tests".to_owned(),
+                command: "rust-analyzer.runSingle".to_owned(),
+                arguments: Some(vec![json!({
+                    "label": "test-mod tests::ecparser",
+                    "kind": "cargo",
+                    "args": {
+                        "environment": {},
+                        "cwd": "/code",
+                        "workspaceRoot": "/code",
+                        "cargoArgs": ["test", "--package", "mylib", "--lib"],
+                        "executableArgs": ["tests::ecparser", "--nocapture"]
+                    }
+                })]),
+            }),
+            data: None,
+        }]))
+    });
+
+    fake_server.set_request_handler::<lsp::request::CodeActionRequest, _, _>(|_, _| async move {
+        Ok(None)
+    });
+
+    // refresh_code_actions has CODE_ACTIONS_DEBOUNCE_TIMEOUT debounce,
+    // and code_lens_actions has its own 30ms debounce spawned inside.
+    cx_a.executor()
+        .advance_clock(editor::CODE_ACTIONS_DEBOUNCE_TIMEOUT * 2);
+    cx_a.run_until_parked();
+    cx_a.executor().advance_clock(Duration::from_millis(100));
+    cx_a.run_until_parked();
+
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.toggle_code_actions(
+            &ToggleCodeActions {
+                deployed_from: None,
+                quick_launch: false,
+            },
+            window,
+            cx,
+        );
+    });
+    // toggle_code_actions spawns async work that may trigger additional
+    // code lens fetches with their own debounce timers.
+    cx_a.executor().advance_clock(Duration::from_secs(1));
+    cx_a.run_until_parked();
+
+    editor_a.update(cx_a, |editor, _| {
+        assert!(
+            editor.context_menu_visible(),
+            "code actions menu should be visible with code lens actions"
+        );
+    });
+
+    let confirm_task = editor_a
+        .update_in(cx_a, |editor, window, cx| {
+            Editor::confirm_code_action(editor, &ConfirmCodeAction { item_ix: Some(0) }, window, cx)
+        })
+        .unwrap();
+
+    confirm_task
+        .await
+        .expect("Code lens client command should succeed in SSH remote mode");
 }
