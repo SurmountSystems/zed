@@ -36,10 +36,8 @@ use crate::{
     Follow, InlineAssistant, LoadThreadFromClipboard, NewThread, NewWorktreeBranchTarget,
     OpenActiveThreadAsMarkdown, OpenAgentDiff, OpenHistory, ResetTrialEndUpsell, ResetTrialUpsell,
     SwitchWorktree, ToggleNavigationMenu, ToggleNewThreadMenu, ToggleOptionsMenu,
-    ToggleWorktreeSelector,
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     conversation_view::{AcpThreadViewEvent, ThreadView},
-    thread_worktree_picker::ThreadWorktreePicker,
     ui::EndTrialUpsell,
 };
 use crate::{
@@ -69,7 +67,7 @@ use language::LanguageRegistry;
 use language_model::LanguageModelRegistry;
 use project::project_settings::ProjectSettings;
 use project::trusted_worktrees::{PathTrust, TrustedWorktrees};
-use project::{Project, ProjectPath, Worktree, linked_worktree_short_name};
+use project::{Project, ProjectPath, Worktree};
 use prompt_store::{PromptStore, UserPromptId};
 use release_channel::ReleaseChannel;
 use remote::RemoteConnectionOptions;
@@ -275,14 +273,6 @@ pub fn init(cx: &mut App) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
                         panel.update(cx, |panel, cx| {
                             panel.toggle_new_thread_menu(&ToggleNewThreadMenu, window, cx);
-                        });
-                    }
-                })
-                .register_action(|workspace, _: &ToggleWorktreeSelector, window, cx| {
-                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-                        panel.update(cx, |panel, cx| {
-                            panel.toggle_worktree_selector(&ToggleWorktreeSelector, window, cx);
                         });
                     }
                 })
@@ -750,7 +740,7 @@ pub struct AgentPanel {
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
-    start_thread_in_menu_handle: PopoverMenuHandle<ThreadWorktreePicker>,
+
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_navigation_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_navigation_menu: Option<Entity<ContextMenu>>,
@@ -1117,7 +1107,7 @@ impl AgentPanel {
             draft_thread: None,
             retained_threads: HashMap::default(),
             new_thread_menu_handle: PopoverMenuHandle::default(),
-            start_thread_in_menu_handle: PopoverMenuHandle::default(),
+
             agent_panel_menu_handle: PopoverMenuHandle::default(),
             agent_navigation_menu_handle: PopoverMenuHandle::default(),
             agent_navigation_menu: None,
@@ -1699,15 +1689,6 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         self.new_thread_menu_handle.toggle(window, cx);
-    }
-
-    pub fn toggle_worktree_selector(
-        &mut self,
-        _: &ToggleWorktreeSelector,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.start_thread_in_menu_handle.toggle(window, cx);
     }
 
     pub fn increase_font_size(
@@ -4074,117 +4055,9 @@ impl AgentPanel {
         !self.project.read(cx).repositories(cx).is_empty()
     }
 
-    fn is_active_view_creating_worktree(&self, _cx: &App) -> bool {
-        match &self.worktree_creation_status {
-            Some((view_id, WorktreeCreationStatus::Creating(_))) => {
-                self.active_conversation_view().map(|v| v.entity_id()) == Some(*view_id)
-            }
-            _ => false,
-        }
-    }
-
-    fn is_active_view_loading_worktree(&self, _cx: &App) -> bool {
-        match &self.worktree_creation_status {
-            Some((view_id, WorktreeCreationStatus::Loading(_))) => {
-                self.active_conversation_view().map(|v| v.entity_id()) == Some(*view_id)
-            }
-            _ => false,
-        }
-    }
-
-    fn current_worktree_label(&self, cx: &App) -> SharedString {
-        let project = self.project.read(cx);
-
-        if let Some(repo) = project.active_repository(cx) {
-            let repo = repo.read(cx);
-            let main_path = &repo.original_repo_abs_path;
-            let current_path = &repo.work_directory_abs_path;
-
-            return linked_worktree_short_name(main_path, current_path)
-                .unwrap_or_else(|| "main worktree".into());
-        }
-
-        project
-            .visible_worktrees(cx)
-            .next()
-            .and_then(|wt| {
-                wt.read(cx)
-                    .abs_path()
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| SharedString::from(name.to_string()))
-            })
-            .unwrap_or_else(|| "Worktree".into())
-    }
-
-    fn render_start_thread_in_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_creating = self.is_active_view_creating_worktree(cx);
-        let is_loading = self.is_active_view_loading_worktree(cx);
-        let is_busy = is_creating || is_loading;
-
-        let label = match &self.worktree_creation_status {
-            Some((view_id, WorktreeCreationStatus::Creating(name)))
-                if self.active_conversation_view().map(|v| v.entity_id()) == Some(*view_id) =>
-            {
-                SharedString::from(format!("Creating {name}…"))
-            }
-            Some((view_id, WorktreeCreationStatus::Loading(name)))
-                if self.active_conversation_view().map(|v| v.entity_id()) == Some(*view_id) =>
-            {
-                SharedString::from(format!("Loading {name}…"))
-            }
-            _ => self.current_worktree_label(cx),
-        };
-
-        let chevron_icon = if self.start_thread_in_menu_handle.is_deployed() {
-            IconName::ChevronUp
-        } else {
-            IconName::ChevronDown
-        };
-
-        let focus_handle = self.focus_handle(cx);
-
-        let trigger_button = Button::new("thread-target-trigger", label)
-            .disabled(is_busy)
-            .loading(is_busy)
-            .start_icon(
-                Icon::new(IconName::GitWorktree)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
-            .end_icon(
-                Icon::new(chevron_icon)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            );
-
-        let project = self.project.clone();
-
-        PopoverMenu::new("thread-target-selector")
-            .trigger_with_tooltip(trigger_button, {
-                move |_window, cx| {
-                    Tooltip::for_action_in(
-                        "Select Worktree…",
-                        &ToggleWorktreeSelector,
-                        &focus_handle,
-                        cx,
-                    )
-                }
-            })
-            .menu(move |window, cx| {
-                Some(cx.new(|cx| ThreadWorktreePicker::new(project.clone(), window, cx)))
-            })
-            .with_handle(self.start_thread_in_menu_handle.clone())
-            .anchor(Corner::TopLeft)
-            .offset(gpui::Point {
-                x: px(1.0),
-                y: px(1.0),
-            })
-    }
-
     fn render_toolbar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let agent_server_store = self.project.read(cx).agent_server_store().clone();
-        let has_visible_worktrees = self.project.read(cx).visible_worktrees(cx).next().is_some();
+
         let focus_handle = self.focus_handle(cx);
 
         let (selected_agent_custom_icon, selected_agent_label) =
@@ -4531,13 +4404,7 @@ impl AgentPanel {
                         .size_full()
                         .gap(DynamicSpacing::Base04.rems(cx))
                         .pl(DynamicSpacing::Base04.rems(cx))
-                        .child(agent_selector_menu)
-                        .when(
-                            agent_v2_enabled
-                                && has_visible_worktrees
-                                && self.project_has_git_repository(cx),
-                            |this| this.child(self.render_start_thread_in_selector(cx)),
-                        ),
+                        .child(agent_selector_menu),
                 )
                 .child(
                     h_flex()
@@ -5090,24 +4957,6 @@ impl AgentPanel {
     /// method for visual tests.
     pub fn open_history_for_tests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_history(window, cx);
-    }
-
-    /// Opens the start_thread_in selector popover menu.
-    ///
-    /// This is a test-only helper for visual tests.
-    pub fn open_start_thread_in_menu_for_tests(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.start_thread_in_menu_handle.show(window, cx);
-    }
-
-    /// Dismisses the start_thread_in dropdown menu.
-    ///
-    /// This is a test-only helper for visual tests.
-    pub fn close_start_thread_in_menu_for_tests(&mut self, cx: &mut Context<Self>) {
-        self.start_thread_in_menu_handle.hide(cx);
     }
 
     /// Creates a draft thread using a stub server and sets it as the active view.

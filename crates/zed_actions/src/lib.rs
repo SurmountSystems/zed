@@ -1,6 +1,7 @@
 use gpui::{Action, actions};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 // If the zed binary doesn't use anything in this crate, it will be optimized away
 // and the actions won't initialize. So we just provide an empty initialization function
@@ -249,6 +250,55 @@ pub mod workspace {
             OpenWithSystem,
         ]
     );
+}
+
+/// Describes which branch to use when creating a new git worktree.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum NewWorktreeBranchTarget {
+    /// Create a new randomly named branch from the current HEAD.
+    /// Will match worktree name if the newly created worktree was also randomly named.
+    #[default]
+    CurrentBranch,
+    /// Check out an existing branch, or create a new branch from it if it's
+    /// already occupied by another worktree.
+    ExistingBranch { name: String },
+    /// Create a new branch with an explicit name, optionally from a specific ref.
+    CreateBranch {
+        name: String,
+        #[serde(default)]
+        from_ref: Option<String>,
+    },
+}
+
+/// Creates a new git worktree and switches the workspace to it.
+/// Dispatched by the unified worktree picker when the user selects a "Create new worktree" entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct CreateWorktree {
+    /// When this is None, Zed will randomly generate a worktree name.
+    pub worktree_name: Option<String>,
+    pub branch_target: NewWorktreeBranchTarget,
+}
+
+/// Switches the workspace to an existing linked worktree.
+/// Dispatched by the unified worktree picker when the user selects an existing worktree.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchWorktree {
+    pub path: PathBuf,
+    pub display_name: String,
+}
+
+/// Opens an existing worktree in a new window.
+/// Dispatched by the worktree picker's "Open in New Window" button.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct OpenWorktreeInNewWindow {
+    pub path: PathBuf,
 }
 
 pub mod git {
