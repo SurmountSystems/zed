@@ -732,7 +732,7 @@ impl MultiWorkspace {
             self.retained_workspaces.push(workspace.clone());
         }
 
-        self.activate(workspace.clone(), window, cx);
+        self.activate(workspace.clone(), None, window, cx);
         cx.emit(MultiWorkspaceEvent::WorkspaceAdded(workspace));
     }
 
