@@ -11,8 +11,8 @@ use std::pin::Pin;
 use std::str::FromStr;
 
 use crate::{
-    AnthropicError, AnthropicModelMode, CacheControl, CacheControlType, ContentDelta,
-    CountTokensRequest, Event, ImageSource, Message, RequestContent, ResponseContent,
+    AdaptiveThinkingDisplay, AnthropicError, AnthropicModelMode, CacheControl, CacheControlType,
+    ContentDelta, CountTokensRequest, Event, ImageSource, Message, RequestContent, ResponseContent,
     StringOrContents, Thinking, Tool, ToolChoice, ToolResultContent, ToolResultPart, Usage,
 };
 
@@ -156,7 +156,9 @@ pub fn into_anthropic_count_tokens_request(
                 AnthropicModelMode::Thinking { budget_tokens } => {
                     Some(Thinking::Enabled { budget_tokens })
                 }
-                AnthropicModelMode::AdaptiveThinking => Some(Thinking::Adaptive),
+                AnthropicModelMode::AdaptiveThinking => Some(Thinking::Adaptive {
+                    display: Some(AdaptiveThinkingDisplay::Summarized),
+                }),
                 AnthropicModelMode::Default => None,
             }
         } else {
@@ -326,7 +328,9 @@ pub fn into_anthropic(
                 AnthropicModelMode::Thinking { budget_tokens } => {
                     Some(Thinking::Enabled { budget_tokens })
                 }
-                AnthropicModelMode::AdaptiveThinking => Some(Thinking::Adaptive),
+                AnthropicModelMode::AdaptiveThinking => Some(Thinking::Adaptive {
+                    display: Some(AdaptiveThinkingDisplay::Summarized),
+                }),
                 AnthropicModelMode::Default => None,
             }
         } else {
