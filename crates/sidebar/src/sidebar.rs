@@ -1978,6 +1978,7 @@ impl Sidebar {
                                             .update(cx, |multi_workspace, cx| {
                                                 multi_workspace.activate(
                                                     activate_workspace.clone(),
+                                                    None,
                                                     window,
                                                     cx,
                                                 );
