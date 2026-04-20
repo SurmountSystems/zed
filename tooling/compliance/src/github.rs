@@ -97,15 +97,38 @@ impl fmt::Display for CommitAuthor {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct CommitSignature {
+    #[serde(rename = "isValid")]
+    is_valid: bool,
+    signer: Option<GithubLogin>,
+}
+
+impl CommitSignature {
+    pub fn is_valid(&self) -> bool {
+        self.is_valid
+    }
+
+    pub fn signer(&self) -> Option<&GithubLogin> {
+        self.signer.as_ref()
+    }
+}
+
 #[derive(Debug, Deserialize)]
-pub struct CommitAuthors {
+pub struct CommitMetadata {
     #[serde(rename = "author")]
     primary_author: CommitAuthor,
     #[serde(rename = "authors", deserialize_with = "graph_ql::deserialize_nodes")]
     co_authors: Vec<CommitAuthor>,
+    #[serde(default)]
+    signature: Option<CommitSignature>,
+    #[serde(default)]
+    additions: u64,
+    #[serde(default)]
+    deletions: u64,
 }
 
-impl CommitAuthors {
+impl CommitMetadata {
     pub fn co_authors(&self) -> Option<impl Iterator<Item = &CommitAuthor>> {
         self.co_authors.is_empty().not().then(|| {
             self.co_authors
@@ -113,26 +136,42 @@ impl CommitAuthors {
                 .filter(|co_author| *co_author != &self.primary_author)
         })
     }
+
+    pub fn primary_author(&self) -> &CommitAuthor {
+        &self.primary_author
+    }
+
+    pub fn signature(&self) -> Option<&CommitSignature> {
+        self.signature.as_ref()
+    }
+
+    pub fn additions(&self) -> u64 {
+        self.additions
+    }
+
+    pub fn deletions(&self) -> u64 {
+        self.deletions
+    }
 }
 
 #[derive(Debug, Deref)]
-pub struct AuthorsForCommits(HashMap<CommitSha, CommitAuthors>);
+pub struct CommitMetadataBySha(HashMap<CommitSha, CommitMetadata>);
 
-impl AuthorsForCommits {
+impl CommitMetadataBySha {
     const SHA_PREFIX: &'static str = "commit";
 }
 
-impl<'de> serde::Deserialize<'de> for AuthorsForCommits {
+impl<'de> serde::Deserialize<'de> for CommitMetadataBySha {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = HashMap::<String, CommitAuthors>::deserialize(deserializer)?;
+        let raw = HashMap::<String, CommitMetadata>::deserialize(deserializer)?;
         let map = raw
             .into_iter()
             .map(|(key, value)| {
                 let sha = key
-                    .strip_prefix(AuthorsForCommits::SHA_PREFIX)
+                    .strip_prefix(CommitMetadataBySha::SHA_PREFIX)
                     .unwrap_or(&key);
                 (CommitSha::new(sha.to_owned()), value)
             })
@@ -192,11 +231,11 @@ pub trait GithubApiClient {
         repo: &Repository<'_>,
         pr_number: u64,
     ) -> Result<Vec<PullRequestComment>>;
-    async fn get_commit_authors(
+    async fn get_commit_metadata(
         &self,
         repo: &Repository<'_>,
         commit_shas: &[&CommitSha],
-    ) -> Result<AuthorsForCommits>;
+    ) -> Result<CommitMetadataBySha>;
     async fn check_repo_write_permission(
         &self,
         repo: &Repository<'_>,
@@ -234,7 +273,7 @@ pub mod graph_ql {
 
     use crate::git::CommitSha;
 
-    use super::AuthorsForCommits;
+    use super::CommitMetadataBySha;
 
     #[derive(Debug, Deserialize)]
     pub struct GraphQLResponse<T> {
@@ -261,8 +300,8 @@ pub mod graph_ql {
     }
 
     #[derive(Debug, Deserialize)]
-    pub struct CommitAuthorsResponse {
-        pub repository: AuthorsForCommits,
+    pub struct CommitMetadataResponse {
+        pub repository: CommitMetadataBySha,
     }
 
     pub fn deserialize_nodes<'de, T, D>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
@@ -277,7 +316,7 @@ pub mod graph_ql {
         Nodes::<T>::deserialize(deserializer).map(|wrapper| wrapper.nodes)
     }
 
-    pub fn build_co_authors_query<'a>(
+    pub fn build_commit_metadata_query<'a>(
         org: &str,
         repo: &str,
         shas: impl IntoIterator<Item = &'a CommitSha>,
@@ -296,6 +335,12 @@ pub mod graph_ql {
                         user { login }
                     }
                 }
+                signature {
+                    isValid
+                    signer { login }
+                }
+                additions
+                deletions
             }
         "#;
 
@@ -304,7 +349,7 @@ pub mod graph_ql {
             .map(|commit_sha| {
                 format!(
                     "{sha_prefix}{sha}: object(oid: \"{sha}\") {{ {FRAGMENT} }}",
-                    sha_prefix = AuthorsForCommits::SHA_PREFIX,
+                    sha_prefix = CommitMetadataBySha::SHA_PREFIX,
                     sha = **commit_sha,
                 )
             })
@@ -333,7 +378,7 @@ mod octo_client {
     };
 
     use super::{
-        AuthorsForCommits, GithubApiClient, GithubLogin, GithubUser, PullRequestComment,
+        CommitMetadataBySha, GithubApiClient, GithubLogin, GithubUser, PullRequestComment,
         PullRequestData, PullRequestReview, ReviewState,
     };
 
@@ -481,18 +526,18 @@ mod octo_client {
                 .collect())
         }
 
-        async fn get_commit_authors(
+        async fn get_commit_metadata(
             &self,
             repo: &Repository<'_>,
             commit_shas: &[&CommitSha],
-        ) -> Result<AuthorsForCommits> {
-            let query = graph_ql::build_co_authors_query(
+        ) -> Result<CommitMetadataBySha> {
+            let query = graph_ql::build_commit_metadata_query(
                 repo.owner.as_ref(),
                 repo.name.as_ref(),
                 commit_shas.iter().copied(),
             );
             let query = serde_json::json!({ "query": query });
-            self.graphql::<graph_ql::CommitAuthorsResponse>(&query)
+            self.graphql::<graph_ql::CommitMetadataResponse>(&query)
                 .await
                 .map(|response| response.repository)
         }

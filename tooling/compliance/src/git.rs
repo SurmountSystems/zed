@@ -15,6 +15,9 @@ use regex::Regex;
 use semver::Version;
 use serde::Deserialize;
 
+pub(crate) const ZED_ZIPPY_LOGIN: &str = "zed-zippy[bot]";
+pub(crate) const ZED_ZIPPY_EMAIL: &str = "234243425+zed-zippy[bot]@users.noreply.github.com";
+
 pub trait Subcommand {
     type ParsedOutput: FromStr<Err = anyhow::Error>;
 
@@ -151,6 +154,10 @@ impl Committer {
             email: email.to_owned(),
         }
     }
+
+    pub(crate) fn is_zed_zippy(&self) -> bool {
+        self.email == ZED_ZIPPY_EMAIL
+    }
 }
 
 impl fmt::Display for Committer {
@@ -225,6 +232,16 @@ impl CommitDetails {
 
     pub(crate) fn sha(&self) -> &CommitSha {
         &self.sha
+    }
+
+    pub(crate) fn title_mention(&self) -> Option<&str> {
+        static MENTION_REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"@([a-zA-Z0-9][a-zA-Z0-9-]*)").unwrap());
+
+        MENTION_REGEX
+            .captures(&self.title)
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str())
     }
 }
 
@@ -573,6 +590,38 @@ mod tests {
     fn commit_sha_short_returns_first_8_chars() {
         let sha = CommitSha("abcdef1234567890abcdef1234567890abcdef12".into());
         assert_eq!(sha.short(), "abcdef12");
+    }
+
+    #[test]
+    fn title_mention_extracts_username() {
+        let line = format!(
+            "abc123{d}Zed Zippy{d}bot@test.com{d}Bump to 0.230.2 for @cole-miller",
+            d = CommitDetails::FIELD_DELIMITER
+        );
+        let commit = CommitDetails::parse(&line, "").unwrap();
+        assert_eq!(commit.title_mention(), Some("cole-miller"));
+    }
+
+    #[test]
+    fn title_mention_returns_none_without_mention() {
+        let line = format!(
+            "abc123{d}Alice{d}alice@test.com{d}Fix a bug",
+            d = CommitDetails::FIELD_DELIMITER
+        );
+        let commit = CommitDetails::parse(&line, "").unwrap();
+        assert!(commit.title_mention().is_none());
+    }
+
+    #[test]
+    fn committer_is_zed_zippy() {
+        let committer = Committer::new("Zed Zippy", ZED_ZIPPY_EMAIL);
+        assert!(committer.is_zed_zippy());
+    }
+
+    #[test]
+    fn committer_is_not_zed_zippy() {
+        let committer = Committer::new("Alice", "alice@test.com");
+        assert!(!committer.is_zed_zippy());
     }
 
     #[test]
