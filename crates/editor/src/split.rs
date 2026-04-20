@@ -1348,11 +1348,11 @@ impl SplittableEditor {
                     };
                 let lhs_point = lhs_snapshot.point_to_display_point(lhs_point, Bias::Left);
                 let rhs_point = rhs_snapshot.point_to_display_point(rhs_point, Bias::Left);
-                // assert_eq!(
-                //     lhs_point.row(),
-                //     rhs_point.row(),
-                //     "mismatch in hunk position"
-                // );
+                assert_eq!(
+                    lhs_point.row(),
+                    rhs_point.row(),
+                    "mismatch in hunk position"
+                );
             }
         }
     }
