@@ -3398,6 +3398,109 @@ async fn test_cmd_n_shows_new_thread_entry_in_absorbed_worktree(cx: &mut TestApp
     });
 }
 
+#[gpui::test]
+async fn test_all_ephemeral_drafts_in_group_are_hidden_from_sidebar(cx: &mut TestAppContext) {
+    agent_ui::test_support::init_test(cx);
+    cx.update(|cx| {
+        ThreadStore::init_global(cx);
+        ThreadMetadataStore::init_global(cx);
+        language_model::LanguageModelRegistry::test(cx);
+        prompt_store::init(cx);
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {},
+            "src": {},
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new("/project/.git"),
+        false,
+        git::repository::Worktree {
+            path: std::path::PathBuf::from("/wt-feature-a"),
+            ref_name: Some("refs/heads/feature-a".into()),
+            sha: "aaa".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let main_project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    let worktree_project = project::Project::test(fs.clone(), ["/wt-feature-a".as_ref()], cx).await;
+    main_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+    worktree_project
+        .update(cx, |p, cx| p.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(main_project.clone(), window, cx));
+    let (sidebar, main_panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+    let worktree_workspace = multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.test_add_workspace(worktree_project.clone(), window, cx)
+    });
+    let worktree_panel = add_agent_panel(&worktree_workspace, cx);
+    cx.run_until_parked();
+
+    // Create an ephemeral draft in each workspace's panel via a stub
+    // connection (so each ConversationView reaches Connected and the
+    // panel's `draft_thread` pointer is populated).
+    agent_ui::test_support::open_draft_with_connection(&main_panel, StubAgentConnection::new(), cx);
+    agent_ui::test_support::open_draft_with_connection(
+        &worktree_panel,
+        StubAgentConnection::new(),
+        cx,
+    );
+    cx.run_until_parked();
+
+    let main_draft_id = main_panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
+    let worktree_draft_id =
+        worktree_panel.read_with(cx, |panel, cx| panel.active_thread_id(cx).unwrap());
+    assert_ne!(main_draft_id, worktree_draft_id);
+
+    let is_draft_row_visible =
+        |sidebar: &Entity<Sidebar>, cx: &mut gpui::VisualTestContext, id: ThreadId| -> bool {
+            sidebar.read_with(cx, |sidebar, _| {
+                sidebar.contents.entries.iter().any(
+                    |entry| matches!(entry, ListEntry::Thread(t) if t.metadata.thread_id == id),
+                )
+            })
+        };
+
+    // Main workspace is active: both workspaces' ephemeral drafts
+    // should be hidden from sidebar rows.
+    assert!(
+        !is_draft_row_visible(&sidebar, cx, main_draft_id),
+        "main workspace's ephemeral draft should be hidden while main is active"
+    );
+    assert!(
+        !is_draft_row_visible(&sidebar, cx, worktree_draft_id),
+        "worktree workspace's ephemeral draft should also be hidden while main is active"
+    );
+
+    // Switch to the worktree workspace — same rule still applies.
+    multi_workspace.update_in(cx, |mw, window, cx| {
+        mw.activate(worktree_workspace.clone(), window, cx);
+    });
+    cx.run_until_parked();
+
+    assert!(
+        !is_draft_row_visible(&sidebar, cx, main_draft_id),
+        "main workspace's ephemeral draft should still be hidden when worktree is active"
+    );
+    assert!(
+        !is_draft_row_visible(&sidebar, cx, worktree_draft_id),
+        "worktree workspace's ephemeral draft should be hidden when worktree is active"
+    );
+}
+
 async fn init_test_project_with_git(
     worktree_path: &str,
     cx: &mut TestAppContext,

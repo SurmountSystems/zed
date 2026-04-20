@@ -1061,21 +1061,13 @@ impl Sidebar {
             if should_load_threads {
                 let thread_store = ThreadMetadataStore::global(cx);
 
-                // The MultiWorkspace's currently-active workspace is the
-                // only one whose ephemeral draft we hide from the sidebar:
-                // it is represented by the `+` button's active state
-                // instead. Drafts on other workspaces in the group — even
-                // active-on-those-workspaces ones — remain visible so the
-                // user can reach them.
-                let active_ephemeral_drafts: HashSet<ThreadId> = active_workspace
-                    .as_ref()
-                    .filter(|aws| group_workspaces.contains(aws))
-                    .and_then(|aws| {
-                        aws.read(cx)
+                let active_ephemeral_drafts: HashSet<ThreadId> = group_workspaces
+                    .iter()
+                    .filter_map(|ws| {
+                        ws.read(cx)
                             .panel::<AgentPanel>(cx)
                             .and_then(|panel| panel.read(cx).active_draft_thread_id(cx))
                     })
-                    .into_iter()
                     .collect();
 
                 // Build a lookup from workspace root paths to their workspace

@@ -786,6 +786,10 @@ impl AgentPanel {
 
         let is_draft_active = self.active_thread_is_draft(cx);
         let active_thread_id = self.active_thread_id(cx);
+        let active_thread_agent = self
+            .active_conversation_view()
+            .map(|cv| cv.read(cx).agent_key().clone())
+            .unwrap_or_else(|| self.selected_agent.clone());
         let last_active_thread = self.active_agent_thread(cx).map(|thread| {
             let thread = thread.read(cx);
 
@@ -794,7 +798,7 @@ impl AgentPanel {
             SerializedActiveThread {
                 session_id: (!is_draft_active).then(|| thread.session_id().0.to_string()),
                 thread_id: active_thread_id,
-                agent_type: self.selected_agent.clone(),
+                agent_type: active_thread_agent,
                 title: title.map(|t| t.to_string()),
                 work_dirs: work_dirs.map(|dirs| dirs.serialize()),
             }
@@ -1300,19 +1304,50 @@ impl AgentPanel {
         self.new_draft(true, window, cx);
     }
 
-    pub fn activate_draft(&mut self, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let draft = self.ensure_draft(window, cx);
-        if let BaseView::AgentThread { conversation_view } = &self.base_view {
-            if conversation_view.entity_id() == draft.entity_id() {
-                if focus {
-                    self.focus_handle(cx).focus(window, cx);
+    pub fn new_draft(&mut self, focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let existing_draft = self.draft_thread.clone();
+        let draft_is_active = existing_draft.as_ref().is_some_and(|d| {
+            matches!(
+                &self.base_view,
+                BaseView::AgentThread { conversation_view }
+                    if conversation_view.entity_id() == d.entity_id()
+            )
+        });
+        let draft_has_content = existing_draft
+            .as_ref()
+            .is_some_and(|d| self.draft_has_content(d, cx));
+
+        if let Some(draft) = existing_draft {
+            if !draft_has_content {
+                if draft_is_active {
+                    if focus {
+                        self.focus_handle(cx).focus(window, cx);
+                    }
+                    return;
                 }
+                self.set_base_view(
+                    BaseView::AgentThread {
+                        conversation_view: draft,
+                    },
+                    focus,
+                    window,
+                    cx,
+                );
                 return;
             }
+
+            // Draft has content: park it in retained_threads so it remains
+            // visible in the sidebar, then fall through to create a new
+            // empty draft.
+            let draft_id = draft.read(cx).thread_id;
+            self.draft_thread = None;
+            self.retained_threads.insert(draft_id, draft);
         }
+
+        let new_draft = self.ensure_draft(window, cx);
         self.set_base_view(
             BaseView::AgentThread {
-                conversation_view: draft,
+                conversation_view: new_draft,
             },
             focus,
             window,
@@ -6223,14 +6258,6 @@ mod tests {
 
     #[gpui::test]
     async fn test_new_draft_survives_reload_when_real_thread_is_active(cx: &mut TestAppContext) {
-        // Scenario: the user has an ephemeral new-draft with typed content,
-        // navigates to a real thread, and restarts. On reload:
-        //   - The real thread is restored as the active view.
-        //   - The draft's metadata row survives.
-        //   - The draft's prompt text is still recoverable from the kvp
-        //     store and rehydrates when the user opens the draft.
-        //   - The new draft is still in the new-draft slot, and so
-        //     filtered out from the sidebar.
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
@@ -6275,23 +6302,57 @@ mod tests {
         let real_session_id = crate::test_support::active_session_id(&panel, cx);
         cx.run_until_parked();
 
-        // 2. Open a new draft (becomes the ephemeral new-draft) and type into it.
+        // 2. Open a draft, type into it, then press Cmd-N again to
+        //    park it into retained_threads as a *retained* draft.
         panel.update_in(cx, |panel, window, cx| {
             panel.new_draft(true, window, cx);
         });
         cx.run_until_parked();
+        let retained_draft_id = crate::test_support::active_thread_id(&panel, cx);
+        crate::test_support::type_draft_prompt(&panel, "retained draft text", cx);
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_draft(true, window, cx);
+        });
+        cx.run_until_parked();
+
+        // The pre-existing draft is now in retained_threads (parked),
+        // and a fresh empty ephemeral new-draft is active.
+        panel.read_with(cx, |panel, cx| {
+            assert!(
+                panel.retained_threads.contains_key(&retained_draft_id),
+                "first draft with content should be parked into retained_threads"
+            );
+            assert_ne!(
+                panel.active_thread_id(cx),
+                Some(retained_draft_id),
+                "active view should be a fresh ephemeral draft, not the retained one"
+            );
+        });
+
+        // 3. Type into the new ephemeral draft.
         let draft_thread_id = crate::test_support::active_thread_id(&panel, cx);
         crate::test_support::type_draft_prompt(&panel, "in-flight draft text", cx);
 
-        // Sanity-check: the editor observer has pushed the text through
-        // `set_draft_prompt` -> `PromptUpdated` -> kvp write.
-        let kvp_after_set = cx.update(|_, cx| crate::draft_prompt_store::read(draft_thread_id, cx));
+        // Sanity-check: both drafts' text has been persisted to the kvp
+        // store via the editor observer / PromptUpdated chain.
+        let (ephemeral_kvp, retained_kvp) = cx.update(|_, cx| {
+            (
+                crate::draft_prompt_store::read(draft_thread_id, cx),
+                crate::draft_prompt_store::read(retained_draft_id, cx),
+            )
+        });
         assert!(
-            kvp_after_set.is_some(),
-            "PromptUpdated should persist the draft prompt to the kvp store"
+            ephemeral_kvp.is_some(),
+            "ephemeral draft's prompt should be in the kvp store"
+        );
+        assert!(
+            retained_kvp.is_some(),
+            "retained draft's prompt should be in the kvp store"
         );
 
         assert_ne!(real_thread_id, draft_thread_id);
+        assert_ne!(retained_draft_id, draft_thread_id);
         panel.read_with(cx, |panel, cx| {
             assert!(
                 panel.active_view_is_new_draft(cx),
@@ -6299,9 +6360,9 @@ mod tests {
             );
         });
 
-        // 3. Switch the active view back to the real thread. The draft
-        //    remains in `draft_thread` (the ephemeral slot) but is no
-        //    longer the active view.
+        // 4. Switch the active view back to the real thread. The ephemeral
+        //    draft remains in `draft_thread` (the ephemeral slot) but is
+        //    no longer the active view.
         panel.update_in(cx, |panel, window, cx| {
             panel.load_agent_thread(Agent::Stub, real_thread_id, None, None, false, window, cx);
         });
@@ -6312,7 +6373,7 @@ mod tests {
             assert!(!panel.active_view_is_new_draft(cx));
         });
 
-        // 4. Serialize + reload.
+        // 5. Serialize + reload.
         panel.update(cx, |panel, cx| panel.serialize(cx));
         cx.run_until_parked();
         let async_cx = cx.update(|window, cx| window.to_async(cx));
@@ -6321,8 +6382,8 @@ mod tests {
             .expect("panel load should succeed");
         cx.run_until_parked();
 
-        // 5. The real thread is the active view on reload AND the draft
-        //    slot is still occupied by the new-draft thread.
+        // 6. The real thread is the active view on reload AND the draft
+        //    slot is still occupied by the ephemeral new-draft thread.
         loaded_panel.read_with(cx, |panel, cx| {
             assert_eq!(
                 panel.active_thread_id(cx),
@@ -6341,34 +6402,259 @@ mod tests {
             );
         });
 
-        // 6. The draft's metadata row survives (with session_id=None).
+        // 7. All three threads' metadata rows survive the reload.
         cx.update(|_window, cx| {
             let store = ThreadMetadataStore::global(cx).read(cx);
-            let draft_row = store
+            let ephemeral_row = store
                 .entry(draft_thread_id)
-                .expect("draft metadata row should survive reload");
-            assert!(draft_row.is_draft(), "draft row should still be a draft");
+                .expect("ephemeral draft metadata row should survive reload");
+            assert!(
+                ephemeral_row.is_draft(),
+                "ephemeral draft row should still be a draft"
+            );
+            let retained_row = store
+                .entry(retained_draft_id)
+                .expect("retained draft metadata row should survive reload");
+            assert!(
+                retained_row.is_draft(),
+                "retained draft row should still be a draft"
+            );
             let real_row = store
                 .entry(real_thread_id)
                 .expect("real thread metadata row should survive reload");
             assert_eq!(real_row.session_id.as_ref(), Some(&real_session_id));
         });
 
-        // 7. Opening the draft via load_agent_thread activates the
-        //    restored new-draft ConversationView and exposes its
+        // 8. Opening the ephemeral draft via load_agent_thread activates
+        //    the restored new-draft ConversationView and exposes its
         //    kvp-seeded prompt text in the editor.
         loaded_panel.update_in(cx, |panel, window, cx| {
             panel.load_agent_thread(Agent::Stub, draft_thread_id, None, None, false, window, cx);
         });
         cx.run_until_parked();
 
-        let restored_text =
+        let restored_ephemeral_text =
             loaded_panel.read_with(cx, |panel, cx| panel.editor_text(draft_thread_id, cx));
         assert_eq!(
-            restored_text.as_deref(),
+            restored_ephemeral_text.as_deref(),
             Some("in-flight draft text"),
-            "draft prompt text should be restored from the kvp store"
+            "ephemeral draft prompt text should be restored from the kvp store"
         );
+
+        // 9. Opening the retained draft via load_agent_thread builds a
+        //    fresh ConversationView (since retained_threads was not
+        //    carried across the reload) and seeds its editor from the
+        //    kvp store.
+        loaded_panel.update_in(cx, |panel, window, cx| {
+            panel.load_agent_thread(
+                Agent::Stub,
+                retained_draft_id,
+                None,
+                None,
+                false,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let restored_retained_text =
+            loaded_panel.read_with(cx, |panel, cx| panel.editor_text(retained_draft_id, cx));
+        assert_eq!(
+            restored_retained_text.as_deref(),
+            Some("retained draft text"),
+            "retained draft prompt text should be restored from the kvp store"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_toolbar_agent_switch_does_not_retarget_active_ephemeral_draft(
+        cx: &mut TestAppContext,
+    ) {
+        // The ephemeral draft is bound to whatever agent was selected
+        // when the slot was first created. Picking a different agent in
+        // the toolbar changes `selected_agent` (and in the real handler
+        // spawns a fresh retained thread) but does NOT re-target the
+        // ephemeral draft. Pressing Cmd-N afterwards re-focuses the
+        // original draft unchanged.
+        //
+        // If this contract ever changes (e.g. toolbar switch should
+        // retarget the draft in place), this test is the canary.
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.new_draft(true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let draft_thread_id = crate::test_support::active_thread_id(&panel, cx);
+        panel.read_with(cx, |panel, cx| {
+            let draft_view = panel.draft_thread.as_ref().expect("draft slot populated");
+            assert_eq!(
+                draft_view.read(cx).agent_key(),
+                &Agent::Stub,
+                "draft ConversationView should be bound to Agent::Stub on creation"
+            );
+        });
+
+        // Simulate a toolbar agent switch: set `selected_agent` to a
+        // different agent.
+        let other_agent = Agent::Custom {
+            id: "other-agent".into(),
+        };
+        panel.update(cx, |panel, _cx| {
+            panel.selected_agent = other_agent.clone();
+        });
+        cx.run_until_parked();
+
+        // Cmd-N with an empty-and-active draft short-circuits in
+        // `new_draft`: the existing ephemeral draft is focused as-is,
+        // still bound to Agent::Stub.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_draft(true, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.active_thread_id(cx),
+                Some(draft_thread_id),
+                "Cmd-N on an empty draft should re-focus it, not spawn a new one"
+            );
+            let draft_view = panel.draft_thread.as_ref().expect("draft slot still set");
+            assert_eq!(
+                draft_view.read(cx).agent_key(),
+                &Agent::Stub,
+                "ephemeral draft agent should not be retargeted by a toolbar switch"
+            );
+            assert_eq!(
+                panel.selected_agent, other_agent,
+                "toolbar selection should still reflect the user's choice"
+            );
+        });
+    }
+
+    /// Regression test for a silent agent-migration across restart:
+    /// when the ephemeral draft was also the active view at serialize
+    /// time and `selected_agent` had diverged from the draft's bound
+    /// agent, `AgentPanel::load` used to rebuild the active view from
+    /// `selected_agent` and then adopt that retargeted view into the
+    /// ephemeral slot via `restore_new_draft`'s short-circuit —
+    /// silently discarding the draft's original agent binding.
+    ///
+    /// The fix is in `serialize`: the active view's own `agent_key()`
+    /// is recorded in `SerializedActiveThread.agent_type`, instead of
+    /// the panel's (possibly-diverged) `selected_agent`.
+    #[gpui::test]
+    async fn test_reloaded_ephemeral_draft_preserves_original_agent(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        workspace.update(cx, |workspace, _cx| workspace.set_random_database_id());
+
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, None, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+        panel.update_in(cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Stub;
+            panel.new_draft(true, window, cx);
+        });
+        cx.run_until_parked();
+
+        let draft_thread_id = crate::test_support::active_thread_id(&panel, cx);
+        crate::test_support::type_draft_prompt(&panel, "pinned to stub", cx);
+
+        // Diverge `selected_agent` from the draft's bound agent before
+        // serialize.
+        let other_agent = Agent::Custom {
+            id: "other-agent".into(),
+        };
+        panel.update(cx, |panel, _cx| {
+            panel.selected_agent = other_agent.clone();
+        });
+        panel.update(cx, |panel, cx| panel.serialize(cx));
+        cx.run_until_parked();
+
+        // Sanity-check: the draft's metadata row has agent_id="stub",
+        // not "other-agent".
+        cx.update(|_, cx| {
+            let store = ThreadMetadataStore::global(cx).read(cx);
+            let row = store
+                .entry(draft_thread_id)
+                .expect("draft metadata row should exist");
+            assert_eq!(
+                row.agent_id.as_ref(),
+                "stub",
+                "draft metadata should retain its original agent binding"
+            );
+        });
+
+        let async_cx = cx.update(|window, cx| window.to_async(cx));
+        let reloaded_panel = AgentPanel::load(workspace.downgrade(), async_cx)
+            .await
+            .expect("panel load should succeed");
+        cx.run_until_parked();
+
+        reloaded_panel.read_with(cx, |panel, cx| {
+            let draft_view = panel
+                .draft_thread
+                .as_ref()
+                .expect("draft slot should be repopulated");
+            assert_eq!(
+                draft_view.read(cx).thread_id,
+                draft_thread_id,
+                "restored draft should have the same ThreadId"
+            );
+            assert_eq!(
+                draft_view.read(cx).agent_key(),
+                &Agent::Stub,
+                "restored draft should still be bound to its original Agent::Stub, \
+                 not the panel's current `selected_agent`"
+            );
+        });
     }
 
     async fn setup_panel(cx: &mut TestAppContext) -> (Entity<AgentPanel>, VisualTestContext) {
