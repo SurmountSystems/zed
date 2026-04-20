@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap, fmt, ops::Not, rc::Rc};
+use std::{borrow::Cow, collections::HashMap, fmt, rc::Rc};
 
 use anyhow::Result;
 use derive_more::Deref;
@@ -130,11 +130,13 @@ pub struct CommitMetadata {
 
 impl CommitMetadata {
     pub fn co_authors(&self) -> Option<impl Iterator<Item = &CommitAuthor>> {
-        self.co_authors.is_empty().not().then(|| {
-            self.co_authors
-                .iter()
-                .filter(|co_author| *co_author != &self.primary_author)
-        })
+        let mut co_authors = self
+            .co_authors
+            .iter()
+            .filter(|co_author| *co_author != &self.primary_author)
+            .peekable();
+
+        co_authors.peek().is_some().then_some(co_authors)
     }
 
     pub fn primary_author(&self) -> &CommitAuthor {
