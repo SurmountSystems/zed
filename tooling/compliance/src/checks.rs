@@ -59,10 +59,9 @@ impl fmt::Display for ReviewSuccess {
             Self::ApprovingComment(_) => {
                 formatter.write_str("Approved by an organization approval comment")
             }
-            Self::ZedZippyCommit(_) => formatter.write_str(
-                "Fully untampered automated commit \
-                or previously reviwed cherry-pick",
-            ),
+            Self::ZedZippyCommit(_) => {
+                formatter.write_str("Fully untampered automated version bump commit")
+            }
         }
     }
 }
