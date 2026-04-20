@@ -488,6 +488,7 @@ impl SplittableEditor {
             editor.disable_runnables();
             editor.disable_diagnostics(cx);
             editor.set_minimap_visibility(crate::MinimapVisibility::Disabled, window, cx);
+            editor.start_temporary_diff_override();
             editor
         });
         // TODO(split-diff) we might want to tag editor events with whether they came from rhs/lhs
