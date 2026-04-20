@@ -8,7 +8,7 @@ use alacritty_terminal::{
         search::{Match, RegexIter, RegexSearch},
     },
 };
-use log::{info, warn};
+use log::{error, info, warn};
 use regex::Regex;
 use std::{
     iter::{once, once_with},
@@ -47,10 +47,11 @@ impl RegexSearches {
             url_regex: RegexSearch::new(URL_REGEX).unwrap(),
             path_hyperlink_regexes: path_hyperlink_regexes
                 .into_iter()
+                .inspect(|r| log::info!("path regex: {}", r.as_ref()))
                 .filter_map(|regex| {
                     Regex::new(regex.as_ref())
                         .inspect_err(|error| {
-                            warn!(
+                            error!(
                                 concat!(
                                     "Ignoring path hyperlink regex specified in ",
                                     "`terminal.path_hyperlink_regexes`:\n\n\t{}\n\nError: {}",

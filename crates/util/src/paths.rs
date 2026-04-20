@@ -1422,32 +1422,29 @@ pub trait UrlExt {
 impl UrlExt for url::Url {
     // Copied from `url::Url::to_file_path`, but the `cfg` handling is replaced with runtime branching on `PathStyle`
     fn to_file_path_ext(&self, source_path_style: PathStyle) -> Result<PathBuf, ()> {
-        if let Some(segments) = self.path_segments() {
-            let host = match self.host() {
-                None | Some(url::Host::Domain("localhost")) => None,
-                Some(_) if source_path_style.is_windows() && self.scheme() == "file" => {
-                    self.host_str()
-                }
-                _ => return Err(()),
-            };
+        let segments = self.path_segments().ok_or(())?;
+        let host = match self.host() {
+            None | Some(url::Host::Domain("localhost")) => None,
+            Some(_) if self.scheme() == "file" => self.host_str(),
+            _ => return Err(()),
+        };
 
-            let str_len = self.as_str().len();
-            let estimated_capacity = if source_path_style.is_windows() {
-                // remove scheme: - has possible \\ for hostname
-                str_len.saturating_sub(self.scheme().len() + 1)
-            } else {
-                // remove scheme://
-                str_len.saturating_sub(self.scheme().len() + 3)
-            };
-            return match source_path_style {
-                PathStyle::Posix => {
-                    file_url_segments_to_pathbuf_posix(estimated_capacity, host, segments)
-                }
-                PathStyle::Windows => {
-                    file_url_segments_to_pathbuf_windows(estimated_capacity, host, segments)
-                }
-            };
-        }
+        let str_len = self.as_str().len();
+        let estimated_capacity = if source_path_style.is_windows() {
+            // remove scheme: - has possible \\ for hostname
+            str_len.saturating_sub(self.scheme().len() + 1)
+        } else {
+            // remove scheme://
+            str_len.saturating_sub(self.scheme().len() + 3)
+        };
+        return match source_path_style {
+            PathStyle::Posix => {
+                file_url_segments_to_pathbuf_posix(estimated_capacity, host, segments)
+            }
+            PathStyle::Windows => {
+                file_url_segments_to_pathbuf_windows(estimated_capacity, host, segments)
+            }
+        };
 
         fn file_url_segments_to_pathbuf_posix(
             estimated_capacity: usize,
@@ -1456,14 +1453,12 @@ impl UrlExt for url::Url {
         ) -> Result<PathBuf, ()> {
             use percent_encoding::percent_decode;
 
-            if host.is_some() {
-                return Err(());
-            }
-
             let mut bytes = Vec::new();
             bytes.try_reserve(estimated_capacity).map_err(|_| ())?;
 
-            for segment in segments {
+            // OSC 8 mandates that file:// URIs must be encoded as file://{host}{path}
+            // We need to skip the {host} part if it's set
+            for segment in segments.skip(host.is_some() as usize) {
                 bytes.push(b'/');
                 bytes.extend(percent_decode(segment.as_bytes()));
             }
@@ -1493,6 +1488,7 @@ impl UrlExt for url::Url {
             use percent_encoding::percent_decode_str;
             let mut string = String::new();
             string.try_reserve(estimated_capacity).map_err(|_| ())?;
+
             if let Some(host) = host {
                 string.push_str(r"\\");
                 string.push_str(host);
@@ -1555,7 +1551,6 @@ impl UrlExt for url::Url {
             let path = PathBuf::from(string);
             Ok(path)
         }
-        Err(())
     }
 }
 
@@ -3303,14 +3298,6 @@ mod tests {
             url.to_file_path_ext(PathStyle::Posix),
             Ok(PathBuf::from("/home/user/file.txt"))
         );
-    }
-
-    #[test]
-    fn test_url_to_file_path_ext_posix_rejects_host() {
-        use super::UrlExt;
-
-        let url = url::Url::parse("file://somehost/home/user/file.txt").unwrap();
-        assert_eq!(url.to_file_path_ext(PathStyle::Posix), Err(()));
     }
 
     #[test]
