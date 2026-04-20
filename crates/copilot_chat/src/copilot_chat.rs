@@ -289,13 +289,8 @@ impl Model {
     }
 
     pub fn supports_response(&self) -> bool {
-        self.supported_endpoints.len() > 0
-            && !self
-                .supported_endpoints
-                .contains(&ModelSupportedEndpoint::ChatCompletions)
-            && self
-                .supported_endpoints
-                .contains(&ModelSupportedEndpoint::Responses)
+        self.supported_endpoints
+            .contains(&ModelSupportedEndpoint::Responses)
     }
 
     pub fn supports_messages(&self) -> bool {
@@ -315,6 +310,7 @@ impl Model {
         self.supports_thinking()
             || self.supports_adaptive_thinking()
             || self.max_thinking_budget().is_some()
+            || !self.reasoning_effort_levels().is_empty()
     }
 
     pub fn max_thinking_budget(&self) -> Option<u32> {
