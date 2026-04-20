@@ -40,9 +40,9 @@ To choose another agent, click the thread menu in the top-left of the Agent Pane
 
 You can run multiple agent threads at once, each working independently with its own agent, context window, and conversation history. Open the Threads Sidebar with {#kb multi_workspace::ToggleWorkspaceSidebar} to see all your threads grouped by project. Click any thread to switch to it, or use the thread switcher ({#kb agents_sidebar::ToggleThreadSwitcher}) to cycle between recent threads without opening the sidebar.
 
-Threads you're no longer working on can be moved to history by hovering over them in the sidebar and clicking the archive icon. Threads History holds all your threads and you can restore them at any time.
+Threads you're no longer working on can be moved to history by hovering over them in the sidebar and clicking the archive icon. Thread History holds all your threads and you can restore them at any time.
 
-If two threads might edit the same files, you can isolate one in a new Git worktree. Use the worktree selector in the toolbar to pick which worktree the agent runs in, or create a new one. See [Worktree Isolation](./parallel-agents.md#worktree-isolation) for details.
+If two threads might edit the same files, you can isolate one in a new Git worktree. Use the worktree picker in the title bar to pick which worktree the agent runs in, or create a new one. See [Worktree Isolation](./parallel-agents.md#worktree-isolation) for details.
 
 For more details on the Threads Sidebar and managing multiple projects, see [Parallel Agents](./parallel-agents.md).
 

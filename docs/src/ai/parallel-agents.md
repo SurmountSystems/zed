@@ -23,21 +23,21 @@ Click any thread in the sidebar to switch to it. The Agent Panel updates to show
 
 For quick switching without opening the sidebar, use the thread switcher: press {#kb agents_sidebar::ToggleThreadSwitcher} to cycle forward through recent threads, or hold `Shift` while pressing that binding to go backward. This works from both the Agent Panel and the Threads Sidebar.
 
-### Threads History {#threads-history}
+### Thread History {#threads-history}
 
-Threads History holds all your threads. Toggle it with {#kb agents_sidebar::ToggleThreadHistory} or by clicking the View All Threads icon in the sidebar bottom bar.
+Thread History holds all your threads. Toggle it with {#kb agents_sidebar::ToggleThreadHistory} or by clicking the clock icon in the sidebar bottom bar, next to the sidebar toggle.
 
-To move a thread to the Threads History view, hover over it in the sidebar and click the archive icon that appears. You can also select a thread and press {#kb agent::RemoveSelectedThread}. Running threads cannot be moved to history until they finish.
+To move a thread to the Thread History view, hover over it in the sidebar and click the archive icon that appears. You can also select a thread and press {#kb agent::RemoveSelectedThread}. Running threads cannot be moved to history until they finish.
 
-To restore a thread, open Threads History and click the thread you want to bring back. Zed moves it back to the thread list and opens it in the Agent Panel. If the thread was running in a Git worktree that was removed, Zed restores the worktree automatically.
+To restore a thread, open Thread History and click the thread you want to bring back. Zed moves it back to the thread list and opens it in the Agent Panel. If the thread was running in a Git worktree that was removed, Zed restores the worktree automatically.
 
-To permanently delete a thread, open Threads History, hover over the thread, and click the trash icon. This removes the thread's conversation history and cleans up any associated worktree data. Deleted threads cannot be recovered.
+To permanently delete a thread, open Thread History, hover over the thread, and click the trash icon. This removes the thread's conversation history and cleans up any associated worktree data. Deleted threads cannot be recovered.
 
 You can search your threads in history; search will fuzzy match on thread titles.
 
 ### Importing External Agent Threads {#importing-threads}
 
-If you have external agents installed, Zed will detect whether you have existing threads and invite you to import them into Zed. Every time you open Threads History, you should see an icon button in the sidebar bottom bar that allows you to import threads at any time. Clicking on it will open a modal, where you can select the agents whose threads you want to import.
+If you have external agents installed, Zed will detect whether you have existing threads and invite you to import them into Zed. Once you open Thread History, you'll find an import icon button in the Thread History toolbar that lets you import threads at any time. Clicking on it opens a modal where you can select the agents whose threads you want to import.
 
 ## Running Multiple Threads {#running-multiple-threads}
 
@@ -57,9 +57,11 @@ Within a project, you can add multiple folders from a local or remote project. U
 
 If two threads might edit the same files, start one in a new Git worktree to give it an isolated checkout.
 
-In the Agent Panel toolbar, click the worktree selector to choose which worktree you want the agent to run in, or create a new one. New worktrees start in detached HEAD state, and Zed will attempt to check out the branch you selected. If that branch is already in use by another worktree, the new worktree stays in detached HEAD.
+Worktrees are managed from the title bar. Click the worktree picker (to the right of the project picker) to switch between existing worktrees or create a new one. New worktrees are created in a detached HEAD state, so you won't accidentally share a branch between worktrees.
 
-After the agent finishes, review the diff and merge the changes through your normal Git workflow. If the thread was running in a linked worktree and no other active threads use it, moving the thread to Threads History saves the worktree's Git state and removes it from disk. Restoring the thread from history restores the worktree.
+Once you're in a new worktree, use the branch picker next to the worktree picker to create a new branch or check out an existing one. If the branch you pick is already checked out in another worktree, the current worktree stays in detached HEAD until you choose a different branch.
+
+After the agent finishes, review the diff and merge the changes through your normal Git workflow. If the thread was running in a linked worktree and no other active threads use it, moving the thread to Thread History saves the worktree's Git state and removes it from disk. Restoring the thread from history restores the worktree.
 
 ## See Also {#see-also}
 
