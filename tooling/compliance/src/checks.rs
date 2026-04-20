@@ -192,7 +192,7 @@ impl<'a> Reporter<'a> {
     ) -> Result<ReviewSuccess, ReviewFailure> {
         let responsible_actor =
             commit
-                .title_mention()
+                .version_bump_mention()
                 .ok_or(ReviewFailure::UnexpectedZippyAction(
                     VersionBumpFailure::NoMentionInTitle,
                 ))?;

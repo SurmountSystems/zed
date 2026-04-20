@@ -234,11 +234,12 @@ impl CommitDetails {
         &self.sha
     }
 
-    pub(crate) fn title_mention(&self) -> Option<&str> {
-        static MENTION_REGEX: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"@([a-zA-Z0-9][a-zA-Z0-9-]*)").unwrap());
+    pub(crate) fn version_bump_mention(&self) -> Option<&str> {
+        static VERSION_BUMP_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"^Bump to [0-9]+\.[0-9]+\.[0-9]+ for @([a-zA-Z0-9][a-zA-Z0-9-]*)$").unwrap()
+        });
 
-        MENTION_REGEX
+        VERSION_BUMP_REGEX
             .captures(&self.title)
             .and_then(|cap| cap.get(1))
             .map(|m| m.as_str())
@@ -593,23 +594,53 @@ mod tests {
     }
 
     #[test]
-    fn title_mention_extracts_username() {
+    fn version_bump_mention_extracts_username() {
         let line = format!(
             "abc123{d}Zed Zippy{d}bot@test.com{d}Bump to 0.230.2 for @cole-miller",
             d = CommitDetails::FIELD_DELIMITER
         );
         let commit = CommitDetails::parse(&line, "").unwrap();
-        assert_eq!(commit.title_mention(), Some("cole-miller"));
+        assert_eq!(commit.version_bump_mention(), Some("cole-miller"));
     }
 
     #[test]
-    fn title_mention_returns_none_without_mention() {
+    fn version_bump_mention_returns_none_without_mention() {
         let line = format!(
             "abc123{d}Alice{d}alice@test.com{d}Fix a bug",
             d = CommitDetails::FIELD_DELIMITER
         );
         let commit = CommitDetails::parse(&line, "").unwrap();
-        assert!(commit.title_mention().is_none());
+        assert!(commit.version_bump_mention().is_none());
+    }
+
+    #[test]
+    fn version_bump_mention_rejects_wrong_prefix() {
+        let line = format!(
+            "abc123{d}Zed Zippy{d}bot@test.com{d}Fix thing for @cole-miller",
+            d = CommitDetails::FIELD_DELIMITER
+        );
+        let commit = CommitDetails::parse(&line, "").unwrap();
+        assert!(commit.version_bump_mention().is_none());
+    }
+
+    #[test]
+    fn version_bump_mention_rejects_bare_mention() {
+        let line = format!(
+            "abc123{d}Zed Zippy{d}bot@test.com{d}@cole-miller bumped something",
+            d = CommitDetails::FIELD_DELIMITER
+        );
+        let commit = CommitDetails::parse(&line, "").unwrap();
+        assert!(commit.version_bump_mention().is_none());
+    }
+
+    #[test]
+    fn version_bump_mention_rejects_trailing_text() {
+        let line = format!(
+            "abc123{d}Zed Zippy{d}bot@test.com{d}Bump to 0.230.2 for @cole-miller extra",
+            d = CommitDetails::FIELD_DELIMITER
+        );
+        let commit = CommitDetails::parse(&line, "").unwrap();
+        assert!(commit.version_bump_mention().is_none());
     }
 
     #[test]
