@@ -47,7 +47,6 @@ impl RegexSearches {
             url_regex: RegexSearch::new(URL_REGEX).unwrap(),
             path_hyperlink_regexes: path_hyperlink_regexes
                 .into_iter()
-                .inspect(|r| log::info!("path regex: {}", r.as_ref()))
                 .filter_map(|regex| {
                     Regex::new(regex.as_ref())
                         .inspect_err(|error| {
