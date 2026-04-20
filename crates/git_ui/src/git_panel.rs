@@ -1804,11 +1804,18 @@ impl GitPanel {
         // 3. finally, if there is no info about this `entry` in the repo, we fall back to whatever status is encoded
         //    in `entry` arg.
         repo.pending_ops_for_path(&entry.repo_path)
-            .map(|ops| {
+            .and_then(|ops| {
+                // In case the last operation in the list of pending operations
+                // failed, we can't assume the stage status for this entry and
+                // need to fallback to the actual state in the repo.
+                if ops.last_op_errored() {
+                    return None;
+                }
+
                 if ops.staging() || ops.staged() {
-                    StageStatus::Staged
+                    Some(StageStatus::Staged)
                 } else {
-                    StageStatus::Unstaged
+                    Some(StageStatus::Unstaged)
                 }
             })
             .or_else(|| {
@@ -2010,6 +2017,7 @@ impl GitPanel {
                 this.update(cx, |this, cx| {
                     if let Err(err) = result {
                         this.show_error_toast(if stage { "add" } else { "reset" }, err, cx);
+                        this.update_counts(active_repository.read(cx));
                     }
                     cx.notify();
                 })
@@ -4879,7 +4887,7 @@ impl GitPanel {
 
         let is_staging_or_staged = repo
             .pending_ops_for_path(&repo_path)
-            .map(|ops| ops.staging() || ops.staged())
+            .map(|ops| !ops.last_op_errored() && (ops.staging() || ops.staged()))
             .or_else(|| {
                 repo.status_for_path(&repo_path)
                     .and_then(|status| status.status.staging().as_bool())

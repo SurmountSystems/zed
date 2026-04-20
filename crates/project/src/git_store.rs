@@ -5462,8 +5462,9 @@ impl Repository {
             snapshot
                 .status()
                 .filter_map(|entry| {
-                    if let Some(ops) =
-                        pending_ops.get(&PathKey(entry.repo_path.as_ref().clone()), ())
+                    if let Some(ops) = pending_ops
+                        .get(&PathKey(entry.repo_path.as_ref().clone()), ())
+                        .filter(|ops| !ops.last_op_errored())
                     {
                         if ops.staging() || ops.staged() {
                             None
@@ -5495,8 +5496,9 @@ impl Repository {
             snapshot
                 .status()
                 .filter_map(|entry| {
-                    if let Some(ops) =
-                        pending_ops.get(&PathKey(entry.repo_path.as_ref().clone()), ())
+                    if let Some(ops) = pending_ops
+                        .get(&PathKey(entry.repo_path.as_ref().clone()), ())
+                        .filter(|ops| !ops.last_op_errored())
                     {
                         if !ops.staging() && !ops.staged() {
                             None
