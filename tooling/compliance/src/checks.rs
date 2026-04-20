@@ -516,6 +516,38 @@ mod tests {
         }
     }
 
+    fn alice_author() -> serde_json::Value {
+        serde_json::json!({
+            "name": "Alice",
+            "email": "alice@test.com",
+            "user": { "login": "alice" }
+        })
+    }
+
+    fn bob_author() -> serde_json::Value {
+        serde_json::json!({
+            "name": "Bob",
+            "email": "bob@test.com",
+            "user": { "login": "bob" }
+        })
+    }
+
+    fn charlie_author() -> serde_json::Value {
+        serde_json::json!({
+            "name": "Charlie",
+            "email": "charlie@test.com",
+            "user": { "login": "charlie" }
+        })
+    }
+
+    fn zippy_author() -> serde_json::Value {
+        serde_json::json!({
+            "name": "Zed Zippy",
+            "email": ZED_ZIPPY_EMAIL,
+            "user": { "login": ZED_ZIPPY_LOGIN }
+        })
+    }
+
     struct TestScenario {
         pull_request: PullRequestData,
         reviews: Vec<PullRequestReview>,
@@ -587,11 +619,7 @@ mod tests {
                 comments: vec![],
                 commit_metadata_json: serde_json::json!({
                     "abc12345abc12345": {
-                        "author": {
-                            "name": "Zed Zippy",
-                            "email": ZED_ZIPPY_EMAIL,
-                            "user": { "login": ZED_ZIPPY_LOGIN }
-                        },
+                        "author": zippy_author(),
                         "authors": { "nodes": [] },
                         "signature": {
                             "isValid": true,
@@ -737,16 +765,8 @@ mod tests {
             .with_comments(vec![comment("bob", "@zed-zippy approve")])
             .with_commit_metadata_json(serde_json::json!({
                 "abc12345abc12345": {
-                    "author": {
-                        "name": "Alice",
-                        "email": "alice@test.com",
-                        "user": { "login": "alice" }
-                    },
-                    "authors": { "nodes": [{
-                        "name": "Charlie",
-                        "email": "charlie@test.com",
-                        "user": { "login": "charlie" }
-                    }] }
+                    "author": alice_author(),
+                    "authors": { "nodes": [charlie_author()] }
                 }
             }))
             .with_commit(make_commit(
@@ -767,16 +787,8 @@ mod tests {
         let result = TestScenario::single_commit()
             .with_commit_metadata_json(serde_json::json!({
                 "abc12345abc12345": {
-                    "author": {
-                        "name": "Alice",
-                        "email": "alice@test.com",
-                        "user": { "login": "alice" }
-                    },
-                    "authors": { "nodes": [{
-                        "name": "Bob",
-                        "email": "bob@test.com",
-                        "user": { "login": "bob" }
-                    }] }
+                    "author": alice_author(),
+                    "authors": { "nodes": [bob_author()] }
                 }
             }))
             .with_commit(make_commit(
@@ -891,11 +903,7 @@ mod tests {
         let result = TestScenario::zippy_version_bump()
             .with_commit_metadata_json(serde_json::json!({
                 "abc12345abc12345": {
-                    "author": {
-                        "name": "Zed Zippy",
-                        "email": ZED_ZIPPY_EMAIL,
-                        "user": { "login": ZED_ZIPPY_LOGIN }
-                    },
+                    "author": zippy_author(),
                     "authors": { "nodes": [] },
                     "additions": 2,
                     "deletions": 2
@@ -916,11 +924,7 @@ mod tests {
         let result = TestScenario::zippy_version_bump()
             .with_commit_metadata_json(serde_json::json!({
                 "abc12345abc12345": {
-                    "author": {
-                        "name": "Zed Zippy",
-                        "email": ZED_ZIPPY_EMAIL,
-                        "user": { "login": ZED_ZIPPY_LOGIN }
-                    },
+                    "author": zippy_author(),
                     "authors": { "nodes": [] },
                     "signature": {
                         "isValid": false,
@@ -945,11 +949,7 @@ mod tests {
         let result = TestScenario::zippy_version_bump()
             .with_commit_metadata_json(serde_json::json!({
                 "abc12345abc12345": {
-                    "author": {
-                        "name": "Zed Zippy",
-                        "email": ZED_ZIPPY_EMAIL,
-                        "user": { "login": ZED_ZIPPY_LOGIN }
-                    },
+                    "author": zippy_author(),
                     "authors": { "nodes": [] },
                     "signature": {
                         "isValid": true,
@@ -974,11 +974,7 @@ mod tests {
         let result = TestScenario::zippy_version_bump()
             .with_commit_metadata_json(serde_json::json!({
                 "abc12345abc12345": {
-                    "author": {
-                        "name": "Alice",
-                        "email": "alice@test.com",
-                        "user": { "login": "alice" }
-                    },
+                    "author": alice_author(),
                     "authors": { "nodes": [] },
                     "signature": {
                         "isValid": true,
@@ -1003,18 +999,8 @@ mod tests {
         let result = TestScenario::zippy_version_bump()
             .with_commit_metadata_json(serde_json::json!({
                 "abc12345abc12345": {
-                    "author": {
-                        "name": "Zed Zippy",
-                        "email": ZED_ZIPPY_EMAIL,
-                        "user": { "login": ZED_ZIPPY_LOGIN }
-                    },
-                    "authors": { "nodes": [
-                        {
-                            "name": "Alice",
-                            "email": "alice@test.com",
-                            "user": { "login": "alice" }
-                        }
-                    ] },
+                    "author": zippy_author(),
+                    "authors": { "nodes": [alice_author()] },
                     "signature": {
                         "isValid": true,
                         "signer": { "login": ZED_ZIPPY_LOGIN }
