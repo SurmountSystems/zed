@@ -550,8 +550,6 @@ pub enum SoftWrap {
     None,
     /// Soft wrap lines that exceed the editor width.
     EditorWidth,
-    /// Soft wrap lines at the preferred line length.
-    Column(u32),
     /// Soft wrap line at the preferred line length or the editor width (whichever is smaller).
     Bounded(u32),
 }
@@ -2666,7 +2664,7 @@ impl Editor {
                 EditorEvent::ScrollPositionChanged { local, .. } => {
                     if *local {
                         editor.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
-                        editor.inline_blame_popover.take();
+                        editor.hide_blame_popover(true, cx);
                         let snapshot = editor.snapshot(window, cx);
                         let new_anchor = editor
                             .scroll_manager
@@ -3802,7 +3800,7 @@ impl Editor {
             self.refresh_matching_bracket_highlights(&display_map, cx);
             self.refresh_outline_symbols_at_cursor(cx);
             self.update_visible_edit_prediction(window, cx);
-            self.inline_blame_popover.take();
+            self.hide_blame_popover(true, cx);
             if self.git_blame_inline_enabled {
                 self.start_inline_blame_timer(window, cx);
             }
@@ -7600,23 +7598,36 @@ impl Editor {
         self.mouse_context_menu.is_some()
     }
 
+    /// Hides the inline blame popover element, in case it's already visible, or
+    /// interrupts the task meant to show it, in case the task is running.
+    ///
+    /// When `ignore_timeout` is set to `true`, the popover is hidden
+    /// immediately, otherwise it'll be hidden after a short delay.
+    ///
+    /// Returns `true` if the popover was visible and was hidden, `false`
+    /// otherwise.
     pub fn hide_blame_popover(&mut self, ignore_timeout: bool, cx: &mut Context<Self>) -> bool {
         self.inline_blame_popover_show_task.take();
+
         if let Some(state) = &mut self.inline_blame_popover {
-            let hide_task = cx.spawn(async move |editor, cx| {
-                if !ignore_timeout {
+            if ignore_timeout {
+                self.inline_blame_popover.take();
+                cx.notify();
+            } else {
+                state.hide_task = Some(cx.spawn(async move |editor, cx| {
                     cx.background_executor()
                         .timer(std::time::Duration::from_millis(100))
                         .await;
-                }
-                editor
-                    .update(cx, |editor, cx| {
-                        editor.inline_blame_popover.take();
-                        cx.notify();
-                    })
-                    .ok();
-            });
-            state.hide_task = Some(hide_task);
+
+                    editor
+                        .update(cx, |editor, cx| {
+                            editor.inline_blame_popover.take();
+                            cx.notify();
+                        })
+                        .ok();
+                }));
+            }
+
             true
         } else {
             false
@@ -21924,9 +21935,6 @@ impl Editor {
         let settings = self.buffer.read(cx).language_settings(cx);
         if settings.show_wrap_guides {
             match self.soft_wrap_mode(cx) {
-                SoftWrap::Column(soft_wrap) => {
-                    wrap_guides.push((soft_wrap as usize, true));
-                }
                 SoftWrap::Bounded(soft_wrap) => {
                     wrap_guides.push((soft_wrap as usize, true));
                 }
@@ -21946,9 +21954,6 @@ impl Editor {
                 SoftWrap::None
             }
             language_settings::SoftWrap::EditorWidth => SoftWrap::EditorWidth,
-            language_settings::SoftWrap::PreferredLineLength => {
-                SoftWrap::Column(settings.preferred_line_length)
-            }
             language_settings::SoftWrap::Bounded => {
                 SoftWrap::Bounded(settings.preferred_line_length)
             }
@@ -22025,9 +22030,7 @@ impl Editor {
             let soft_wrap = match self.soft_wrap_mode(cx) {
                 SoftWrap::GitDiff => return,
                 SoftWrap::None => language_settings::SoftWrap::EditorWidth,
-                SoftWrap::EditorWidth | SoftWrap::Column(_) | SoftWrap::Bounded(_) => {
-                    language_settings::SoftWrap::None
-                }
+                SoftWrap::EditorWidth | SoftWrap::Bounded(_) => language_settings::SoftWrap::None,
             };
             self.soft_wrap_mode_override = Some(soft_wrap);
         }
@@ -29388,7 +29391,7 @@ pub fn diagnostic_style(severity: lsp::DiagnosticSeverity, colors: &StatusColors
         lsp::DiagnosticSeverity::ERROR => colors.error,
         lsp::DiagnosticSeverity::WARNING => colors.warning,
         lsp::DiagnosticSeverity::INFORMATION => colors.info,
-        lsp::DiagnosticSeverity::HINT => colors.info,
+        lsp::DiagnosticSeverity::HINT => colors.hint,
         _ => colors.ignored,
     }
 }
