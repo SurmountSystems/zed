@@ -25,9 +25,9 @@ For quick switching without opening the sidebar, use the thread switcher: press 
 
 ### Thread History {#threads-history}
 
-Thread History holds all your threads. Toggle it with {#kb agents_sidebar::ToggleThreadHistory} or by clicking the clock icon in the sidebar bottom bar, next to the sidebar toggle.
+To remove a thread from the sidebar, you can archive it by hovering over it and clicking the archive icon that appears. You can also select a thread and press {#kb agent::ArchiveSelectedThread}. Running threads cannot be moved to history until they finish.
 
-To move a thread to the Thread History view, hover over it in the sidebar and click the archive icon that appears. You can also select a thread and press {#kb agent::RemoveSelectedThread}. Running threads cannot be moved to history until they finish.
+The Thread History view holds all your threads, including ones that you have archived. Toggle it with {#kb agents_sidebar::ToggleThreadHistory} or by clicking the clock icon in the sidebar bottom bar, next to the sidebar toggle.
 
 To restore a thread, open Thread History and click the thread you want to bring back. Zed moves it back to the thread list and opens it in the Agent Panel. If the thread was running in a Git worktree that was removed, Zed restores the worktree automatically.
 
