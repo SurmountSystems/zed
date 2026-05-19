@@ -811,6 +811,8 @@ mod tests {
         child_thread.subagent_context = Some(crate::SubagentContext {
             parent_thread_id: parent_id.clone(),
             depth: 2,
+            persona: None,
+            capability_mode: None,
         });
 
         database

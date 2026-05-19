@@ -43,6 +43,8 @@ pub struct SystemPromptTemplate<'a> {
     /// Contents of the user-global `~/.config/zed/AGENTS.md` file (or the
     /// platform equivalent), if present and non-empty.
     pub user_agents_md: Option<SharedString>,
+    pub subagent_persona: Option<String>,
+    pub subagent_capability_mode: Option<String>,
 }
 
 impl Template for SystemPromptTemplate<'_> {
@@ -87,6 +89,8 @@ mod tests {
             model_name: Some("test-model".to_string()),
             date: "2026-01-01".to_string(),
             user_agents_md: None,
+            subagent_persona: None,
+            subagent_capability_mode: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -118,6 +122,8 @@ mod tests {
             model_name: Some("test-model".to_string()),
             date: "2026-01-01".to_string(),
             user_agents_md: Some("always be concise".into()),
+            subagent_persona: None,
+            subagent_capability_mode: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();

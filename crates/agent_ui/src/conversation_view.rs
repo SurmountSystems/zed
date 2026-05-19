@@ -1,10 +1,10 @@
+use acp_thread::AgentConnection;
 use acp_thread::{
     AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessage, AssistantMessageChunk,
     AuthRequired, LoadError, MaxOutputTokensError, MentionUri, PermissionOptionChoice,
     PermissionOptions, PermissionPattern, RetryStatus, SelectedPermissionOutcome, ThreadStatus,
-    ToolCall, ToolCallContent, ToolCallStatus, UserMessageId,
+    ToolCallContent, ToolCallStatus, UserMessageId,
 };
-use acp_thread::{AgentConnection, Plan};
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
 use agent::{
     NativeAgentServer, NativeAgentSessionList, NoModelConfiguredError, SharedThread, ThreadStore,
@@ -4817,6 +4817,7 @@ pub(crate) mod tests {
         cx.new(|cx| {
             AcpThread::new(
                 None,
+                None,
                 Some(name.into()),
                 None,
                 connection,
@@ -4957,6 +4958,7 @@ pub(crate) mod tests {
                 AcpThread::new(
                     None,
                     None,
+                    None,
                     Some(work_dirs),
                     self,
                     project,
@@ -5041,6 +5043,7 @@ pub(crate) mod tests {
                 AcpThread::new(
                     None,
                     None,
+                    None,
                     Some(work_dirs),
                     self,
                     project,
@@ -5121,6 +5124,7 @@ pub(crate) mod tests {
                 AcpThread::new(
                     None,
                     None,
+                    None,
                     Some(work_dirs),
                     self.clone(),
                     project,
@@ -5154,6 +5158,7 @@ pub(crate) mod tests {
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             let thread = cx.new(|cx| {
                 AcpThread::new(
+                    None,
                     None,
                     None,
                     Some(work_dirs),
@@ -7369,6 +7374,7 @@ pub(crate) mod tests {
                 parent_session_id,
                 None,
                 None,
+                None,
                 connection,
                 project,
                 action_log,
@@ -7980,6 +7986,7 @@ pub(crate) mod tests {
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             let thread = cx.new(|cx| {
                 AcpThread::new(
+                    None,
                     None,
                     Some("CloseCapableConnection".into()),
                     Some(work_dirs),

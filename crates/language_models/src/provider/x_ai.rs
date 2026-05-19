@@ -6,10 +6,10 @@ use gpui::{AnyView, App, AsyncApp, Context, Entity, Task, TaskExt, Window};
 use http_client::HttpClient;
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
-    LanguageModelRequest, LanguageModelToolChoice, LanguageModelToolSchemaFormat, RateLimiter,
-    env_var,
+    LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
+    LanguageModelToolSchemaFormat, RateLimiter, env_var,
 };
 use open_ai::ResponseStreamEvent;
 pub use settings::XaiAvailableModel as AvailableModel;
@@ -174,6 +174,7 @@ impl LanguageModelProvider for XAiLanguageModelProvider {
                     supports_images: model.supports_images,
                     supports_tools: model.supports_tools,
                     parallel_tool_calls: model.parallel_tool_calls,
+                    reasoning_effort_levels: model.reasoning_effort_levels.clone(),
                 },
             );
         }
@@ -280,6 +281,41 @@ impl LanguageModel for XAiLanguageModel {
         self.model.supports_images()
     }
 
+    fn supports_thinking(&self) -> bool {
+        !self.supported_effort_levels().is_empty()
+    }
+
+    fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
+        let levels = match &self.model {
+            x_ai::Model::Grok43 | x_ai::Model::Grok420Reasoning => vec!["low", "medium", "high"],
+            x_ai::Model::Custom {
+                reasoning_effort_levels: Some(l),
+                ..
+            } => l.iter().map(|s| s.as_str()).collect(),
+            _ => Vec::new(),
+        };
+        if levels.is_empty() {
+            return Vec::new();
+        }
+        levels
+            .into_iter()
+            .map(|level| {
+                let (name, is_default) = match level {
+                    "low" | "minimal" => ("Low", false),
+                    "medium" => ("Medium", true),
+                    "high" => ("High", false),
+                    "xhigh" | "extra-high" => ("Extra High", false),
+                    other => (other, false),
+                };
+                LanguageModelEffortLevel {
+                    name: name.into(),
+                    value: level.into(),
+                    is_default,
+                }
+            })
+            .collect()
+    }
+
     fn supports_streaming_tools(&self) -> bool {
         true
     }
@@ -329,13 +365,23 @@ impl LanguageModel for XAiLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
+        let reasoning_effort = if request.thinking_allowed {
+            request
+                .thinking_effort
+                .as_deref()
+                .and_then(|effort| effort.parse::<open_ai::ReasoningEffort>().ok())
+                .filter(|effort| *effort != open_ai::ReasoningEffort::None)
+        } else {
+            None
+        };
+
         let request = crate::provider::open_ai::into_open_ai(
             request,
             self.model.id(),
             self.model.supports_parallel_tool_calls(),
             self.model.supports_prompt_cache_key(),
             self.max_output_tokens(),
-            None,
+            reasoning_effort,
             false,
         );
         let completions = self.stream_completion(request, cx);

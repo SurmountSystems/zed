@@ -17,6 +17,7 @@ use ui::IconName;
 pub const GEMINI_ID: &str = "gemini";
 pub const CLAUDE_AGENT_ID: &str = "claude-acp";
 pub const CODEX_ID: &str = "codex-acp";
+pub const GROK_ID: &str = "grok";
 
 /// A generic agent server implementation for custom user-defined agents
 pub struct CustomAgentServer {
@@ -35,7 +36,10 @@ impl AgentServer for CustomAgentServer {
     }
 
     fn logo(&self) -> IconName {
-        IconName::Terminal
+        match self.agent_id().as_ref() {
+            GROK_ID => IconName::AiXAi,
+            _ => IconName::Terminal,
+        }
     }
 
     fn default_mode(&self, cx: &App) -> Option<acp::SessionModeId> {
@@ -344,6 +348,17 @@ impl AgentServer for CustomAgentServer {
                 }
                 GEMINI_ID => {
                     extra_env.insert("SURFACE".to_owned(), "zed".to_owned());
+                }
+                GROK_ID => {
+                    if let Ok(api_key) = std::env::var("XAI_API_KEY") {
+                        extra_env.insert("XAI_API_KEY".into(), api_key);
+                    }
+                    // Grok Build also respects its own envs; pass through common ones
+                    for (k, v) in std::env::vars() {
+                        if k.starts_with("GROK_") || k == "GROK_SUBAGENTS" || k == "GROK_SANDBOX" {
+                            extra_env.insert(k, v);
+                        }
+                    }
                 }
                 _ => {}
             }

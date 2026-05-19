@@ -1120,6 +1120,7 @@ impl AcpConnection {
                     let thread: Entity<AcpThread> = cx.new(|cx| {
                         AcpThread::new(
                             None,
+                            None,
                             title,
                             Some(work_dirs),
                             this.clone(),
@@ -1599,6 +1600,7 @@ impl AgentConnection for AcpConnection {
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             let thread: Entity<AcpThread> = cx.new(|cx| {
                 AcpThread::new(
+                    None,
                     None,
                     None,
                     Some(work_dirs),

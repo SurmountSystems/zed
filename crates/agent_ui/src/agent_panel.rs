@@ -23,7 +23,7 @@ use settings::{LanguageModelProviderSetting, LanguageModelSelection};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
+        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, OpenZedTodosSurface, ReauthenticateAgent,
         ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
         ResolveConflictsWithAgent, ReviewBranchDiff,
     },
@@ -42,12 +42,12 @@ use crate::{
     ResetTrialEndUpsell, ResetTrialUpsell, ShowAllSidebarThreadMetadata, ShowThreadMetadata,
     ToggleNewThreadMenu, ToggleOptionsMenu,
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
-    conversation_view::{AcpThreadViewEvent, ThreadView},
+    conversation_view::{AcpThreadViewEvent, ThreadView, ZedTodosComponent, ZedTodosDockPrototype},
     ui::{AgentNotification, AgentNotificationEvent, EndTrialUpsell},
 };
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
-    NewNativeAgentThreadFromSummary,
+    NewGrokThread, NewNativeAgentThreadFromSummary,
 };
 use agent_settings::AgentSettings;
 use ai_onboarding::AgentPanelOnboarding;
@@ -212,6 +212,8 @@ struct SerializedAgentPanel {
     last_active_thread: Option<SerializedActiveThread>,
     #[serde(default)]
     new_draft_thread_id: Option<ThreadId>,
+    #[serde(default)]
+    show_zed_todos_surface: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -260,11 +262,29 @@ pub fn init(cx: &mut App) {
                         panel.update(cx, |panel, cx| panel.open_configuration(window, cx));
                     }
                 })
+                .register_action(|workspace, _: &OpenZedTodosSurface, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        panel.update(cx, |panel, cx| panel.open_zed_todos_surface(window, cx));
+                    }
+                })
                 .register_action(|workspace, action: &NewExternalAgentThread, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
                         panel.update(cx, |panel, cx| {
                             panel.new_external_agent_thread(action, window, cx);
+                        });
+                    }
+                })
+                .register_action(|workspace, action: &NewGrokThread, window, cx| {
+                    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        panel.update(cx, |panel, cx| {
+                            let external = NewExternalAgentThread {
+                                agent: AgentId::from("grok"),
+                                resume_session_id: action.resume_session_id.clone(),
+                            };
+                            panel.new_external_agent_thread(&external, window, cx);
                         });
                     }
                 })
@@ -681,7 +701,7 @@ fn format_timestamp_human(dt: &DateTime<Utc>) -> String {
         format!("{days} days ago")
     };
 
-    format!("{} ({})", dt.to_rfc3339(), relative)
+    format!("{} · {}", dt.to_rfc3339(), relative)
 }
 
 /// Used for `dev: show thread metadata` action
@@ -792,6 +812,7 @@ impl From<AgentThread> for BaseView {
 
 enum OverlayView {
     Configuration,
+    ZedTodosSurface(Entity<ZedTodosDockPrototype>),
 }
 
 enum VisibleSurface<'a> {
@@ -799,6 +820,7 @@ enum VisibleSurface<'a> {
     AgentThread(&'a Entity<ConversationView>),
     Terminal(&'a Entity<TerminalView>),
     Configuration(Option<&'a Entity<AgentConfiguration>>),
+    ZedTodosSurface(Option<&'a Entity<ZedTodosDockPrototype>>),
 }
 
 enum WhichFontSize {
@@ -819,6 +841,7 @@ impl OverlayView {
     pub fn which_font_size_used(&self) -> WhichFontSize {
         match self {
             OverlayView::Configuration => WhichFontSize::None,
+            OverlayView::ZedTodosSurface(_) => WhichFontSize::None,
         }
     }
 }
@@ -924,6 +947,9 @@ impl AgentPanel {
             .as_ref()
             .map(|draft| draft.read(cx).thread_id);
 
+        let show_zed_todos_surface =
+            matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)));
+
         let kvp = KeyValueStore::global(cx);
         self.pending_serialization = Some(cx.background_spawn(async move {
             save_serialized_panel(
@@ -933,6 +959,7 @@ impl AgentPanel {
                     last_created_entry_kind,
                     last_active_thread,
                     new_draft_thread_id,
+                    show_zed_todos_surface,
                 },
                 kvp,
             )
@@ -1069,6 +1096,9 @@ impl AgentPanel {
                         .and_then(|p| p.new_draft_thread_id)
                     {
                         panel.restore_new_draft(new_draft_thread_id, window, cx);
+                    }
+                    if serialized_panel.as_ref().map_or(false, |p| p.show_zed_todos_surface) {
+                        panel.open_zed_todos_surface(window, cx);
                     }
                     cx.notify();
                 });
@@ -1531,7 +1561,22 @@ impl AgentPanel {
             return;
         }
 
-        self.selected_agent = action.agent.clone().into();
+        let agent: Agent = action.agent.clone().into();
+        self.selected_agent = agent.clone();
+        if let Some(resume_id_str) = &action.resume_session_id {
+            let session_id = acp::SessionId::new(resume_id_str.clone());
+            self.external_thread_by_session(
+                agent,
+                session_id,
+                None,
+                None,
+                true,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+            return;
+        }
         self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
     }
 
@@ -2944,6 +2989,23 @@ impl AgentPanel {
         }
     }
 
+    pub(crate) fn open_zed_todos_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))) {
+            self.clear_overlay(true, window, cx);
+            self.serialize(cx);
+            return;
+        }
+        let Some(active_acp_thread) = self.active_agent_thread(cx) else {
+            return;
+        };
+        let zed_todos_dock_prototype = cx.new(|cx| ZedTodosDockPrototype::new_for_thread(active_acp_thread, cx));
+        self.overlay_view = Some(OverlayView::ZedTodosSurface(zed_todos_dock_prototype.clone()));
+        zed_todos_dock_prototype.focus_handle(cx).focus(window, cx);
+        cx.emit(AgentPanelEvent::ActiveViewChanged);
+        cx.notify();
+        self.serialize(cx);
+    }
+
     pub(crate) fn open_active_thread_as_markdown(
         &mut self,
         _: &OpenActiveThreadAsMarkdown,
@@ -3033,18 +3095,48 @@ impl AgentPanel {
             return;
         };
 
-        let Some(encoded) = clipboard.text() else {
+        let Some(text) = clipboard.text() else {
             Self::show_deferred_toast(&self.workspace, "Clipboard does not contain text", cx);
             return;
         };
 
-        let thread_data = match base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &encoded)
-        {
+        let trimmed = text.trim();
+        // Low-friction roundtrip path for G-16: if clipboard contains a bare Grok TUI
+        // session ID (the UUID dir name), resume it directly via the grok ACP agent
+        // (which shares the ~/.grok/sessions backing store). This lets users copy an
+        // ID from `grok sessions list`, `ls ~/.grok/sessions/...`, or jq/sqlite output
+        // and paste via LoadThreadFromClipboard to continue with full Zed visuals
+        // (plans, subagents, monitors) without restarting work. The ID format check
+        // is the same predicate used by discover_grok_tui_sessions.
+        if project::agent_server_store::is_valid_grok_tui_session_id(trimmed) {
+            let session_id = acp::SessionId::new(trimmed.to_string());
+            let grok_agent = Agent::Custom {
+                id: AgentId("grok".into()),
+            };
+            self.external_thread_by_session(
+                grok_agent,
+                session_id,
+                None,
+                None,
+                true,
+                AgentThreadSource::AgentPanel,
+                window,
+                cx,
+            );
+            Self::show_deferred_toast(
+                &self.workspace,
+                "Resumed Grok TUI session from clipboard ID (roundtrip to visual state)",
+                cx,
+            );
+            return;
+        }
+
+        let thread_data = match base64::Engine::decode(&base64::prelude::BASE64_STANDARD, trimmed) {
             Ok(data) => data,
             Err(_) => {
                 Self::show_deferred_toast(
                     &self.workspace,
-                    "Failed to decode clipboard content (expected base64)",
+                    "Failed to decode clipboard content (expected base64 or Grok session ID)",
                     cx,
                 );
                 return;
@@ -3382,7 +3474,9 @@ impl AgentPanel {
                     return true;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
-                thread.connection().supports_load_session() && thread.status() == ThreadStatus::Idle
+                thread.connection().supports_load_session()
+                    && thread.status() == ThreadStatus::Idle
+                    && !thread.has_active_background_monitors()
             })
             .collect::<Vec<_>>();
 
@@ -3459,6 +3553,7 @@ impl AgentPanel {
             self.focus_handle(cx).focus(window, cx);
         }
         cx.emit(AgentPanelEvent::ActiveViewChanged);
+        self.serialize(cx);
     }
 
     fn clear_overlay_state(&mut self) {
@@ -3523,6 +3618,9 @@ impl AgentPanel {
             return match overlay_view {
                 OverlayView::Configuration => {
                     VisibleSurface::Configuration(self.configuration.as_ref())
+                }
+                OverlayView::ZedTodosSurface(zed_todos_dock_prototype) => {
+                    VisibleSurface::ZedTodosSurface(Some(zed_todos_dock_prototype))
                 }
             };
         }
@@ -3885,6 +3983,13 @@ impl Focusable for AgentPanel {
             VisibleSurface::Configuration(configuration) => {
                 if let Some(configuration) = configuration {
                     configuration.focus_handle(cx)
+                } else {
+                    self.focus_handle.clone()
+                }
+            }
+            VisibleSurface::ZedTodosSurface(zed_todos_dock_prototype) => {
+                if let Some(zed_todos_dock_prototype) = zed_todos_dock_prototype {
+                    zed_todos_dock_prototype.focus_handle(cx)
                 } else {
                     self.focus_handle.clone()
                 }
@@ -4295,6 +4400,7 @@ impl AgentPanel {
             VisibleSurface::Configuration(_) => {
                 Label::new("Settings").truncate().into_any_element()
             }
+            VisibleSurface::ZedTodosSurface(_) => Label::new("Zed Todos").truncate().into_any_element(),
             VisibleSurface::Uninitialized => Label::new("Agent").truncate().into_any_element(),
         };
 
@@ -4351,6 +4457,7 @@ impl AgentPanel {
     ) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
         let showing_terminal = matches!(self.visible_surface(), VisibleSurface::Terminal(_));
+        let has_active_agent_thread = self.active_agent_thread(cx).is_some();
 
         let conversation_view = match &self.base_view {
             BaseView::AgentThread { conversation_view } => Some(conversation_view.clone()),
@@ -4443,8 +4550,11 @@ impl AgentPanel {
                             menu = menu.action("Profiles", Box::new(ManageProfiles::default()));
                         }
 
+                        menu = menu.action("Settings", Box::new(OpenSettings));
+                        if has_active_agent_thread {
+                            menu = menu.action("Zed Todos", Box::new(OpenZedTodosSurface));
+                        }
                         menu = menu
-                            .action("Settings", Box::new(OpenSettings))
                             .separator()
                             .action("Toggle Threads Sidebar", Box::new(ToggleWorkspaceSidebar));
 
@@ -4512,6 +4622,10 @@ impl AgentPanel {
             let label = store
                 .agent_display_name(&id)
                 .unwrap_or_else(|| self.selected_agent.label());
+            let label = store
+                .grok_co_equal_indicator(&id)
+                .map(|ind| format!("{} · {}", label, ind).into())
+                .unwrap_or(label);
             (icon, label)
         } else {
             (None, self.selected_agent.label())
@@ -4648,6 +4762,10 @@ impl AgentPanel {
                                                 .map(|a| a.name().clone())
                                         })
                                         .unwrap_or_else(|| agent_id.0.clone());
+                                    let display_name = agent_server_store
+                                        .grok_co_equal_indicator(agent_id)
+                                        .map(|ind| format!("{} · {}", display_name, ind).into())
+                                        .unwrap_or(display_name);
                                     AgentMenuItem {
                                         id: agent_id.clone(),
                                         display_name,
@@ -4699,6 +4817,7 @@ impl AgentPanel {
                                                             panel.new_external_agent_thread(
                                                                 &NewExternalAgentThread {
                                                                     agent: agent_id.clone(),
+                                                                    resume_session_id: None,
                                                                 },
                                                                 window,
                                                                 cx,
@@ -4745,6 +4864,14 @@ impl AgentPanel {
         };
         let selected_agent_label_for_tooltip = selected_agent_label.clone();
 
+        let selected_agent_meta: SharedString = if selected_agent_label.to_string().contains("Co-Equal") {
+            "Co-Equal peer to standalone Grok TUI (ACP bridge: full skills G-15 + sessions G-16 + memory scaffolds G-17)".into()
+        } else if showing_terminal {
+            "Terminal surface".into()
+        } else {
+            "Agent selector".into()
+        };
+
         let selected_agent = div()
             .id("selected_agent_icon")
             .px_0p5()
@@ -4764,7 +4891,7 @@ impl AgentPanel {
                 Tooltip::with_meta(
                     selected_agent_label_for_tooltip.clone(),
                     None,
-                    "Selected Agent",
+                    selected_agent_meta.clone(),
                     cx,
                 )
             });
@@ -4919,6 +5046,26 @@ impl AgentPanel {
                 .with_handle(self.new_thread_menu_handle.clone())
                 .menu(move |window, cx| new_thread_menu_builder(window, cx));
 
+            let zt1_demo: Option<AnyElement> = if let Some(acp_thread) = self.active_agent_thread(cx) {
+                let thread = acp_thread.read(cx);
+                let (total_pending_approvals, read_only_approvals, potentially_destructive_approvals) =
+                    ZedTodosComponent::pending_approval_counts(&thread);
+                if total_pending_approvals == 0 {
+                    None
+                } else {
+                    Some(
+                        Label::new(format!(
+                            "ZT-1:{} RO:{} D:{}",
+                            total_pending_approvals, read_only_approvals, potentially_destructive_approvals
+                        ))
+                        .color(Color::Accent)
+                        .into_any_element(),
+                    )
+                }
+            } else {
+                None
+            };
+
             base_container
                 .child(
                     h_flex()
@@ -4944,6 +5091,7 @@ impl AgentPanel {
                         .pl_1()
                         .pr_1()
                         .when(can_create_entries, |this| this.child(new_thread_menu))
+                        .when_some(zt1_demo, |this, el| this.child(el))
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )
@@ -5300,6 +5448,9 @@ impl Render for AgentPanel {
                     .child(self.render_drag_target(cx)),
                 VisibleSurface::Configuration(configuration) => {
                     parent.children(configuration.cloned())
+                }
+                VisibleSurface::ZedTodosSurface(zed_todos_dock_prototype) => {
+                    parent.children(zed_todos_dock_prototype.cloned())
                 }
             })
             .children(self.render_trial_end_upsell(window, cx));
@@ -5681,6 +5832,7 @@ mod tests {
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             cx.new(|cx| {
                 AcpThread::new(
+                    None,
                     None,
                     title,
                     Some(work_dirs),
@@ -6969,6 +7121,7 @@ mod tests {
             panel.new_external_agent_thread(
                 &NewExternalAgentThread {
                     agent: AgentId::new("external-agent"),
+                    resume_session_id: None,
                 },
                 window,
                 cx,
@@ -9112,6 +9265,7 @@ mod tests {
         // should become active.
         cx.dispatch_action(NewExternalAgentThread {
             agent: Agent::Stub.id(),
+            resume_session_id: None,
         });
         cx.run_until_parked();
 
@@ -9740,6 +9894,7 @@ mod tests {
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             cx.new(|cx| {
                 AcpThread::new(
+                    None,
                     None,
                     title,
                     Some(work_dirs),

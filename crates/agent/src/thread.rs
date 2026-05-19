@@ -3,7 +3,7 @@ use crate::{
     DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool,
     FindPathTool, FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool,
     ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision,
+    SystemPromptTemplate, Template, Templates, TerminalTool, TodoWriteTool, MonitorTool, EnterPlanModeTool, ToolPermissionDecision,
     UpdatePlanTool, UserAgentsMd, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{MentionUri, UserMessageId};
@@ -41,7 +41,7 @@ use language_model::{
     LanguageModelToolUse, LanguageModelToolUseId, Role, SelectedModel, Speed, StopReason,
     TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
-use project::Project;
+use project::{GrokMemoryArtifacts, Project, grok_memory_artifacts_for_cwd};
 use prompt_store::ProjectContext;
 use schemars::{JsonSchema, Schema};
 use serde::de::DeserializeOwned;
@@ -66,6 +66,8 @@ const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
 
+const GROK_BUILD_SYSTEM_FRAGMENTS: &str = "You are Grok operating in Grok Build mode for co-equal fidelity with the standalone xAI Grok TUI. Use exact tool names and input shapes from observed P4-0 captures: todo_write (for plan entries with status/content, to track and render progress), enter_plan_mode (to toggle read-only planning phase before edits), monitor (for long-running background commands returning handles for later retrieval via get_command_or_subagent_output), spawn_agent with persona field. Supported personas for subagent delegation (from grok inspect and TUI): plan, general-purpose, explore, implementer, reviewer, verifier, architect, researcher. Always include persona on spawn for subagent sessions. Maintain plan discipline: create short verifiable plans via todo_write before multi-step work, mark steps promptly, use enter_plan_mode for proposal/approval flows. Match TUI reasoning style: truth-seeking, direct, efficient parallel orchestration via monitors and subagents, confidence reporting where uncertain. Follow tool schemas precisely for monitor/todo_write/enter_plan_mode/spawn to ensure native request building produces identical behaviors to captured sessions.";
+
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
 pub struct NoModelConfiguredError;
@@ -86,6 +88,10 @@ pub struct SubagentContext {
 
     /// Current depth level (0 = root agent, 1 = first-level subagent, etc.)
     pub depth: u8,
+    #[serde(default)]
+    pub persona: Option<acp_thread::AgentPersona>,
+    #[serde(default)]
+    pub capability_mode: Option<acp_thread::AgentCapabilityMode>,
 }
 
 /// The ID of the user prompt that initiated a request.
@@ -668,7 +674,13 @@ pub trait ThreadEnvironment {
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>>;
+    fn create_subagent(
+        &self,
+        label: String,
+        persona: Option<acp_thread::AgentPersona>,
+        capability_mode: Option<acp_thread::AgentCapabilityMode>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>>;
 
     fn resume_subagent(
         &self,
@@ -982,6 +994,7 @@ pub struct Thread {
     project_context: Entity<ProjectContext>,
     pub(crate) templates: Arc<Templates>,
     model: Option<Arc<dyn LanguageModel>>,
+    grok_build_profile: bool,
     summarization_model: Option<Arc<dyn LanguageModel>>,
     thinking_enabled: bool,
     thinking_effort: Option<String>,
@@ -1010,7 +1023,22 @@ impl Thread {
             .embedded_context(true)
     }
 
-    pub fn new_subagent(parent_thread: &Entity<Thread>, cx: &mut Context<Self>) -> Self {
+    fn compute_grok_build_profile(model: Option<&dyn LanguageModel>) -> bool {
+        model.map_or(false, |model| {
+            if &model.provider_id().0 == "x_ai" {
+                model.name().0.to_ascii_lowercase().contains("grok")
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn new_subagent(
+        parent_thread: &Entity<Thread>,
+        persona: Option<acp_thread::AgentPersona>,
+        capability_mode: Option<acp_thread::AgentCapabilityMode>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let project = parent_thread.read(cx).project.clone();
         let project_context = parent_thread.read(cx).project_context.clone();
         let context_server_registry = parent_thread.read(cx).context_server_registry.clone();
@@ -1031,6 +1059,8 @@ impl Thread {
         thread.subagent_context = Some(SubagentContext {
             parent_thread_id: parent_thread.read(cx).id().clone(),
             depth: parent_thread.read(cx).depth() + 1,
+            persona,
+            capability_mode,
         });
         thread.inherit_parent_settings(parent_thread, cx);
         if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
@@ -1082,6 +1112,7 @@ impl Thread {
             .default_model
             .as_ref()
             .and_then(|model| model.speed);
+        let grok_build_profile = Self::compute_grok_build_profile(model.as_deref());
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
             watch::channel(Self::prompt_capabilities(model.as_deref()));
         Self {
@@ -1112,6 +1143,7 @@ impl Thread {
             project_context,
             templates,
             model,
+            grok_build_profile,
             summarization_model: None,
             thinking_enabled: enable_thinking,
             speed,
@@ -1157,6 +1189,7 @@ impl Thread {
         };
 
         self.model = Some(model.clone());
+        self.grok_build_profile = Self::compute_grok_build_profile(self.model.as_deref());
         self.thinking_enabled = selection.enable_thinking && model.supports_thinking();
         self.thinking_effort = selection.effort.clone();
         self.speed = selection.speed.filter(|_| model.supports_fast_mode());
@@ -1339,6 +1372,7 @@ impl Thread {
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
 
+        let grok_build_profile = Self::compute_grok_build_profile(model.as_deref());
         Self {
             id,
             prompt_id: PromptId::new(),
@@ -1365,6 +1399,7 @@ impl Thread {
             project_context,
             templates,
             model,
+            grok_build_profile,
             summarization_model: None,
             thinking_enabled: db_thread.thinking_enabled,
             thinking_effort: db_thread.thinking_effort,
@@ -1477,6 +1512,7 @@ impl Thread {
     pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
         let old_usage = self.latest_token_usage();
         self.model = Some(model.clone());
+        self.grok_build_profile = Self::compute_grok_build_profile(self.model.as_deref());
         let new_caps = Self::prompt_capabilities(self.model.as_deref());
         let new_usage = self.latest_token_usage();
         if old_usage != new_usage {
@@ -1647,8 +1683,15 @@ impl Thread {
         self.add_tool(RenameTool::new(self.project.clone()));
 
         if self.depth() < MAX_SUBAGENT_DEPTH {
-            self.add_tool(SpawnAgentTool::new(environment));
+            self.add_tool(SpawnAgentTool::new(environment.clone()));
         }
+
+        // Register Grok-specific shims (todo_write, monitor, enter_plan_mode) so that
+        // native Grok profiles (is_grok_build_profile) can drive the same ZT-1 classified
+        // surface as the bridged path. These are O(1) and only added for Grok models.
+        self.add_tool(TodoWriteTool);
+        self.add_tool(MonitorTool::new(self.project.clone(), environment));
+        self.add_tool(EnterPlanModeTool);
     }
 
     pub fn add_tool<T: AgentTool>(&mut self, tool: T) {
@@ -3058,6 +3101,26 @@ impl Thread {
         self.subagent_context.as_ref().map(|c| c.depth).unwrap_or(0)
     }
 
+    pub fn persona(&self) -> Option<acp_thread::AgentPersona> {
+        self.subagent_context.as_ref().and_then(|c| c.persona)
+    }
+
+    pub fn capability_mode(&self) -> Option<acp_thread::AgentCapabilityMode> {
+        self.subagent_context.as_ref().and_then(|c| c.capability_mode)
+    }
+
+    pub fn is_grok_build_profile(&self, _cx: &App) -> bool {
+        self.grok_build_profile
+    }
+
+    pub fn grok_memory(&self, cx: &App) -> GrokMemoryArtifacts {
+        if let Some(worktree) = self.project.read(cx).visible_worktrees(cx).next() {
+            let abs_path = worktree.read(cx).abs_path().to_path_buf();
+            return grok_memory_artifacts_for_cwd(&abs_path);
+        }
+        GrokMemoryArtifacts::default()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_subagent_context(&mut self, context: SubagentContext) {
         self.subagent_context = Some(context);
@@ -3078,16 +3141,33 @@ impl Thread {
         );
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
-        let system_prompt = SystemPromptTemplate {
+        let subagent_persona = self.persona().map(|p| p.display_name().to_string());
+        let subagent_capability_mode = self.capability_mode().map(|m| m.display_name().to_string());
+        let mut system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
             model_name: self.model.as_ref().map(|m| m.name().0.to_string()),
             date: Local::now().format("%Y-%m-%d").to_string(),
             user_agents_md,
+            subagent_persona,
+            subagent_capability_mode,
         }
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+        if self.is_grok_build_profile(cx) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(GROK_BUILD_SYSTEM_FRAGMENTS);
+            let memory_artifacts = self.grok_memory(cx);
+            if let Some(full) = &memory_artifacts.workspace_memory_full {
+                system_prompt.push_str("\n\n## Grok Persistent Memory (MEMORY.md)\n");
+                system_prompt.push_str(full);
+            }
+            if let Some(full) = &memory_artifacts.global_memory_full {
+                system_prompt.push_str("\n\n## Grok Persistent Memory (global)\n");
+                system_prompt.push_str(full);
+            }
+        }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],
@@ -4027,16 +4107,21 @@ impl ToolCallEventStream {
         let fs = self.fs.clone();
         let stream = self.stream.clone();
         let tool_use_id = self.tool_use_id.clone();
+        let tool_name_for_meta = context.as_ref().map(|c| c.tool_name.clone());
         cx.spawn(async move |cx| {
             let (response_tx, mut response_rx) = oneshot::channel();
+            let update_fields = acp::ToolCallUpdateFields::new().title(title);
+            let tool_call_update = if let Some(ref name) = tool_name_for_meta {
+                acp::ToolCallUpdate::new(tool_use_id.to_string(), update_fields)
+                    .meta(acp_thread::meta_with_tool_name(name))
+            } else {
+                acp::ToolCallUpdate::new(tool_use_id.to_string(), update_fields)
+            };
             if let Err(error) = stream
                 .0
                 .unbounded_send(Ok(ThreadEvent::ToolCallAuthorization(
                     ToolCallAuthorization {
-                        tool_call: acp::ToolCallUpdate::new(
-                            tool_use_id.to_string(),
-                            acp::ToolCallUpdateFields::new().title(title),
-                        ),
+                        tool_call: tool_call_update,
                         options,
                         response: response_tx,
                         context,
@@ -4444,7 +4529,7 @@ mod tests {
         cx.update(|cx| {
             let mut subagents = Vec::new();
             for _ in 0..count {
-                let subagent = cx.new(|cx| Thread::new_subagent(parent, cx));
+                let subagent = cx.new(|cx| Thread::new_subagent(parent, None, None, cx));
                 parent.update(cx, |thread, _cx| {
                     thread.register_running_subagent(subagent.downgrade());
                 });

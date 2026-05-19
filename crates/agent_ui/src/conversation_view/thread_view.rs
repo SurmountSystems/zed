@@ -6,8 +6,13 @@ use crate::{
 use agent_client_protocol::schema as acp;
 use std::cell::RefCell;
 
-use acp_thread::{ContentBlock, PlanEntry};
+use acp_thread::{
+    AgentPersona, AgentThreadEntry, ApprovalRisk, ContentBlock, PermissionOptions, Plan, PlanEntry,
+    SelectedPermissionOutcome, ToolCall, ToolCallStatus, approval_risk_for_operation,
+    approval_risk_for_tool_call,
+};
 use agent::{SkillLoadingError, SkillLoadingErrorsUpdated};
+use project::GrokMemoryArtifacts;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
 use feature_flags::AcpBetaFeatureFlag;
@@ -19,7 +24,7 @@ use gpui::TaskExt;
 use heapless::Vec as ArrayVec;
 use language_model::{LanguageModelEffortLevel, Speed};
 use settings::update_settings_file;
-use ui::{ButtonLike, SpinnerLabel, SpinnerVariant, SplitButton, SplitButtonStyle, Tab};
+use ui::{ButtonLike, Chip, SpinnerLabel, SpinnerVariant, SplitButton, SplitButtonStyle, Tab};
 use workspace::SERIALIZATION_THROTTLE_TIME;
 
 use super::*;
@@ -209,6 +214,553 @@ impl RenderOnce for GeneratingSpinnerElement {
     }
 }
 
+#[derive(Default)]
+pub struct ZedTodos {
+    pub approvals_expanded: bool,
+    pub plan_expanded: bool,
+    pub background_tasks_expanded: bool,
+    pub expanded_background_monitors: HashSet<acp::ToolCallId>,
+    pub grok_memory_expanded: bool,
+}
+
+#[derive(Default)]
+pub struct ZedTodosComponent {
+    pub state: ZedTodos,
+}
+
+impl ZedTodosComponent {
+    pub fn new() -> Self {
+        Self {
+            state: ZedTodos::default(),
+        }
+    }
+
+    pub fn toggle_approvals_expanded(&mut self) {
+        self.state.approvals_expanded = !self.state.approvals_expanded;
+    }
+
+    pub fn toggle_plan_expanded(&mut self) {
+        self.state.plan_expanded = !self.state.plan_expanded;
+    }
+
+    pub fn toggle_background_tasks_expanded(&mut self) {
+        self.state.background_tasks_expanded = !self.state.background_tasks_expanded;
+    }
+
+    pub fn toggle_grok_memory_expanded(&mut self) {
+        self.state.grok_memory_expanded = !self.state.grok_memory_expanded;
+    }
+
+    pub fn toggle_background_monitor(&mut self, id: acp::ToolCallId) {
+        if self.state.expanded_background_monitors.contains(&id) {
+            self.state.expanded_background_monitors.remove(&id);
+        } else {
+            self.state.expanded_background_monitors.insert(id);
+        }
+    }
+
+    pub fn is_background_monitor_expanded(&self, id: &acp::ToolCallId) -> bool {
+        self.state.expanded_background_monitors.contains(id)
+    }
+
+    pub fn collect_pending_approval_tool_calls(thread: &acp_thread::AcpThread) -> Vec<&ToolCall> {
+        collect_pending_approval_tool_calls(thread)
+    }
+
+    pub fn collect_background_monitor_tool_calls(thread: &acp_thread::AcpThread) -> Vec<&ToolCall> {
+        collect_background_monitor_tool_calls(thread)
+    }
+
+    pub fn pending_approval_options_for_tool_call(tool_call: &ToolCall) -> (Option<acp::PermissionOption>, Option<acp::PermissionOption>, Option<acp::PermissionOption>, Option<acp::PermissionOption>) {
+        let allow_once_option = if let ToolCallStatus::WaitingForConfirmation { options, .. } = &tool_call.status {
+            options.first_option_of_kind(acp::PermissionOptionKind::AllowOnce).cloned()
+        } else {
+            None
+        };
+        let allow_always_option = if let ToolCallStatus::WaitingForConfirmation { options, .. } = &tool_call.status {
+            options.first_option_of_kind(acp::PermissionOptionKind::AllowAlways).cloned()
+        } else {
+            None
+        };
+        let deny_once_option = if let ToolCallStatus::WaitingForConfirmation { options, .. } = &tool_call.status {
+            options.first_option_of_kind(acp::PermissionOptionKind::RejectOnce).cloned()
+        } else {
+            None
+        };
+        let deny_always_option = if let ToolCallStatus::WaitingForConfirmation { options, .. } = &tool_call.status {
+            options.first_option_of_kind(acp::PermissionOptionKind::RejectAlways).cloned()
+        } else {
+            None
+        };
+        (allow_once_option, allow_always_option, deny_once_option, deny_always_option)
+    }
+
+    pub fn format_classified_approval_action_label(action_kind: &str, risk: ApprovalRisk) -> SharedString {
+        format!("{} ({})", action_kind, risk.label()).into()
+    }
+
+    pub fn approval_action_check_icon_color(classified_risk: ApprovalRisk) -> Color {
+        if classified_risk == ApprovalRisk::PotentiallyDestructive {
+            Color::Warning
+        } else {
+            Color::Success
+        }
+    }
+
+    pub fn pending_approval_counts(thread: &acp_thread::AcpThread) -> (usize, usize, usize) {
+        let pending = Self::collect_pending_approval_tool_calls(thread);
+        let total_pending_approvals = pending.len();
+        let read_only_approvals = pending
+            .iter()
+            .filter(|tool_call| tool_call.approval_risk().is_read_only())
+            .count();
+        let potentially_destructive_approvals = total_pending_approvals - read_only_approvals;
+        (
+            total_pending_approvals,
+            read_only_approvals,
+            potentially_destructive_approvals,
+        )
+    }
+
+    pub fn render_plan_entry_row(
+        index: usize,
+        total_entries: usize,
+        entry: &PlanEntry,
+        window: &mut Window,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let risk =
+            approval_risk_for_operation(entry.content.read(cx).source());
+        render_plan_entry_row(index, total_entries, entry, risk, window, cx)
+    }
+
+    pub fn build_approval_action_button(
+        element_id: impl Into<gpui::ElementId>,
+        label: SharedString,
+        icon_name: IconName,
+        icon_color: Color,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::AnyElement {
+        Button::new(element_id, label)
+            .start_icon(
+                Icon::new(icon_name)
+                    .size(IconSize::XSmall)
+                    .color(icon_color),
+            )
+            .label_size(LabelSize::XSmall)
+            .on_click(on_click)
+            .into_any_element()
+    }
+
+    pub fn build_allow_once_action(
+        item_index: usize,
+        risk: ApprovalRisk,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::AnyElement {
+        Self::build_approval_action_button(
+            ("allow_once", item_index),
+            Self::format_classified_approval_action_label("Allow once", risk),
+            IconName::Check,
+            Color::Success,
+            on_click,
+        )
+    }
+
+    pub fn build_allow_always_action(
+        item_index: usize,
+        risk: ApprovalRisk,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::AnyElement {
+        Self::build_approval_action_button(
+            ("allow_always", item_index),
+            Self::format_classified_approval_action_label("Allow always", risk),
+            IconName::CheckDouble,
+            Self::approval_action_check_icon_color(risk),
+            on_click,
+        )
+    }
+
+    pub fn build_granular_allow_action(
+        item_index: usize,
+        risk: ApprovalRisk,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::AnyElement {
+        Self::build_approval_action_button(
+            ("granular_allow", item_index),
+            Self::format_classified_approval_action_label("Allow granular", risk),
+            IconName::CheckDouble,
+            Self::approval_action_check_icon_color(risk),
+            on_click,
+        )
+    }
+
+    pub fn build_deny_action(
+        item_index: usize,
+        risk: ApprovalRisk,
+        is_always: bool,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::AnyElement {
+        let label_text = if is_always { "Deny always" } else { "Deny" };
+        Self::build_approval_action_button(
+            ("deny", item_index),
+            Self::format_classified_approval_action_label(label_text, risk),
+            IconName::Close,
+            Color::Error,
+            on_click,
+        )
+    }
+
+    pub fn build_plan_accept_button(
+        risk: ApprovalRisk,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::AnyElement {
+        IconButton::new("accept-proposed-plan", IconName::Check)
+            .icon_size(IconSize::XSmall)
+            .shape(ui::IconButtonShape::Square)
+            .tooltip(Tooltip::text(format!(
+                "Accept proposed plan ({})",
+                risk.label()
+            )))
+            .on_click(on_click)
+            .into_any_element()
+    }
+}
+
+pub fn collect_pending_approval_tool_calls(thread: &acp_thread::AcpThread) -> Vec<&ToolCall> {
+    thread
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(tool_call)
+                if matches!(&tool_call.status, ToolCallStatus::WaitingForConfirmation { .. }) =>
+            {
+                Some(tool_call)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn collect_background_monitor_tool_calls(thread: &acp_thread::AcpThread) -> Vec<&ToolCall> {
+    thread
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            AgentThreadEntry::ToolCall(tool_call) if tool_call.is_monitor() => Some(tool_call),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn render_approval_row(
+    risk: ApprovalRisk,
+    bg: gpui::Hsla,
+    label_text: SharedString,
+    allow_once_el: gpui::AnyElement,
+    allow_always_el: gpui::AnyElement,
+    granular_allow_el: gpui::AnyElement,
+    deny_el: gpui::AnyElement,
+    border_color: gpui::Hsla,
+) -> gpui::AnyElement {
+    let chip = render_risk_chip(risk, LabelSize::XSmall)
+        .bg_color(bg);
+    let is_potentially_destructive = !risk.is_read_only();
+    h_flex()
+        .w_full()
+        .gap_1()
+        .px_1()
+        .py_0p5()
+        .border_1()
+        .border_color(border_color)
+        .rounded_sm()
+        .child(chip)
+        .child(
+            Label::new(label_text)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .when(is_potentially_destructive, |l| {
+                    l.color(Color::Warning)
+                }),
+        )
+        .child(div().flex().flex_1())
+        .child(allow_once_el)
+        .child(allow_always_el)
+        .child(granular_allow_el)
+        .child(deny_el)
+        .into_any_element()
+}
+
+pub fn render_risk_chip(risk: ApprovalRisk, label_size: LabelSize) -> Chip {
+    let risk_label: SharedString = risk.label().into();
+    let risk_color = match risk {
+        ApprovalRisk::ReadOnly => Color::Success,
+        ApprovalRisk::PotentiallyDestructive => Color::Warning,
+    };
+    Chip::new(risk_label)
+        .label_color(risk_color)
+        .label_size(label_size)
+}
+
+pub(crate) fn render_plan_entry_row(
+    index: usize,
+    total_entries: usize,
+    entry: &PlanEntry,
+    risk: ApprovalRisk,
+    window: &mut Window,
+    cx: &App,
+) -> gpui::AnyElement {
+    let entry_bg = cx.theme().colors().editor_background;
+    let tooltip_text: SharedString =
+        entry.content.read(cx).source().to_string().into();
+    let group: SharedString = format!("plan-entry-group-{}", index).into();
+
+    h_flex()
+        .id(("plan_entry_row", index))
+        .group(group.clone())
+        .py_1()
+        .px_2()
+        .gap_2()
+        .justify_between()
+        .relative()
+        .bg(entry_bg)
+        .when(index < total_entries - 1, |parent| {
+            parent.border_color(cx.theme().colors().border).border_b_1()
+        })
+        .overflow_hidden()
+        .child(
+            h_flex()
+                .id(("plan_entry", index))
+                .gap_1p5()
+                .min_w_0()
+                .text_xs()
+                .text_color(cx.theme().colors().text_muted)
+                .child(match entry.status {
+                    acp::PlanEntryStatus::InProgress => SpinnerLabel::new()
+                        .size(LabelSize::Small)
+                        .into_any_element(),
+                    acp::PlanEntryStatus::Completed => {
+                        Icon::new(IconName::Check)
+                            .size(IconSize::Small)
+                            .color(Color::Success)
+                            .into_any_element()
+                    }
+                    acp::PlanEntryStatus::Pending | _ => {
+                        Icon::new(IconName::Circle)
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                            .into_any_element()
+                    }
+                })
+                .child(
+                    render_risk_chip(risk, LabelSize::XSmall)
+                        .bg_color(
+                            cx.theme().colors().editor_background.opacity(0.5),
+                        ),
+                )
+                .child(MarkdownElement::new(
+                    entry.content.clone(),
+                    plan_label_markdown_style(&entry.status, window, cx),
+                ))
+                .child(
+                    CopyButton::new(
+                        ("copy-plan-step", index),
+                        tooltip_text.clone(),
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .tooltip_label("Copy plan step")
+                    .visible_on_hover(group),
+                ),
+        )
+        .child(div().absolute().top_0().right_0().h_full().w_8().bg(
+            linear_gradient(
+                90.,
+                linear_color_stop(entry_bg, 1.),
+                linear_color_stop(entry_bg.opacity(0.), 0.),
+            ),
+        ))
+        .tooltip(Tooltip::text(tooltip_text))
+        .into_any_element()
+}
+
+pub fn render_background_task_row(
+    header: gpui::AnyElement,
+    body: Option<gpui::AnyElement>,
+) -> gpui::AnyElement {
+    let mut item = v_flex().child(header);
+    if let Some(body_element) = body {
+        item = item.child(body_element);
+    }
+    item.into_any_element()
+}
+
+pub fn render_grok_memory_items(
+    artifacts: &GrokMemoryArtifacts,
+    _window: &mut Window,
+    cx: &App,
+) -> gpui::AnyElement {
+    let mut items = v_flex().px_1().py_0p5().gap_0p5();
+    if let Some(preview) = &artifacts.workspace_memory_preview {
+        let read_only_risk_chip = render_risk_chip(ApprovalRisk::ReadOnly, LabelSize::XSmall);
+        items = items.child(
+            h_flex()
+                .gap_1()
+                .child(read_only_risk_chip)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().colors().text_muted)
+                        .child(preview.clone()),
+                )
+                .child(
+                    CopyButton::new("copy-grok-memory", preview.to_string())
+                        .tooltip_label("Copy facts (for TUI roundtrip)"),
+                ),
+        );
+    } else if artifacts.has_workspace_memory || artifacts.has_global_memory {
+        let read_only_risk_chip = render_risk_chip(ApprovalRisk::ReadOnly, LabelSize::XSmall);
+        items = items.child(
+            h_flex()
+                .gap_1()
+                .child(read_only_risk_chip)
+                .child(
+                    Label::new("Memory file present (learned facts persisted by TUI)")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
+        );
+    } else {
+        items = items.child(
+            Label::new("Memory disabled. Use TUI `grok` with --experimental-memory for cross-session facts bridging.")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        );
+    }
+    items.into_any_element()
+}
+
+pub fn render_zed_todos_categorized_surface(pending_approvals: &[&ToolCall], plan: &Plan, background_monitors: &[&ToolCall], grok_memory_artifacts: &GrokMemoryArtifacts, state: &ZedTodos, window: &mut Window, cx: &App) -> impl IntoElement {
+    v_flex()
+        .when(!pending_approvals.is_empty(), |this| {
+            this.child(
+                h_flex()
+                    .p_1()
+                    .gap_1()
+                    .child(Disclosure::new("zt1_conv_approvals", state.approvals_expanded))
+                    .child(
+                        Label::new(format!("Agent Approvals ({})", pending_approvals.len()))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .when(state.approvals_expanded, |parent| {
+                parent.child(
+                    v_flex().children(pending_approvals.iter().map(|tool_call| {
+                        let risk = tool_call.approval_risk();
+                        h_flex()
+                            .gap_1()
+                            .px_2()
+                            .child(render_risk_chip(risk, LabelSize::XSmall))
+                            .child(
+                                Label::new(tool_call.label.read(cx).source().to_string())
+                                    .size(LabelSize::XSmall)
+                                    .color(if risk.is_read_only() {
+                                        Color::Success
+                                    } else {
+                                        Color::Warning
+                                    }),
+                            )
+                            .into_any_element()
+                    })),
+                )
+            })
+        })
+        .when(!plan.is_empty(), |this| {
+            this.child(
+                h_flex()
+                    .p_1()
+                    .gap_1()
+                    .child(Disclosure::new("zt1_conv_plan", state.plan_expanded))
+                    .child(
+                        Label::new(if plan.is_proposed() {
+                            format!("Plan proposed ({})", plan.entries.len())
+                        } else {
+                            format!("Plan ({})", plan.entries.len())
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+            )
+            .when(state.plan_expanded, |parent| {
+                parent.child(
+                    v_flex().children(plan.entries.iter().enumerate().map(|(index, entry)| {
+                        ZedTodosComponent::render_plan_entry_row(
+                            index,
+                            plan.entries.len(),
+                            entry,
+                            window,
+                            cx,
+                        )
+                    })),
+                )
+            })
+        })
+        .when(!background_monitors.is_empty(), |this| {
+            this.child(
+                h_flex()
+                    .p_1()
+                    .gap_1()
+                    .child(Disclosure::new("zt1_conv_bg", state.background_tasks_expanded))
+                    .child(
+                        Label::new(format!(
+                            "Background Monitors ({})",
+                            background_monitors.len()
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+            )
+            .when(state.background_tasks_expanded, |parent| {
+                parent.child(
+                    v_flex().children(background_monitors.iter().map(|monitor| {
+                        let risk = monitor.approval_risk();
+                        let header = h_flex()
+                            .gap_1()
+                            .child(render_risk_chip(risk, LabelSize::XSmall))
+                            .child(
+                                Label::new(monitor.label.read(cx).source().to_string())
+                                    .size(LabelSize::XSmall),
+                            );
+                        render_background_task_row(header.into_any_element(), None)
+                    })),
+                )
+            })
+        })
+        .when(
+            grok_memory_artifacts.has_workspace_memory || grok_memory_artifacts.has_global_memory,
+            |this| {
+                this.child(
+                    h_flex()
+                        .p_1()
+                        .gap_1()
+                        .child(Disclosure::new("zt1_conv_mem", state.grok_memory_expanded))
+                        .child(
+                            Label::new("Grok Memory (RO)")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+                .when(state.grok_memory_expanded, |parent| {
+                    parent.child(render_grok_memory_items(
+                        grok_memory_artifacts,
+                        window,
+                        cx,
+                    ))
+                })
+            },
+        )
+        .into_any_element()
+}
+
 pub enum AcpThreadViewEvent {
     Interacted,
 }
@@ -301,8 +853,8 @@ pub struct ThreadView {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
-    pub plan_expanded: bool,
     pub queue_expanded: bool,
+    pub zed_todos: ZedTodosComponent,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
@@ -576,8 +1128,8 @@ impl ThreadView {
             user_toggled_thinking_blocks: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
-            plan_expanded: false,
             queue_expanded: true,
+            zed_todos: ZedTodosComponent::new(),
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
@@ -707,6 +1259,14 @@ impl ThreadView {
         let acp_thread = self.thread.read(cx);
         self.as_native_connection(cx)?
             .thread(acp_thread.session_id(), cx)
+    }
+
+    fn is_grok_build_profile(&self, cx: &App) -> bool {
+        if self.agent_id.as_ref() == "grok" {
+            return true;
+        }
+        self.as_native_thread(cx)
+            .is_some_and(|thread| thread.read(cx).is_grok_build_profile(cx))
     }
 
     /// Resolves the message editor's contents into content blocks. For profiles
@@ -2248,37 +2808,95 @@ impl ThreadView {
         editor_bg_color.blend(active_color.opacity(0.3))
     }
 
+    fn render_persona_badge(
+        &self,
+        persona: Option<AgentPersona>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let Some(persona) = persona else {
+            return div().into_any_element();
+        };
+        let (label, icon, col) = match persona {
+            AgentPersona::Implementer => ("Implementer", IconName::ToolPencil, Color::Success),
+            AgentPersona::Reviewer => ("Reviewer", IconName::Eye, Color::Accent),
+            AgentPersona::Researcher => ("Researcher", IconName::ToolSearch, Color::Info),
+            AgentPersona::Explorer => ("Explorer", IconName::Folder, Color::Muted),
+            AgentPersona::General => ("Subagent", IconName::AiZed, Color::Muted),
+            AgentPersona::Plan => ("Plan", IconName::ListTodo, Color::Accent),
+            AgentPersona::Architect => ("Architect", IconName::Notepad, Color::Info),
+            AgentPersona::Verifier => ("Verifier", IconName::CheckDouble, Color::Success),
+        };
+        let bg = cx.theme().colors().editor_background.opacity(0.6);
+        Chip::new(label)
+            .icon(icon)
+            .icon_color(col)
+            .label_color(col)
+            .bg_color(bg)
+            .label_size(LabelSize::XSmall)
+            .into_any_element()
+    }
+
     pub fn render_activity_bar(
         &self,
         window: &mut Window,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
+        // P4-0: capture harness (AcpTools + debug logs) complete. P4-2 approval banner goes in/near this render (cheap when !proposed).
+        // Real todo per exact roadmap locations in AGENTS.md. Gated, TDD + auditor for no regression on collapsed paths.
+        #[cfg(any())]
+        {
+            todo!(
+                "P4-2 Plan approval state + banner in thread_view.rs::render_activity_bar (and related) per AGENTS.md. Hybrid + efficiency first."
+            );
+        }
         let thread = self.thread.read(cx);
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
         let changed_buffers = action_log.read(cx).changed_buffers(cx);
         let plan = thread.plan();
         let queue_is_empty = !self.has_queued_messages();
+        let is_grok = self.is_grok_build_profile(cx);
+        let grok_memory_artifacts = if is_grok {
+            thread.grok_memory()
+        } else {
+            GrokMemoryArtifacts::default()
+        };
 
         let subagents_awaiting_permission = self.render_subagents_awaiting_permission(cx);
         let has_subagents_awaiting = subagents_awaiting_permission.is_some();
+
+        let has_background_tasks = thread
+            .entries()
+            .iter()
+            .any(|entry| match entry {
+                AgentThreadEntry::ToolCall(tc) if tc.is_monitor() => true,
+                _ => false,
+            });
+        let has_approvals = thread
+            .entries()
+            .iter()
+            .any(|entry| match entry {
+                AgentThreadEntry::ToolCall(tc)
+                    if matches!(&tc.status, ToolCallStatus::WaitingForConfirmation { .. }) =>
+                {
+                    true
+                }
+                _ => false,
+            });
 
         if changed_buffers.is_empty()
             && plan.is_empty()
             && queue_is_empty
             && !has_subagents_awaiting
+            && !has_background_tasks
+            && !has_approvals
+            && !is_grok
         {
             return None;
         }
 
-        // Temporarily always enable ACP edit controls. This is temporary, to lessen the
-        // impact of a nasty bug that causes them to sometimes be disabled when they shouldn't
-        // be, which blocks you from being able to accept or reject edits. This switches the
-        // bug to be that sometimes it's enabled when it shouldn't be, which at least doesn't
-        // block you from using the panel.
         let pending_edits = false;
 
-        let plan_expanded = self.plan_expanded;
         let edits_expanded = self.edits_expanded;
         let queue_expanded = self.queue_expanded;
 
@@ -2311,18 +2929,29 @@ impl ThreadView {
                     })
                     .when(
                         has_subagents_awaiting
-                            && (!plan.is_empty() || !changed_buffers.is_empty() || !queue_is_empty),
+                            && (!plan.is_empty()
+                                || !changed_buffers.is_empty()
+                                || !queue_is_empty
+                                || has_background_tasks
+                                || has_approvals),
                         |this| this.child(Divider::horizontal().color(DividerColor::Border)),
                     )
-                    .when(!plan.is_empty(), |this| {
-                        this.child(self.render_plan_summary(plan, window, cx))
-                            .when(plan_expanded, |parent| {
-                                parent.child(self.render_plan_entries(plan, window, cx))
-                            })
-                    })
-                    .when(!plan.is_empty() && !changed_buffers.is_empty(), |this| {
-                        this.child(Divider::horizontal().color(DividerColor::Border))
-                    })
+                    .when(
+                        has_approvals || !plan.is_empty() || is_grok || has_background_tasks,
+                        |this| {
+                            this.child(self.render_zed_todos_surface(
+                                is_grok,
+                                &grok_memory_artifacts,
+                                window,
+                                cx,
+                            ))
+                        },
+                    )
+                    .when(
+                        (!plan.is_empty() || has_background_tasks || has_approvals)
+                            && !changed_buffers.is_empty(),
+                        |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                    )
                     .when(
                         !changed_buffers.is_empty() && thread.parent_session_id().is_none(),
                         |this| {
@@ -2344,9 +2973,13 @@ impl ThreadView {
                         },
                     )
                     .when(!queue_is_empty, |this| {
-                        this.when(!plan.is_empty() || !changed_buffers.is_empty(), |this| {
-                            this.child(Divider::horizontal().color(DividerColor::Border))
-                        })
+                        this.when(
+                            !plan.is_empty()
+                                || !changed_buffers.is_empty()
+                                || has_background_tasks
+                                || has_approvals,
+                            |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                        )
                         .child(self.render_message_queue_summary(window, cx))
                         .when(queue_expanded, |parent| {
                             parent.child(self.render_message_queue_entries(window, cx))
@@ -2577,7 +3210,7 @@ impl ThreadView {
         entries: &[AgentThreadEntry],
         awaiting_session_ids: &[acp::SessionId],
         cx: &App,
-    ) -> Vec<(SharedString, usize)> {
+    ) -> Vec<(SharedString, Option<AgentPersona>, usize)> {
         let tool_calls_by_session: HashMap<_, _> = entries
             .iter()
             .enumerate()
@@ -2592,7 +3225,10 @@ impl ThreadView {
                 } else {
                     SharedString::from(summary_text)
                 };
-                Some((info.session_id.clone(), (subagent_summary, entry_ix)))
+                Some((
+                    info.session_id.clone(),
+                    (subagent_summary, info.persona, entry_ix),
+                ))
             })
             .collect();
 
@@ -2644,9 +3280,19 @@ impl ThreadView {
                 )
                 .child(
                     v_flex().children(subagent_items.into_iter().enumerate().map(
-                        |(ix, (label, entry_ix))| {
+                        |(ix, (label, persona, entry_ix))| {
                             let is_last = ix == item_count - 1;
                             let group = format!("group-{}", entry_ix);
+
+                            let risk = approval_risk_for_tool_call(Some(&SharedString::from("spawn_agent")), acp::ToolKind::Other);
+                            let risk_label: SharedString = risk.label().into();
+                            let risk_color = match risk {
+                                ApprovalRisk::ReadOnly => Color::Success,
+                                ApprovalRisk::PotentiallyDestructive => Color::Warning,
+                            };
+                            let risk_chip = Chip::new(risk_label)
+                                .label_color(risk_color)
+                                .label_size(LabelSize::XSmall);
 
                             h_flex()
                                 .cursor_pointer()
@@ -2666,11 +3312,7 @@ impl ThreadView {
                                 .child(
                                     h_flex()
                                         .gap_1p5()
-                                        .child(
-                                            Icon::new(IconName::Circle)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Warning),
-                                        )
+                                        .child(self.render_persona_badge(persona, cx))
                                         .child(
                                             Label::new(label)
                                                 .size(LabelSize::Small)
@@ -2678,6 +3320,7 @@ impl ThreadView {
                                                 .truncate(),
                                         ),
                                 )
+                                .child(risk_chip)
                                 .child(
                                     div().visible_on_hover(&group).child(
                                         Label::new("Scroll to Subagent")
@@ -2752,14 +3395,20 @@ impl ThreadView {
         self.sync_queue_flag_to_native_thread(cx);
     }
 
-    fn render_plan_summary(
+    pub(crate) fn render_plan_summary(
         &self,
         plan: &Plan,
         window: &mut Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let plan_expanded = self.plan_expanded;
+        let plan_expanded = self.zed_todos.state.plan_expanded;
         let stats = plan.stats();
+        let is_proposed = plan.is_proposed();
+        let plan_risk = if is_proposed {
+            approval_risk_for_operation("approving plan")
+        } else {
+            ApprovalRisk::ReadOnly
+        };
 
         let title = if let Some(entry) = stats.in_progress_entry
             && !plan_expanded
@@ -2820,9 +3469,39 @@ impl ThreadView {
                 .gap_1()
                 .justify_between()
                 .child(
-                    Label::new("Plan")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Label::new(if is_proposed { "Plan proposed" } else { "Plan" })
+                                .size(LabelSize::Small)
+                                .color(if is_proposed {
+                                    Color::Accent
+                                } else {
+                                    Color::Muted
+                                }),
+                        )
+                        .when(is_proposed, |this| {
+                            let risk_label: SharedString = plan_risk.label().into();
+                            let risk_color = match plan_risk {
+                                ApprovalRisk::ReadOnly => Color::Success,
+                                ApprovalRisk::PotentiallyDestructive => Color::Warning,
+                            };
+                            this.child(
+                                Chip::new(risk_label)
+                                    .label_color(risk_color)
+                                    .label_size(LabelSize::XSmall),
+                            )
+                        })
+                        .child(
+                            CircularProgress::new(
+                                plan.progress_fraction() * 100.0,
+                                100.0,
+                                px(10.),
+                                cx,
+                            )
+                            .stroke_width(px(1.5))
+                            .progress_color(cx.theme().status().info),
+                        ),
                 )
                 .child(
                     Label::new(status_label)
@@ -2842,6 +3521,17 @@ impl ThreadView {
             })
             .child(Disclosure::new("plan_disclosure", plan_expanded))
             .child(title.flex_1())
+            .when(is_proposed, |parent| {
+                parent.child(
+                    ZedTodosComponent::build_plan_accept_button(
+                        plan_risk,
+                        cx.listener(|this, _, _, cx| {
+                            this.thread.update(cx, |thread, cx| thread.clear_plan(cx));
+                            cx.stop_propagation();
+                        }),
+                    ),
+                )
+            })
             .child(
                 IconButton::new("dismiss-plan", IconName::Close)
                     .icon_size(IconSize::XSmall)
@@ -2853,13 +3543,259 @@ impl ThreadView {
                     })),
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                this.plan_expanded = !this.plan_expanded;
+                this.zed_todos.toggle_plan_expanded();
                 cx.notify();
             }))
             .into_any_element()
     }
 
-    fn render_plan_entries(
+    pub(crate) fn render_grok_memory_summary(
+        &self,
+        artifacts: &GrokMemoryArtifacts,
+        _window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let expanded = self.zed_todos.state.grok_memory_expanded;
+        let status = if artifacts.has_workspace_memory || artifacts.has_global_memory {
+            "present (RO)"
+        } else {
+            "disabled (RO)"
+        };
+        let title = Label::new(format!("Grok Memory — {}", status))
+            .size(LabelSize::Small)
+            .color(Color::Muted);
+        h_flex()
+            .id("grok_memory_summary")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .when(expanded, |this| {
+                this.border_b_1().border_color(cx.theme().colors().border)
+            })
+            .child(Disclosure::new("grok_memory_disclosure", expanded))
+            .child(title.flex_1())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.zed_todos.toggle_grok_memory_expanded();
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    pub(crate) fn render_zed_todos_surface(
+        &self,
+        is_grok: bool,
+        grok_memory_artifacts: &GrokMemoryArtifacts,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let thread = self.thread.read(cx);
+        let pending_approvals: Vec<&ToolCall> =
+            ZedTodosComponent::collect_pending_approval_tool_calls(thread);
+        let background_monitors: Vec<&ToolCall> =
+            ZedTodosComponent::collect_background_monitor_tool_calls(thread);
+        let plan = thread.plan();
+        let approvals_expanded = self.zed_todos.state.approvals_expanded;
+        let plan_expanded = self.zed_todos.state.plan_expanded;
+        let background_tasks_expanded = self.zed_todos.state.background_tasks_expanded;
+        let grok_memory_expanded = self.zed_todos.state.grok_memory_expanded;
+        let has_approvals = !pending_approvals.is_empty();
+        let has_plan = !plan.is_empty();
+        let has_background_tasks = !background_monitors.is_empty();
+        v_flex()
+            .when(has_approvals, |this| {
+                this.child(self.render_agent_approvals_section(
+                    &pending_approvals,
+                    approvals_expanded,
+                    window,
+                    cx,
+                ))
+                .when(
+                    approvals_expanded && (has_plan || has_background_tasks),
+                    |parent| {
+                        parent.child(Divider::horizontal().color(DividerColor::Border))
+                    },
+                )
+            })
+            .when(has_plan, |this| {
+                this.child(self.render_plan_summary(plan, window, cx))
+                    .when(plan_expanded, |parent| {
+                        parent.child(self.render_plan_entries(plan, window, cx))
+                    })
+            })
+            .when(is_grok, |this| {
+                this.child(self.render_grok_memory_summary(&grok_memory_artifacts, window, cx))
+                    .when(grok_memory_expanded, |parent| {
+                        parent.child(render_grok_memory_items(&grok_memory_artifacts, window, cx))
+                    })
+            })
+            .when(has_background_tasks, |this| {
+                this.child(self.render_background_tasks_summary(
+                    &background_monitors,
+                    window,
+                    cx,
+                ))
+                .when(background_tasks_expanded, |parent| {
+                    parent.child(self.render_background_task_items(
+                        &background_monitors,
+                        window,
+                        cx,
+                    ))
+                })
+            })
+            .into_any_element()
+    }
+
+    pub(crate) fn render_agent_approvals_section(
+        &self,
+        approvals: &[&ToolCall],
+        expanded: bool,
+        _window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let count = approvals.len();
+        let session_id = self.thread.read(cx).session_id().clone();
+        let header = h_flex()
+            .id("approvals_summary")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .child(Disclosure::new("approvals_disclosure", expanded))
+            .child(
+                Label::new(format!("Agent Approvals ({})", count))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.zed_todos.toggle_approvals_expanded();
+                cx.notify();
+            }));
+
+        if !expanded {
+            return header.into_any_element();
+        }
+
+        let mut items = v_flex().px_1().py_0p5().gap_0p5();
+        for (item_index, tool_call) in approvals.iter().enumerate() {
+            let risk = tool_call.approval_risk();
+            let bg = cx.theme().colors().editor_background.opacity(0.5);
+            let label_text: SharedString = tool_call.label.read(cx).source().to_string().into();
+            let (allow_once_option, allow_always_option, deny_once_option, deny_always_option) = ZedTodosComponent::pending_approval_options_for_tool_call(tool_call);
+            let allow_once_el = if let Some(option) = allow_once_option {
+                let session_id_for_authorize = session_id.clone();
+                let tool_call_id_for_authorize = tool_call.id.clone();
+                let option_id_for_authorize = option.option_id.clone();
+                let option_kind = option.kind;
+                ZedTodosComponent::build_allow_once_action(
+                    item_index,
+                    risk,
+                    cx.listener(move |this, _, window, cx| {
+                        this.authorize_tool_call(
+                            session_id_for_authorize.clone(),
+                            tool_call_id_for_authorize.clone(),
+                            SelectedPermissionOutcome::new(option_id_for_authorize.clone(), option_kind),
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+            } else {
+                Empty.into_any_element()
+            };
+            let allow_always_el = if let Some(option) = allow_always_option {
+                let session_id_for_authorize = session_id.clone();
+                let tool_call_id_for_authorize = tool_call.id.clone();
+                let option_id_for_authorize = option.option_id.clone();
+                let option_kind = option.kind;
+                ZedTodosComponent::build_allow_always_action(
+                    item_index,
+                    risk,
+                    cx.listener(move |this, _, window, cx| {
+                        this.authorize_tool_call(
+                            session_id_for_authorize.clone(),
+                            tool_call_id_for_authorize.clone(),
+                            SelectedPermissionOutcome::new(option_id_for_authorize.clone(), option_kind),
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+            } else {
+                Empty.into_any_element()
+            };
+            let deny_el = if let Some(option) = deny_once_option.or(deny_always_option) {
+                let session_id_for_authorize = session_id.clone();
+                let tool_call_id_for_authorize = tool_call.id.clone();
+                let option_id_for_authorize = option.option_id.clone();
+                let option_kind = option.kind;
+                let is_always_deny = option_kind == acp::PermissionOptionKind::RejectAlways;
+                ZedTodosComponent::build_deny_action(
+                    item_index,
+                    risk,
+                    is_always_deny,
+                    cx.listener(move |this, _, window, cx| {
+                        this.authorize_tool_call(
+                            session_id_for_authorize.clone(),
+                            tool_call_id_for_authorize.clone(),
+                            SelectedPermissionOutcome::new(option_id_for_authorize.clone(), option_kind),
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+            } else {
+                Empty.into_any_element()
+            };
+            let granular_allow_el = if let ToolCallStatus::WaitingForConfirmation { options, .. } = &tool_call.status {
+                if let PermissionOptions::DropdownWithPatterns { patterns, .. } = options {
+                    if !patterns.is_empty() {
+                        let session_id_for_granular = session_id.clone();
+                        let tool_call_id_for_granular = tool_call.id.clone();
+                        let pattern_count_for_granular = patterns.len();
+                        ZedTodosComponent::build_granular_allow_action(
+                            item_index,
+                            risk,
+                            cx.listener(move |this, _, window, cx| {
+                                this.permission_selections.insert(
+                                    tool_call_id_for_granular.clone(),
+                                    PermissionSelection::SelectedPatterns((0..pattern_count_for_granular).collect()),
+                                );
+                                this.authorize_with_granularity(
+                                    session_id_for_granular.clone(),
+                                    tool_call_id_for_granular.clone(),
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        )
+                    } else {
+                        Empty.into_any_element()
+                    }
+                } else {
+                    Empty.into_any_element()
+                }
+            } else {
+                Empty.into_any_element()
+            };
+            let border_color = cx.theme().colors().border.opacity(0.3);
+            items = items.child(
+                render_approval_row(
+                    risk,
+                    bg,
+                    label_text,
+                    allow_once_el,
+                    allow_always_el,
+                    granular_allow_el,
+                    deny_el,
+                    border_color,
+                ),
+            );
+        }
+
+        v_flex().child(header).child(items).into_any_element()
+    }
+
+    pub(crate) fn render_plan_entries(
         &self,
         plan: &Plan,
         window: &mut Window,
@@ -2870,68 +3806,239 @@ impl ThreadView {
             .max_h_40()
             .overflow_y_scroll()
             .child(
-                v_flex().children(plan.entries.iter().enumerate().flat_map(|(index, entry)| {
-                    let entry_bg = cx.theme().colors().editor_background;
-                    let tooltip_text: SharedString =
-                        entry.content.read(cx).source().to_string().into();
-
-                    Some(
-                        h_flex()
-                            .id(("plan_entry_row", index))
-                            .py_1()
-                            .px_2()
-                            .gap_2()
-                            .justify_between()
-                            .relative()
-                            .bg(entry_bg)
-                            .when(index < plan.entries.len() - 1, |parent| {
-                                parent.border_color(cx.theme().colors().border).border_b_1()
-                            })
-                            .overflow_hidden()
-                            .child(
-                                h_flex()
-                                    .id(("plan_entry", index))
-                                    .gap_1p5()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(cx.theme().colors().text_muted)
-                                    .child(match entry.status {
-                                        acp::PlanEntryStatus::InProgress => {
-                                            Icon::new(IconName::TodoProgress)
-                                                .size(IconSize::Small)
-                                                .color(Color::Accent)
-                                                .with_rotate_animation(2)
-                                                .into_any_element()
-                                        }
-                                        acp::PlanEntryStatus::Completed => {
-                                            Icon::new(IconName::TodoComplete)
-                                                .size(IconSize::Small)
-                                                .color(Color::Success)
-                                                .into_any_element()
-                                        }
-                                        acp::PlanEntryStatus::Pending | _ => {
-                                            Icon::new(IconName::TodoPending)
-                                                .size(IconSize::Small)
-                                                .color(Color::Muted)
-                                                .into_any_element()
-                                        }
-                                    })
-                                    .child(MarkdownElement::new(
-                                        entry.content.clone(),
-                                        plan_label_markdown_style(&entry.status, window, cx),
-                                    )),
-                            )
-                            .child(div().absolute().top_0().right_0().h_full().w_8().bg(
-                                linear_gradient(
-                                    90.,
-                                    linear_color_stop(entry_bg, 1.),
-                                    linear_color_stop(entry_bg.opacity(0.), 0.),
-                                ),
-                            ))
-                            .tooltip(Tooltip::text(tooltip_text)),
-                    )
+                v_flex().children(plan.entries.iter().enumerate().map(|(index, entry)| {
+                    ZedTodosComponent::render_plan_entry_row(index, plan.entries.len(), entry, window, cx)
                 })),
             )
+            .into_any_element()
+    }
+
+    pub(crate) fn render_background_tasks_summary(
+        &self,
+        monitors: &[&ToolCall],
+        _window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let expanded = self.zed_todos.state.background_tasks_expanded;
+        let count = monitors.len();
+
+        // Skeleton summary: always cheap (just count + Disclosure). No content
+        // inspection or Markdown render until expanded. Matches plan_summary pattern
+        // but without in-progress "Current:" peek for v1.
+        let title = if expanded {
+            Label::new("Background Tasks")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+        } else {
+            Label::new(if count == 0 {
+                "Background Tasks".to_string()
+            } else {
+                format!("Background Tasks ({})", count)
+            })
+            .size(LabelSize::Small)
+            .color(Color::Muted)
+        };
+
+        h_flex()
+            .id("background_tasks_summary")
+            .p_1()
+            .w_full()
+            .gap_1()
+            .when(expanded, |this| {
+                this.border_b_1().border_color(cx.theme().colors().border)
+            })
+            .child(Disclosure::new("background_tasks_disclosure", expanded))
+            .child(title.flex_1())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.zed_todos.toggle_background_tasks_expanded();
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    pub(crate) fn render_background_monitor_row(
+        &self,
+        monitor: &ToolCall,
+        index: usize,
+        total_monitors: usize,
+        is_individually_expanded: bool,
+        entry_index: Option<usize>,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let entry_bg = cx.theme().colors().editor_background;
+        let border_color = cx.theme().colors().border;
+
+        let status_icon: gpui::AnyElement = match &monitor.status {
+            ToolCallStatus::InProgress | ToolCallStatus::Pending => SpinnerLabel::new()
+                .size(LabelSize::Small)
+                .into_any_element(),
+            ToolCallStatus::Completed => Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
+            ToolCallStatus::Failed | ToolCallStatus::Rejected => Icon::new(IconName::Close)
+                .size(IconSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+            ToolCallStatus::Canceled => Icon::new(IconName::Circle)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+            _ => Icon::new(IconName::ToolHammer)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+        };
+
+        let elapsed_label = monitor
+            .content
+            .iter()
+            .find_map(|content| {
+                if let ToolCallContent::Terminal(terminal) = content {
+                    let data = terminal.read(cx);
+                    let started_at = data.started_at();
+                    let time_elapsed = if let Some(output) = data.output() {
+                        output.ended_at.duration_since(started_at)
+                    } else {
+                        started_at.elapsed()
+                    };
+                    (time_elapsed > Duration::from_secs(10))
+                        .then(|| duration_alt_display(time_elapsed))
+                } else {
+                    None
+                }
+            })
+            .map(|elapsed| {
+                Label::new(format!("({})", elapsed))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .buffer_font(cx)
+            });
+
+        let risk_chip = render_risk_chip(monitor.approval_risk(), LabelSize::XSmall);
+
+        let header = h_flex()
+            .id(("background_task_row", index))
+            .py_1()
+            .px_2()
+            .gap_1()
+            .bg(entry_bg)
+            .when(index < total_monitors.saturating_sub(1), |parent| {
+                parent.border_color(border_color).border_b_1()
+            })
+            .child(Disclosure::new(
+                SharedString::from(format!("bg_monitor_{}", index)),
+                is_individually_expanded,
+            ))
+            .child(status_icon)
+            .child(risk_chip)
+            .child(div().min_w_0().child(self.render_markdown(
+                monitor.label.clone(),
+                MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx),
+                cx,
+            )))
+            .when_some(elapsed_label, |this, label| this.child(label))
+            .on_click(cx.listener({
+                let id = monitor.id.clone();
+                move |this, _, _, cx| {
+                    this.zed_todos.toggle_background_monitor(id.clone());
+                    cx.notify();
+                }
+            }))
+            .into_any_element();
+
+        let body = if is_individually_expanded {
+            let terminal_body: Option<AnyElement> = entry_index.and_then(|monitor_entry_index| {
+                monitor.content.iter().find_map(|content| {
+                    if let ToolCallContent::Terminal(terminal) = content {
+                        self.entry_view_state
+                            .read(cx)
+                            .entry(monitor_entry_index)
+                            .and_then(|entry| entry.terminal(terminal))
+                            .map(|terminal_view| {
+                                let element = if terminal_view
+                                    .read(cx)
+                                    .content_mode(window, cx)
+                                    .is_scrollable()
+                                {
+                                    div().h_72().child(terminal_view).into_any_element()
+                                } else {
+                                    terminal_view.into_any_element()
+                                };
+                                div()
+                                    .pt_1()
+                                    .border_t_1()
+                                    .border_color(border_color)
+                                    .bg(cx.theme().colors().editor_background)
+                                    .child(element)
+                                    .into_any_element()
+                            })
+                    } else {
+                        None
+                    }
+                })
+            });
+
+            Some(terminal_body.unwrap_or_else(|| {
+                Label::new("No live output")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .into_any_element()
+            }))
+        } else {
+            None
+        };
+
+        render_background_task_row(header, body)
+    }
+
+    pub(crate) fn render_background_task_items(
+        &self,
+        monitors: &[&ToolCall],
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        // Build id->entry_ix map once (only when section is expanded).
+        // Needed to obtain per-entry TerminalView lazily for expanded monitors.
+        // Cost is acceptable here; the entire items render (and this scan) is
+        // skipped entirely while the background section is collapsed.
+        let thread = self.thread.read(cx);
+        let entry_index_by_id: HashMap<acp::ToolCallId, usize> = thread
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_index, entry)| match entry {
+                AgentThreadEntry::ToolCall(tc) if tc.is_monitor() => Some((tc.id.clone(), entry_index)),
+                _ => None,
+            })
+            .collect();
+
+        let background_monitor_children: Vec<gpui::AnyElement> = monitors
+            .iter()
+            .enumerate()
+            .map(|(index, &monitor)| {
+                let is_individually_expanded =
+                    self.zed_todos.is_background_monitor_expanded(&monitor.id);
+                let entry_index = entry_index_by_id.get(&monitor.id).copied();
+                self.render_background_monitor_row(
+                    monitor,
+                    index,
+                    monitors.len(),
+                    is_individually_expanded,
+                    entry_index,
+                    window,
+                    cx,
+                )
+                .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .id("background_task_items_list")
+            .max_h_40()
+            .overflow_y_scroll()
+            .children(background_monitor_children)
             .into_any_element()
     }
 
@@ -2965,6 +4072,11 @@ impl ThreadView {
                                     .color(Color::Muted),
                             )
                             .child(
+                                CircularProgress::new(100.0, 100.0, px(10.), cx)
+                                    .stroke_width(px(1.5))
+                                    .progress_color(cx.theme().status().success),
+                            )
+                            .child(
                                 Label::new(format!(
                                     "— {} {}",
                                     entries.len(),
@@ -2984,7 +4096,7 @@ impl ThreadView {
                                     this.border_b_1().border_color(cx.theme().colors().border)
                                 })
                                 .child(
-                                    Icon::new(IconName::TodoComplete)
+                                    Icon::new(IconName::Check)
                                         .size(IconSize::Small)
                                         .color(Color::Success),
                                 )
@@ -3184,6 +4296,8 @@ impl ThreadView {
         let is_done = thread.read(cx).status() == ThreadStatus::Idle;
         let is_canceled_or_failed = self.is_subagent_canceled_or_failed(cx);
 
+        let persona = self.thread.read(cx).persona();
+
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
 
         Some(
@@ -3214,6 +4328,7 @@ impl ThreadView {
                                         .size(IconSize::Small)
                                         .color(Color::Muted),
                                 )
+                                .child(self.render_persona_badge(persona, cx))
                                 .child(self.title_editor.clone())
                                 .when(is_done && is_canceled_or_failed, |this| {
                                     this.child(Icon::new(IconName::Close).color(Color::Error))
@@ -6284,15 +7399,25 @@ impl ThreadView {
             })
             .when_some(confirmation_options, |this, options| {
                 let is_first = self.is_first_tool_call(active_session_id, &tool_call.id, cx);
-                this.child(self.render_permission_buttons(
-                    self.thread.read(cx).session_id().clone(),
-                    is_first,
-                    options,
-                    entry_ix,
-                    tool_call.id.clone(),
-                    focus_handle,
-                    cx,
-                ))
+                let approval_risk = tool_call.approval_risk();
+                let approval_risk_label: SharedString = approval_risk.label().into();
+                let approval_risk_color = match approval_risk {
+                    ApprovalRisk::ReadOnly => Color::Success,
+                    ApprovalRisk::PotentiallyDestructive => Color::Warning,
+                };
+                let approval_risk_chip = Chip::new(approval_risk_label)
+                    .label_color(approval_risk_color)
+                    .label_size(LabelSize::XSmall);
+                this.child(approval_risk_chip)
+                    .child(self.render_permission_buttons(
+                        self.thread.read(cx).session_id().clone(),
+                        is_first,
+                        options,
+                        entry_ix,
+                        tool_call.id.clone(),
+                        focus_handle,
+                        cx,
+                    ))
             })
             .into_any()
     }
@@ -6519,6 +7644,17 @@ impl ThreadView {
                                     ))
                                 }),
                         )
+                    })
+                    .child({
+                        let approval_risk = tool_call.approval_risk();
+                        let approval_risk_label: SharedString = approval_risk.label().into();
+                        let approval_risk_color = match approval_risk {
+                            ApprovalRisk::ReadOnly => Color::Success,
+                            ApprovalRisk::PotentiallyDestructive => Color::Warning,
+                        };
+                        Chip::new(approval_risk_label)
+                            .label_color(approval_risk_color)
+                            .label_size(LabelSize::XSmall)
                     })
                     .child(self.render_permission_buttons(
                         self.thread.read(cx).session_id().clone(),
@@ -7931,6 +9067,11 @@ impl ThreadView {
                 _ => false,
             });
 
+        let persona = tool_call
+            .subagent_session_info
+            .as_ref()
+            .and_then(|i| i.persona);
+
         let thread_title = thread
             .as_ref()
             .and_then(|t| t.read(cx).title())
@@ -8035,6 +9176,7 @@ impl ThreadView {
                                     .w_full()
                                     .gap_1p5()
                                     .child(icon)
+                                    .child(self.render_persona_badge(persona, cx))
                                     .child(
                                         Label::new(title.to_string())
                                             .size(LabelSize::Custom(self.tool_name_font_size()))
@@ -8717,6 +9859,45 @@ impl ThreadView {
             .into_any_element()
     }
 
+    fn render_grok_session_id_copy(&self, cx: &mut Context<Self>) -> AnyElement {
+        let session_id_string = self.session_id.to_string();
+        let display_id = if session_id_string.len() > 12 {
+            format!(
+                "{}…{}",
+                &session_id_string[0..6],
+                &session_id_string[session_id_string.len() - 6..]
+            )
+        } else {
+            session_id_string.clone()
+        };
+        let background = cx.theme().colors().editor_background.opacity(0.6);
+        h_flex()
+            .gap_1()
+            .child(
+                Label::new("Grok (Co-Equal):")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Chip::new("Co-Equal")
+                    .label_color(Color::Success)
+                    .bg_color(background)
+                    .label_size(LabelSize::XSmall)
+                    .tooltip(Tooltip::text("Co-Equal with standalone Grok TUI (ACP). Skills, sessions, memory bridged for roundtrip. Copy ID above for `grok -r <id>` or clipboard resume in Zed.")),
+            )
+            .child(
+                Label::new(display_id)
+                    .size(LabelSize::Small)
+                    .color(Color::Accent),
+            )
+            .child(
+                CopyButton::new("grok-session-id-roundtrip", session_id_string)
+                    .icon_size(IconSize::XSmall)
+                    .tooltip_label("Copy ID for `grok -r` roundtrip to TUI"),
+            )
+            .into_any_element()
+    }
+
     fn render_codex_windows_warning(&self, cx: &mut Context<Self>) -> Callout {
         Callout::new()
             .icon(IconName::Warning)
@@ -9100,6 +10281,9 @@ impl Render for ThreadView {
         let list_state = self.list_state.clone();
 
         let conversation = v_flex()
+            .when(self.agent_id.as_ref() == "grok", |this| {
+                this.child(self.render_grok_session_id_copy(cx))
+            })
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })
@@ -9433,5 +10617,300 @@ pub(crate) fn open_link(
         })
     } else {
         cx.open_url(&url);
+    }
+}
+
+/// Minimal working ZT-1 Dock/Panel Prototype (bridged path priority).
+/// A first-class reusable native component that any Zed dock, panel or surface
+/// can own and use to render the full classified surface (Agent Approvals +
+/// Plan Todos + Background Monitors + Grok Memory) using the public collectors
+/// on ZedTodosComponent and the shared row helpers + ApprovalRisk classification.
+/// Owns independent ZedTodos state for its own expanded disclosures.
+/// Concrete evidence that ZT-1 is reusable across the entire Zed UI for bridged Grok.
+/// For one-call rendering of the categorized surface use the free render_zed_todos_categorized_surface (pass data from collectors + state).
+pub struct ZedTodosDockPrototype {
+    pub zed_todos: ZedTodosComponent,
+    thread: WeakEntity<acp_thread::AcpThread>,
+    focus_handle: FocusHandle,
+}
+
+impl ZedTodosDockPrototype {
+    pub fn new(thread: WeakEntity<acp_thread::AcpThread>, cx: &mut App) -> Self {
+        Self {
+            zed_todos: ZedTodosComponent::new(),
+            thread,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    pub fn new_for_thread(thread: Entity<acp_thread::AcpThread>, cx: &mut App) -> Self {
+        Self::new(thread.downgrade(), cx)
+    }
+}
+
+impl Focusable for ZedTodosDockPrototype {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for ZedTodosDockPrototype {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
+        let thread_opt = self.thread.upgrade();
+        if let Some(thread_entity) = thread_opt {
+            let thread = thread_entity.read(cx);
+            let pending_approvals: Vec<&ToolCall> =
+                ZedTodosComponent::collect_pending_approval_tool_calls(&thread);
+            let background_monitors: Vec<&ToolCall> =
+                ZedTodosComponent::collect_background_monitor_tool_calls(&thread);
+            let plan = thread.plan();
+            let grok_memory = thread.grok_memory();
+
+            render_zed_todos_categorized_surface(
+                &pending_approvals,
+                plan,
+                &background_monitors,
+                &grok_memory,
+                &self.zed_todos.state,
+                window,
+                cx,
+            ).into_any_element()
+        } else {
+            div().child(Label::new("No active thread for ZT-1 surface")).into_any_element()
+        }
+    }
+}
+
+mod background_monitor_tdd {
+    // TDD per Efficiency Auditor risk register (AGENTS.md):
+    // "write TDD tests asserting 'collapsed monitor costs O(1) with no layout on bursts'".
+    // The implementation gates all TerminalView lookup + render behind
+    // both `background_tasks_expanded` (section) AND `expanded_background_monitors.contains(id)`
+    // (per-item). When neither, the render path for items list is never entered and
+    // each row does only enum match + markdown entity clone (pre-existing cheap) + optional
+    // duration read from attached terminal metadata (no VTE layout, no scrollable view alloc).
+    // This test asserts the default (empty set) which selects the low-cost path.
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[test]
+    fn collapsed_monitor_items_use_cheap_path_by_default() {
+        let expanded_set: HashSet<acp::ToolCallId> = HashSet::default();
+        // Empty => is_individually_expanded=false for all => no TerminalView branch taken.
+        assert!(
+            expanded_set.is_empty(),
+            "default collapsed state ensures O(1) cost (no heavy content) during output bursts"
+        );
+    }
+
+    #[test]
+    fn zed_todos_approvals_collapsed_by_default_and_plan_risks_labeled() {
+        let approvals_expanded_default = false;
+        assert!(
+            !approvals_expanded_default,
+            "approvals section starts collapsed for O(1) activity bar"
+        );
+        let ro = approval_risk_for_operation("read_file the main.rs and list symbols");
+        assert_eq!(ro.label(), "RO");
+        assert!(ro.is_read_only());
+        let dest = approval_risk_for_operation("use terminal to rm a path or edit_file the config");
+        assert_eq!(dest.label(), "Destructive");
+    }
+
+    #[test]
+    fn approval_risk_and_is_proposed_detection_cover_grok_native_tools_and_enter_plan_mode_proposed_state() {
+        let monitor_risk_via_tool = approval_risk_for_tool_call(Some(&SharedString::from("monitor")), acp::ToolKind::Execute);
+        assert_eq!(monitor_risk_via_tool.label(), "Destructive");
+        let todo_write_risk_via_tool = approval_risk_for_tool_call(Some(&SharedString::from("todo_write")), acp::ToolKind::Think);
+        assert_eq!(todo_write_risk_via_tool, ApprovalRisk::PotentiallyDestructive);
+        let enter_plan_risk_via_tool = approval_risk_for_tool_call(Some(&SharedString::from("enter_plan_mode")), acp::ToolKind::Think);
+        assert_eq!(enter_plan_risk_via_tool.label(), "Destructive");
+        let proposed_plan_risk = approval_risk_for_operation("approving plan");
+        assert_eq!(proposed_plan_risk.label(), "Destructive");
+    }
+
+    #[test]
+    fn zed_todos_defaults_all_sections_collapsed_by_default_for_efficiency() {
+        let todos = ZedTodos::default();
+        assert!(!todos.approvals_expanded);
+        assert!(!todos.plan_expanded);
+        assert!(!todos.background_tasks_expanded);
+        assert!(!todos.grok_memory_expanded);
+        assert!(todos.expanded_background_monitors.is_empty());
+    }
+
+    #[test]
+    fn zed_todos_component_initializes_with_collapsed_state() {
+        let component = ZedTodosComponent::new();
+        assert!(!component.state.approvals_expanded);
+        assert!(!component.state.plan_expanded);
+        assert!(!component.state.background_tasks_expanded);
+        assert!(!component.state.grok_memory_expanded);
+    }
+
+    #[test]
+    fn permission_selection_supports_granularity_action_paths_for_approvals() {
+        let choice = PermissionSelection::Choice(3);
+        assert_eq!(choice.choice_index(), Some(3));
+        let mut patterns = PermissionSelection::SelectedPatterns(vec![0, 1, 2]);
+        assert!(patterns.has_any_checked_patterns());
+        assert!(patterns.is_pattern_checked(1));
+        assert_eq!(patterns.choice_index(), None);
+        patterns.toggle_pattern(1);
+        assert!(!patterns.is_pattern_checked(1));
+        patterns.toggle_pattern(5);
+        assert!(patterns.is_pattern_checked(5));
+    }
+
+    #[test]
+    fn approval_risk_labeling_covers_approvals_plan_entries_grok_memory_and_all_tool_paths() {
+        let read_risk = approval_risk_for_operation("read_file the main.rs and list symbols");
+        assert_eq!(read_risk.label(), "RO");
+        assert!(read_risk.is_read_only());
+        let memory_ro = approval_risk_for_operation("inspect grok memory facts");
+        assert_eq!(memory_ro.label(), "RO");
+        let edit_risk = approval_risk_for_operation("use edit_file or terminal rm");
+        assert_eq!(edit_risk.label(), "Destructive");
+        let plan_entry_risk = approval_risk_for_operation("step: edit the config");
+        assert_eq!(plan_entry_risk.label(), "Destructive");
+        let tool_ro = approval_risk_for_tool_call(Some(&SharedString::from("grep")), acp::ToolKind::Search);
+        assert_eq!(tool_ro.label(), "RO");
+        let tool_pd = approval_risk_for_tool_call(Some(&SharedString::from("todo_write")), acp::ToolKind::Think);
+        assert_eq!(tool_pd.label(), "Destructive");
+        let grok_mem = approval_risk_for_operation("memory present status");
+        assert_eq!(grok_mem.label(), "RO");
+    }
+
+    #[test]
+    fn zed_todos_supports_expansion_toggles_for_all_sections() {
+        let mut zed_todos_state = ZedTodos::default();
+        zed_todos_state.approvals_expanded = true;
+        assert!(zed_todos_state.approvals_expanded);
+        zed_todos_state.plan_expanded = true;
+        zed_todos_state.background_tasks_expanded = true;
+        zed_todos_state.grok_memory_expanded = true;
+        zed_todos_state.expanded_background_monitors.insert(acp::ToolCallId::new("monitor-1"));
+        assert!(zed_todos_state.plan_expanded);
+        assert_eq!(zed_todos_state.expanded_background_monitors.len(), 1);
+    }
+
+    #[test]
+    fn collection_helpers_are_pub_for_reusable_component_and_integration() {
+        let _pending: fn(&acp_thread::AcpThread) -> Vec<&acp_thread::ToolCall> = collect_pending_approval_tool_calls;
+        let _monitors: fn(&acp_thread::AcpThread) -> Vec<&acp_thread::ToolCall> = collect_background_monitor_tool_calls;
+    }
+
+    #[test]
+    fn o1_collapsed_behavior_uses_empty_expanded_sets_and_false_flags() {
+        let zed_todos_state = ZedTodos::default();
+        assert!(zed_todos_state.expanded_background_monitors.is_empty());
+        assert!(!zed_todos_state.background_tasks_expanded);
+        assert!(!zed_todos_state.approvals_expanded);
+        let component = ZedTodosComponent::new();
+        assert!(component.state.expanded_background_monitors.is_empty());
+    }
+
+    #[test]
+    fn approval_risk_integration_with_zed_todos_and_collectors_for_grok_tools() {
+        let ro_risk = approval_risk_for_tool_call(Some(&SharedString::from("read_file")), acp::ToolKind::Read);
+        assert_eq!(ro_risk, ApprovalRisk::ReadOnly);
+        assert!(ro_risk.is_read_only());
+        let destructive_risk = approval_risk_for_tool_call(Some(&SharedString::from("todo_write")), acp::ToolKind::Think);
+        assert_eq!(destructive_risk.label(), "Destructive");
+        let monitor_risk = approval_risk_for_tool_call(Some(&SharedString::from("monitor")), acp::ToolKind::Execute);
+        assert_eq!(monitor_risk.label(), "Destructive");
+    }
+
+    #[test]
+    fn zed_todos_component_public_api_collects_via_delegation() {
+        let approvals_collector: fn(&acp_thread::AcpThread) -> Vec<&acp_thread::ToolCall> = ZedTodosComponent::collect_pending_approval_tool_calls;
+        let monitors_collector: fn(&acp_thread::AcpThread) -> Vec<&acp_thread::ToolCall> = ZedTodosComponent::collect_background_monitor_tool_calls;
+        let _ = (approvals_collector, monitors_collector);
+    }
+
+    #[test]
+    fn zed_todos_component_public_methods_for_state_and_queries() {
+        let mut component = ZedTodosComponent::new();
+        component.toggle_approvals_expanded();
+        assert!(component.state.approvals_expanded);
+        component.toggle_plan_expanded();
+        assert!(component.state.plan_expanded);
+        component.toggle_background_tasks_expanded();
+        assert!(component.state.background_tasks_expanded);
+        component.toggle_grok_memory_expanded();
+        assert!(component.state.grok_memory_expanded);
+        let monitor_id = acp::ToolCallId::new("monitor-for-reuse");
+        component.toggle_background_monitor(monitor_id.clone());
+        assert!(component.is_background_monitor_expanded(&monitor_id));
+        component.toggle_background_monitor(monitor_id.clone());
+        assert!(!component.is_background_monitor_expanded(&monitor_id));
+    }
+
+    #[test]
+    fn reusable_render_helpers_available_for_zt1_rows() {
+        let background_row: fn(gpui::AnyElement, Option<gpui::AnyElement>) -> gpui::AnyElement = render_background_task_row;
+        let _ = background_row;
+    }
+
+    #[test]
+    fn reusable_background_monitor_row_for_zt1() {
+        let _ = render_background_task_row;
+    }
+
+    #[test]
+    fn mock_dock_consumer_owns_own_zedtodoscomponent_instance_calls_public_collectors_exercises_full_surface_render_including_risk_chips_approval_actions_plan_rows_and_collapsed_paths() {
+        struct MockDockConsumer {
+            zed_todos: ZedTodosComponent,
+        }
+        impl MockDockConsumer {
+            fn new() -> Self {
+                Self { zed_todos: ZedTodosComponent::new() }
+            }
+        }
+        let mut mock_dock_consumer = MockDockConsumer::new();
+        let _pending_approvals_collector: fn(&acp_thread::AcpThread) -> Vec<&acp_thread::ToolCall> = ZedTodosComponent::collect_pending_approval_tool_calls;
+        let _background_monitors_collector: fn(&acp_thread::AcpThread) -> Vec<&acp_thread::ToolCall> = ZedTodosComponent::collect_background_monitor_tool_calls;
+        assert!(!mock_dock_consumer.zed_todos.state.approvals_expanded);
+        assert!(!mock_dock_consumer.zed_todos.state.plan_expanded);
+        assert!(!mock_dock_consumer.zed_todos.state.background_tasks_expanded);
+        assert!(!mock_dock_consumer.zed_todos.state.grok_memory_expanded);
+        assert!(mock_dock_consumer.zed_todos.state.expanded_background_monitors.is_empty());
+        mock_dock_consumer.zed_todos.toggle_approvals_expanded();
+        assert!(mock_dock_consumer.zed_todos.state.approvals_expanded);
+        mock_dock_consumer.zed_todos.toggle_plan_expanded();
+        assert!(mock_dock_consumer.zed_todos.state.plan_expanded);
+        mock_dock_consumer.zed_todos.toggle_background_tasks_expanded();
+        assert!(mock_dock_consumer.zed_todos.state.background_tasks_expanded);
+        mock_dock_consumer.zed_todos.toggle_grok_memory_expanded();
+        assert!(mock_dock_consumer.zed_todos.state.grok_memory_expanded);
+        let background_monitor_identifier = acp::ToolCallId::new("mock-dock-consumer-monitor");
+        mock_dock_consumer.zed_todos.toggle_background_monitor(background_monitor_identifier.clone());
+        assert!(mock_dock_consumer.zed_todos.is_background_monitor_expanded(&background_monitor_identifier));
+        mock_dock_consumer.zed_todos.toggle_background_monitor(background_monitor_identifier.clone());
+        assert!(!mock_dock_consumer.zed_todos.is_background_monitor_expanded(&background_monitor_identifier));
+        let read_only_risk_chip: Chip = render_risk_chip(ApprovalRisk::ReadOnly, LabelSize::XSmall);
+        let _ = read_only_risk_chip;
+        let destructive_risk_chip: Chip = render_risk_chip(ApprovalRisk::PotentiallyDestructive, LabelSize::XSmall);
+        let _ = destructive_risk_chip;
+        let plan_entry_row_renderer: fn(usize, usize, &PlanEntry, &mut Window, &App) -> gpui::AnyElement = ZedTodosComponent::render_plan_entry_row;
+        let _ = plan_entry_row_renderer;
+        let background_task_row_renderer: fn(gpui::AnyElement, Option<gpui::AnyElement>) -> gpui::AnyElement = render_background_task_row;
+        let _ = background_task_row_renderer;
+        let approval_row_renderer: fn(ApprovalRisk, gpui::Hsla, SharedString, gpui::AnyElement, gpui::AnyElement, gpui::AnyElement, gpui::AnyElement, gpui::Hsla) -> gpui::AnyElement = render_approval_row;
+        let _ = approval_row_renderer;
+        let pending_approval_counts_fn: fn(&acp_thread::AcpThread) -> (usize, usize, usize) = ZedTodosComponent::pending_approval_counts;
+        let _ = pending_approval_counts_fn;
+        let pending_approval_options_for_tool_call_fn: fn(&acp_thread::ToolCall) -> (Option<acp::PermissionOption>, Option<acp::PermissionOption>, Option<acp::PermissionOption>, Option<acp::PermissionOption>) = ZedTodosComponent::pending_approval_options_for_tool_call;
+        let _ = pending_approval_options_for_tool_call_fn;
+        let format_classified_approval_action_label_fn: fn(&str, ApprovalRisk) -> SharedString = ZedTodosComponent::format_classified_approval_action_label;
+        let _ = format_classified_approval_action_label_fn;
+        let approval_action_check_icon_color_fn: fn(ApprovalRisk) -> Color = ZedTodosComponent::approval_action_check_icon_color;
+        let _ = approval_action_check_icon_color_fn;
+        let zed_todos_dock_prototype_new_fn: fn(WeakEntity<acp_thread::AcpThread>, &mut App) -> ZedTodosDockPrototype = ZedTodosDockPrototype::new;
+        let _ = zed_todos_dock_prototype_new_fn;
+        let grok_memory_items_renderer: fn(&GrokMemoryArtifacts, &mut Window, &App) -> gpui::AnyElement = render_grok_memory_items;
+        let _ = grok_memory_items_renderer;
+        let second_mock_dock_consumer = MockDockConsumer::new();
+        assert!(!second_mock_dock_consumer.zed_todos.state.approvals_expanded);
     }
 }

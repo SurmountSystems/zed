@@ -73,7 +73,7 @@ use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
-pub use conversation_view::ConversationView;
+pub use conversation_view::{ConversationView, ZedTodos, ZedTodosComponent, ZedTodosDockPrototype, collect_background_monitor_tool_calls, collect_pending_approval_tool_calls, render_approval_row, render_background_task_row, render_grok_memory_items, render_risk_chip, render_zed_todos_categorized_surface};
 pub use external_source_prompt::ExternalSourcePrompt;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
@@ -308,6 +308,21 @@ pub struct NewExternalAgentThread {
     /// The agent id to use for the conversation.
     #[serde(deserialize_with = "deserialize_external_agent_id")]
     agent: AgentId,
+    #[serde(default)]
+    resume_session_id: Option<String>,
+}
+
+/// Convenience action for directly creating a Grok Build (ACP) thread.
+/// Surfaces "agent: new grok thread" in the command palette making the grok agent
+/// a first-class discoverable peer (G-19 co-equal command surface). Delegates to
+/// NewExternalAgentThread with "grok" id (supports optional resume_session_id for
+/// G-16 roundtrip). Registered alongside other agent actions; uses existing ACP path.
+#[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = agent)]
+#[serde(deny_unknown_fields)]
+pub struct NewGrokThread {
+    #[serde(default)]
+    resume_session_id: Option<String>,
 }
 
 fn deserialize_external_agent_id<'de, D>(deserializer: D) -> Result<AgentId, D::Error>
@@ -1060,10 +1075,38 @@ mod tests {
         .expect("should deserialize legacy custom agent payload");
         assert_eq!(action.agent, AgentId::from("gemini"));
 
+        // Test the newly added grok agent ID (first-class support for Grok Build via ACP)
+        let action = serde_json::from_str::<NewExternalAgentThread>(r#"{"agent":"grok"}"#)
+            .expect("should deserialize grok agent id");
+        assert_eq!(action.agent, AgentId::from("grok"));
+
+        let action = serde_json::from_str::<NewExternalAgentThread>(
+            r#"{"agent":"grok","resume_session_id":"019e3dd6-b6f6-7481-bb30-0f71c763aaf3"}"#,
+        )
+        .expect("should deserialize grok with resume id for TUI/Zed roundtrip");
+        assert_eq!(action.agent, AgentId::from("grok"));
+        assert_eq!(
+            action.resume_session_id,
+            Some("019e3dd6-b6f6-7481-bb30-0f71c763aaf3".to_string())
+        );
+
         let action = serde_json::from_str::<NewExternalAgentThread>(r#"{"agent":"NativeAgent"}"#)
             .expect("should deserialize legacy native agent payload");
         assert_eq!(action.agent, Agent::NativeAgent.id());
 
         assert!(serde_json::from_str::<NewExternalAgentThread>(r#"{}"#).is_err());
+
+        // G-19: also cover the direct NewGrokThread action (for command palette discoverability of grok peer)
+        let grok_action = serde_json::from_str::<NewGrokThread>(
+            r#"{"resume_session_id":"019e3dd6-b6f6-7481-bb30-0f71c763aaf3"}"#,
+        )
+        .expect("should deserialize NewGrokThread with resume for co-equal roundtrip");
+        assert_eq!(
+            grok_action.resume_session_id,
+            Some("019e3dd6-b6f6-7481-bb30-0f71c763aaf3".to_string())
+        );
+        let plain_grok =
+            serde_json::from_str::<NewGrokThread>(r#"{}"#).expect("NewGrokThread allows empty");
+        assert!(plain_grok.resume_session_id.is_none());
     }
 }

@@ -1,4 +1,11 @@
-use std::{collections::HashSet, fmt::Display, rc::Rc, sync::Arc};
+use std::collections::HashSet;
+use std::fmt::Display;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::schema as acp;
 use agent_servers::{AcpDebugMessage, AcpDebugMessageContent, AcpDebugMessageDirection};
@@ -381,6 +388,254 @@ impl AcpTools {
         }
     }
 
+    fn capture_selected_connection(&mut self, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.selected_connection.clone() else {
+            return;
+        };
+        let Some(watched) = self.watched_connections.get(&agent_id) else {
+            return;
+        };
+        if watched.messages.is_empty() {
+            return;
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let safe_agent = agent_id.0.replace(['/', '\\', ' '], "_");
+        let capture_name = format!("{}-{}", safe_agent, timestamp);
+        let base_dir: PathBuf = PathBuf::from("captures").join("p4-0");
+        let capture_dir = base_dir.join(&capture_name);
+        if let Err(err) = fs::create_dir_all(&capture_dir) {
+            log::error!(
+                "P4-0 capture: failed to create dir {:?}: {err}",
+                capture_dir
+            );
+            return;
+        }
+
+        // Write full messages using existing serializer (JSON array for easy consumption by P4-1+)
+        if let Some(serialized) = self.serialize_observed_messages() {
+            let messages_path = capture_dir.join("messages.json");
+            if let Err(err) = fs::write(&messages_path, serialized) {
+                log::error!("P4-0 capture: failed writing messages: {err}");
+            }
+        }
+
+        // Write raw debug messages jsonl (one JSON per line for streaming append style)
+        let jsonl_path = capture_dir.join("messages.jsonl");
+        let mut jsonl_file = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&jsonl_path)
+        {
+            Ok(f) => f,
+            Err(err) => {
+                log::error!("P4-0 capture: failed opening jsonl: {err}");
+                return;
+            }
+        };
+
+        for (ix, message) in watched.messages.iter().enumerate() {
+            let params_value = match &message.params {
+                Ok(Some(v)) => v.clone(),
+                Ok(None) => serde_json::Value::Null,
+                Err(e) => serde_json::to_value(e).unwrap_or(serde_json::Value::Null),
+            };
+            let entry = serde_json::json!({
+                "index": ix,
+                "direction": match message.direction {
+                    AcpDebugMessageDirection::Incoming => "incoming",
+                    AcpDebugMessageDirection::Outgoing => "outgoing",
+                    AcpDebugMessageDirection::Stderr => "stderr",
+                },
+                "type": message.message_type.to_string().to_lowercase(),
+                "name": message.name.to_string(),
+                "id": message.request_id,
+                "params": params_value,
+            });
+            if let Ok(line) = serde_json::to_string(&entry) {
+                let _ = writeln!(jsonl_file, "{}", line);
+            }
+        }
+        let _ = jsonl_file.flush();
+
+        // Extract and persist key artifacts for native Grok parity: tool schemas from observed calls (esp. monitor, todo_write, enter_plan_mode), meta, subagent/persona, plan, modes
+        self.write_capture_artifacts(&agent_id, &watched.messages, &capture_dir);
+
+        // Summary
+        let summary = format!(
+            "P4-0 Grok ACP Capture\nAgent: {}\nCaptured at: {}\nMessages: {}\nDir: {:?}\n\nSee messages.json and artifacts for tool schemas, system fragments, monitor patterns, plan decisions, persona usage.\nUse for P4-1+ native implementation to ensure fidelity.\n",
+            agent_id.0,
+            timestamp,
+            watched.messages.len(),
+            capture_dir
+        );
+        let _ = fs::write(capture_dir.join("CAPTURE_SUMMARY.txt"), summary);
+
+        log::info!(
+            "P4-0 capture complete for {}: {} messages written to {:?}",
+            agent_id.0,
+            watched.messages.len(),
+            capture_dir
+        );
+        cx.notify();
+    }
+
+    fn write_capture_artifacts(
+        &self,
+        agent_id: &AgentId,
+        messages: &[WatchedConnectionMessage],
+        capture_dir: &PathBuf,
+    ) {
+        let mut observed_tools: std::collections::HashMap<String, Vec<serde_json::Value>> =
+            std::collections::HashMap::default();
+        let mut metas: Vec<serde_json::Value> = Vec::new();
+        let mut plan_entries: Vec<serde_json::Value> = Vec::new();
+        let mut subagent_personas: Vec<String> = Vec::new();
+        let mut stderr_fragments: Vec<String> = Vec::new();
+        let mut init_caps: Option<serde_json::Value> = None;
+
+        for message in messages {
+            // Collect tool call shapes for schemas (monitor, todo_write, enter_plan_mode etc from real grok binary)
+            if message.name.as_ref().contains("tool")
+                || matches!(
+                    message.message_type,
+                    MessageType::Notification | MessageType::Request
+                )
+            {
+                if let Ok(Some(params)) = &message.params {
+                    if let Some(tool_name) = params
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .or_else(|| params.get("tool_name").and_then(|n| n.as_str()))
+                    {
+                        let input = params
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| params.clone());
+                        observed_tools
+                            .entry(tool_name.to_string())
+                            .or_default()
+                            .push(input);
+                    }
+                }
+            }
+
+            // Meta fields (personas, subagents, plans, monitors)
+            if let Ok(Some(params)) = &message.params {
+                if let Some(meta) = params.get("meta").or_else(|| params.get("_meta")) {
+                    metas.push(meta.clone());
+                }
+                // Subagent persona usage
+                if let Some(persona) = params
+                    .get("persona")
+                    .or_else(|| params.get("subagent").and_then(|s| s.get("persona")))
+                {
+                    if let Some(pstr) = persona.as_str() {
+                        subagent_personas.push(pstr.to_string());
+                    }
+                }
+            }
+
+            // Plans
+            if message.name.as_ref().contains("plan") || message.name.as_ref().contains("todo") {
+                if let Ok(Some(params)) = &message.params {
+                    plan_entries.push(params.clone());
+                }
+            }
+
+            // Stderr for potential system prompt fragments or binary logs
+            if message.direction == AcpDebugMessageDirection::Stderr {
+                if let Ok(Some(params)) = &message.params {
+                    if let Some(line) = params.as_str() {
+                        if line.len() > 10
+                            && (line.contains("prompt")
+                                || line.contains("system")
+                                || line.contains("Grok")
+                                || line.contains("monitor")
+                                || line.contains("plan"))
+                        {
+                            stderr_fragments.push(line.to_string());
+                        }
+                    }
+                } else if message.name.as_ref().contains("stderr")
+                    || message.name.as_ref().is_empty()
+                {
+                    // fallback
+                }
+            }
+
+            // Init / capabilities for command/mode behavior
+            if message.name.as_ref().contains("initialize")
+                || message.name.as_ref().contains("capabilities")
+            {
+                if let Ok(Some(params)) = &message.params {
+                    init_caps = Some(params.clone());
+                }
+            }
+        }
+
+        // Persist observed tool schemas / samples (core for P4 fidelity)
+        let tools_path = capture_dir.join("observed-tool-calls.json");
+        let tools_json = serde_json::json!({
+            "agent": agent_id.0,
+            "note": "Real tool call shapes observed from grok binary via ACP. Use to ensure native re-implementation has matching monitor, todo_write, enter_plan_mode, spawn_agent etc schemas and input shapes.",
+            "observed": observed_tools,
+        });
+        if let Ok(s) = serde_json::to_string_pretty(&tools_json) {
+            let _ = fs::write(&tools_path, s);
+        }
+
+        if !metas.is_empty() {
+            let _ = fs::write(
+                capture_dir.join("observed-metas.json"),
+                serde_json::to_string_pretty(&metas).unwrap_or_default(),
+            );
+        }
+
+        if !plan_entries.is_empty() {
+            let _ = fs::write(
+                capture_dir.join("plan-and-todo-samples.json"),
+                serde_json::to_string_pretty(&plan_entries).unwrap_or_default(),
+            );
+        }
+
+        if !subagent_personas.is_empty() {
+            let _ = fs::write(
+                capture_dir.join("observed-personas.txt"),
+                subagent_personas.join("\n"),
+            );
+        }
+
+        if !stderr_fragments.is_empty() {
+            let _ = fs::write(
+                capture_dir.join("stderr-fragments.txt"),
+                stderr_fragments.join("\n---\n"),
+            );
+        }
+
+        if let Some(caps) = init_caps {
+            let _ = fs::write(
+                capture_dir.join("initialize-caps.json"),
+                serde_json::to_string_pretty(&caps).unwrap_or_default(),
+            );
+        }
+
+        // Also dump full inspect if grok is present (for skills/agents/personas config)
+        // This runs only on capture click (dev harness, not hot path)
+        let inspect_out = capture_dir.join("grok-inspect.json");
+        // Best-effort, ignore errors (grok may not be in PATH in all envs, or needs login)
+        let _ = smol::block_on(async {
+            smol::process::Command::new("grok")
+                .args(["inspect", "--json"])
+                .output()
+                .await
+                .and_then(|o| fs::write(&inspect_out, o.stdout))
+        });
+    }
+
     fn render_message(
         &mut self,
         index: usize,
@@ -750,6 +1005,15 @@ impl Render for AcpTools {
                                     .disabled(!has_messages)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.clear_messages(cx);
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("capture_p4_0", IconName::Download)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Capture P4-0 Grok ACP Session (writes structured artifacts under captures/p4-0 for native implementation baseline)"))
+                                    .disabled(!has_messages)
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.capture_selected_connection(cx);
                                     })),
                             ),
                     ),

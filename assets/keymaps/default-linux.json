@@ -610,6 +610,12 @@
   {
     "context": "Workspace",
     "bindings": {
+      // Grok Build (xAI) - Linux first. Provides the complete Grok Build TUI
+      // experience (all tools, plan mode, subagents/personas, skills, background
+      // monitoring, etc.) rendered visually in the Zed agent panel.
+      // macOS equivalent added (G-08); Windows pending (see AGENTS.md).
+      "ctrl-alt-x": ["agent::NewGrokThread", {}],
+
       "alt-open": ["projects::OpenRecent", { "create_new_window": false }],
       // Change the default action on `menu::Confirm` by setting the parameter
       // "alt-ctrl-o": ["projects::OpenRecent", { "create_new_window": true }],

@@ -1,4 +1,4 @@
-use crate::{AgentTool, ToolCallEventStream, ToolInput};
+use crate::{AgentTool, GrokPlanItem, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema as acp;
 use gpui::{App, SharedString, Task};
 use schemars::JsonSchema;
@@ -30,9 +30,13 @@ impl From<PlanEntryStatus> for acp::PlanEntryStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct PlanItem {
     /// Human-readable description of what this task aims to accomplish.
+    #[serde(alias = "content")]
     pub step: String,
     /// The current status of this task.
     pub status: PlanEntryStatus,
+    /// Optional active form (Grok P4-0 observed shape for todo_write/enter_plan_mode fidelity; ignored for acp PlanEntry).
+    #[serde(default, alias = "active_form", skip_serializing)]
+    pub active_form: Option<String>,
 }
 
 impl From<PlanItem> for acp::PlanEntry {
@@ -42,6 +46,16 @@ impl From<PlanItem> for acp::PlanEntry {
             acp::PlanEntryPriority::Medium,
             value.status.into(),
         )
+    }
+}
+
+impl From<GrokPlanItem> for PlanItem {
+    fn from(g: GrokPlanItem) -> Self {
+        PlanItem {
+            step: g.content,
+            status: g.status,
+            active_form: g.active_form,
+        }
     }
 }
 
@@ -57,8 +71,17 @@ pub struct UpdatePlanToolInput {
 pub struct UpdatePlanTool;
 
 impl UpdatePlanTool {
-    fn to_plan(input: UpdatePlanToolInput) -> acp::Plan {
+    pub(crate) fn to_plan(input: UpdatePlanToolInput) -> acp::Plan {
         acp::Plan::new(input.plan.into_iter().map(Into::into).collect())
+    }
+
+    /// Helper for enter_plan_mode shim (Grok fidelity).
+    /// Produces a "proposed" plan (all pending) so ZT-1 can detect it via `Plan::is_proposed`.
+    pub(crate) fn enter_plan_proposed(items: Vec<PlanItem>) -> acp::Plan {
+        // Current implementation simply wraps the items. The "proposed" detection
+        // happens via the heuristic in `Plan::is_proposed` (no completed / in_progress entries).
+        // See AGENTS.md G-18 and the plan approval work for future refinements.
+        acp::Plan::new(items.into_iter().map(Into::into).collect())
     }
 }
 

@@ -1,0 +1,33 @@
+[advisories]
+# RUSTSEC-2021-0046 is a vulnerability in the old, unrelated `telemetry` crate
+# published on crates.io (https://crates.io/crates/telemetry, last updated 2017).
+# Zed vendors its own completely separate internal crate also named `telemetry`
+# (a path dependency under crates/telemetry). This is a name collision false
+# positive; the advisory does not apply to Zed's code.
+ignore = [
+    # False positive: name collision with the ancient unrelated `telemetry` crate on crates.io.
+    # Zed's `crates/telemetry` is an internal crate with no relation to the vulnerable code.
+    "RUSTSEC-2021-0046",
+
+    # rsa 0.9.10 - Marvin Attack (timing side-channel for PKCS#1 v1.5 decryption).
+    # Transitive via jsonwebtoken / other crypto in language_models + collab auth paths.
+    # The attack requires the ability to perform many adaptive decryption queries against
+    # a service that uses the vulnerable RSA decryption path with attacker-controlled
+    # ciphertexts. Zed's usage is primarily for JWT verification (signature checks), not
+    # decrypting attacker-controlled data. Tracked for eventual rsa / jsonwebtoken update.
+    "RUSTSEC-2023-0071",
+
+    # rustls-webpki 0.101.7 advisories (three recent 2026 reports):
+    # - RUSTSEC-2026-0098 (URI name constraints)
+    # - RUSTSEC-2026-0099 (wildcard name constraints)
+    # - RUSTSEC-2026-0104 (CRL parsing panic)
+    #
+    # These affect the legacy rustls 0.21 + webpki 0.101 series, pulled in via the
+    # aws-smithy-* / aws-config / aws-sdk-* crates used by collab and language_models
+    # (for S3, Bedrock, etc.). The vulnerable code paths are not exercised in Zed's
+    # actual usage of the AWS SDK clients. Updating the entire AWS SDK stack is a
+    # larger change; these are ignored until that migration or a backport is done.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+]

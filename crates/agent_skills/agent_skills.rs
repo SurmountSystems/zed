@@ -26,6 +26,45 @@ pub const GLOBAL_SKILLS_DIR_DISPLAY: &str =
 #[cfg(not(target_os = "windows"))]
 pub const GLOBAL_SKILLS_DIR_DISPLAY: &str = concatcp!("~/", AGENTS_DIR_NAME, "/", SKILLS_DIR_NAME);
 
+/// First segment of the Grok Build skills directory path: `.grok`.
+pub const GROK_DIR_NAME: &str = ".grok";
+
+/// Sub-directory under `GROK_DIR_NAME` containing skills that ship with the
+/// Grok binary (design, implement, review, etc.). These are loaded on the
+/// same Global precedence tier as user `.grok/skills` so that a user's
+/// custom skill in the latter can shadow the bundled one; .agents still wins.
+pub const GROK_BUNDLED_DIR_NAME: &str = "bundled";
+
+/// User-facing display form of the global Grok skills directory path.
+/// Mirrors GLOBAL_SKILLS_DIR_DISPLAY but for the Grok ecosystem.
+#[cfg(target_os = "windows")]
+pub const GLOBAL_GROK_SKILLS_DIR_DISPLAY: &str =
+    concatcp!("%USERPROFILE%\\", GROK_DIR_NAME, "\\", SKILLS_DIR_NAME);
+#[cfg(not(target_os = "windows"))]
+pub const GLOBAL_GROK_SKILLS_DIR_DISPLAY: &str =
+    concatcp!("~/", GROK_DIR_NAME, "/", SKILLS_DIR_NAME);
+
+/// User-facing display form for the Grok bundled skills dir.
+/// Windows uses env-var form; mirrors the pattern for the user grok root.
+#[cfg(target_os = "windows")]
+pub const GLOBAL_GROK_BUNDLED_SKILLS_DIR_DISPLAY: &str = concatcp!(
+    "%USERPROFILE%\\",
+    GROK_DIR_NAME,
+    "\\",
+    GROK_BUNDLED_DIR_NAME,
+    "\\",
+    SKILLS_DIR_NAME
+);
+#[cfg(not(target_os = "windows"))]
+pub const GLOBAL_GROK_BUNDLED_SKILLS_DIR_DISPLAY: &str = concatcp!(
+    "~/",
+    GROK_DIR_NAME,
+    "/",
+    GROK_BUNDLED_DIR_NAME,
+    "/",
+    SKILLS_DIR_NAME
+);
+
 /// Opaque identifier for the project scope a skill was loaded from.
 ///
 /// `agent_skills` is a leaf crate and intentionally does not depend on
@@ -707,37 +746,70 @@ pub fn project_skills_relative_path() -> &'static str {
     ".agents/skills"
 }
 
+/// Global Grok Build skills directory: `~/.grok/skills/`.
+///
+/// Symmetric to `global_skills_dir` but for the Grok ecosystem so that
+/// skills authored for the `grok` CLI are automatically visible to Zed's
+/// native agent (and vice-versa for users who prefer `.agents`).
+pub fn global_grok_skills_dir() -> PathBuf {
+    paths::home_dir().join(GROK_DIR_NAME).join(SKILLS_DIR_NAME)
+}
+
+/// Project-local Grok skills live at this path relative to a worktree root,
+/// e.g. `<worktree>/.grok/skills/<skill>/SKILL.md`.
+pub fn project_grok_skills_relative_path() -> &'static str {
+    ".grok/skills"
+}
+
+/// Global Grok bundled skills directory: `~/.grok/bundled/skills/`.
+///
+/// Complements `global_grok_skills_dir` (the user-writable one) so that
+/// skills shipped in the grok install (e.g. "implement", "review", "design")
+/// are visible to Zed's native agent with the same Global source tag and
+/// shadowing rules. User skills under either `.grok/skills` or `.agents/skills`
+/// take precedence by load order + same-precedence first-wins in apply.
+pub fn global_grok_bundled_skills_dir() -> PathBuf {
+    paths::home_dir()
+        .join(GROK_DIR_NAME)
+        .join(GROK_BUNDLED_DIR_NAME)
+        .join(SKILLS_DIR_NAME)
+}
+
 /// Returns `true` if `path` looks like it points into an agent skills
-/// directory — i.e. it contains `AGENTS_DIR_NAME` immediately followed by
-/// `SKILLS_DIR_NAME` as two consecutive path components, anywhere in the
-/// path. Comparison is case-insensitive so it agrees with classifiers
-/// that canonicalize against `~/.agents/skills` on case-insensitive
-/// filesystems (macOS/Windows by default).
+/// directory (Zed `.agents/skills`, Grok user `.grok/skills`, or Grok
+/// bundled `.grok/bundled/skills`) — i.e. the two- or three-component
+/// patterns `(.agents|.grok)/skills` or `.grok/bundled/skills` appear
+/// consecutively anywhere. Case-insensitive.
 ///
-/// The path arriving here can be any of:
-///
-///   1. Bare relative-to-worktree-root: `.agents/skills/...`
-///   2. Worktree-name prefixed:         `<worktree>/.agents/skills/...`
-///   3. Absolute:                       `/path/to/worktree/.agents/skills/...`
-///
-/// Any-depth matching has a known cost: a `.agents/skills` directory
-/// nested inside vendored sources (e.g. `vendor/x/.agents/skills/...`)
-/// would also be flagged. We accept that as the safer-failing direction —
-/// an extra confirmation prompt for a vendored file is annoying, while
-/// silently letting the agent overwrite a `.agents/skills` tree the user
-/// didn't expect to be touched is unsafe.
+/// Extended for G-15 so that read fast-paths, edit gating, and
+/// sensitive classification also protect files inside grok's shipped
+/// skills (whose resources are referenced by relative paths from their
+/// SKILL.md). The any-depth scan prevents bypasses via .. or symlinks
+/// the same way the original two-root logic did.
 pub fn is_agents_skills_path(path: &Path) -> bool {
-    let mut components = path.components().map(|c| c.as_os_str());
-    let Some(mut prev) = components.next() else {
-        return false;
-    };
-    for curr in components {
-        if component_matches_ignore_ascii_case(prev, AGENTS_DIR_NAME)
-            && component_matches_ignore_ascii_case(curr, SKILLS_DIR_NAME)
-        {
-            return true;
+    let comps: Vec<_> = path.components().map(|c| c.as_os_str()).collect();
+    for i in 0..comps.len() {
+        if i + 1 < comps.len() {
+            let c = comps[i];
+            let n = comps[i + 1];
+            if (component_matches_ignore_ascii_case(c, AGENTS_DIR_NAME)
+                || component_matches_ignore_ascii_case(c, GROK_DIR_NAME))
+                && component_matches_ignore_ascii_case(n, SKILLS_DIR_NAME)
+            {
+                return true;
+            }
         }
-        prev = curr;
+        if i + 2 < comps.len() {
+            let c = comps[i];
+            let n = comps[i + 1];
+            let n2 = comps[i + 2];
+            if component_matches_ignore_ascii_case(c, GROK_DIR_NAME)
+                && component_matches_ignore_ascii_case(n, GROK_BUNDLED_DIR_NAME)
+                && component_matches_ignore_ascii_case(n2, SKILLS_DIR_NAME)
+            {
+                return true;
+            }
+        }
     }
     false
 }
@@ -1871,6 +1943,84 @@ description: A skill with no body content
         assert!(is_agents_skills_path(Path::new(".agents/SKILLS/foo")));
         assert!(is_agents_skills_path(Path::new(
             "project/.AGENTS/SKILLS/foo"
+        )));
+    }
+
+    // TDD for G-10 Grok bridging: the is_ check (used for edit gating and
+    // fast paths) must also recognize .grok/skills paths so Grok-authored
+    // skills receive the same protections without code duplication.
+    #[test]
+    fn is_agents_skills_path_grok_simple_positive() {
+        assert!(is_agents_skills_path(Path::new(
+            "foo/.grok/skills/my-skill/SKILL.md"
+        )));
+        assert!(is_agents_skills_path(Path::new(".grok/skills/bar")));
+    }
+
+    #[test]
+    fn is_agents_skills_path_grok_negative() {
+        assert!(!is_agents_skills_path(Path::new("foo/.grok/other")));
+        assert!(!is_agents_skills_path(Path::new(".grok")));
+    }
+
+    #[test]
+    fn is_agents_skills_path_grok_case_insensitive() {
+        assert!(is_agents_skills_path(Path::new(".GROK/skills/foo")));
+        assert!(is_agents_skills_path(Path::new(".grok/SKILLS/foo")));
+        assert!(is_agents_skills_path(Path::new("project/.GROK/SKILLS/foo")));
+    }
+
+    #[test]
+    fn global_and_project_grok_paths_are_symmetric() {
+        let g = global_grok_skills_dir();
+        assert!(g.to_string_lossy().contains(".grok"));
+        assert!(g.to_string_lossy().contains("skills"));
+        assert_eq!(project_grok_skills_relative_path(), ".grok/skills");
+        let a = global_skills_dir();
+        assert!(a.to_string_lossy().contains(".agents"));
+        assert_ne!(a, g);
+    }
+
+    #[test]
+    fn global_grok_bundled_skills_dir_is_under_grok_bundled() {
+        let b = global_grok_bundled_skills_dir();
+        let s = b.to_string_lossy();
+        assert!(s.contains(".grok"));
+        assert!(s.contains("bundled"));
+        assert!(s.contains("skills"));
+        assert_ne!(b, global_grok_skills_dir());
+    }
+
+    #[test]
+    fn is_agents_skills_path_grok_bundled_positive() {
+        // G-15: .grok/bundled/skills paths must be recognized for gating
+        // and fast-path so resources referenced by bundled SKILL.md bodies
+        // (e.g. ../shared/personas/*.md) are readable by model via skill tool.
+        assert!(is_agents_skills_path(Path::new(
+            "foo/.grok/bundled/skills/implement/SKILL.md"
+        )));
+        assert!(is_agents_skills_path(Path::new(
+            "/home/user/.grok/bundled/skills/review/SKILL.md"
+        )));
+        assert!(is_agents_skills_path(Path::new(
+            ".grok/bundled/skills/design"
+        )));
+    }
+
+    #[test]
+    fn is_agents_skills_path_grok_bundled_negative() {
+        assert!(!is_agents_skills_path(Path::new("foo/.grok/bundled/other")));
+        assert!(!is_agents_skills_path(Path::new(".grok/bundled")));
+        assert!(!is_agents_skills_path(Path::new(
+            ".grok/bundled/skills-extra"
+        )));
+    }
+
+    #[test]
+    fn is_agents_skills_path_grok_bundled_case_insensitive() {
+        assert!(is_agents_skills_path(Path::new(".GROK/BUNDLED/SKILLS/foo")));
+        assert!(is_agents_skills_path(Path::new(
+            "project/.grok/Bundled/Skills/bar"
         )));
     }
 }

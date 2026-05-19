@@ -45,7 +45,7 @@ use crate::{
     worktree_store::WorktreeIdCounter,
 };
 pub use agent_registry_store::{AgentRegistryStore, RegistryAgent};
-pub use agent_server_store::{AgentId, AgentServerStore, AgentServersUpdated, ExternalAgentSource};
+pub use agent_server_store::{AgentId, AgentServerStore, AgentServersUpdated, ExternalAgentSource, GrokMemoryArtifacts, grok_memory_artifacts_for_cwd};
 pub use git_store::{
     ConflictRegion, ConflictSet, ConflictSetSnapshot, ConflictSetUpdate,
     git_traversal::{ChildEntriesGitIter, GitEntry, GitEntryRef, GitTraversal},

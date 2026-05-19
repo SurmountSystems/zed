@@ -212,7 +212,12 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
         Task::ready(Ok(handle as Rc<dyn crate::TerminalHandle>))
     }
 
-    fn create_subagent(&self, _label: String, _cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
+    fn create_subagent(
+        &self,
+        _label: String,
+        _persona: Option<acp_thread::AgentPersona>,
+        _cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
         Ok(self
             .subagent_handle
             .clone()
@@ -251,7 +256,12 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
         Task::ready(Ok(handle as Rc<dyn crate::TerminalHandle>))
     }
 
-    fn create_subagent(&self, _label: String, _cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
+    fn create_subagent(
+        &self,
+        _label: String,
+        _persona: Option<acp_thread::AgentPersona>,
+        _cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
     }
 }
@@ -4960,6 +4970,8 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        persona: None,
+        capability_mode: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5095,6 +5107,8 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        persona: None,
+        capability_mode: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5243,6 +5257,8 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        persona: None,
+        capability_mode: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5373,6 +5389,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         label: "initial task".to_string(),
         message: "do the first task".to_string(),
         session_id: None,
+        persona: None,
+        capability_mode: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -5434,6 +5452,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
         label: "follow-up task".to_string(),
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
+        persona: None,
+        capability_mode: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -5527,7 +5547,7 @@ async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestApp
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, cx));
     subagent_thread.read_with(cx, |subagent_thread, cx| {
         assert!(subagent_thread.is_subagent());
         assert_eq!(subagent_thread.depth(), 1);
@@ -5602,7 +5622,7 @@ async fn test_subagent_thread_uses_configured_subagent_model(cx: &mut TestAppCon
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, cx));
     subagent_thread.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
             subagent_thread.model().map(|model| model.id()),
@@ -5663,11 +5683,13 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
         thread.set_subagent_context(SubagentContext {
             parent_thread_id: acp::SessionId::new("parent-id"),
             depth: MAX_SUBAGENT_DEPTH - 1,
+            persona: None,
+            capability_mode: None,
         });
         thread
     });
     let deep_subagent_thread = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&deep_parent_thread, cx);
+        let mut thread = Thread::new_subagent(&deep_parent_thread, None, None, cx);
         thread.add_default_tools(environment, cx);
         thread
     });
@@ -5823,7 +5845,7 @@ async fn test_parent_cancel_stops_subagent(cx: &mut TestAppContext) {
         )
     });
 
-    let subagent = cx.new(|cx| Thread::new_subagent(&parent, cx));
+    let subagent = cx.new(|cx| Thread::new_subagent(&parent, None, None, cx));
 
     parent.update(cx, |thread, _cx| {
         thread.register_running_subagent(subagent.downgrade());
@@ -5906,6 +5928,8 @@ async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        persona: None,
+        capability_mode: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6032,6 +6056,8 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         label: "initial task".to_string(),
         message: "do the first task".to_string(),
         session_id: None,
+        persona: None,
+        capability_mode: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -6098,6 +6124,8 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
         label: "follow-up task".to_string(),
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
+        persona: None,
+        capability_mode: None,
     };
     let resume_tool_use = LanguageModelToolUse {
         id: "subagent_2".into(),
@@ -6206,6 +6234,8 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
         label: "label".to_string(),
         message: "subagent task prompt".to_string(),
         session_id: None,
+        persona: None,
+        capability_mode: None,
     };
     let subagent_tool_use = LanguageModelToolUse {
         id: "subagent_1".into(),
@@ -7569,4 +7599,244 @@ async fn test_mid_turn_model_and_settings_refresh(cx: &mut TestAppContext) {
 
     // Thinking should now be enabled.
     assert!(model_b_completions[0].thinking_allowed);
+}
+
+#[gpui::test]
+async fn test_grok_plan_item_schema_roundtrip_and_todo_write_enter_plan_inputs(cx: &mut TestAppContext) {
+    init_test(cx);
+    let plan_item_pending = crate::tools::GrokPlanItem {
+        content: "Research approach for native Grok tools".to_string(),
+        status: crate::tools::PlanEntryStatus::Pending,
+        active_form: Some("Researching approach".to_string()),
+    };
+    let serialized = serde_json::to_value(&plan_item_pending).expect("GrokPlanItem serialize for schema fidelity");
+    assert_eq!(serialized["content"], "Research approach for native Grok tools");
+    assert_eq!(serialized["status"], "pending");
+    assert!(serialized["active_form"].is_string());
+    let deserialized: crate::tools::GrokPlanItem = serde_json::from_value(serialized).expect("GrokPlanItem deserialize roundtrip");
+    assert_eq!(deserialized.content, "Research approach for native Grok tools");
+    assert_eq!(deserialized.active_form.as_deref(), Some("Researching approach"));
+    let todo_input = crate::tools::TodoWriteInput { todos: vec![deserialized.clone()] };
+    let todo_serial = serde_json::to_value(&todo_input).expect("TodoWriteInput roundtrip");
+    assert_eq!(todo_serial["todos"].as_array().expect("array").len(), 1);
+    let enter_input = crate::tools::EnterPlanModeInput { plan: vec![plan_item_pending], explanation: Some("propose before edit".to_string()) };
+    let enter_serial = serde_json::to_value(&enter_input).expect("EnterPlanModeInput roundtrip");
+    assert!(enter_serial["explanation"].is_string());
+}
+
+#[gpui::test]
+async fn test_monitor_tool_ack_and_background_task_creation_via_injectable_environment(cx: &mut TestAppContext) {
+    init_test(cx);
+    always_allow_tools(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project_entity = Project::test(fs, [], cx).await;
+    let fake_terminal = FakeTerminalHandle::new_never_exits(cx);
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(fake_terminal)
+    }));
+    let creation_count_before = environment.terminal_creation_count();
+    #[allow(clippy::arc_with_non_send_sync)]
+    let monitor_tool = Arc::new(crate::tools::MonitorTool::new(project_entity.clone(), environment.clone() as Rc<dyn crate::ThreadEnvironment>));
+    let (event_stream, mut receiver) = crate::ToolCallEventStream::test();
+    let run_task = cx.update(|cx| {
+        monitor_tool.run(
+            crate::ToolInput::resolved(crate::tools::MonitorInput {
+                command: "sleep 5".to_string(),
+                cd: ".".to_string(),
+                timeout_ms: Some(1000),
+                description: Some("background monitor test".to_string()),
+            }),
+            event_stream,
+            cx,
+        )
+    });
+    let fields_update = receiver.expect_update_fields().await;
+    assert!(
+        fields_update.content.iter().any(|block_list| {
+            block_list.iter().any(|content_block| matches!(content_block, acp::ToolCallContent::Terminal(_)))
+        }),
+        "MonitorTool must emit terminal content for bg task in UI"
+    );
+    let result = run_task.await;
+    assert!(result.is_ok(), "monitor run must succeed with ack under allow");
+    assert_eq!(result.unwrap(), "Background monitor started");
+    let creation_count_after = environment.terminal_creation_count();
+    assert!(creation_count_after > creation_count_before, "environment create_terminal must be invoked exactly once for monitor bg creation");
+}
+
+#[gpui::test]
+async fn test_enter_plan_mode_tool_emits_proposed_plan_state(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let _project_entity = Project::test(fs, [], cx).await;
+    let (event_stream, mut receiver) = crate::ToolCallEventStream::test();
+    #[allow(clippy::arc_with_non_send_sync)]
+    let enter_tool = Arc::new(crate::tools::EnterPlanModeTool);
+    let run_task = cx.update(|cx| {
+        enter_tool.run(
+            crate::ToolInput::resolved(crate::tools::EnterPlanModeInput {
+                plan: vec![crate::tools::GrokPlanItem {
+                    content: "Proposed first step".to_string(),
+                    status: crate::tools::PlanEntryStatus::Pending,
+                    active_form: None,
+                }],
+                explanation: None,
+            }),
+            event_stream,
+            cx,
+        )
+    });
+    let plan_update = receiver.expect_update_plan().await;
+    assert!(!plan_update.entries.is_empty(), "enter_plan_mode must produce plan entries for proposed state");
+    let result_string = run_task.await.expect("enter plan mode run succeeds");
+    assert_eq!(result_string, "Plan mode entered");
+}
+
+#[test]
+fn test_capability_mode_read_only_restriction_in_system_prompt_via_template() {
+    let project_context = prompt_store::ProjectContext::default();
+    let templates_instance = crate::templates::Templates::new();
+    let read_only_template = crate::templates::SystemPromptTemplate {
+        project: &project_context,
+        available_tools: vec!["read_file".into()],
+        model_name: Some("grok-test".to_string()),
+        date: "2026-05-18".to_string(),
+        user_agents_md: None,
+        subagent_persona: Some("Researcher".to_string()),
+        subagent_capability_mode: Some("Read-Only".to_string()),
+    };
+    let rendered_prompt = read_only_template.render(&templates_instance).expect("template render for RO restriction test");
+    assert!(rendered_prompt.contains("Capability Mode: Read-Only"), "mode header must appear for subagent");
+    assert!(rendered_prompt.contains("When operating in Read-Only mode, restrict to analysis, search, read, and diagnostic tools only"), "RO restriction paragraph must be injected under capability guard");
+    let full_template = crate::templates::SystemPromptTemplate {
+        project: &project_context,
+        available_tools: vec!["read_file".into()],
+        model_name: Some("grok-test".to_string()),
+        date: "2026-05-18".to_string(),
+        user_agents_md: None,
+        subagent_persona: None,
+        subagent_capability_mode: None,
+    };
+    let rendered_full = full_template.render(&templates_instance).expect("full render");
+    assert!(!rendered_full.contains("When operating in Read-Only mode, restrict"), "RO restriction must be absent when no capability mode");
+}
+
+#[test]
+fn test_grok_memory_ro_load_via_injectable_predicate_for_prompt_guard() {
+    use std::path::Path;
+    let test_cwd = Path::new("/test/cwd");
+    let artifacts_with_full = project::grok_memory_artifacts_for_cwd_with(
+        Some("/h"),
+        test_cwd,
+        |p| p == Path::new("/test/cwd/MEMORY.md"),
+        |p| if p.ends_with("MEMORY.md") { Some("injected fact for native grok prompt under is_grok_build_profile".to_string()) } else { None },
+    );
+    assert!(artifacts_with_full.has_workspace_memory);
+    let full_for_injection = artifacts_with_full.workspace_memory_full.expect("full must load for prompt append");
+    assert!(full_for_injection.contains("is_grok_build_profile"));
+}
+
+#[gpui::test]
+async fn test_is_grok_build_profile_detection_via_model_name_and_provider(cx: &mut TestAppContext) {
+    init_test(cx);
+    let ThreadTest { thread, .. } = setup(cx, TestModel::Fake).await;
+    let non_grok_model = Arc::new(FakeLanguageModel::with_id_and_thinking("anthropic", "sonnet", "Claude", false));
+    thread.update(cx, |thread_instance, cx| {
+        thread_instance.set_model(non_grok_model, cx);
+    });
+    thread.read_with(cx, |thread_instance, app_context| {
+        assert!(!thread_instance.is_grok_build_profile(app_context));
+    });
+    let grok_model = Arc::new(FakeLanguageModel::with_id_and_thinking("x_ai", "grok-beta", "Grok", false));
+    thread.update(cx, |thread_instance, cx| {
+        thread_instance.set_model(grok_model, cx);
+    });
+    thread.read_with(cx, |thread_instance, app_context| {
+        assert!(thread_instance.is_grok_build_profile(app_context));
+    });
+}
+
+#[gpui::test]
+async fn test_todo_write_monitor_enter_plan_mode_tools_registration_fidelity(cx: &mut TestAppContext) {
+    init_test(cx);
+    let ThreadTest { thread, .. } = setup(cx, TestModel::Fake).await;
+    thread.read_with(cx, |thread_instance, _app_context| {
+        assert!(thread_instance.has_registered_tool("todo_write"));
+        assert!(thread_instance.has_registered_tool("monitor"));
+        assert!(thread_instance.has_registered_tool("enter_plan_mode"));
+    });
+    let todo_input = crate::tools::TodoWriteInput { todos: vec![crate::tools::GrokPlanItem { content: "step".to_string(), status: crate::tools::PlanEntryStatus::Pending, active_form: None }] };
+    let todo_serial = serde_json::to_value(&todo_input).expect("TodoWriteInput serializes matching P4-0 shape with content status");
+    assert!(todo_serial.is_object());
+    let enter_input = crate::tools::EnterPlanModeInput { plan: vec![], explanation: None };
+    let enter_serial = serde_json::to_value(&enter_input).expect("EnterPlanModeInput serializes");
+    assert!(enter_serial.is_object());
+    let monitor_input = crate::tools::MonitorInput { command: "echo".to_string(), cd: ".".to_string(), timeout_ms: None, description: None };
+    let monitor_serial = serde_json::to_value(&monitor_input).expect("MonitorInput serializes");
+    assert!(monitor_serial.is_object());
+}
+
+#[gpui::test]
+async fn test_persona_and_capability_mode_propagation_via_native_subagent_spawn(cx: &mut TestAppContext) {
+    init_test(cx);
+    let ThreadTest { thread: parent_entity, .. } = setup(cx, TestModel::Fake).await;
+    let persona_value = acp_thread::AgentPersona::from_name("researcher");
+    let capability_value = acp_thread::AgentCapabilityMode::from_name("read-only");
+    let subagent_thread = cx.update(|cx| {
+        Thread::new_subagent(&parent_entity, Some(persona_value), Some(capability_value), cx)
+    });
+    assert_eq!(subagent_thread.persona().map(|p| p.display_name().to_string()), Some("Researcher".to_string()));
+    assert!(subagent_thread.capability_mode().is_some_and(|m| m.is_read_only()));
+}
+
+#[test]
+fn test_grok_memory_artifacts_and_grok_memory_call_default_path() {
+    use std::path::Path;
+    let artifacts = project::grok_memory_artifacts_for_cwd_with(
+        None,
+        Path::new("/no/mem"),
+        |_p| false,
+        |_p| None,
+    );
+    assert!(!artifacts.has_workspace_memory);
+    assert!(!artifacts.has_global_memory);
+}
+
+#[gpui::test]
+async fn test_zt1_native_grok_profile_risk_classification_proposed_plan_banner_and_native_plan_tools_integration(cx: &mut TestAppContext) {
+    init_test(cx);
+    let (event_stream, mut receiver) = crate::ToolCallEventStream::test();
+    #[allow(clippy::arc_with_non_send_sync)]
+    let enter_tool = Arc::new(crate::tools::EnterPlanModeTool);
+    let run_task = cx.update(|cx| {
+        enter_tool.run(
+            crate::ToolInput::resolved(crate::tools::EnterPlanModeInput {
+                plan: vec![crate::tools::GrokPlanItem {
+                    content: "Native grok ZT1 proposed step".to_string(),
+                    status: crate::tools::PlanEntryStatus::Pending,
+                    active_form: None,
+                }],
+                explanation: None,
+            }),
+            event_stream,
+            cx,
+        )
+    });
+    let plan_update_emitted = receiver.expect_update_plan().await;
+    let plan_is_proposed_for_zt1_banner = cx.update(|app| {
+        let wrapped_plan_entries: Vec<acp_thread::PlanEntry> = plan_update_emitted.entries.into_iter().map(|entry| acp_thread::PlanEntry::from_acp(entry, app)).collect();
+        let wrapped_plan_for_banner = acp_thread::Plan { entries: wrapped_plan_entries };
+        wrapped_plan_for_banner.is_proposed()
+    });
+    assert!(plan_is_proposed_for_zt1_banner);
+    let result_string = run_task.await.expect("enter plan mode under native grok profile succeeds");
+    assert_eq!(result_string, "Plan mode entered");
+    let todo_write_approval_risk = acp_thread::approval_risk_for_tool_call(Some(&::gpui::SharedString::from("todo_write")), acp::ToolKind::Think);
+    assert_eq!(todo_write_approval_risk.label(), "Destructive");
+    let enter_plan_mode_approval_risk = acp_thread::approval_risk_for_tool_call(Some(&::gpui::SharedString::from("enter_plan_mode")), acp::ToolKind::Think);
+    assert_eq!(enter_plan_mode_approval_risk.label(), "Destructive");
+    let monitor_approval_risk = acp_thread::approval_risk_for_tool_call(Some(&::gpui::SharedString::from("monitor")), acp::ToolKind::Execute);
+    assert_eq!(monitor_approval_risk.label(), "Destructive");
+    let proposed_plan_approval_risk = acp_thread::approval_risk_for_operation("approving plan");
+    assert_eq!(proposed_plan_approval_risk.label(), "Destructive");
 }

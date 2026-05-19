@@ -783,6 +783,7 @@ mod test_support {
             let thread = cx.new(|cx| {
                 AcpThread::new(
                     None,
+                    None,
                     title,
                     Some(work_dirs),
                     self.clone(),

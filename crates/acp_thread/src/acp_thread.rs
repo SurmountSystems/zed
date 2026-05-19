@@ -21,8 +21,9 @@ use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{
-    AgentLocation, Project,
+    AgentLocation, GrokMemoryArtifacts, Project,
     git_store::{GitStoreCheckpoint, GitStoreEvent, RepositoryEvent},
+    grok_memory_artifacts_for_cwd,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
@@ -59,6 +60,10 @@ impl std::error::Error for MaxOutputTokensError {}
 /// This is a workaround since ACP's ToolCall doesn't have a dedicated name field.
 pub const TOOL_NAME_META_KEY: &str = "tool_name";
 
+/// Tool name used by Grok Build (and similar agents) for the background/monitoring tool.
+/// Used to identify monitor-style long-running tasks for special UI treatment in the activity bar.
+pub const MONITOR_TOOL_NAME: &str = "monitor";
+
 /// Helper to extract tool name from ACP meta
 pub fn tool_name_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
     meta.as_ref()
@@ -75,6 +80,71 @@ pub fn meta_with_tool_name(tool_name: &str) -> acp::Meta {
 /// Key used in ACP ToolCall meta to store the session id and message indexes
 pub const SUBAGENT_SESSION_INFO_META_KEY: &str = "subagent_session_info";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalRisk {
+    ReadOnly,
+    PotentiallyDestructive,
+}
+
+impl ApprovalRisk {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "RO",
+            Self::PotentiallyDestructive => "Destructive",
+        }
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        *self == Self::ReadOnly
+    }
+}
+
+pub fn approval_risk_for_tool_call(
+    tool_name: Option<&SharedString>,
+    kind: acp::ToolKind,
+) -> ApprovalRisk {
+    if let Some(name) = tool_name {
+        match name.as_ref() {
+            "read_file" | "list_directory" | "grep" | "find_path" | "find_references"
+            | "get_code_actions" | "go_to_definition" | "diagnostics" | "skill" => {
+                return ApprovalRisk::ReadOnly;
+            }
+            "edit_file" | "write_file" | "terminal" | "create_directory" | "delete_path"
+            | "move_path" | "rename_symbol" | "spawn_agent" | "monitor" | "todo_write"
+            | "enter_plan_mode" => return ApprovalRisk::PotentiallyDestructive,
+            _ => {}
+        }
+    }
+    match kind {
+        acp::ToolKind::Read
+        | acp::ToolKind::Search
+        | acp::ToolKind::Fetch
+        | acp::ToolKind::Think => ApprovalRisk::ReadOnly,
+        _ => ApprovalRisk::PotentiallyDestructive,
+    }
+}
+
+pub fn approval_risk_for_operation(operation_description: &str) -> ApprovalRisk {
+    let lower = operation_description.to_ascii_lowercase();
+    if lower.contains("read")
+        || lower.contains("list")
+        || lower.contains("grep")
+        || lower.contains("find_path")
+        || lower.contains("find_refer")
+        || lower.contains("search")
+        || lower.contains("fetch")
+        || lower.contains("think")
+        || lower.contains("diagnos")
+        || lower.contains("get_code")
+        || lower.contains("go_to_def")
+        || lower.contains("memory") && !lower.contains("clear") && !lower.contains("write") && !lower.contains("edit") && !lower.contains("store") && !lower.contains("update")
+    {
+        ApprovalRisk::ReadOnly
+    } else {
+        ApprovalRisk::PotentiallyDestructive
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubagentSessionInfo {
     /// The session id of the subagent sessiont that was spawned
@@ -84,6 +154,10 @@ pub struct SubagentSessionInfo {
     /// The index of the output of the message that the subagent has returned
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_end_index: Option<usize>,
+    #[serde(default)]
+    pub persona: Option<AgentPersona>,
+    #[serde(default)]
+    pub capability_mode: Option<AgentCapabilityMode>,
 }
 
 /// Helper to extract subagent session id from ACP meta
@@ -91,6 +165,74 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
     meta.as_ref()
         .and_then(|m| m.get(SUBAGENT_SESSION_INFO_META_KEY))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPersona {
+    #[default]
+    General,
+    Implementer,
+    Reviewer,
+    Researcher,
+    Explorer,
+    Plan,
+    Architect,
+    Verifier,
+}
+
+impl AgentPersona {
+    pub fn from_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "implementer" | "implement" => Self::Implementer,
+            "reviewer" | "review" => Self::Reviewer,
+            "researcher" | "research" => Self::Researcher,
+            "explorer" | "explore" => Self::Explorer,
+            "plan" | "planner" => Self::Plan,
+            "architect" | "design" => Self::Architect,
+            "verifier" | "verif" | "check" => Self::Verifier,
+            "general" | "general-purpose" | "general_purpose" => Self::General,
+            _ => Self::General,
+        }
+    }
+    pub fn display_name(&self) -> SharedString {
+        match self {
+            Self::General => "Subagent".into(),
+            Self::Implementer => "Implementer".into(),
+            Self::Reviewer => "Reviewer".into(),
+            Self::Researcher => "Researcher".into(),
+            Self::Explorer => "Explorer".into(),
+            Self::Plan => "Plan".into(),
+            Self::Architect => "Architect".into(),
+            Self::Verifier => "Verifier".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCapabilityMode {
+    #[default]
+    Full,
+    ReadOnly,
+}
+
+impl AgentCapabilityMode {
+    pub fn from_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "read-only" | "readonly" | "ro" | "read_only" => Self::ReadOnly,
+            _ => Self::Full,
+        }
+    }
+    pub fn display_name(&self) -> SharedString {
+        match self {
+            Self::Full => "Full".into(),
+            Self::ReadOnly => "Read-Only".into(),
+        }
+    }
+    pub fn is_read_only(&self) -> bool {
+        *self == Self::ReadOnly
+    }
 }
 
 #[derive(Debug)]
@@ -266,6 +408,22 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
+    /// Returns true if this ToolCall represents a background/monitor-style long-running task
+    /// (e.g. Grok's `monitor` tool or background terminal execution).
+    ///
+    /// This is used by the UI (G-04) to surface such tasks efficiently in the activity bar
+    /// with low overhead (collapsed by default, live updates only when expanded).
+    /// See AGENTS.md for the full G-04 design and TDD requirements.
+    pub fn is_monitor(&self) -> bool {
+        self.tool_name
+            .as_ref()
+            .is_some_and(|name| name == MONITOR_TOOL_NAME)
+    }
+
+    pub fn approval_risk(&self) -> ApprovalRisk {
+        approval_risk_for_tool_call(self.tool_name.as_ref(), self.kind)
+    }
+
     fn from_acp(
         tool_call: acp::ToolCall,
         status: ToolCallStatus,
@@ -967,6 +1125,15 @@ impl Plan {
         self.entries.is_empty()
     }
 
+    pub fn is_proposed(&self) -> bool {
+        // Current heuristic for "proposed" plans on bridged Grok:
+        // All entries are still Pending and nothing has been started yet.
+        // Matches observed behavior from P4-0 capture harness and real sessions.
+        // (See AGENTS.md G-18 and PLAN.md for future more precise detection.)
+        let stats = self.stats();
+        !self.entries.is_empty() && stats.completed == 0 && stats.in_progress_entry.is_none()
+    }
+
     pub fn stats(&self) -> PlanStats<'_> {
         let mut stats = PlanStats {
             in_progress_entry: None,
@@ -991,6 +1158,20 @@ impl Plan {
         }
 
         stats
+    }
+
+    pub fn total_entries(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn progress_fraction(&self) -> f32 {
+        let total = self.entries.len();
+        if total == 0 {
+            0.0
+        } else {
+            let completed = self.stats().completed as usize;
+            completed as f32 / total as f32
+        }
     }
 }
 
@@ -1077,6 +1258,7 @@ pub struct AcpThread {
     session_id: acp::SessionId,
     work_dirs: Option<PathList>,
     parent_session_id: Option<acp::SessionId>,
+    persona: Option<AgentPersona>,
     title: Option<SharedString>,
     provisional_title: Option<SharedString>,
     entries: Vec<AgentThreadEntry>,
@@ -1247,6 +1429,7 @@ impl Error for LoadError {}
 impl AcpThread {
     pub fn new(
         parent_session_id: Option<acp::SessionId>,
+        persona: Option<AgentPersona>,
         title: Option<SharedString>,
         work_dirs: Option<PathList>,
         connection: Rc<dyn AgentConnection>,
@@ -1284,6 +1467,7 @@ impl AcpThread {
 
         Self {
             parent_session_id,
+            persona,
             work_dirs,
             action_log,
             _git_store_subscription,
@@ -1315,6 +1499,10 @@ impl AcpThread {
 
     pub fn parent_session_id(&self) -> Option<&acp::SessionId> {
         self.parent_session_id.as_ref()
+    }
+
+    pub fn persona(&self) -> Option<AgentPersona> {
+        self.persona
     }
 
     pub fn prompt_capabilities(&self) -> acp::PromptCapabilities {
@@ -1487,6 +1675,20 @@ impl AcpThread {
         }
 
         false
+    }
+
+    pub fn has_active_background_monitors(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            if let AgentThreadEntry::ToolCall(tool_call) = entry {
+                tool_call.is_monitor()
+                    && matches!(
+                        tool_call.status,
+                        ToolCallStatus::InProgress | ToolCallStatus::Pending
+                    )
+            } else {
+                false
+            }
+        })
     }
 
     pub fn used_tools_since_last_user_message(&self) -> bool {
@@ -2223,6 +2425,15 @@ impl AcpThread {
 
     pub fn plan(&self) -> &Plan {
         &self.plan
+    }
+
+    pub fn grok_memory(&self) -> GrokMemoryArtifacts {
+        if let Some(dirs) = self.work_dirs() {
+            if let Some(cwd) = dirs.ordered_paths().next() {
+                return grok_memory_artifacts_for_cwd(cwd);
+            }
+        }
+        GrokMemoryArtifacts::default()
     }
 
     pub fn update_plan(&mut self, request: acp::Plan, cx: &mut Context<Self>) {
@@ -3236,6 +3447,156 @@ mod tests {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
+        });
+    }
+
+    #[gpui::test]
+    fn test_tool_call_is_monitor(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let label_monitor = cx.new(|cx| Markdown::new("monitor".into(), None, None, cx));
+            let label_other = cx.new(|cx| Markdown::new("other".into(), None, None, cx));
+            let label_none = cx.new(|cx| Markdown::new("none".into(), None, None, cx));
+
+            let monitor_call = ToolCall {
+                id: acp::ToolCallId::new("monitor-1"),
+                label: label_monitor,
+                kind: acp::ToolKind::Execute,
+                content: vec![],
+                status: ToolCallStatus::Pending,
+                locations: vec![],
+                resolved_locations: vec![],
+                raw_input: None,
+                raw_input_markdown: None,
+                raw_output: None,
+                tool_name: Some(MONITOR_TOOL_NAME.into()),
+                subagent_session_info: None,
+            };
+            assert!(monitor_call.is_monitor());
+
+            let other_call = ToolCall {
+                id: acp::ToolCallId::new("other-1"),
+                label: label_other,
+                kind: acp::ToolKind::Execute,
+                content: vec![],
+                status: ToolCallStatus::Pending,
+                locations: vec![],
+                resolved_locations: vec![],
+                raw_input: None,
+                raw_input_markdown: None,
+                raw_output: None,
+                tool_name: Some("spawn_agent".into()),
+                subagent_session_info: None,
+            };
+            assert!(!other_call.is_monitor());
+
+            let none_call = ToolCall {
+                id: acp::ToolCallId::new("none-1"),
+                label: label_none,
+                kind: acp::ToolKind::Execute,
+                content: vec![],
+                status: ToolCallStatus::Pending,
+                locations: vec![],
+                resolved_locations: vec![],
+                raw_input: None,
+                raw_input_markdown: None,
+                raw_output: None,
+                tool_name: None,
+                subagent_session_info: None,
+            };
+            assert!(!none_call.is_monitor());
+        });
+    }
+
+    #[test]
+    fn test_agent_persona_serde_and_from_name() {
+        let p = AgentPersona::from_name("researcher");
+        assert_eq!(p, AgentPersona::Researcher);
+        assert_eq!(p.display_name(), "Researcher");
+        let info = SubagentSessionInfo {
+            session_id: acp::SessionId::new("s1"),
+            message_start_index: 0,
+            message_end_index: None,
+            persona: Some(p),
+            capability_mode: None,
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["persona"], "researcher");
+        assert_eq!(v["capability_mode"], serde_json::Value::Null);
+        let back: SubagentSessionInfo = serde_json::from_value(v).unwrap();
+        assert_eq!(back.persona, Some(AgentPersona::Researcher));
+        assert_eq!(back.capability_mode, None);
+        let unknown = AgentPersona::from_name("foo");
+        assert_eq!(unknown, AgentPersona::General);
+        assert_eq!(AgentPersona::from_name("plan"), AgentPersona::Plan);
+        assert_eq!(
+            AgentPersona::from_name("general-purpose"),
+            AgentPersona::General
+        );
+        assert_eq!(AgentPersona::from_name("explore"), AgentPersona::Explorer);
+        assert_eq!(AgentPersona::from_name("verifier"), AgentPersona::Verifier);
+        assert_eq!(
+            AgentPersona::from_name("architect"),
+            AgentPersona::Architect
+        );
+        assert_eq!(
+            AgentPersona::from_name("implement"),
+            AgentPersona::Implementer
+        );
+        assert_eq!(AgentPersona::Plan.display_name(), "Plan");
+        assert_eq!(AgentPersona::Verifier.display_name(), "Verifier");
+        let m = AgentCapabilityMode::from_name("read-only");
+        assert_eq!(m, AgentCapabilityMode::ReadOnly);
+        assert_eq!(m.display_name(), "Read-Only");
+        assert!(m.is_read_only());
+        assert_eq!(AgentCapabilityMode::from_name("full"), AgentCapabilityMode::Full);
+        assert!(!AgentCapabilityMode::from_name("foo").is_read_only());
+    }
+
+    #[gpui::test]
+    fn test_plan_progress_fraction(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            let mut make_entry = |status: acp::PlanEntryStatus| PlanEntry {
+                content: cx.new(|cx| Markdown::new("step".into(), None, None, cx)),
+                priority: acp::PlanEntryPriority::Medium,
+                status,
+            };
+            let empty = Plan { entries: vec![] };
+            assert_eq!(empty.total_entries(), 0);
+            assert!((empty.progress_fraction() - 0.0).abs() < 0.001);
+            let p1 = Plan {
+                entries: vec![make_entry(acp::PlanEntryStatus::Completed)],
+            };
+            assert_eq!(p1.total_entries(), 1);
+            assert!((p1.progress_fraction() - 1.0).abs() < 0.001);
+            let p2 = Plan {
+                entries: vec![
+                    make_entry(acp::PlanEntryStatus::Completed),
+                    make_entry(acp::PlanEntryStatus::Pending),
+                    make_entry(acp::PlanEntryStatus::InProgress),
+                ],
+            };
+            assert_eq!(p2.total_entries(), 3);
+            assert!((p2.progress_fraction() - (1.0f32 / 3.0f32)).abs() < 0.001);
+            let proposed = Plan {
+                entries: vec![
+                    make_entry(acp::PlanEntryStatus::Pending),
+                    make_entry(acp::PlanEntryStatus::Pending),
+                ],
+            };
+            assert!(proposed.is_proposed());
+            let active = Plan {
+                entries: vec![
+                    make_entry(acp::PlanEntryStatus::InProgress),
+                    make_entry(acp::PlanEntryStatus::Pending),
+                ],
+            };
+            assert!(!active.is_proposed());
+            let done = Plan {
+                entries: vec![make_entry(acp::PlanEntryStatus::Completed)],
+            };
+            assert!(!done.is_proposed());
         });
     }
 
@@ -4772,6 +5133,7 @@ mod tests {
                 AcpThread::new(
                     None,
                     None,
+                    None,
                     Some(work_dirs),
                     self.clone(),
                     project,
@@ -5848,5 +6210,67 @@ mod tests {
             ThreadStatus::Idle,
             "running_turn must be cleared even when tx was dropped without send"
         );
+    }
+
+    // TDD for G-04: describes the desired collapsed-by-default low-overhead
+    // monitor identification (before heavy UI impl in ThreadView).
+    // Monitors (e.g. Grok `monitor` tool) must be detected via is_monitor()
+    // so activity bar can gate expensive rendering behind disclosure expand.
+    #[test]
+    fn test_monitor_tool_name_and_is_monitor_semantics() {
+        assert_eq!(MONITOR_TOOL_NAME, "monitor");
+        // tool_name_from_meta + equality is the detection mechanism used by
+        // ThreadView's filter + has_background_tasks check (O(n) skeleton).
+        let meta = meta_with_tool_name(MONITOR_TOOL_NAME);
+        let extracted = tool_name_from_meta(&Some(meta));
+        assert_eq!(extracted.as_deref(), Some("monitor"));
+        // Future: when ToolCall can be built in test, assert tc.is_monitor()
+    }
+
+    #[test]
+    fn test_approval_risk_classification_for_grok_native_tool_names() {
+        let monitor_risk = approval_risk_for_tool_call(Some(&SharedString::from("monitor")), acp::ToolKind::Execute);
+        assert_eq!(monitor_risk, ApprovalRisk::PotentiallyDestructive);
+        assert_eq!(monitor_risk.label(), "Destructive");
+        let todo_write_risk = approval_risk_for_tool_call(Some(&SharedString::from("todo_write")), acp::ToolKind::Think);
+        assert_eq!(todo_write_risk, ApprovalRisk::PotentiallyDestructive);
+        let enter_plan_mode_risk = approval_risk_for_tool_call(Some(&SharedString::from("enter_plan_mode")), acp::ToolKind::Think);
+        assert_eq!(enter_plan_mode_risk, ApprovalRisk::PotentiallyDestructive);
+        let read_fallback = approval_risk_for_tool_call(Some(&SharedString::from("unknown_grok_tool")), acp::ToolKind::Read);
+        assert_eq!(read_fallback, ApprovalRisk::ReadOnly);
+    }
+
+    #[test]
+    fn test_agent_persona_and_capability_mode_propagation_roundtrip() {
+        let persona = AgentPersona::from_name("implementer");
+        let capability = AgentCapabilityMode::from_name("read-only");
+        let session_info = SubagentSessionInfo {
+            session_id: acp::SessionId::new("sess-42"),
+            message_start_index: 5,
+            message_end_index: Some(12),
+            persona: Some(persona),
+            capability_mode: Some(capability),
+        };
+        let serialized = serde_json::to_value(&session_info).expect("serialization for propagation test");
+        assert_eq!(serialized["persona"], "implementer");
+        assert_eq!(serialized["capability_mode"], "read_only");
+        let deserialized: SubagentSessionInfo = serde_json::from_value(serialized).expect("deser for propagation");
+        assert_eq!(deserialized.persona, Some(AgentPersona::Implementer));
+        assert!(deserialized.capability_mode.expect("mode present after roundtrip").is_read_only());
+    }
+
+    #[test]
+    fn test_plan_is_proposed_and_approval_risk_classification_on_grok_plan_tools() {
+        let make_pending = || acp::PlanEntry::new("investigate".to_string(), acp::PlanEntryPriority::Medium, acp::PlanEntryStatus::Pending);
+        let proposed = Plan { entries: vec![make_pending(), make_pending()] };
+        assert!(proposed.is_proposed());
+        let active = Plan { entries: vec![acp::PlanEntry::new("work".to_string(), acp::PlanEntryPriority::Medium, acp::PlanEntryStatus::InProgress)] };
+        assert!(!active.is_proposed());
+        let todo_risk = approval_risk_for_tool_call(Some(&SharedString::from("todo_write")), acp::ToolKind::Think);
+        assert_eq!(todo_risk, ApprovalRisk::PotentiallyDestructive);
+        let monitor_risk = approval_risk_for_tool_call(Some(&SharedString::from("monitor")), acp::ToolKind::Execute);
+        assert_eq!(monitor_risk, ApprovalRisk::PotentiallyDestructive);
+        let enter_risk = approval_risk_for_tool_call(Some(&SharedString::from("enter_plan_mode")), acp::ToolKind::Think);
+        assert_eq!(enter_risk, ApprovalRisk::PotentiallyDestructive);
     }
 }

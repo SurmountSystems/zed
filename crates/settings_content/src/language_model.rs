@@ -387,6 +387,8 @@ pub struct XaiAvailableModel {
     pub supports_images: Option<bool>,
     pub supports_tools: Option<bool>,
     pub parallel_tool_calls: Option<bool>,
+    /// Supported reasoning effort levels for Grok models, e.g. ["low", "medium", "high"].
+    pub reasoning_effort_levels: Option<Vec<String>>,
 }
 
 #[with_fallible_options]

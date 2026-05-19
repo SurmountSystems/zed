@@ -258,7 +258,7 @@ fn process_content(
     content
 }
 
-fn working_dir(
+pub(crate) fn working_dir(
     input: &TerminalToolInput,
     project: &Entity<Project>,
     cx: &mut App,

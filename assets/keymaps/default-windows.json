@@ -612,6 +612,10 @@
       // Change the default action on `menu::Confirm` by setting the parameter
       // "ctrl-alt-o": ["projects::OpenRecent", { "create_new_window": true }],
       "ctrl-r": ["projects::OpenRecent", { "create_new_window": false }],
+      // Grok Build (xAI) Windows binding (G-19 follow-on). Matches Linux ctrl-alt-x / macOS cmd-alt-x
+      // for first-class dedicated NewGrokThread discoverability across platforms (command palette,
+      // direct key, co-equal ACP peer status). Makes grok command surface practical on Win.
+      "ctrl-alt-x": ["agent::NewGrokThread", {}],
       // Change to open path modal for existing remote connection by setting the parameter
       // "ctrl-shift-alt-o": "["projects::OpenRemote", { "from_existing_connection": true }]",
       "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": false, "create_new_window": false }],

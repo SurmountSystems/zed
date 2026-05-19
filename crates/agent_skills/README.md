@@ -17,7 +17,7 @@ The spec deliberately leaves a lot unspecified — where skills live on disk, ho
 
 ## Discovery
 
-### Only `.agents/skills`
+### Only `.agents/skills` (with Grok Build bridging)
 
 Two scopes:
 
@@ -27,6 +27,8 @@ Two scopes:
 The cross-tool-friendly `.agents/` location was the spec's recommended convention at the time we shipped, and we picked the one location and stuck with it. We do not also scan tool-specific directories that other agent tools sometimes use for their own native skills, even though doing so would let users share skills they've already authored for those tools without copying them over.
 
 The reasoning is interop friction is finite. If a user wants their skills to work in multiple tools, the right answer is for those tools to converge on the spec's location. Scanning a half-dozen tool-specific paths makes our discovery surface unpredictable and biases us toward whichever tools happened to ship first. A user who wants their existing skills to load in this agent can move or symlink them.
+
+**Grok Build bridging (G-15, building on G-10):** For co-equal use we scan three global roots as `Global` (`.agents/skills/`, `~/.grok/skills/`, `~/.grok/bundled/skills/`) plus the two project-local (`.agents/skills/` and `.grok/skills/`) using identical rules and `SkillSource` tags. Bundled skills (design/implement/review etc. from the grok install) become available to the native agent; user skills in `.agents/` or `~/.grok/skills/` shadow them via load order + first-wins on equal precedence. `is_agents_skills_path`, gating, and read fast-path cover all three. No new variants; loads remain parallel under `SKILL_IO_CONCURRENCY`. ACP `grok` binary owns its own loads unchanged. See AGENTS.md G-15.
 
 ### Flat scan: only immediate children of the skills root
 

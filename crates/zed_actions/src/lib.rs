@@ -494,6 +494,8 @@ pub mod agent {
             /// Opens the agent settings panel.
             #[action(deprecated_aliases = ["agent::OpenConfiguration"])]
             OpenSettings,
+            /// Opens the Zed Todos surface displaying classified approvals, plan, background tasks and memory for the active agent thread.
+            OpenZedTodosSurface,
             /// Opens the agent onboarding modal.
             OpenOnboardingModal,
             /// Resets the agent onboarding state.

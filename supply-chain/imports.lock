@@ -1,0 +1,6 @@
+
+# cargo-vet imports lock
+
+[[unpublished.zed_extension_api]]
+version = "0.8.0"
+audited_as = "0.7.0"

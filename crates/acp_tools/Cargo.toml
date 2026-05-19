@@ -32,3 +32,5 @@ theme_settings.workspace = true
 ui.workspace = true
 util.workspace = true
 workspace.workspace = true
+log.workspace = true
+smol.workspace = true

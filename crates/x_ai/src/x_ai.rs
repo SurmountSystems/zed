@@ -25,6 +25,8 @@ pub enum Model {
         supports_images: Option<bool>,
         supports_tools: Option<bool>,
         parallel_tool_calls: Option<bool>,
+        /// Supported reasoning effort levels (as lowercase strings: "low", "medium", "high", etc).
+        reasoning_effort_levels: Option<Vec<String>>,
     },
 }
 

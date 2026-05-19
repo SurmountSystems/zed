@@ -2753,6 +2753,7 @@ mod tests {
             cx.new(|cx| {
                 acp_thread::AcpThread::new(
                     Some(regular_session_id.clone()),
+                    None,
                     Some("Subagent Thread".into()),
                     None,
                     connection.clone(),

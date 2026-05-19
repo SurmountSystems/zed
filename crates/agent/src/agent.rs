@@ -32,7 +32,8 @@ use acp_thread::{
 use agent_client_protocol::schema as acp;
 use agent_skills::{
     MAX_SKILL_DESCRIPTIONS_SIZE, Skill, SkillLoadError, SkillScopeId, SkillSource, SkillSummary,
-    builtin_skills, global_skills_dir, load_skills_from_directory, project_skills_relative_path,
+    builtin_skills, global_grok_bundled_skills_dir, global_grok_skills_dir, global_skills_dir,
+    load_skills_from_directory, project_grok_skills_relative_path, project_skills_relative_path,
 };
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -413,26 +414,38 @@ impl NativeAgent {
     }
 
     async fn run_skills_scan(this: WeakEntity<Self>, fs: Arc<dyn Fs>, cx: &mut AsyncApp) {
-        let skills_dir = global_skills_dir();
-        if !fs.is_dir(&skills_dir).await {
-            // Skills directory doesn't exist; revert state so the next
-            // user trigger retries.
+        let agents_dir = global_skills_dir();
+        let grok_dir = global_grok_skills_dir();
+        let bundled_dir = global_grok_bundled_skills_dir();
+        let agents_exists = fs.is_dir(&agents_dir).await;
+        let grok_exists = fs.is_dir(&grok_dir).await;
+        let bundled_exists = fs.is_dir(&bundled_dir).await;
+        if !agents_exists && !grok_exists && !bundled_exists {
             let _ = this.update(cx, |this, _cx| {
                 this.skills_state = SkillsState::Idle;
             });
             return;
         }
 
-        // Skills directory exists. Start a watch and trigger a refresh
-        // of every project's context so the freshly-discovered skills
-        // get loaded.
         let _ = this.update(cx, |this, cx| {
-            cx.spawn({
+            if agents_exists {
                 let fs = fs.clone();
-                let skills_dir = skills_dir.clone();
-                async move |this, cx| Self::run_skills_watch(this, fs, skills_dir, cx).await
-            })
-            .detach();
+                let d = agents_dir.clone();
+                cx.spawn(async move |this, cx| Self::run_skills_watch(this, fs, d, cx).await)
+                    .detach();
+            }
+            if grok_exists {
+                let fs = fs.clone();
+                let d = grok_dir.clone();
+                cx.spawn(async move |this, cx| Self::run_skills_watch(this, fs, d, cx).await)
+                    .detach();
+            }
+            if bundled_exists {
+                let fs = fs.clone();
+                let d = bundled_dir.clone();
+                cx.spawn(async move |this, cx| Self::run_skills_watch(this, fs, d, cx).await)
+                    .detach();
+            }
             this.skills_state = SkillsState::Watching;
             for state in this.projects.values_mut() {
                 state.project_context_needs_refresh.send(()).ok();
@@ -489,18 +502,30 @@ impl NativeAgent {
                 event.path == skills_dir && event.kind == Some(fs::PathEventKind::Removed)
             });
 
+            let should_go_idle = if watched_root_removed {
+                let agents_d = global_skills_dir();
+                let grok_d = global_grok_skills_dir();
+                let bundled_d = global_grok_bundled_skills_dir();
+                let any_left = fs.is_dir(&agents_d).await
+                    || fs.is_dir(&grok_d).await
+                    || fs.is_dir(&bundled_d).await;
+                !any_left
+            } else {
+                false
+            };
+
             let updated = this.update(cx, |this, _cx| {
                 for state in this.projects.values_mut() {
                     state.project_context_needs_refresh.send(()).ok();
                 }
-                if watched_root_removed {
+                if should_go_idle {
                     // Drop back to Idle so the next user trigger
                     // retries the scan; the next trigger will rediscover
-                    // the directory if the user has recreated it.
+                    // whichever directories the user has (re)created.
                     this.skills_state = SkillsState::Idle;
                 }
             });
-            if updated.is_err() || watched_root_removed {
+            if updated.is_err() || should_go_idle {
                 return;
             }
         }
@@ -548,6 +573,7 @@ impl NativeAgent {
         let thread = thread_handle.read(cx);
         let session_id = thread.id().clone();
         let parent_session_id = thread.parent_thread_id();
+        let persona = thread.persona();
         let title = thread.title();
         let draft_prompt = thread.draft_prompt().map(Vec::from);
         let scroll_position = thread.ui_scroll_position();
@@ -558,6 +584,7 @@ impl NativeAgent {
         let acp_thread = cx.new(|cx| {
             let mut acp_thread = acp_thread::AcpThread::new(
                 parent_session_id,
+                persona,
                 title,
                 None,
                 connection,
@@ -820,7 +847,8 @@ impl NativeAgent {
         // skip all on-disk lookups so users see no behavior change.
         let skills_enabled = cx.has_flag::<SkillsFeatureFlag>();
 
-        // Load global skills
+        // Load global skills from both ecosystems for G-10 bridging.
+        // .agents first so it wins name collisions with .grok (same precedence).
         let global_skills_task = if skills_enabled {
             let global_skills_dir = global_skills_dir();
             let global_skills_fs = fs.clone();
@@ -835,61 +863,120 @@ impl NativeAgent {
         } else {
             Task::ready(Vec::new())
         };
+        let global_grok_skills_task = if skills_enabled {
+            let global_grok_dir = global_grok_skills_dir();
+            let global_grok_fs = fs.clone();
+            cx.background_spawn(async move {
+                load_skills_from_directory(&global_grok_fs, &global_grok_dir, SkillSource::Global)
+                    .await
+            })
+        } else {
+            Task::ready(Vec::new())
+        };
+        let global_grok_bundled_skills_task = if skills_enabled {
+            let global_grok_bundled_dir = global_grok_bundled_skills_dir();
+            let global_grok_bundled_fs = fs.clone();
+            cx.background_spawn(async move {
+                load_skills_from_directory(
+                    &global_grok_bundled_fs,
+                    &global_grok_bundled_dir,
+                    SkillSource::Global,
+                )
+                .await
+            })
+        } else {
+            Task::ready(Vec::new())
+        };
 
         // Load project-local skills, but only from worktrees the user has
-        // trusted. Skills in `.agents/skills/` ship with the project; a
-        // freshly cloned untrusted repo can carry hostile descriptions or
-        // bodies, so we keep them out of the catalog and the slash-command
-        // list until trust is granted. The subscription in
-        // `register_project_with_initial_context` triggers a context
-        // refresh when a worktree's trust state changes, so newly trusted
-        // worktrees pick up their skills without restarting.
+        // trusted. Skills in `.agents/skills/` (and `.grok/skills/` via G-10
+        // bridge) ship with the project; a freshly cloned untrusted repo can
+        // carry hostile descriptions or bodies, so we keep them out of the
+        // catalog and the slash-command list until trust is granted. The
+        // subscription in `register_project_with_initial_context` triggers a
+        // context refresh when a worktree's trust state changes, so newly
+        // trusted worktrees pick up their skills without restarting.
         let trusted_worktrees = TrustedWorktrees::try_get_global(cx);
         let worktree_store = project.read(cx).worktree_store();
         let project_skills_task = if skills_enabled {
-            let project_skills_futures: Vec<
+            // Dual-directory collection for .agents/skills + .grok/skills per
+            // trusted worktree. Both use identical ProjectLocal source (same
+            // precedence); agents dir pushed first so it wins same-name
+            // collisions within a project. Scan capture and trust gating
+            // unchanged.
+            let mut project_skills_futures: Vec<
                 futures::future::BoxFuture<'static, Vec<Result<Skill, SkillLoadError>>>,
-            > = worktrees
-                .iter()
-                .filter_map(|worktree| {
-                    let worktree_id = worktree.read(cx).id();
-                    let is_trusted = trusted_worktrees.as_ref().is_none_or(|trusted_worktrees| {
-                        trusted_worktrees.update(cx, |trusted_worktrees, cx| {
-                            trusted_worktrees.can_trust(&worktree_store, worktree_id, cx)
-                        })
-                    });
-                    if !is_trusted {
-                        return None;
-                    }
-                    let worktree_snapshot = worktree.read(cx);
-                    let abs_path = worktree_snapshot.abs_path();
-                    let worktree_root_name: Arc<str> = worktree_snapshot.root_name_str().into();
-                    // Capture scan_complete *before* spawning so we don't have to re-borrow
-                    // the worktree from inside the async task (which would require a cx).
-                    let scan_complete = worktree_snapshot
-                        .as_local()
-                        .map(|local| local.scan_complete());
+            > = Vec::new();
+            for worktree in worktrees.iter() {
+                let worktree_id = worktree.read(cx).id();
+                let is_trusted = trusted_worktrees.as_ref().is_none_or(|trusted_worktrees| {
+                    trusted_worktrees.update(cx, |trusted_worktrees, cx| {
+                        trusted_worktrees.can_trust(&worktree_store, worktree_id, cx)
+                    })
+                });
+                if !is_trusted {
+                    continue;
+                }
+                let worktree_snapshot = worktree.read(cx);
+                let abs_path = worktree_snapshot.abs_path();
+                let worktree_root_name: Arc<str> = worktree_snapshot.root_name_str().into();
+
+                // .agents/skills for this worktree
+                {
                     let skills_dir = abs_path.join(project_skills_relative_path());
                     let fs = fs.clone();
-                    Some(
+                    let wt_id = worktree_id;
+                    let root_name = worktree_root_name.clone();
+                    let sc = worktree_snapshot
+                        .as_local()
+                        .map(|local| local.scan_complete());
+                    project_skills_futures.push(
                         async move {
-                            if let Some(scan_complete) = scan_complete {
+                            if let Some(scan_complete) = sc {
                                 scan_complete.await;
                             }
                             load_skills_from_directory(
                                 &fs,
                                 &skills_dir,
                                 SkillSource::ProjectLocal {
-                                    worktree_id: SkillScopeId(worktree_id.to_usize()),
-                                    worktree_root_name,
+                                    worktree_id: SkillScopeId(wt_id.to_usize()),
+                                    worktree_root_name: root_name,
                                 },
                             )
                             .await
                         }
                         .boxed(),
-                    )
-                })
-                .collect();
+                    );
+                }
+
+                // .grok/skills for this worktree (G-10 bridge)
+                {
+                    let skills_dir = abs_path.join(project_grok_skills_relative_path());
+                    let fs = fs.clone();
+                    let wt_id = worktree_id;
+                    let root_name = worktree_root_name.clone();
+                    let sc = worktree_snapshot
+                        .as_local()
+                        .map(|local| local.scan_complete());
+                    project_skills_futures.push(
+                        async move {
+                            if let Some(scan_complete) = sc {
+                                scan_complete.await;
+                            }
+                            load_skills_from_directory(
+                                &fs,
+                                &skills_dir,
+                                SkillSource::ProjectLocal {
+                                    worktree_id: SkillScopeId(wt_id.to_usize()),
+                                    worktree_root_name: root_name,
+                                },
+                            )
+                            .await
+                        }
+                        .boxed(),
+                    );
+                }
+            }
             cx.background_spawn(async move { future::join_all(project_skills_futures).await })
         } else {
             Task::ready(Vec::new())
@@ -949,7 +1036,18 @@ impl NativeAgent {
             // global vs. project-local skills via the source label.
             // Project-overrides-global is applied below, only for the
             // model-facing catalog.
-            let global_skills = global_skills_task.await;
+            let global_agents = global_skills_task.await;
+            let global_grok = global_grok_skills_task.await;
+            let global_grok_bundled = global_grok_bundled_skills_task.await;
+            // Chain order ensures .agents > ~/.grok/skills > ~/.grok/bundled/skills
+            // for same-prec Global skills (first occurrence wins in apply_skill_overrides).
+            // This makes a user skill under .grok/skills shadow its bundled counterpart
+            // exactly as the grok binary does, while .agents still takes highest global rank.
+            let global_skills: Vec<_> = global_agents
+                .into_iter()
+                .chain(global_grok)
+                .chain(global_grok_bundled)
+                .collect();
             let project_skills_results = project_skills_task.await;
             let (skills, mut skill_errors) =
                 combine_skills(global_skills, project_skills_results.into_iter().flatten());
@@ -2525,6 +2623,8 @@ impl NativeThreadEnvironment {
     pub(crate) fn create_subagent_thread(
         &self,
         label: String,
+        persona: Option<acp_thread::AgentPersona>,
+        capability_mode: Option<acp_thread::AgentCapabilityMode>,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
@@ -2542,7 +2642,7 @@ impl NativeThreadEnvironment {
         }
 
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, cx);
+            let mut thread = Thread::new_subagent(&parent_thread_entity, persona, capability_mode, cx);
             thread.set_title(label.into(), cx);
             thread
         });
@@ -2653,8 +2753,14 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         })
     }
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>> {
-        self.create_subagent_thread(label, cx)
+    fn create_subagent(
+        &self,
+        label: String,
+        persona: Option<acp_thread::AgentPersona>,
+        capability_mode: Option<acp_thread::AgentCapabilityMode>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_subagent_thread(label, persona, capability_mode, cx)
     }
 
     fn resume_subagent(
@@ -3893,7 +3999,8 @@ mod internal_tests {
 
         // Build the subagent thread the same way
         // `NativeThreadEnvironment::create_subagent_thread` does.
-        let subagent_thread = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, cx)));
+        let subagent_thread =
+            cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, cx)));
 
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.

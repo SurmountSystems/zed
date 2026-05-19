@@ -44,6 +44,11 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one.
     #[serde(default)]
     pub session_id: Option<acp::SessionId>,
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// Capability mode for the spawned subagent. Use "read-only" to restrict the subagent to analysis and non-mutating operations only (Grok-style read-only subagents and plan-phase delegation). Defaults to full capabilities when omitted.
+    #[serde(default)]
+    pub capability_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,11 +146,19 @@ impl AgentTool for SpawnAgentTool {
                     session_info: None,
                 })?;
 
+            let persona = input
+                .persona
+                .as_deref()
+                .map(acp_thread::AgentPersona::from_name);
+            let capability_mode = input
+                .capability_mode
+                .as_deref()
+                .map(acp_thread::AgentCapabilityMode::from_name);
             let (subagent, mut session_info) = cx.update(|cx| {
                 let subagent = if let Some(session_id) = input.session_id {
                     self.environment.resume_subagent(session_id, cx)
                 } else {
-                    self.environment.create_subagent(input.label, cx)
+                    self.environment.create_subagent(input.label, persona, capability_mode, cx)
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,
@@ -156,6 +169,8 @@ impl AgentTool for SpawnAgentTool {
                     session_id: subagent.id(),
                     message_start_index: subagent.num_entries(cx),
                     message_end_index: None,
+                    persona,
+                    capability_mode,
                 };
 
                 event_stream.subagent_spawned(subagent.id());
