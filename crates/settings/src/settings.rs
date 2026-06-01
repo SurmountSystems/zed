@@ -25,10 +25,8 @@ pub mod private {
 
 use gpui::{App, Global};
 
-use rust_embed::RustEmbed;
 use std::env;
 use std::{borrow::Cow, fmt, str};
-use util::asset_str;
 
 pub use ::settings_content::*;
 pub use base_keymap_setting::*;
@@ -115,12 +113,7 @@ impl fmt::Display for WorktreeId {
     }
 }
 
-#[derive(RustEmbed)]
-#[folder = "../../assets"]
-#[include = "settings/*"]
-#[include = "keymaps/*"]
-#[exclude = "*.DS_Store"]
-pub struct SettingsAssets;
+
 
 pub fn init(cx: &mut App) {
     let settings = SettingsStore::new(cx, &default_settings());
@@ -129,11 +122,11 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn default_settings() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/default.json")
+    Cow::Borrowed(include_str!("../../../assets/settings/default.json"))
 }
 
 pub fn default_semantic_token_rules() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/default_semantic_token_rules.json")
+    Cow::Borrowed(include_str!("../../../assets/settings/default_semantic_token_rules.json"))
 }
 
 #[cfg(target_os = "macos")]
@@ -145,40 +138,51 @@ pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-windows.json";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub const DEFAULT_KEYMAP_PATH: &str = "keymaps/default-linux.json";
 
+#[cfg(target_os = "macos")]
 pub fn default_keymap() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>(DEFAULT_KEYMAP_PATH)
+    Cow::Borrowed(include_str!("../../../assets/keymaps/default-macos.json"))
+}
+
+#[cfg(target_os = "windows")]
+pub fn default_keymap() -> Cow<'static, str> {
+    Cow::Borrowed(include_str!("../../../assets/keymaps/default-windows.json"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn default_keymap() -> Cow<'static, str> {
+    Cow::Borrowed(include_str!("../../../assets/keymaps/default-linux.json"))
 }
 
 pub const VIM_KEYMAP_PATH: &str = "keymaps/vim.json";
 
 pub fn vim_keymap() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>(VIM_KEYMAP_PATH)
+    Cow::Borrowed(include_str!("../../../assets/keymaps/vim.json"))
 }
 
 pub fn initial_user_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_user_settings.json")
+    Cow::Borrowed(include_str!("../../../assets/settings/initial_user_settings.json"))
 }
 
 pub fn initial_server_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_server_settings.json")
+    Cow::Borrowed(include_str!("../../../assets/settings/initial_server_settings.json"))
 }
 
 pub fn initial_project_settings_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_local_settings.json")
+    Cow::Borrowed(include_str!("../../../assets/settings/initial_local_settings.json"))
 }
 
 pub fn initial_keymap_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("keymaps/initial.json")
+    Cow::Borrowed(include_str!("../../../assets/keymaps/initial.json"))
 }
 
 pub fn initial_tasks_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_tasks.json")
+    Cow::Borrowed(include_str!("../../../assets/settings/initial_tasks.json"))
 }
 
 pub fn initial_debug_tasks_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_debug_tasks.json")
+    Cow::Borrowed(include_str!("../../../assets/settings/initial_debug_tasks.json"))
 }
 
 pub fn initial_local_debug_tasks_content() -> Cow<'static, str> {
-    asset_str::<SettingsAssets>("settings/initial_local_debug_tasks.json")
+    Cow::Borrowed(include_str!("../../../assets/settings/initial_local_debug_tasks.json"))
 }

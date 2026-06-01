@@ -114,7 +114,7 @@ impl AgentTool for FindPathTool {
     ) -> SharedString {
         let mut title = "Find paths".to_string();
         if let Ok(input) = input {
-            title.push_str(&format!(" matching “`{}`”", input.glob));
+            title.push_str(&format!(" matching \"`{}`\"", input.glob));
         }
         title.into()
     }

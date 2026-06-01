@@ -875,6 +875,13 @@ impl AcpConnection {
         };
 
         // Set up the foreground dispatch loop to process work items from handlers.
+        // NOTE (Grok Build Gap Closure): This loop runs on the main thread. For bridged
+        // "grok" agents, large structured updates (rich plans, many tool calls with terminal
+        // content, subagent trees, monitor output) are delivered as work items here. Heavy
+        // handlers can produce multi-second main-thread stalls (observed as 22s+ blocks in
+        // miniprof hang traces). The long-term mitigation is to prefer the native
+        // is_grok_build_profile path, which emits the same events without crossing the ACP
+        // JSON boundary or this dispatch queue.
         let dispatch_context = ClientContext {
             sessions: sessions.clone(),
             session_list: client_session_list.clone(),

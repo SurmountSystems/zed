@@ -35,7 +35,7 @@ use util::{ResultExt, fs::remove_matching, maybe, merge_json_value_into};
 pub(crate) fn semantic_token_rules() -> SemanticTokenRules {
     let content = grammars::get_file("go/semantic_token_rules.json")
         .expect("missing go/semantic_token_rules.json");
-    let json = std::str::from_utf8(&content.data).expect("invalid utf-8 in semantic_token_rules");
+    let json = std::str::from_utf8(content).expect("invalid utf-8 in semantic_token_rules");
     settings::parse_json_with_comments::<SemanticTokenRules>(json)
         .expect("failed to parse go semantic_token_rules.json")
 }

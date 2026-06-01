@@ -469,11 +469,19 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
         let new_text_len = new_text.len();
         let icon_path = uri.icon_path(cx);
         let crease_text: SharedString = uri.name().into();
-        let source_highlight_id = cx
-            .theme()
-            .syntax()
-            .highlight_id("variable")
-            .map(HighlightId::new);
+        let is_grok_skill =
+            skill.source.as_ref().contains("grok") || skill.source.as_ref().contains(".grok");
+        let source_highlight_id = if is_grok_skill {
+            cx.theme()
+                .syntax()
+                .highlight_id("accent")
+                .map(HighlightId::new)
+        } else {
+            cx.theme()
+                .syntax()
+                .highlight_id("variable")
+                .map(HighlightId::new)
+        };
         let label = build_slash_item_label(&skill.name, Some(&skill.source), source_highlight_id);
         Completion {
             replace_range: source_range.clone(),
@@ -2353,7 +2361,7 @@ fn build_slash_command_label(
 /// the item origin after the name when one is present and non-empty.
 /// The suffix is styled with the muted `variable` highlight and excluded
 /// from the fuzzy filter range so typing the source doesn't match the entry.
-fn build_slash_item_label(
+pub(crate) fn build_slash_item_label(
     name: &Arc<str>,
     source: Option<&SharedString>,
     source_highlight_id: Option<HighlightId>,
@@ -2362,12 +2370,18 @@ fn build_slash_item_label(
     let Some(source) = source else {
         return CodeLabel::plain(name.to_string(), None);
     };
+    let display_source: SharedString =
+        if source.as_ref().contains("grok") || source.as_ref().contains(".grok") {
+            "Grok".into()
+        } else {
+            source.clone()
+        };
     let mut builder = CodeLabelBuilder::default();
     builder.push_str(name, None);
     // Two spaces gives a touch of breathing room between the name and
     // the muted source label.
     builder.push_str("  ", None);
-    builder.push_str(source, source_highlight_id);
+    builder.push_str(&display_source, source_highlight_id);
     // The filter range defaults to the entire label after `build()`,
     // which would let the source text participate in fuzzy filtering.
     // Slash commands are matched up-front in `search_slash_commands`
@@ -2738,6 +2752,31 @@ mod tests {
                 argument: None,
             })
         );
+
+        // Grok prompt drawer improvement test: Grok-sourced skills (from .grok/skills bridging)
+        // receive the "accent" highlight in the slash completion label so they stand out
+        // for co-equal Grok Build users. Non-Grok sources keep the default "variable" style.
+        // This exercises the is_grok_skill path added for prompt drawer polish.
+        let grok_label = build_slash_item_label(
+            &Arc::from("review"),
+            Some(&SharedString::from(".grok/skills/review")),
+            None,
+        );
+        let grok_text = grok_label.text.to_string();
+        assert!(grok_text.contains("review"));
+        // Grok improvement: .grok sources are displayed as clean "Grok" suffix in the drawer
+        // (not the full path) for better UX on Grok Build threads.
+        assert!(grok_text.contains("Grok"));
+        assert!(!grok_text.contains(".grok/skills/review"));
+
+        let normal_label = build_slash_item_label(
+            &Arc::from("fix"),
+            Some(&SharedString::from("myproject")),
+            None,
+        );
+        let normal_text = normal_label.text.to_string();
+        assert!(normal_text.contains("fix"));
+        assert!(normal_text.contains("myproject"));
 
         assert_eq!(
             SlashCommandCompletion::try_parse("Lorem /help /test", 0),

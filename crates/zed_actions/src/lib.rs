@@ -494,8 +494,12 @@ pub mod agent {
             /// Opens the agent settings panel.
             #[action(deprecated_aliases = ["agent::OpenConfiguration"])]
             OpenSettings,
-            /// Opens the Zed Todos surface displaying classified approvals, plan, background tasks and memory for the active agent thread.
+            /// Opens the full rich classified Zed Todos (ZT-1) surface with RO/Destructive chips, proposed plans + accept, monitors, and memory for the active thread.
+            /// After selecting "Grok Build mode" (via agent selector, "agent: new grok thread", or ctrl-alt-x / cmd-alt-x), use this (from Command Palette or bound key) to enter the complete visual Grok Build experience.
+            /// The swarm is also building a "Full Agent Mode / full screen" button for direct spacious access. See external-agents.md#Grok for details.
             OpenZedTodosSurface,
+            /// Provides the "agent: open full grok surface" command palette entry and pairs with keybinding + toolbar button for one-keystroke or prominent entry to the classified ZT-1 experience on any Grok thread.
+            OpenFullGrokSurface,
             /// Opens the agent onboarding modal.
             OpenOnboardingModal,
             /// Resets the agent onboarding state.

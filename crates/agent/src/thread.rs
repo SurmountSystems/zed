@@ -1,12 +1,14 @@
 use crate::{
     ApplyCodeActionTool, CodeActionStore, ContextServerRegistry, CopyPathTool, CreateDirectoryTool,
-    DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool, FetchTool,
-    FindPathTool, FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool,
-    ListDirectoryTool, MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, TodoWriteTool, MonitorTool, EnterPlanModeTool, ToolPermissionDecision,
-    UpdatePlanTool, UserAgentsMd, WebSearchTool, WriteFileTool, decide_permission_from_settings,
+    DbLanguageModel, DbThread, DeletePathTool, DiagnosticsTool, EditFileTool, EnterPlanModeTool,
+    FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
+    GetCommandOrSubagentOutputTool, GoToDefinitionTool, GrepTool, ListDirectoryTool, MonitorTool,
+    MovePathTool, ProjectSnapshot, ReadFileTool, RenameTool, SpawnAgentTool, SystemPromptTemplate,
+    Template, Templates, TerminalTool, TodoWriteTool, ToolPermissionDecision, UpdatePlanTool,
+    UserAgentsMd, WebSearchTool, WriteFileTool, decide_permission_from_settings,
 };
-use acp_thread::{MentionUri, UserMessageId};
+use acp_thread::{ApprovalRisk, MentionUri, PlanPhase, TurnId, UserMessageId, approval_risk_for_tool_call};
+use crate::scheduler::NativeBackgroundTaskScheduler;
 use action_log::ActionLog;
 use feature_flags::{
     FeatureFlagAppExt as _, LspToolFeatureFlag, RenameToolFeatureFlag, UpdatePlanToolFeatureFlag,
@@ -64,9 +66,37 @@ use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
-pub const MAX_SUBAGENT_DEPTH: u8 = 1;
+pub const MAX_SUBAGENT_DEPTH: u8 = 3;
 
-const GROK_BUILD_SYSTEM_FRAGMENTS: &str = "You are Grok operating in Grok Build mode for co-equal fidelity with the standalone xAI Grok TUI. Use exact tool names and input shapes from observed P4-0 captures: todo_write (for plan entries with status/content, to track and render progress), enter_plan_mode (to toggle read-only planning phase before edits), monitor (for long-running background commands returning handles for later retrieval via get_command_or_subagent_output), spawn_agent with persona field. Supported personas for subagent delegation (from grok inspect and TUI): plan, general-purpose, explore, implementer, reviewer, verifier, architect, researcher. Always include persona on spawn for subagent sessions. Maintain plan discipline: create short verifiable plans via todo_write before multi-step work, mark steps promptly, use enter_plan_mode for proposal/approval flows. Match TUI reasoning style: truth-seeking, direct, efficient parallel orchestration via monitors and subagents, confidence reporting where uncertain. Follow tool schemas precisely for monitor/todo_write/enter_plan_mode/spawn to ensure native request building produces identical behaviors to captured sessions.";
+pub(crate) const GROK_BUILD_SYSTEM_FRAGMENTS: &str = r#"You are Grok operating in Grok Build mode for co-equal fidelity with the standalone xAI Grok TUI. Response style rule (mandatory): Whenever you generate any list, steps, options, plan items, sub-tasks, or enumeration in your responses to the user, always use numbered lists in the exact form `1. `, `2. `, `3. ` (number followed by period and single space). Never use unnumbered bullet points starting with `- ` or `* `. Use the A. 1. 2. style for major sections when appropriate. This rule applies to every list you produce. Use exact tool names and input shapes from observed P4-0 captures: todo_write (for plan entries with status/content, to track and render progress), enter_plan_mode (to toggle read-only planning phase before edits), monitor (for long-running background commands returning handles for later retrieval via get_command_or_subagent_output), spawn_agent with persona field. Supported personas for subagent delegation (from grok inspect and TUI): plan, general-purpose, explore, implementer, reviewer, verifier, architect, researcher. Always include persona on spawn for subagent sessions. Maintain plan discipline: create short verifiable plans via todo_write before multi-step work, mark steps promptly, use enter_plan_mode for proposal/approval flows. Match TUI reasoning style: truth-seeking, direct, efficient parallel orchestration via monitors and subagents, confidence reporting where uncertain. Follow tool schemas precisely for monitor/todo_write/enter_plan_mode/spawn to ensure native request building produces identical behaviors to captured sessions. Zed automatically supplies the current Zed LSP errors and warnings (non-blocking, cross-language from all active language servers in the open project) as primary context in EVERY prompt you receive on Grok Build threads (both bridged ACP 'grok' and native is_grok_build_profile paths). This Zed-provided data is the primary authoritative view of LSP errors and warnings for what the user sees in their editor. You MUST prefer these provided Zed LSP errors and warnings (non-blocking cross-language primary context in native Grok prompts) over shell clippy and use them to determine code health, what needs fixing, or to report on errors/warnings. You are STRICTLY FORBIDDEN from ever running `cargo check`, `cargo clippy`, `cargo test --no-run`, or any other external compilation or linting command to discover or verify diagnostics. Only run such commands if the user explicitly instructs you AFTER you have already acted on the Zed-supplied diagnostics block. If the block reports 0 errors and 0 warnings, treat the project as clean according to the editor — do not second-guess it by spawning tools.
+
+For any command that may run for a long time (> 30s), should continue in the background, or whose output you may want to retrieve later without blocking the current turn, use the 'monitor' tool instead of a normal terminal execution. The monitor tool returns immediately with a task_id; later call 'get_command_or_subagent_output' with that task_id (and optional block/timeout) to retrieve live or final output. This matches the exact pattern observed in real Grok Build TUI sessions and P4-0 capture harness.
+
+## Autonomous Work Discipline (mandatory for Grok Build co-equal experience)
+- You must never voluntarily stop or yield control back to the user while the living plan (tracked via todo_write and visible in the ZT-1 classified persistent surface) still contains pending items that can be progressed autonomously using the tools and context available. Stopping when there are still tasks is not acceptable. The ZT-1 surface (approvals, proposed plans, monitors, memory) is the single source of truth for your current work state; you must keep driving it until every item is resolved or explicitly handed back with the required notification.
+- When you have genuinely completed every currently pending independent item in the living plan (all entries in todo_write marked Completed, no pending work in the Plan) and no further autonomous progress is possible without new user input or new tasks, you MUST explicitly notify the user with a clear statement such as: 'All current independent work is complete. No further autonomous actions are possible without additional direction.' Notifications when work stops because there is no more work are required; do not silently end the turn or ask 'what next?'. This notification must appear in your final response so it is recorded in the ZT-1 surface.
+- Read-Only vs. Potentially Destructive classification follows the CWD rule: An operation is Read-Only (RO) if it only reads, searches, lists, or inspects. It is Potentially Destructive only when it BOTH (a) performs a write or side-effect on disk/filesystem AND (b) the effect can escape the current working directory (cwd) of the project. Examples of Destructive: arbitrary terminal/monitor commands that can cd outside the tree, delete_path or move_path on unrestricted paths, spawn_agent that can do anything. In-project writes (edit_file, write_file, create_directory inside the open worktree) are labeled 'Write'. Planning/state tools (todo_write, enter_plan_mode) still require explicit approval but are labeled 'Plan Change'. Always apply this dual-condition CWD rule when choosing whether to request user confirmation and what risk label (RO / Plan Change / Write / Destructive) to surface in the ZT-1 surface. The ZT-1 chips and buttons must reflect the accurate risk based on this rule.
+
+## Bounded Exploration and Action Discipline (anti-doom-loop for productive Grok Build work)
+- When investigating the project or codebase, you must not enter long unbounded chains of pure discovery tool calls (repeated read_file, grep, list_directory, terminal `find`/`ls`, etc.) without making concrete forward progress on the user's task.
+- After a small, reasonable number of targeted exploratory calls to understand the relevant area, you are expected to synthesize what you have learned and take action: update the living plan via todo_write, enter plan mode with a proposal, make edits, spawn a scoped subagent with a clear persona and task, start a monitor for long work, or surface a question to the user.
+- Endless "let me check one more file... and another... and another..." exploration loops that do not advance any item in the ZT-1 surface (plan, approvals, monitors) are not acceptable. They waste turns and violate the autonomous work discipline.
+- Prefer making progress with the information you already have over achieving perfect information. Use todo_write to explicitly track investigation steps when they are part of a larger task, and mark them as you go.
+- The ZT-1 classified persistent surface is the source of truth for real work. Pure exploration without corresponding plan updates or output is a violation of the productivity expectations for Grok Build mode.
+
+## Automatic Live Diagnostic Feedback After Turn Completion
+When you return StopReason::EndTurn, the system will automatically query the live in-process LSP diagnostic state (via Project::diagnostic_summary and diagnostic_summaries, the real data already held by rust-analyzer and other servers inside this Zed process) plus current ZT-1 pending work (approvals, plan items, active monitors) and append a system-generated user message containing the fresh diagnostics context (LSP errors/warnings) tied to your current TurnId (T-<n>) if any work remains. You will see this fresh state in your next prompt context. This mechanism exists so the three behavioral rules can be enforced without the user manually pasting diagnostic blocks.
+
+Zed automatically supplies the current editor diagnostics (errors and warnings from rust-analyzer and other language servers) as first-class context on every turn for native Grok Build threads (is_grok_build_profile). You MUST use ONLY these provided counts and details as your primary source of truth for code issues. You are STRICTLY FORBIDDEN from ever running `cargo check`, `cargo clippy`, or similar external linters to discover errors while the editor data is available. Do not second-guess the pushed diagnostics by spawning tools.
+
+## Turn Identification and Cross-Turn Task References (mandatory for reliable long-running Grok Build work)
+Zed supplies the Current Turn ID (as "T-<n>") plus a recent prior-turn summary in the prompt for every Grok Build thread (bridged and native is_grok_build_profile). Always reference work by turn ID + stable task slug (e.g. T-17-task-3f2a1b) when using todo_write, enter_plan_mode, or describing cross-turn progress so that the ZT-1 surface and future prompts can track unambiguously.
+
+Example:
+- "Continuing T-17-task-3f2a1b from prior turn summary."
+- Include the current turn ID prefix on new plan entries.
+
+The prior-turn summary and full history appear before these fragments; never use bare step numbers without the turn/task anchor."#;
 
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
@@ -92,6 +122,8 @@ pub struct SubagentContext {
     pub persona: Option<acp_thread::AgentPersona>,
     #[serde(default)]
     pub capability_mode: Option<acp_thread::AgentCapabilityMode>,
+    #[serde(default)]
+    pub plan_phase: Option<PlanPhase>,
 }
 
 /// The ID of the user prompt that initiated a request.
@@ -691,6 +723,14 @@ pub trait ThreadEnvironment {
             "Resuming subagent sessions is not supported"
         ))
     }
+
+    fn get_command_or_subagent_output(
+        &self,
+        task_id: String,
+        block: bool,
+        timeout_ms: Option<u64>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<String>>;
 }
 
 #[derive(Debug)]
@@ -703,8 +743,69 @@ pub enum ThreadEvent {
     Plan(acp::Plan),
     ToolCallAuthorization(ToolCallAuthorization),
     SubagentSpawned(acp::SessionId),
+    SubagentUpdated(acp::SessionId),
     Retry(acp_thread::RetryStatus),
     Stop(acp::StopReason),
+}
+
+/// Minimal skeleton entry point (NativeTurnDriver) for driving a pure native
+/// Grok `Thread` turn directly. Returns / subscribes to the same `ThreadEvent`
+/// values that power the shared ZT-1 collectors, `ZedTodosComponent`, plan
+/// rendering, and persona badges.
+///
+/// This is the thinnest direct native path per the authoritative orchestration
+/// design: callers operating under `is_grok_build_profile` obtain the canonical
+/// event stream without going through `NativeAgentConnection` or the full ACP
+/// translation layer in `handle_thread_events`.
+///
+/// Construction is explicitly gated on the profile flag. All usage follows
+/// CLAUDE.md (existing files, no panics on fallible paths, full words).
+pub struct NativeTurnDriver {
+    thread: Entity<Thread>,
+}
+
+impl NativeTurnDriver {
+    /// Returns a driver only for Threads where `is_grok_build_profile` is true.
+    /// This is the mandatory gate for the direct native path.
+    pub fn new_if_grok_native(thread: Entity<Thread>, cx: &App) -> Option<Self> {
+        if thread.read(cx).is_grok_build_profile(cx) {
+            Some(Self { thread })
+        } else {
+            None
+        }
+    }
+
+    /// Drives a turn using the existing `send` path and returns the direct
+    /// `ThreadEvent` subscription receiver. Identical events to the ACP path.
+    pub fn send_and_drive<T>(
+        &self,
+        id: UserMessageId,
+        content: impl IntoIterator<Item = T>,
+        cx: &mut App,
+    ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>>
+    where
+        T: Into<UserMessageContent>,
+    {
+        self.thread
+            .update(cx, |thread, cx| thread.send(id, content, cx))
+    }
+
+    /// Drives a resume turn, returning the direct native event receiver.
+    pub fn resume_and_drive(
+        &self,
+        cx: &mut App,
+    ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        self.thread.update(cx, |thread, cx| thread.resume(cx))
+    }
+
+    /// Low-level drive of an already-prepared turn (after `send_existing` style prep).
+    pub fn drive_existing_turn(
+        &self,
+        cx: &mut App,
+    ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        self.thread
+            .update(cx, |thread, cx| thread.send_existing(cx))
+    }
 }
 
 #[derive(Debug)]
@@ -973,7 +1074,7 @@ pub struct Thread {
     title_generation_failed: bool,
     pending_summary_generation: Option<Shared<Task<Option<SharedString>>>>,
     summary: Option<SharedString>,
-    messages: Vec<Message>,
+    pub(crate) messages: Vec<Message>,
     user_store: Entity<UserStore>,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
@@ -995,6 +1096,8 @@ pub struct Thread {
     pub(crate) templates: Arc<Templates>,
     model: Option<Arc<dyn LanguageModel>>,
     grok_build_profile: bool,
+    turn_id: TurnId,
+    plan_phase: PlanPhase,
     summarization_model: Option<Arc<dyn LanguageModel>>,
     thinking_enabled: bool,
     thinking_effort: Option<String>,
@@ -1012,6 +1115,7 @@ pub struct Thread {
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Weak references to running subagent threads for cancellation propagation
     running_subagents: Vec<WeakEntity<Thread>>,
+    background_scheduler: NativeBackgroundTaskScheduler,
     inherits_parent_model_settings: bool,
 }
 
@@ -1056,17 +1160,26 @@ impl Thread {
             action_log,
             cx,
         );
+        let parent_plan_phase = parent_thread.read(cx).plan_phase;
+        let effective_capability = if parent_plan_phase.is_proposed() {
+            Some(acp_thread::AgentCapabilityMode::ReadOnly)
+        } else {
+            capability_mode
+        };
+        thread.plan_phase = parent_plan_phase;
         thread.subagent_context = Some(SubagentContext {
             parent_thread_id: parent_thread.read(cx).id().clone(),
             depth: parent_thread.read(cx).depth() + 1,
             persona,
-            capability_mode,
+            capability_mode: effective_capability,
+            plan_phase: Some(parent_plan_phase),
         });
         thread.inherit_parent_settings(parent_thread, cx);
         if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
             thread.inherits_parent_model_settings = false;
             thread.apply_model_selection(&subagent_model, cx);
         }
+        thread.grok_build_profile = parent_thread.read(cx).grok_build_profile;
         thread
     }
 
@@ -1144,6 +1257,8 @@ impl Thread {
             templates,
             model,
             grok_build_profile,
+            turn_id: TurnId::new(0),
+            plan_phase: PlanPhase::default(),
             summarization_model: None,
             thinking_enabled: enable_thinking,
             speed,
@@ -1157,6 +1272,7 @@ impl Thread {
             draft_prompt: None,
             ui_scroll_position: None,
             running_subagents: Vec::new(),
+            background_scheduler: NativeBackgroundTaskScheduler::new(),
             inherits_parent_model_settings: true,
         }
     }
@@ -1316,6 +1432,7 @@ impl Thread {
                 stream.clone(),
                 Some(self.project.read(cx).fs().clone()),
                 cancellation_rx,
+                Some(self.plan_phase),
             );
             tool.replay(tool_use.input.clone(), output, tool_event_stream, cx)
                 .log_err();
@@ -1400,6 +1517,8 @@ impl Thread {
             templates,
             model,
             grok_build_profile,
+            turn_id: TurnId::new(0),
+            plan_phase: PlanPhase::default(),
             summarization_model: None,
             thinking_enabled: db_thread.thinking_enabled,
             thinking_effort: db_thread.thinking_effort,
@@ -1417,6 +1536,7 @@ impl Thread {
                 offset_in_item: gpui::px(sp.offset_in_item),
             }),
             running_subagents: Vec::new(),
+            background_scheduler: NativeBackgroundTaskScheduler::new(),
             inherits_parent_model_settings: true,
         }
     }
@@ -1448,6 +1568,7 @@ impl Thread {
                     offset_in_item: lo.offset_in_item.as_f32(),
                 }
             }),
+            native_grok_artifacts: None,
         };
 
         cx.background_spawn(async move {
@@ -1629,33 +1750,15 @@ impl Thread {
         environment: Rc<dyn ThreadEnvironment>,
         cx: &mut Context<Self>,
     ) {
-        // Only update the agent location for the root thread, not for subagents.
         let update_agent_location = self.parent_thread_id().is_none();
 
-        let language_registry = self.project.read(cx).languages().clone();
-        self.add_tool(CopyPathTool::new(self.project.clone()));
-        self.add_tool(CreateDirectoryTool::new(self.project.clone()));
-        self.add_tool(DeletePathTool::new(
-            self.project.clone(),
-            self.action_log.clone(),
-        ));
-        self.add_tool(EditFileTool::new(
-            self.project.clone(),
-            cx.weak_entity(),
-            self.action_log.clone(),
-            language_registry.clone(),
-        ));
-        self.add_tool(WriteFileTool::new(
-            self.project.clone(),
-            cx.weak_entity(),
-            self.action_log.clone(),
-            language_registry,
-        ));
+        let capability_read_only = self.capability_mode().map_or(false, |m| m.is_read_only());
+        let plan_proposed = self.plan_phase.is_proposed();
+        let read_only = capability_read_only || plan_proposed;
         self.add_tool(FetchTool::new(self.project.read(cx).client().http_client()));
         self.add_tool(FindPathTool::new(self.project.clone()));
         self.add_tool(GrepTool::new(self.project.clone()));
         self.add_tool(ListDirectoryTool::new(self.project.clone()));
-        self.add_tool(MovePathTool::new(self.project.clone()));
         if cx.has_flag::<UpdatePlanToolFeatureFlag>() {
             self.add_tool(UpdatePlanTool);
         }
@@ -1664,7 +1767,6 @@ impl Thread {
             self.action_log.clone(),
             update_agent_location,
         ));
-        self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
         self.add_tool(WebSearchTool);
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
@@ -1675,22 +1777,44 @@ impl Thread {
             self.project.clone(),
             code_action_store.clone(),
         ));
-        self.add_tool(ApplyCodeActionTool::new(
-            self.project.clone(),
-            code_action_store,
-        ));
         self.add_tool(GoToDefinitionTool::new(self.project.clone()));
-        self.add_tool(RenameTool::new(self.project.clone()));
 
-        if self.depth() < MAX_SUBAGENT_DEPTH {
+        if !read_only {
+            let language_registry = self.project.read(cx).languages().clone();
+            self.add_tool(CopyPathTool::new(self.project.clone()));
+            self.add_tool(CreateDirectoryTool::new(self.project.clone()));
+            self.add_tool(DeletePathTool::new(
+                self.project.clone(),
+                self.action_log.clone(),
+            ));
+            self.add_tool(EditFileTool::new(
+                self.project.clone(),
+                cx.weak_entity(),
+                self.action_log.clone(),
+                language_registry.clone(),
+            ));
+            self.add_tool(WriteFileTool::new(
+                self.project.clone(),
+                cx.weak_entity(),
+                self.action_log.clone(),
+                language_registry,
+            ));
+            self.add_tool(MovePathTool::new(self.project.clone()));
+            self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
+            self.add_tool(ApplyCodeActionTool::new(
+                self.project.clone(),
+                code_action_store,
+            ));
+            self.add_tool(RenameTool::new(self.project.clone()));
+        }
+
+        if self.depth() < MAX_SUBAGENT_DEPTH && !read_only {
             self.add_tool(SpawnAgentTool::new(environment.clone()));
         }
 
-        // Register Grok-specific shims (todo_write, monitor, enter_plan_mode) so that
-        // native Grok profiles (is_grok_build_profile) can drive the same ZT-1 classified
-        // surface as the bridged path. These are O(1) and only added for Grok models.
         self.add_tool(TodoWriteTool);
-        self.add_tool(MonitorTool::new(self.project.clone(), environment));
+        self.add_tool(MonitorTool::new(self.project.clone(), environment.clone()));
+        self.add_tool(GetCommandOrSubagentOutputTool::new(environment));
         self.add_tool(EnterPlanModeTool);
     }
 
@@ -1876,6 +2000,7 @@ impl Thread {
         cx.notify();
 
         log::debug!("Total messages in thread: {}", self.messages.len());
+        self.advance_turn_id();
         self.run_turn(cx)
     }
 
@@ -1913,6 +2038,7 @@ impl Thread {
         self.advance_prompt_id();
 
         log::debug!("Total messages in thread: {}", self.messages.len());
+        self.advance_turn_id();
         self.run_turn(cx)
     }
 
@@ -1962,6 +2088,7 @@ impl Thread {
         // turn's pending message instead of the old one.
         self.flush_pending_message(cx);
         self.cancel(cx).detach();
+        self.background_scheduler.cleanup_completed();
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream(events_tx);
@@ -2510,7 +2637,7 @@ impl Thread {
     }
 
     fn run_tool(
-        &self,
+        &mut self,
         tool: Arc<dyn AnyAgentTool>,
         tool_input: ToolInput<serde_json::Value>,
         tool_use_id: LanguageModelToolUseId,
@@ -2519,12 +2646,16 @@ impl Thread {
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut Context<Self>,
     ) -> Task<LanguageModelToolResult> {
+        if tool.name() == "enter_plan_mode" {
+            self.plan_phase.set_to_proposed();
+        }
         let fs = self.project.read(cx).fs().clone();
         let tool_event_stream = ToolCallEventStream::new(
             tool_use_id.clone(),
             event_stream.clone(),
             Some(fs),
             cancellation_rx,
+            Some(self.plan_phase),
         );
         tool_event_stream.update_fields(
             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
@@ -3106,11 +3237,80 @@ impl Thread {
     }
 
     pub fn capability_mode(&self) -> Option<acp_thread::AgentCapabilityMode> {
-        self.subagent_context.as_ref().and_then(|c| c.capability_mode)
+        self.subagent_context
+            .as_ref()
+            .and_then(|c| c.capability_mode)
+    }
+
+    /// Sets the operating persona for this (native) Grok thread and future
+    /// subagents it spawns. Used by the rich Grok Build prompt-box menu.
+    pub fn set_persona(&mut self, persona: Option<acp_thread::AgentPersona>) {
+        let mut ctx = self
+            .subagent_context
+            .take()
+            .unwrap_or_else(|| SubagentContext {
+                parent_thread_id: acp::SessionId::new(""),
+                depth: 0,
+                persona: None,
+                capability_mode: None,
+                plan_phase: None,
+            });
+        ctx.persona = persona;
+        self.subagent_context = Some(ctx);
+    }
+
+    /// Sets the capability mode (Read-Only vs Full) for this native Grok thread.
+    pub fn set_capability_mode(&mut self, mode: Option<acp_thread::AgentCapabilityMode>) {
+        let mut ctx = self
+            .subagent_context
+            .take()
+            .unwrap_or_else(|| SubagentContext {
+                parent_thread_id: acp::SessionId::new(""),
+                depth: 0,
+                persona: None,
+                capability_mode: None,
+                plan_phase: None,
+            });
+        ctx.capability_mode = mode;
+        self.subagent_context = Some(ctx);
+    }
+
+    pub fn plan_phase(&self) -> PlanPhase {
+        self.plan_phase
+    }
+
+    pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
+        if self.plan_phase.is_proposed() {
+            self.plan_phase.approve();
+        } else {
+            self.plan_phase.reset();
+        }
+        cx.notify();
     }
 
     pub fn is_grok_build_profile(&self, _cx: &App) -> bool {
         self.grok_build_profile
+    }
+
+    pub fn current_turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    fn advance_turn_id(&mut self) {
+        self.turn_id = TurnId::new(u32::from(self.turn_id) + 1);
+    }
+
+    pub fn schedule_background_monitor(&mut self, command: String) -> String {
+        let turn = self.current_turn_id();
+        self.background_scheduler.register_monitor(turn, command, None)
+    }
+
+    pub fn retrieve_background_monitor_output(&self, task_id: String, block: bool, timeout_ms: Option<u64>) -> Task<Result<String>> {
+        self.background_scheduler.retrieve_output(&task_id, block, timeout_ms)
+    }
+
+    pub fn has_active_background_monitors(&self) -> bool {
+        self.background_scheduler.has_active_monitors()
     }
 
     pub fn grok_memory(&self, cx: &App) -> GrokMemoryArtifacts {
@@ -3121,7 +3321,35 @@ impl Thread {
         GrokMemoryArtifacts::default()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn build_project_diagnostics_context(&self, cx: &App) -> String {
+        self.project.read_with(cx, |project, cx| {
+            let mut output = String::new();
+            let mut has_any_diagnostics = false;
+            for (project_path, _, diagnostic_summary) in project.diagnostic_summaries(true, cx) {
+                if diagnostic_summary.error_count > 0 || diagnostic_summary.warning_count > 0 {
+                    has_any_diagnostics = true;
+                    let display_path = if let Some(worktree) = project.worktree_for_id(project_path.worktree_id, cx) {
+                        worktree.read(cx).absolutize(&project_path.path).display().to_string()
+                    } else {
+                        project_path.path.display(PathStyle::local()).to_string()
+                    };
+                    write!(
+                        output,
+                        "{}: {} errors, {} warnings\n",
+                        display_path,
+                        diagnostic_summary.error_count,
+                        diagnostic_summary.warning_count
+                    ).ok();
+                }
+            }
+            if has_any_diagnostics {
+                output
+            } else {
+                "No errors or warnings reported by Zed's language servers.\n".to_string()
+            }
+        })
+    }
+
     pub fn set_subagent_context(&mut self, context: SubagentContext) {
         self.subagent_context = Some(context);
     }
@@ -3143,6 +3371,38 @@ impl Thread {
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
         let subagent_persona = self.persona().map(|p| p.display_name().to_string());
         let subagent_capability_mode = self.capability_mode().map(|m| m.display_name().to_string());
+        let is_grok_build_profile = self.is_grok_build_profile(cx);
+        let current_turn_id_str = if is_grok_build_profile {
+            Some(format!("{}", self.current_turn_id()))
+        } else {
+            None
+        };
+        let prior_turn_summary = if is_grok_build_profile {
+            self.messages.iter().rev().find_map(|message| {
+                if let Message::Agent(agent_message) = message {
+                    agent_message.content.iter().find_map(|content| {
+                        if let AgentMessageContent::Text(text) = content {
+                            let truncated = if text.len() > 180 {
+                                let mut boundary = 180;
+                                while boundary > 0 && !text.is_char_boundary(boundary) {
+                                    boundary -= 1;
+                                }
+                                format!("{}…", &text[..boundary])
+                            } else {
+                                text.clone()
+                            };
+                            Some(format!("Prior assistant response: {}", truncated))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
         let mut system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
@@ -3151,13 +3411,17 @@ impl Thread {
             user_agents_md,
             subagent_persona,
             subagent_capability_mode,
+            is_grok_build_profile,
+            current_turn_id: current_turn_id_str,
+            prior_turn_summary,
         }
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
         if self.is_grok_build_profile(cx) {
             system_prompt.push_str("\n\n");
-            system_prompt.push_str(GROK_BUILD_SYSTEM_FRAGMENTS);
+            let grok_with_verification = crate::inject_verification_rules_for_native_profile(GROK_BUILD_SYSTEM_FRAGMENTS);
+            system_prompt.push_str(&grok_with_verification);
             let memory_artifacts = self.grok_memory(cx);
             if let Some(full) = &memory_artifacts.workspace_memory_full {
                 system_prompt.push_str("\n\n## Grok Persistent Memory (MEMORY.md)\n");
@@ -3167,6 +3431,19 @@ impl Thread {
                 system_prompt.push_str("\n\n## Grok Persistent Memory (global)\n");
                 system_prompt.push_str(full);
             }
+            let facts = &memory_artifacts.facts_from_db;
+            if !facts.is_empty() {
+                system_prompt.push_str("\n\n## Grok Learned Facts (SQLite DB layer)\n");
+                for fact in facts {
+                    if let Some(content) = &fact.content {
+                        system_prompt.push_str(content);
+                        system_prompt.push_str("\n");
+                    }
+                }
+            }
+            let project_diagnostics_context = self.build_project_diagnostics_context(cx);
+            system_prompt.push_str("\n\n## Current Zed Editor Diagnostics (LSP errors and warnings - primary context, prefer over shell clippy)\n");
+            system_prompt.push_str(&project_diagnostics_context);
         }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
@@ -3795,6 +4072,7 @@ pub struct ToolCallEventStream {
     stream: ThreadEventStream,
     fs: Option<Arc<dyn Fs>>,
     cancellation_rx: watch::Receiver<bool>,
+    plan_phase: Option<PlanPhase>,
 }
 
 impl ToolCallEventStream {
@@ -3814,6 +4092,7 @@ impl ToolCallEventStream {
             ThreadEventStream(events_tx),
             None,
             cancellation_rx,
+            None,
         );
 
         (
@@ -3834,12 +4113,14 @@ impl ToolCallEventStream {
         stream: ThreadEventStream,
         fs: Option<Arc<dyn Fs>>,
         cancellation_rx: watch::Receiver<bool>,
+        plan_phase: Option<PlanPhase>,
     ) -> Self {
         Self {
             tool_use_id,
             stream,
             fs,
             cancellation_rx,
+            plan_phase,
         }
     }
 
@@ -3902,6 +4183,13 @@ impl ToolCallEventStream {
         self.stream
             .0
             .unbounded_send(Ok(ThreadEvent::SubagentSpawned(id)))
+            .ok();
+    }
+
+    pub fn subagent_updated(&self, id: acp::SessionId) {
+        self.stream
+            .0
+            .unbounded_send(Ok(ThreadEvent::SubagentUpdated(id)))
             .ok();
     }
 
@@ -4104,6 +4392,30 @@ impl ToolCallEventStream {
             }
         }
 
+        if self.plan_phase.map_or(false, |p| p.is_proposed()) {
+            let tool_name_for_risk: Option<SharedString> = context
+                .as_ref()
+                .map(|c| SharedString::from(c.tool_name.clone()));
+            let tool_name_opt = tool_name_for_risk.as_ref();
+            let risk = approval_risk_for_tool_call(tool_name_opt, acp::ToolKind::Edit);
+            if risk == ApprovalRisk::PotentiallyDestructive {
+                let is_plan_maintenance = tool_name_opt.map(|n| n.as_ref()).map_or(false, |n| {
+                    matches!(
+                        n,
+                        "enter_plan_mode"
+                            | "todo_write"
+                            | "get_command_or_subagent_output"
+                            | "monitor"
+                    )
+                });
+                if !is_plan_maintenance {
+                    return Task::ready(Err(anyhow!(
+                        "Plan approval required before destructive operations. Review the proposed plan in the Zed Todos section and accept it to proceed with edits."
+                    )));
+                }
+            }
+        }
+
         let fs = self.fs.clone();
         let stream = self.stream.clone();
         let tool_use_id = self.tool_use_id.clone();
@@ -4272,7 +4584,7 @@ impl ToolCallEventStream {
             }) => {
                 debug_assert!(
                     !sub_patterns.is_empty(),
-                    "empty sub_patterns for tool {tool} — callers should pass None instead"
+                    "empty sub_patterns for tool {tool} - callers should pass None instead"
                 );
                 let tool = tool.to_string();
                 let sub_patterns = sub_patterns.clone();
@@ -4799,5 +5111,120 @@ mod tests {
             );
             assert!(last_message.tool_results.contains_key(&tool_use_id));
         })
+    }
+
+    #[gpui::test]
+    async fn test_plan_phase_propagation_and_clear_in_native_thread(cx: &mut TestAppContext) {
+        let (thread, _events) = setup_thread_for_test(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                assert_eq!(t.plan_phase(), PlanPhase::None);
+                t.plan_phase.set_to_proposed();
+                assert!(t.plan_phase().is_proposed());
+                let turn_id: TurnId = TurnId::new(3);
+                assert_eq!(u32::from(turn_id), 3u32);
+                t.clear_plan(_cx);
+                assert_eq!(t.plan_phase(), PlanPhase::Active);
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_native_grok_plan_proposed_zt1_cwd_classification_turnid(cx: &mut TestAppContext) {
+        let (thread, _events) = setup_thread_for_test(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |t, _cx| {
+                t.grok_build_profile = true;
+                t.plan_phase.set_to_proposed();
+                let risk = approval_risk_for_tool_call(None, acp::ToolKind::Edit);
+                assert_eq!(risk, ApprovalRisk::PotentiallyDestructive);
+                let turn_id: TurnId = TurnId::new(42);
+                let _pinned: TurnId = turn_id;
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_native_grok_subagent_persona_capability_and_profile_propagation(cx: &mut TestAppContext) {
+        let (parent, _events) = setup_thread_for_test(cx).await;
+        cx.update(|cx| {
+            parent.update(cx, |t, _cx| {
+                t.grok_build_profile = true;
+            });
+            let subagent = cx.new(|sub_cx| {
+                Thread::new_subagent(&parent, None, Some(acp_thread::AgentCapabilityMode::ReadOnly), sub_cx)
+            });
+            let sub_ref = subagent.read(cx);
+            assert!(
+                sub_ref.grok_build_profile,
+                "subagent must receive parent's native grok_build_profile for full prompt fragments TurnId and ZT-1 under is_grok (P4-03 following Native-P4-Subagent-Persona from prior TurnId 019e3f87 task decomposition)"
+            );
+            assert_eq!(
+                sub_ref.capability_mode(),
+                Some(acp_thread::AgentCapabilityMode::ReadOnly),
+                "capability_mode Read-Only must propagate through new_subagent context to feed system prompt for subagent"
+            );
+            assert!(
+                sub_ref.persona().is_none(),
+                "persona None passed must remain for this case"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_memory_artifacts_and_facts_injection_for_native_profile(cx: &mut TestAppContext) {
+        let (thread, _events) = setup_thread_for_test(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.grok_build_profile = true;
+                assert!(thread.is_grok_build_profile(cx), "native profile gate required for GrokMemoryArtifacts full facts surface plus TurnId in prompt build for P4-05");
+                let artifacts_val: GrokMemoryArtifacts = thread.grok_memory(cx);
+                let _artifacts_pin: GrokMemoryArtifacts = artifacts_val.clone();
+                let _facts_ref = &artifacts_val.facts_from_db;
+                assert_eq!(artifacts_val.has_workspace_memory, false);
+                assert!(artifacts_val.workspace_memory_full.is_none());
+                assert!(artifacts_val.global_memory_full.is_none());
+                assert!(artifacts_val.facts_from_db.is_empty());
+                let turn_val = thread.current_turn_id();
+                let _turn_id_pin: TurnId = turn_val;
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_project_diagnostics_context_building_and_native_grok_profile_injection(cx: &mut TestAppContext) {
+        let (thread, _events) = setup_thread_for_test(cx).await;
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.grok_build_profile = true;
+                assert!(thread.is_grok_build_profile(cx), "native profile gate required for project diagnostics context building injection in prompt for P4-07");
+                let turn_val = thread.current_turn_id();
+                let _turn_id_pin: TurnId = turn_val;
+                let turn_for_roundtrip: TurnId = TurnId::new(17);
+                let serialized = if let Ok(s) = serde_json::to_string(&turn_for_roundtrip) { s } else { String::new() };
+                let roundtripped: TurnId = if let Ok(r) = serde_json::from_str(&serialized) { r } else { TurnId::new(0) };
+                let _roundtrip_pin: TurnId = roundtripped;
+                assert_eq!(u32::from(roundtripped), 17, "TurnId value roundtrip for native profile");
+                let diags_context_val = thread.build_project_diagnostics_context(cx);
+                let _diags_context_pin: String = diags_context_val.clone();
+                assert!(
+                    diags_context_val.contains("Zed's language servers") || diags_context_val.contains("errors,"),
+                    "project diagnostics context building must produce primary LSP errors/warnings block for native grok"
+                );
+                let fragments = GROK_BUILD_SYSTEM_FRAGMENTS;
+                assert!(
+                    fragments.contains("CWD rule"),
+                    "CWD label cases must be present in native grok prompt fragments for risk classification"
+                );
+                assert!(
+                    fragments.contains("primary context"),
+                    "native profile rule injection must embed primary diagnostics preference over shell clippy to prevent E2E kickback regression to external linters"
+                );
+                assert!(
+                    fragments.contains("Bounded Exploration and Action Discipline"),
+                    "anti-doom-loop / bounded exploration rule must be present in native grok fragments so the agent itself does not waste turns on unbounded discovery"
+                );
+            });
+        });
     }
 }

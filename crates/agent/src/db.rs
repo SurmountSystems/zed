@@ -81,6 +81,8 @@ pub struct DbThread {
     pub draft_prompt: Option<Vec<acp::ContentBlock>>,
     #[serde(default)]
     pub ui_scroll_position: Option<SerializedScrollPosition>,
+    #[serde(default)]
+    pub native_grok_artifacts: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -96,11 +98,15 @@ pub struct SharedThread {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub model: Option<DbLanguageModel>,
+    #[serde(default)]
+    pub profile: Option<AgentProfileId>,
+    #[serde(default)]
+    pub native_grok_artifacts: Option<serde_json::Value>,
     pub version: String,
 }
 
 impl SharedThread {
-    pub const VERSION: &'static str = "1.0.0";
+    pub const VERSION: &'static str = "1.1.0";
 
     pub fn from_db_thread(thread: &DbThread) -> Self {
         Self {
@@ -108,6 +114,8 @@ impl SharedThread {
             messages: thread.messages.clone(),
             updated_at: thread.updated_at,
             model: thread.model.clone(),
+            profile: thread.profile.clone(),
+            native_grok_artifacts: thread.native_grok_artifacts.clone(),
             version: Self::VERSION.to_string(),
         }
     }
@@ -122,7 +130,7 @@ impl SharedThread {
             cumulative_token_usage: Default::default(),
             request_token_usage: Default::default(),
             model: self.model,
-            profile: None,
+            profile: self.profile,
             imported: true,
             subagent_context: None,
             speed: None,
@@ -130,6 +138,7 @@ impl SharedThread {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            native_grok_artifacts: self.native_grok_artifacts,
         }
     }
 
@@ -147,7 +156,7 @@ impl SharedThread {
 }
 
 impl DbThread {
-    pub const VERSION: &'static str = "0.3.0";
+    pub const VERSION: &'static str = "0.4.0";
 
     pub fn from_json(json: &[u8]) -> Result<Self> {
         let saved_thread_json = serde_json::from_slice::<serde_json::Value>(json)?;
@@ -309,6 +318,7 @@ impl DbThread {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            native_grok_artifacts: None,
         })
     }
 }
@@ -431,6 +441,15 @@ impl ThreadsDatabase {
                 "})?()?;
             }
         }
+
+        // Index supporting the ORDER BY updated_at DESC, created_at DESC in list_threads(),
+        // which is called at launch to populate agent thread history. Without it a full
+        // scan+sort on a large threads table (common for active Grok/agent users) causes
+        // multi-second stalls before first frame.
+        let _ = connection
+            .exec("CREATE INDEX IF NOT EXISTS idx_threads_updated_created ON threads(updated_at DESC, created_at DESC)")?
+            ()
+            .ok();
 
         let db = Self {
             executor,
@@ -632,6 +651,7 @@ impl ThreadsDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acp_thread::TurnId;
     use chrono::{DateTime, TimeZone, Utc};
     use collections::HashMap;
     use gpui::TestAppContext;
@@ -639,20 +659,23 @@ mod tests {
 
     #[test]
     fn test_shared_thread_roundtrip() {
-        let original = SharedThread {
+        let original: SharedThread = SharedThread {
             title: "Test Thread".into(),
             messages: vec![],
             updated_at: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
             model: None,
+            profile: None,
+            native_grok_artifacts: None,
             version: SharedThread::VERSION.to_string(),
         };
 
         let bytes = original.to_bytes().expect("Failed to serialize");
-        let restored = SharedThread::from_bytes(&bytes).expect("Failed to deserialize");
+        let restored: SharedThread = SharedThread::from_bytes(&bytes).expect("Failed to deserialize");
 
         assert_eq!(restored.title, original.title);
         assert_eq!(restored.version, original.version);
         assert_eq!(restored.updated_at, original.updated_at);
+        assert_eq!(restored.profile, original.profile);
     }
 
     #[test]
@@ -694,6 +717,7 @@ mod tests {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            native_grok_artifacts: None,
         }
     }
 
@@ -813,6 +837,7 @@ mod tests {
             depth: 2,
             persona: None,
             capability_mode: None,
+            plan_phase: None,
         });
 
         database
@@ -950,5 +975,166 @@ mod tests {
             .expect("scroll_position should be restored");
         assert_eq!(scroll.item_ix, 42);
         assert!((scroll.offset_in_item - 13.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_native_grok_artifacts_defaults_to_none() {
+        let json = r#"{
+            "title": "Old Thread",
+            "messages": [],
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let db_thread: DbThread = serde_json::from_str(json).expect("Failed to deserialize");
+
+        assert!(
+            db_thread.native_grok_artifacts.is_none(),
+            "Legacy threads without native_grok_artifacts field should default to None"
+        );
+    }
+
+    #[test]
+    fn test_native_profile_and_artifacts_shared_roundtrip() {
+        let _session_identifier = "grok-native-profile-thread";
+        let current_native_grok_turn_identifier: TurnId = TurnId::from(17u32);
+        let introduced_in_turn_for_first_plan: TurnId = TurnId::from(12u32);
+        let plan_entry_with_task_slug: serde_json::Value = serde_json::json!({
+            "id": "T-12-task-plan-1-slug",
+            "status": "pending",
+            "introduced_in_turn": serde_json::to_value(introduced_in_turn_for_first_plan).expect("TurnId serializes transparently for native artifact plan entry"),
+            "proposed": true
+        });
+        let artifacts_with_plan_monitor_memory: ::serde_json::Value = serde_json::json!({
+            "current_turn_id": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId serializes transparently into native artifact"),
+            "plans": [plan_entry_with_task_slug],
+            "monitors": [{"id": "mon-42", "status": "running"}],
+            "subagents": [{"persona": "researcher", "capability": "full"}],
+            "memory": ["fact about CWD handling for labels"]
+        });
+        let grok_profile = Some(AgentProfileId("grok-build".to_string().into()));
+
+        let original: SharedThread = SharedThread {
+            title: "Native Grok Thread".into(),
+            messages: vec![],
+            updated_at: Utc.with_ymd_and_hms(2024, 5, 19, 0, 0, 0).unwrap(),
+            model: None,
+            profile: grok_profile.clone(),
+            native_grok_artifacts: Some(artifacts_with_plan_monitor_memory.clone()),
+            version: SharedThread::VERSION.to_string(),
+        };
+
+        let bytes = original.to_bytes().expect("Failed to serialize");
+        let restored: SharedThread = SharedThread::from_bytes(&bytes).expect("Failed to deserialize");
+
+        let restored_profile: Option<AgentProfileId> = restored.profile.clone();
+        assert_eq!(restored_profile, grok_profile);
+        assert_eq!(restored.native_grok_artifacts, Some(artifacts_with_plan_monitor_memory));
+        let restored_current_native_grok_turn_identifier: TurnId = restored.native_grok_artifacts.as_ref().and_then(|a| a.get("current_turn_id")).map(|v| serde_json::from_value(v.clone()).expect("TurnId deserializes from restored SharedThread artifact")).unwrap_or(TurnId::from(0u32));
+        assert_eq!(restored_current_native_grok_turn_identifier, current_native_grok_turn_identifier);
+    }
+
+    #[gpui::test]
+    async fn test_native_grok_artifacts_and_profile_roundtrip_via_database(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let session_identifier = session_id("native-grok-full-roundtrip");
+        let current_native_grok_turn_identifier: TurnId = TurnId::from(42u32);
+        let plan_task_slug = "T-42-task-foo-bar-baz-slug";
+        let artifacts_simulating_grok_session: ::serde_json::Value = serde_json::json!({
+            "current_turn_id": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId serializes for DbThread blob"),
+            "plans": [{"id": plan_task_slug, "status": "in_progress", "introduced_in_turn": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId for introduced_in_turn on plan entry in DbThread artifact"), "proposed": false}],
+            "monitors": [],
+            "memory": {"workspace": [], "global": []}
+        });
+        let native_profile = Some(AgentProfileId("xai-grok".to_string().into()));
+
+        let mut native_thread = make_thread(
+            "Native Grok With Full State",
+            Utc.with_ymd_and_hms(2024, 5, 19, 12, 0, 0).unwrap(),
+        );
+        native_thread.profile = native_profile.clone();
+        native_thread.native_grok_artifacts = Some(artifacts_simulating_grok_session.clone());
+
+        database
+            .save_thread(session_identifier.clone(), native_thread, PathList::default())
+            .await
+            .unwrap();
+
+        let loaded: Option<DbThread> = database
+            .load_thread(session_identifier)
+            .await
+            .unwrap();
+
+        let loaded_thread: DbThread = loaded.expect("native thread must roundtrip from database");
+        let loaded_profile: Option<AgentProfileId> = loaded_thread.profile.clone();
+        assert_eq!(loaded_profile, native_profile);
+        let loaded_artifacts = loaded_thread.native_grok_artifacts.expect("artifacts for native plans monitors memory turn must survive sqlite roundtrip");
+        let loaded_current_native_grok_turn_identifier: TurnId = loaded_artifacts.get("current_turn_id").map(|v| serde_json::from_value(v.clone()).expect("TurnId deserializes from DbThread loaded artifact")).unwrap_or(TurnId::from(0u32));
+        assert_eq!(loaded_current_native_grok_turn_identifier, current_native_grok_turn_identifier);
+    }
+
+    #[gpui::test]
+    async fn test_cwd_folder_paths_with_native_artifacts_roundtrip(cx: &mut TestAppContext) {
+        let database = ThreadsDatabase::new(cx.executor()).unwrap();
+
+        let session_identifier = session_id("cwd-native");
+        let folder_paths_for_cwd_label = PathList::new(&[std::path::PathBuf::from("/project/src")]);
+        let current_native_grok_turn_identifier: TurnId = TurnId::from(7u32);
+        let mut thread_with_cwd = make_thread("CWD Aware Native", Utc.with_ymd_and_hms(2024, 5, 19, 0, 0, 0).unwrap());
+        thread_with_cwd.native_grok_artifacts = Some(serde_json::json!({
+            "current_turn_id": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId for CWD native artifact"),
+            "plans": [{"id": "T-7-task-cwd-slug-label", "introduced_in_turn": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId introduced_in_turn for CWD plan slug"), "cwd_label_case": "in_project_write"}],
+            "cwd_label_case": "in_project_write"
+        }));
+
+        database
+            .save_thread(session_identifier.clone(), thread_with_cwd, folder_paths_for_cwd_label.clone())
+            .await
+            .unwrap();
+
+        let listed = database.list_threads().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, session_identifier);
+    }
+
+    #[test]
+    fn test_turnid_task_slug_persistence_shared_db_roundtrips_and_native_profile_kickback_regression() {
+        let current_native_grok_turn_identifier: TurnId = TurnId::from(23u32);
+        let task_slug_for_kickback_plan: &str = "T-23-task-kickback-regression-plan-slug";
+        let kickback_plan_entry: serde_json::Value = serde_json::json!({
+            "id": task_slug_for_kickback_plan,
+            "introduced_in_turn": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId for introduced_in_turn in kickback plan entry"),
+            "status": "pending",
+            "proposed": true
+        });
+        let artifacts_for_kickback: ::serde_json::Value = serde_json::json!({
+            "current_turn_id": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId into kickback artifact"),
+            "plans": [kickback_plan_entry.clone()],
+            "memory": {"injected_rules": "native profile kickback for T-N-task-slug references"}
+        });
+        let native_grok_profile = Some(AgentProfileId("grok-build".to_string().into()));
+
+        let original_shared: SharedThread = SharedThread {
+            title: "Kickback Regression Shared".into(),
+            messages: vec![],
+            updated_at: Utc.with_ymd_and_hms(2024, 5, 19, 0, 0, 0).unwrap(),
+            model: None,
+            profile: native_grok_profile.clone(),
+            native_grok_artifacts: Some(artifacts_for_kickback.clone()),
+            version: SharedThread::VERSION.to_string(),
+        };
+        let shared_bytes = original_shared.to_bytes().expect("serialize Shared for kickback");
+        let restored_shared: SharedThread = SharedThread::from_bytes(&shared_bytes).expect("deserialize Shared for kickback");
+        let restored_from_shared_turn: TurnId = restored_shared.native_grok_artifacts.as_ref().and_then(|a| a.get("current_turn_id")).map(|v| serde_json::from_value(v.clone()).expect("TurnId from Shared kickback")).unwrap_or(TurnId::from(0u32));
+        assert_eq!(restored_from_shared_turn, current_native_grok_turn_identifier);
+        assert_eq!(restored_shared.native_grok_artifacts.as_ref().and_then(|a| a.get("plans")).and_then(|p| p.as_array()).map(|arr| arr.len()).unwrap_or(0), 1usize);
+
+        let db_thread_from_shared = original_shared.to_db_thread();
+        assert_eq!(db_thread_from_shared.native_grok_artifacts.as_ref(), Some(&artifacts_for_kickback));
+        let roundtripped_back: SharedThread = SharedThread::from_db_thread(&db_thread_from_shared);
+        let back_turn: TurnId = roundtripped_back.native_grok_artifacts.as_ref().and_then(|a| a.get("current_turn_id")).map(|v| serde_json::from_value(v.clone()).expect("TurnId from to_db/from_db kickback path")).unwrap_or(TurnId::from(0u32));
+        assert_eq!(back_turn, current_native_grok_turn_identifier);
+        let back_plan_id = roundtripped_back.native_grok_artifacts.as_ref().and_then(|a| a.get("plans")).and_then(|p| p.as_array()).and_then(|arr| arr.get(0)).and_then(|pl| pl.get("id")).and_then(|i| i.as_str()).unwrap_or("");
+        assert_eq!(back_plan_id, task_slug_for_kickback_plan);
     }
 }

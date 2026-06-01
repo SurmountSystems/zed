@@ -26,21 +26,15 @@ pub fn get_prompt(name: &'static str) -> Cow<'static, str> {
 
 #[cfg(not(feature = "dynamic_prompts"))]
 pub fn get_prompt(name: &'static str) -> Cow<'static, str> {
-    use rust_embed::RustEmbed;
+    use include_dir::{include_dir, Dir};
 
-    #[derive(RustEmbed)]
-    #[folder = "src/prompts"]
-    struct EmbeddedPrompts;
+    static PROMPTS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src/prompts");
 
-    match EmbeddedPrompts::get(name) {
-        Some(file) => match file.data {
-            Cow::Borrowed(bytes) => {
-                Cow::Borrowed(std::str::from_utf8(bytes).expect("prompt file is not valid UTF-8"))
-            }
-            Cow::Owned(bytes) => {
-                Cow::Owned(String::from_utf8(bytes).expect("prompt file is not valid UTF-8"))
-            }
-        },
+    match PROMPTS.get_file(name) {
+        Some(file) => {
+            let content = String::from_utf8_lossy(file.contents());
+            Cow::Owned(content.into_owned())
+        }
         None => panic!("prompt file not found: {name}"),
     }
 }

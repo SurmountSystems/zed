@@ -7,7 +7,7 @@ use collections::HashMap;
 use editor::{Editor, EditorEvent, EditorMode, MinimapVisibility, SizingBehavior};
 use gpui::{
     AnyEntity, App, AppContext as _, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ScrollHandle, TextStyleRefinement, WeakEntity, Window,
+    ListState, ScrollHandle, TextStyleRefinement, WeakEntity, Window,
 };
 use language::language_settings::SoftWrap;
 use project::{AgentId, Project};
@@ -55,6 +55,10 @@ impl EntryViewState {
         self.entries.get(index)
     }
 
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     pub fn sync_entry(
         &mut self,
         index: usize,
@@ -62,6 +66,13 @@ impl EntryViewState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let current_len = self.entries.len();
+        if index > current_len {
+            for missing_index in current_len..index {
+                self.sync_entry(missing_index, thread, window, cx);
+            }
+        }
+
         let Some(thread_entry) = thread.read(cx).entries().get(index) else {
             return;
         };
@@ -243,7 +254,7 @@ impl EntryViewState {
     fn set_entry(&mut self, index: usize, entry: Entry) {
         if index == self.entries.len() {
             self.entries.push(entry);
-        } else {
+        } else if index < self.entries.len() {
             self.entries[index] = entry;
         }
     }
@@ -271,6 +282,28 @@ impl EntryViewState {
                     }
                 }
             }
+        }
+    }
+
+    pub fn reconcile_with_thread(
+        &mut self,
+        thread: &Entity<AcpThread>,
+        list_state: ListState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_length = thread.read(cx).entries().len();
+        let mut current_length = self.entries.len();
+        while current_length < thread_length {
+            let entry_index = current_length;
+            self.sync_entry(entry_index, thread, window, cx);
+            list_state.splice_focusable(
+                entry_index..entry_index,
+                [self
+                    .entry(entry_index)
+                    .and_then(|entry| entry.focus_handle(cx))],
+            );
+            current_length += 1;
         }
     }
 }
@@ -603,6 +636,66 @@ mod tests {
                 }
             ]
         );
+    }
+
+    mod retained_thread_desync_tdd {
+        use super::*;
+        use gpui::{ListAlignment, ListState, TestAppContext};
+        use ui::px;
+
+        #[gpui::test]
+        async fn test_entry_view_state_recovers_from_retained_thread_growth_desync(cx: &mut TestAppContext) {
+            super::init_test(cx);
+            let fs = FakeFs::new(cx.executor());
+            let project = Project::test(fs, [], cx).await;
+            let (multi_workspace, cx) = cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+            let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+            let connection = Rc::new(StubAgentConnection::new());
+            let thread = cx.update(|_, cx| connection.clone().new_session(project.clone(), PathList::new(&[] as &[&Path]), cx)).await.unwrap();
+            let session_id = thread.update(cx, |thread, _| thread.session_id().clone());
+            let thread_store = None;
+            let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::default()));
+            cx.update(|_, cx| {
+                let tool = acp::ToolCall::new("initial", "Initial").status(acp::ToolCallStatus::Completed).content(vec![]);
+                connection.send_update(session_id.clone(), acp::SessionUpdate::ToolCall(tool), cx);
+            });
+            cx.run_until_parked();
+            let entry_view_state = cx.new(|_| {
+                EntryViewState::new(
+                    workspace.downgrade(),
+                    project.downgrade(),
+                    thread_store,
+                    None,
+                    session_capabilities.clone(),
+                    "Test Agent".into(),
+                )
+            });
+            entry_view_state.update_in(cx, |view_state, window, cx| {
+                if thread.read(cx).entries().len() > 0 {
+                    view_state.sync_entry(0, &thread, window, cx);
+                }
+            });
+            for k in 0..12u32 {
+                cx.update(|_, cx| {
+                    let tool = acp::ToolCall::new(format!("growth-{}", k), "Growth").status(acp::ToolCallStatus::Completed).content(vec![]);
+                    connection.send_update(session_id.clone(), acp::SessionUpdate::ToolCall(tool), cx);
+                });
+            }
+            cx.run_until_parked();
+            let high_index = thread.read_with(cx, |t, _| t.entries().len().saturating_sub(1));
+            entry_view_state.update_in(cx, |view_state, window, cx| {
+                view_state.sync_entry(high_index, &thread, window, cx);
+            });
+            let state_len = entry_view_state.read_with(cx, |v, _| v.len());
+            let thread_len = thread.read_with(cx, |t, _| t.entries().len());
+            assert_eq!(state_len, thread_len);
+            let list_state = ListState::new(0, ListAlignment::Top, px(2048.0));
+            list_state.splice(0..0, state_len);
+            assert_eq!(list_state.item_count(), thread_len);
+            entry_view_state.update_in(cx, |view_state, window, cx| {
+                view_state.sync_entry(high_index, &thread, window, cx);
+            });
+        }
     }
 
     fn init_test(cx: &mut TestAppContext) {

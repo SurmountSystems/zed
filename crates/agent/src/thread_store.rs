@@ -140,6 +140,7 @@ impl ThreadStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acp_thread::TurnId;
     use chrono::{DateTime, TimeZone, Utc};
     use collections::HashMap;
     use gpui::TestAppContext;
@@ -167,6 +168,7 @@ mod tests {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            native_grok_artifacts: None,
         }
     }
 
@@ -309,5 +311,66 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, first_id);
         assert_eq!(entries[1].id, second_id);
+    }
+
+    #[gpui::test]
+    async fn test_native_artifacts_preserved_in_thread_store_save_load(cx: &mut TestAppContext) {
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        cx.run_until_parked();
+
+        let session_identifier = session_id("store-native-artifacts");
+        let current_native_grok_turn_identifier: TurnId = TurnId::from(99u32);
+        let task_slug_in_thread_store_plan: &str = "T-99-task-store-persisted-slug";
+        let artifacts: ::serde_json::Value = serde_json::json!({
+            "current_turn_id": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId serializes for thread store native artifact"),
+            "plans": [{"id": task_slug_in_thread_store_plan, "status": "pending", "introduced_in_turn": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId introduced_in_turn for plan slug in thread store")}],
+            "monitors": [],
+            "memory": {}
+        });
+        let mut native_thread = make_thread("Store Native", Utc.with_ymd_and_hms(2024, 5, 19, 0, 0, 0).unwrap());
+        native_thread.native_grok_artifacts = Some(artifacts.clone());
+
+        let save_task = thread_store.update(cx, |store, cx| {
+            let _artifacts_clone_for_shadow = artifacts.clone();
+            store.save_thread(session_identifier.clone(), native_thread, PathList::default(), cx)
+        });
+        save_task.await.unwrap();
+        cx.run_until_parked();
+
+        let loaded_option: Option<DbThread> = {
+            let load_task = thread_store.update(cx, |store, cx| store.load_thread(session_identifier.clone(), cx));
+            load_task.await.unwrap()
+        };
+        let loaded_thread: DbThread = loaded_option.expect("thread store must deliver native artifacts");
+        let loaded_artifacts = loaded_thread.native_grok_artifacts.expect("native plans monitors turn memory roundtripped via store");
+        let loaded_current_native_grok_turn_identifier: TurnId = loaded_artifacts.get("current_turn_id").map(|v| serde_json::from_value(v.clone()).expect("TurnId deserializes via thread store load")).unwrap_or(TurnId::from(0u32));
+        assert_eq!(loaded_current_native_grok_turn_identifier, current_native_grok_turn_identifier);
+    }
+
+    #[gpui::test]
+    async fn test_turnid_and_task_slug_in_native_artifacts_via_thread_store(cx: &mut TestAppContext) {
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        cx.run_until_parked();
+
+        let session_identifier = session_id("thread-store-turnid-slug");
+        let current_turn: TurnId = TurnId::from(55u32);
+        let plan_slug: &str = "T-55-task-threadstore-slug";
+        let mut thread = make_thread("ThreadStore TurnId", Utc.with_ymd_and_hms(2024, 5, 19, 0, 0, 0).unwrap());
+        thread.native_grok_artifacts = Some(serde_json::json!({
+            "current_turn_id": serde_json::to_value(current_turn).expect("TurnId for thread store test"),
+            "plans": [{"id": plan_slug, "introduced_in_turn": serde_json::to_value(current_turn).expect("introduced_in_turn TurnId for slug in thread store"), "status": "pending"}]
+        }));
+
+        let save = thread_store.update(cx, |store, cx| store.save_thread(session_identifier.clone(), thread, PathList::default(), cx));
+        save.await.unwrap();
+        cx.run_until_parked();
+
+        let loaded_opt: Option<DbThread> = thread_store.update(cx, |store, cx| store.load_thread(session_identifier.clone(), cx)).await.unwrap();
+        let loaded = loaded_opt.expect("loaded");
+        let arts = loaded.native_grok_artifacts.expect("artifacts");
+        let loaded_turn: TurnId = arts.get("current_turn_id").map(|v| serde_json::from_value(v.clone()).expect("TurnId roundtrip in thread store")).unwrap_or(TurnId::from(0u32));
+        assert_eq!(loaded_turn, current_turn);
+        let loaded_slug = arts.get("plans").and_then(|p| p.as_array()).and_then(|a| a.get(0)).and_then(|pl| pl.get("id")).and_then(|s| s.as_str()).unwrap_or("");
+        assert_eq!(loaded_slug, plan_slug);
     }
 }

@@ -6,7 +6,7 @@ mod delete_path_tool;
 mod diagnostics_tool;
 mod edit_file_tool;
 mod edit_session;
-#[cfg(all(test, feature = "unit-eval"))]
+#[cfg(test)]
 mod evals;
 mod fetch_tool;
 mod find_path_tool;
@@ -93,6 +93,8 @@ pub use write_file_tool::*;
 pub struct GrokPlanItem {
     /// Human-readable description of the task (P4-0 observed shape for todo_write and enter_plan_mode inputs uses "content").
     pub content: String,
+    /// Stable short slug for cross-turn task references (TurnId-based task-ids from prior work, e.g. "task-17-..." style) in Grok Build sessions.
+    pub id: String,
     /// Current status.
     pub status: PlanEntryStatus,
     /// Optional active form for display during progress (observed in some plan/todo samples).
@@ -112,7 +114,7 @@ impl From<GrokPlanItem> for acp::PlanEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct TodoWriteInput {
-    /// List of todos (matches P4-0 captured todo_write input shape with "todos" containing content/status/active_form items).
+    /// List of todos (matches P4-0 captured todo_write input shape with "todos" containing content/status/active_form items using TurnId task-ids in the "id" fields per prior work).
     pub todos: Vec<GrokPlanItem>,
 }
 
@@ -161,15 +163,23 @@ pub struct MonitorTool {
 
 impl MonitorTool {
     pub fn new(project: Entity<Project>, environment: Rc<dyn ThreadEnvironment>) -> Self {
-        Self { project, environment }
+        Self {
+            project,
+            environment,
+        }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct MonitorInput {
+    /// The command to execute for background monitoring (matches P4-0 observed monitor tool input shape for native dispatch fidelity).
     pub command: String,
+    /// Working directory to use for the command. Primary key "cd" (to match terminal tool); "cwd" alias supports current working directory label variants observed in P4-0 tool calls for exact deserialization and schema roundtrip fidelity.
+    #[serde(alias = "cwd")]
     pub cd: String,
+    /// Optional timeout in milliseconds for the monitor command.
     pub timeout_ms: Option<u64>,
+    /// Optional human readable description of the monitor task.
     #[serde(default)]
     pub description: Option<String>,
 }
@@ -236,12 +246,7 @@ impl AgentTool for MonitorTool {
             authorize.await.map_err(|e| e.to_string())?;
 
             let terminal = environment
-                .create_terminal(
-                    input_val.command.clone(),
-                    working_dir,
-                    Some(16 * 1024),
-                    cx,
-                )
+                .create_terminal(input_val.command.clone(), working_dir, Some(16 * 1024), cx)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -249,6 +254,13 @@ impl AgentTool for MonitorTool {
             event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
                 acp::ToolCallContent::Terminal(acp::Terminal::new(terminal_id)),
             ]));
+
+            let retained = terminal.clone();
+            cx.spawn(async move |_cx| {
+                let _keep_alive = retained;
+                futures::future::pending::<()>().await;
+            })
+            .detach();
 
             Ok("Background monitor started".to_string())
         })
@@ -261,6 +273,7 @@ pub struct EnterPlanModeTool;
 pub struct EnterPlanModeInput {
     /// Plan entries for enter_plan_mode (uses content/status shape for P4-0 fidelity match on Grok's plan tool inputs).
     pub plan: Vec<GrokPlanItem>,
+    /// Optional explanation for entering plan mode (supports P4-0 observed optional field shape in enter_plan_mode inputs).
     #[serde(default)]
     pub explanation: Option<String>,
 }
@@ -296,6 +309,73 @@ impl AgentTool for EnterPlanModeTool {
             );
             event_stream.update_plan(plan);
             Ok("Plan mode entered".to_string())
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GetCommandOrSubagentOutputInput {
+    pub task_id: String,
+    #[serde(default)]
+    pub block: bool,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+pub struct GetCommandOrSubagentOutputTool {
+    environment: Rc<dyn ThreadEnvironment>,
+}
+
+impl GetCommandOrSubagentOutputTool {
+    pub fn new(environment: Rc<dyn ThreadEnvironment>) -> Self {
+        Self { environment }
+    }
+}
+
+impl AgentTool for GetCommandOrSubagentOutputTool {
+    type Input = GetCommandOrSubagentOutputInput;
+    type Output = String;
+
+    const NAME: &'static str = "get_command_or_subagent_output";
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Read
+    }
+
+    fn initial_title(
+        &self,
+        input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        if let Ok(parsed) = input {
+            format!("Get output {}", parsed.task_id).into()
+        } else {
+            "Get command or subagent output".into()
+        }
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        let environment = self.environment.clone();
+        cx.spawn(async move |cx| {
+            let parsed = input.recv().await.map_err(|e| e.to_string())?;
+            let title: SharedString = format!("Retrieve output for {}", parsed.task_id).into();
+            let context =
+                crate::ToolPermissionContext::new(Self::NAME, vec![parsed.task_id.clone()]);
+            let authorize = cx.update(|cx| {
+                let authorize = event_stream.authorize(title, context, cx);
+                Ok::<_, String>(authorize)
+            })?;
+            authorize.await.map_err(|e| e.to_string())?;
+            let output = environment
+                .get_command_or_subagent_output(parsed.task_id, parsed.block, parsed.timeout_ms, cx)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(output)
         })
     }
 }
@@ -384,6 +464,7 @@ tools! {
     GrepTool,
     ListDirectoryTool,
     MonitorTool,
+    GetCommandOrSubagentOutputTool,
     MovePathTool,
     ReadFileTool,
     RenameTool,

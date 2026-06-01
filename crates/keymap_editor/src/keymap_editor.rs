@@ -28,7 +28,7 @@ use language::{Language, LanguageConfig, ToOffset as _};
 use notifications::status_toast::StatusToast;
 use project::{CompletionDisplayOptions, Project};
 use settings::{
-    BaseKeymap, KeybindSource, KeymapFile, Settings as _, SettingsAssets, infer_json_indent_size,
+    KeybindSource, KeymapFile, Settings as _, infer_json_indent_size,
 };
 use ui::{
     ActiveTheme as _, App, Banner, BorrowAppContext, ColumnWidthConfig, ContextMenu,
@@ -3724,16 +3724,11 @@ async fn remove_keybinding(
 }
 
 fn collect_contexts_from_assets() -> Vec<SharedString> {
-    let mut keymap_assets = vec![
-        util::asset_str::<SettingsAssets>(settings::DEFAULT_KEYMAP_PATH),
-        util::asset_str::<SettingsAssets>(settings::VIM_KEYMAP_PATH),
+    // Hybrid migration: load from filesystem for the keymap editor tool
+    let keymap_assets = vec![
+        std::fs::read_to_string("../assets/keymaps/default-linux.json").unwrap(),
+        std::fs::read_to_string("../assets/keymaps/vim.json").unwrap(),
     ];
-    keymap_assets.extend(
-        BaseKeymap::OPTIONS
-            .iter()
-            .filter_map(|(_, base_keymap)| base_keymap.asset_path())
-            .map(util::asset_str::<SettingsAssets>),
-    );
 
     let mut contexts = HashSet::default();
 

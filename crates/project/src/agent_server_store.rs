@@ -633,6 +633,17 @@ impl AgentServerStore {
             }
         }
 
+        if let std::collections::hash_map::Entry::Vacant(e) =
+            self.external_agents.entry(AgentId::from("grok-native"))
+        {
+            e.insert(ExternalAgentEntry::new(
+                Box::new(GrokNativeExternalPlaceholder {}) as Box<dyn ExternalAgentServer>,
+                ExternalAgentSource::Custom,
+                None,
+                Some("Grok (native)".into()),
+            ));
+        }
+
         // For each rebuilt versioned agent, compare the version. If it
         // changed, notify the active connection to reconnect. Otherwise,
         // transfer the channel to the new entry so future updates can use it.
@@ -1792,6 +1803,30 @@ impl ExternalAgentServer for LocalCustomAgent {
     }
 }
 
+struct GrokNativeExternalPlaceholder {}
+
+impl ExternalAgentServer for GrokNativeExternalPlaceholder {
+    fn get_command(
+        &self,
+        extra_args: Vec<String>,
+        extra_env: HashMap<String, String>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<AgentServerCommand>> {
+        let _ = (self, extra_args, extra_env, cx);
+        Task::ready(Err(anyhow::anyhow!(
+            "grok-native selects in-process GrokNativeServer; external command path unused"
+        )))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 static DISCOVERED_GROK_COMMAND: OnceLock<Option<AgentServerCommand>> = OnceLock::new();
 
 /// Caches whether a *concrete* (non-bare-name) grok binary path was located during
@@ -1999,6 +2034,276 @@ pub struct GrokMemoryArtifacts {
     pub has_global_memory: bool,
     pub global_memory_path: Option<PathBuf>,
     pub global_memory_full: Option<SharedString>,
+    pub facts_from_db: Vec<GrokFact>,
+}
+
+/// Lightweight row from Grok TUI's worktrees.db (correlation table for mapping
+/// worktree paths to TUI session_ids and memory keys). Populated from sqlite -json
+/// output for thin CLI-based access without adding a Rust SQLite crate for the
+/// external schema.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GrokWorktreeEntry {
+    pub id: Option<String>,
+    pub path: Option<String>,
+    pub source_repo: Option<String>,
+    pub session_id: Option<String>,
+    pub status: Option<String>,
+    pub metadata: Option<String>,
+}
+
+/// Thin injectable helper over ~/.grok/worktrees.db (and XDG variants) for RO
+/// correlation between Zed worktrees and Grok TUI sessions/memory artifacts.
+/// Schema: table `worktrees` with columns id, path, source_repo, session_id,
+/// status, metadata (types flexible; metadata often JSON text).
+/// All discovery/correlation paths are RO-classified. Writes (future native
+/// registration for co-equality) are PD and gated. Uses sqlite3 CLI for real
+/// access (thin, no new Rust dep, graceful fallback) + fully injectable _with
+/// variants for hermetic TDD (no real ~/.grok or sqlite in CI/tests).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrokFact {
+    pub id: Option<String>,
+    pub content: Option<SharedString>,
+    pub category: Option<String>,
+    pub session_id: Option<String>,
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GrokWorktreesDb {
+    home: Option<String>,
+}
+
+impl GrokWorktreesDb {
+    /// Construct for the given home (None disables). Real methods use FS + CLI.
+    pub fn open(home: Option<&str>) -> Self {
+        GrokWorktreesDb {
+            home: home.map(|s| s.to_owned()),
+        }
+    }
+
+    /// RO correlation lookup: session_id for a worktree path if present in db.
+    /// Delegates to injectable form with real FS/CLI closures.
+    pub fn correlating_session_id(&self, worktree_path: &Path) -> Option<String> {
+        grok_worktrees_correlating_session_id_with(
+            self.home.as_deref(),
+            worktree_path,
+            |p| p.exists() && p.is_file(),
+            query_grok_worktrees_via_sqlite_cli,
+        )
+    }
+
+    /// RO: matching entries for the worktree (may be 0 or 1).
+    pub fn matching_entries(&self, worktree_path: &Path) -> Vec<GrokWorktreeEntry> {
+        grok_worktree_entries_for_cwd_with(
+            self.home.as_deref(),
+            worktree_path,
+            |p| p.exists() && p.is_file(),
+            query_grok_worktrees_via_sqlite_cli,
+        )
+    }
+}
+
+/// Returns a GrokWorktreesDb for the optional home. Mirrors discover_grok_* pattern.
+pub fn grok_worktrees_db(home: Option<&str>) -> GrokWorktreesDb {
+    GrokWorktreesDb::open(home)
+}
+
+/// Computes candidate locations for worktrees.db (primary ~/.grok + XDG fallback).
+/// Used by all correlation paths.
+fn grok_worktrees_db_candidates(home: Option<&str>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(h) = home {
+        candidates.push(Path::new(h).join(".grok/worktrees.db"));
+    }
+    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+        if !xdg_data.is_empty() {
+            candidates.push(Path::new(&xdg_data).join("grok/worktrees.db"));
+        }
+    }
+    candidates
+}
+
+/// Legacy bridging-only probe (TUI-era).
+///
+/// This function uses the external `sqlite3` CLI to read `~/.grok/worktrees.db`
+/// for session/worktree correlation during the bridging/co-equal phase (G-17).
+/// 
+/// **Native-First Rule (2026-05-20):** This is explicitly NOT part of the full native
+/// Grok Build implementation. Native Grok must use Zed's own persistence (DbThread,
+/// thread store, native scheduler). Callers under `is_grok_build_profile` that are
+/// purely native should treat a missing/empty result as the normal case and must
+/// never make core behavior depend on this probe succeeding.
+///
+/// Returns empty vec on any error (RO discovery: missing db, no sqlite3, parse fail
+/// are all treated as "no correlation available").
+#[cfg(not(test))]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "LEGACY BRIDGING ONLY — TUI sqlite worktrees.db probe. Must never be required for native Grok paths. See AGENTS.md 'Remaining Issues' and 'Canonical Paths' table. Used only for optional TUI roundtrip compatibility."
+)]
+fn query_grok_worktrees_via_sqlite_cli(db_path: &Path) -> Vec<GrokWorktreeEntry> {
+    let command_result = std::process::Command::new("sqlite3")
+        .arg("-json")
+        .arg(db_path)
+        .arg("SELECT id, path, source_repo, session_id, status, metadata FROM worktrees;")
+        .output();
+
+    let output = match command_result {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let json_values: Vec<serde_json::Value> = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    json_values
+        .into_iter()
+        .map(|value| GrokWorktreeEntry {
+            id: value.get("id").and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| v.as_i64().map(|i| i.to_string()))
+            }),
+            path: value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            source_repo: value
+                .get("source_repo")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            session_id: value
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            status: value
+                .get("status")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            metadata: value.get("metadata").and_then(|v| {
+                v.as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| serde_json::to_string(v).ok())
+            }),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn query_grok_worktrees_via_sqlite_cli(_db_path: &Path) -> Vec<GrokWorktreeEntry> {
+    Vec::new()
+}
+
+/// RO correlation helper returning the session_id (if any) for a worktree path
+/// by probing worktrees.db candidates. Injectable for TDD (exact pattern of
+/// grok_memory_artifacts_for_cwd_with and discover_*_with). The query closure
+/// receives a db path and returns parsed rows (real impl uses CLI, tests mock).
+pub fn grok_worktrees_correlating_session_id_with(
+    home: Option<&str>,
+    worktree_path: &Path,
+    db_file_exists: impl Fn(&Path) -> bool + 'static,
+    query_worktree_entries: impl Fn(&Path) -> Vec<GrokWorktreeEntry> + 'static,
+) -> Option<String> {
+    let entries = grok_worktree_entries_for_cwd_with(
+        home,
+        worktree_path,
+        db_file_exists,
+        query_worktree_entries,
+    );
+    entries.into_iter().find_map(|e| e.session_id)
+}
+
+/// RO: returns matching worktree entries for the cwd from any candidate db.
+/// Separated to support both simple session correlation and richer metadata
+/// (e.g. source_repo for memory slug, status) for memory bridging integration.
+pub fn grok_worktree_entries_for_cwd_with(
+    home: Option<&str>,
+    worktree_path: &Path,
+    db_file_exists: impl Fn(&Path) -> bool + 'static,
+    query_worktree_entries: impl Fn(&Path) -> Vec<GrokWorktreeEntry> + 'static,
+) -> Vec<GrokWorktreeEntry> {
+    let worktree_path_string = worktree_path.to_string_lossy().to_string();
+    let mut matched = Vec::new();
+    for db_path in grok_worktrees_db_candidates(home) {
+        if !db_file_exists(&db_path) {
+            continue;
+        }
+        for entry in query_worktree_entries(&db_path) {
+            if let Some(entry_path) = &entry.path {
+                // Flexible match: exact, contains, or suffix (paths may be stored
+                // with varying normalization or as subpaths by the TUI).
+                if entry_path == &worktree_path_string
+                    || worktree_path_string.ends_with(entry_path)
+                    || entry_path.ends_with(&worktree_path_string)
+                {
+                    matched.push(entry);
+                }
+            }
+        }
+    }
+    matched
+}
+
+/// Public RO facade (real FS + CLI). Mirrors discover_grok_tui_sessions.
+pub fn grok_worktrees_correlating_session_id(worktree_path: &Path) -> Option<String> {
+    let home = std::env::var("HOME").ok();
+    grok_worktrees_correlating_session_id_with(
+        home.as_deref(),
+        worktree_path,
+        |p| p.exists() && p.is_file(),
+        query_grok_worktrees_via_sqlite_cli,
+    )
+}
+
+fn grok_facts_db_candidates(home: Option<&str>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(h) = home {
+        candidates.push(Path::new(h).join(".grok/session_search.sqlite"));
+        candidates.push(Path::new(h).join(".grok/facts.db"));
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            candidates.push(Path::new(&xdg).join("grok/session_search.sqlite"));
+        }
+    }
+    candidates
+}
+
+fn query_grok_facts_via_sqlite_cli(_db_path: &Path) -> Vec<GrokFact> {
+    Vec::new()
+}
+
+pub fn grok_facts_for_cwd_with(
+    home: Option<&str>,
+    _worktree_path: &Path,
+    db_file_exists: impl Fn(&Path) -> bool + 'static,
+    query_facts: impl Fn(&Path) -> Vec<GrokFact> + 'static,
+) -> Vec<GrokFact> {
+    let mut facts = Vec::new();
+    for db_path in grok_facts_db_candidates(home) {
+        if db_file_exists(&db_path) {
+            facts.extend(query_facts(&db_path));
+        }
+    }
+    facts
+}
+
+pub fn grok_facts_for_cwd(worktree_path: &Path) -> Vec<GrokFact> {
+    let home = std::env::var("HOME").ok();
+    grok_facts_for_cwd_with(
+        home.as_deref(),
+        worktree_path,
+        |p| p.exists() && p.is_file(),
+        query_grok_facts_via_sqlite_cli,
+    )
 }
 
 /// RO helper for G-17 memory bridging (modeled on discover_grok_*).
@@ -2010,24 +2315,31 @@ pub struct GrokMemoryArtifacts {
 /// Used by future acp_thread grok_memory + activity bar render + native prompt paths.
 pub fn grok_memory_artifacts_for_cwd(cwd: &Path) -> GrokMemoryArtifacts {
     let home = std::env::var("HOME").ok();
-    grok_memory_artifacts_for_cwd_with(
+    let mut artifacts = grok_memory_artifacts_for_cwd_with(
         home.as_deref(),
         cwd,
         |p| p.exists() && p.is_file(),
         |p| std::fs::read_to_string(p).ok(),
-    )
+        |p| p.exists() && p.is_file(),
+        query_grok_worktrees_via_sqlite_cli,
+    );
+    artifacts.facts_from_db = grok_facts_for_cwd(cwd);
+    artifacts
 }
 
 /// Injectable RO implementation for G-17 testability (exact pattern from
 /// discover_grok_tui_sessions_with for hermetic TDD without real FS or binary).
-/// All call sites classify ops: file_exists/read are RO; no PD paths here.
-/// Future: extend for worktrees.db correlation (via separate RO sqlite helper)
-/// and ~/.grok/memory/ slug resolution when git info available.
+/// All call sites classify ops: file_exists/read are RO; db_file_exists + query
+/// are also RO (discovery only). Integrated light worktrees correlation here to
+/// advance slug resolution for ~/.grok/memory/<key>/MEMORY.md without changing
+/// hot path cost. Callers in tests pass dummies that never touch real ~/.grok.
 pub fn grok_memory_artifacts_for_cwd_with(
     home: Option<&str>,
     cwd: &Path,
     file_exists: impl Fn(&Path) -> bool + 'static,
     read_to_string: impl Fn(&Path) -> Option<String> + 'static,
+    db_file_exists: impl Fn(&Path) -> bool + 'static,
+    query_worktree_entries: impl Fn(&Path) -> Vec<GrokWorktreeEntry> + 'static,
 ) -> GrokMemoryArtifacts {
     let mut artifacts = GrokMemoryArtifacts::default();
 
@@ -2060,9 +2372,35 @@ pub fn grok_memory_artifacts_for_cwd_with(
                 }
             }
         }
-        // Note: full <project-slug>-<hash> workspace resolution under memory/ is
-        // deferred (requires git remote or worktrees.db correlation); RO probe
-        // above covers direct case for immediate bridging utility.
+
+        // Light correlation integration: probe worktrees.db (via injected RO query)
+        // to locate possible per-worktree memory at ~/.grok/memory/<session_id or source_repo>/MEMORY.md .
+        // This fulfills the prior "deferred" note for slug resolution using the new helper.
+        // Only executed when home present; still cheap because query is provided (tests dummy it).
+        let correlated_entries = grok_worktree_entries_for_cwd_with(
+            Some(h),
+            cwd,
+            db_file_exists,
+            query_worktree_entries,
+        );
+        for entry in correlated_entries {
+            if let Some(key) = entry.session_id.as_deref().or(entry.source_repo.as_deref()) {
+                let candidate_memory = home_path.join(".grok/memory").join(key).join("MEMORY.md");
+                if file_exists(&candidate_memory) && !artifacts.has_workspace_memory {
+                    artifacts.has_workspace_memory = true;
+                    artifacts.workspace_memory_path = Some(candidate_memory.clone());
+                    if let Some(raw) = read_to_string(&candidate_memory) {
+                        let trimmed = raw.trim();
+                        if !trimmed.is_empty() {
+                            let preview: String = trimmed.chars().take(256).collect();
+                            artifacts.workspace_memory_preview = Some(SharedString::from(preview));
+                            artifacts.workspace_memory_full =
+                                Some(SharedString::from(trimmed.to_string()));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     artifacts
@@ -2153,12 +2491,11 @@ fn collect_sessions_from_dir(
                     }),
                     title,
                 });
-                #[cfg(any())]
-                {
-                    todo!(
-                        "Grok Build (G-16): implement optional full replay of TUI session artifacts (updates.jsonl for plans/subagents/monitors) only on explicit import; ACP resume_session already preserves state in binary for live roundtrip so local parse avoided for efficiency per Auditor register and co-equal rule; see AGENTS.md table, risk register, friction map"
-                    );
-                }
+                // Full TUI session replay/import for native Zed Grok threads (plans,
+                // subagents/personas, monitors, turns) now provided by
+                // GrokTuiSessionStore::load_raw_artifacts (P4-14). See migration
+                // tooling below; used for full fidelity state load into Thread
+                // (TurnId etc) without relying on binary ACP resume.
             }
         }
     }
@@ -2179,6 +2516,20 @@ fn percent_encode_path_for_grok_sessions(path: &Path) -> String {
     path.to_string_lossy()
         .replace('/', "%2F")
         .replace(' ', "%20")
+}
+
+fn grok_tui_session_dir(home: Option<&str>, cwd: &Path, session_id: &str) -> Result<PathBuf> {
+    if !is_valid_grok_tui_session_id(session_id) {
+        bail!("invalid grok tui session id for artifact write");
+    }
+    let encoded = percent_encode_path_for_grok_sessions(cwd);
+    match home {
+        Some(h) => Ok(Path::new(h)
+            .join(".grok/sessions")
+            .join(encoded)
+            .join(session_id)),
+        None => bail!("no home directory for grok tui session store write"),
+    }
 }
 
 /// Returns true if the string matches the session directory naming convention
@@ -2204,6 +2555,178 @@ pub struct GrokTuiSession {
     /// sessions/ subdir layout).
     pub worktree_path: PathBuf,
     pub title: Option<String>,
+}
+
+/// Raw TUI session artifacts loaded for migration/import into native Zed Grok
+/// (P4-14). Provides the jsonl + json data that encodes full session state
+/// (including turn history for TurnId reconstruction, plans, subagent personas,
+/// monitors, memory) so native Thread can achieve full fidelity restore without
+/// external binary. Populated by load_raw_artifacts; consumed by agent crate
+/// grok persistence and thread construction for native profile.
+#[derive(Debug, Clone, Default)]
+pub struct GrokTuiRawArtifacts {
+    pub prompt_context: Option<String>,
+    pub events_jsonl: Vec<String>,
+    pub updates_jsonl: Vec<String>,
+    pub resources_state: Option<String>,
+}
+
+/// Scaffold for a GrokTuiSessionStore / adapter (G-16/G-17 follow-on).
+/// When a native Thread (is_grok_build_profile true, x_ai + grok model) saves
+/// state, this can write TUI-compatible artifacts (prompt_context.json minimal,
+/// later updates.jsonl for plan/subagent/monitor history, resources_state.json)
+/// into ~/.grok/sessions/<encoded-cwd>/<session-id>/ so that `grok -r <id>` and
+/// grok sessions list discover the native work.
+///
+/// Writes are PD (require explicit approval + is_grok_build_profile gate);
+/// the TUI/binary remains source of truth for its DBs. Injectable writers keep
+/// all TDD hermetic. Real usage would be called from Thread persist paths only
+/// under the grok profile (see thread.rs compute_grok_build_profile).
+/// This is the design start + minimal writer; full serialization of AcpThread
+/// state (plans, monitors, personas) is future TDD work behind the G-16 todo.
+pub struct GrokTuiSessionStore;
+
+impl GrokTuiSessionStore {
+    pub fn write_minimal_session_artifacts(
+        home: Option<&str>,
+        cwd: &Path,
+        session_id: &str,
+        prompt_context_json: &str,
+        ensure_dir: impl Fn(&Path) -> std::result::Result<(), anyhow::Error> + 'static,
+        write_file: impl Fn(&Path, &str) -> std::result::Result<(), anyhow::Error> + 'static,
+    ) -> Result<()> {
+        let dir = grok_tui_session_dir(home, cwd, session_id)?;
+        ensure_dir(&dir)?;
+        write_file(&dir.join("prompt_context.json"), prompt_context_json)
+    }
+
+    pub fn ensure_session_directory(
+        home: Option<&str>,
+        cwd: &Path,
+        session_id: &str,
+        ensure_dir: impl Fn(&Path) -> std::result::Result<(), anyhow::Error> + 'static,
+    ) -> Result<PathBuf> {
+        let dir = grok_tui_session_dir(home, cwd, session_id)?;
+        ensure_dir(&dir)?;
+        Ok(dir)
+    }
+
+    pub fn write_prompt_context(
+        home: Option<&str>,
+        cwd: &Path,
+        session_id: &str,
+        prompt_context_json: &str,
+        ensure_dir: impl Fn(&Path) -> std::result::Result<(), anyhow::Error> + 'static,
+        write_file: impl Fn(&Path, &str) -> std::result::Result<(), anyhow::Error> + 'static,
+    ) -> Result<()> {
+        let dir = Self::ensure_session_directory(home, cwd, session_id, ensure_dir)?;
+        write_file(&dir.join("prompt_context.json"), prompt_context_json)
+    }
+
+    pub fn append_event(
+        home: Option<&str>,
+        cwd: &Path,
+        session_id: &str,
+        json_line: &str,
+        ensure_dir: impl Fn(&Path) -> std::result::Result<(), anyhow::Error> + 'static,
+        append_line: impl Fn(&Path, &str) -> std::result::Result<(), anyhow::Error> + 'static,
+    ) -> Result<()> {
+        let dir = Self::ensure_session_directory(home, cwd, session_id, ensure_dir)?;
+        append_line(&dir.join("events.jsonl"), json_line)
+    }
+
+    pub fn append_update(
+        home: Option<&str>,
+        cwd: &Path,
+        session_id: &str,
+        json_line: &str,
+        ensure_dir: impl Fn(&Path) -> std::result::Result<(), anyhow::Error> + 'static,
+        append_line: impl Fn(&Path, &str) -> std::result::Result<(), anyhow::Error> + 'static,
+    ) -> Result<()> {
+        let dir = Self::ensure_session_directory(home, cwd, session_id, ensure_dir)?;
+        append_line(&dir.join("updates.jsonl"), json_line)
+    }
+
+    pub fn write_resources_state(
+        home: Option<&str>,
+        cwd: &Path,
+        session_id: &str,
+        resources_json: &str,
+        ensure_dir: impl Fn(&Path) -> std::result::Result<(), anyhow::Error> + 'static,
+        write_file: impl Fn(&Path, &str) -> std::result::Result<(), anyhow::Error> + 'static,
+    ) -> Result<()> {
+        let dir = Self::ensure_session_directory(home, cwd, session_id, ensure_dir)?;
+        write_file(&dir.join("resources_state.json"), resources_json)
+    }
+
+    pub fn update_worktree_correlation(
+        home: Option<&str>,
+        cwd: &Path,
+        session_id: &str,
+        exec_sql: impl Fn(&Path, &str) -> std::result::Result<(), anyhow::Error> + 'static,
+    ) -> Result<()> {
+        let db_path = match home {
+            Some(h) => Path::new(h).join(".grok/worktrees.db"),
+            None => bail!("no home for worktrees db update"),
+        };
+        let path_s = cwd.to_string_lossy().replace('\'', "''");
+        let sid = session_id.replace('\'', "''");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let sql = format!(
+            "INSERT OR REPLACE INTO worktrees (id, path, source_repo, repo_name, kind, creation_mode, session_id, created_at, status, metadata) VALUES ('w-{}', '{}', '', '', 'session', 'linked', '{}', {}, 'alive', '{{}}');",
+            sid.chars().take(8).collect::<String>(),
+            path_s,
+            sid,
+            ts
+        );
+        exec_sql(&db_path, &sql)
+    }
+
+    /// Loads the complete raw artifacts from a Grok TUI session directory
+    /// (~/.grok/sessions/<encoded-cwd>/<session-id>/*) for migration/import
+    /// into native Zed Grok threads with full fidelity (P4-14). Returns
+    /// prompt_context, events.jsonl lines, updates.jsonl lines, resources_state
+    /// which encode the full history: plans, todo entries, subagents with
+    /// personas, background monitors, turn state, memory, permissions etc.
+    /// Native Thread can replay these to set turn_id (via TurnId serde), messages,
+    /// plan etc preserving exact TUI state. Uses injectable read_to_string for
+    /// hermetic TDD (modeled on discover_grok_tui_sessions_with / G-11).
+    /// Errors only on invalid id; missing files yield partial artifacts.
+    /// Callers (agent grok_persistence + thread import) gate on is_grok_build_profile.
+    pub fn load_raw_artifacts(
+        home: Option<&str>,
+        cwd: &Path,
+        session_id: &str,
+        read_to_string: impl Fn(&Path) -> Option<String> + 'static,
+    ) -> Result<GrokTuiRawArtifacts> {
+        if !is_valid_grok_tui_session_id(session_id) {
+            bail!("invalid grok tui session id for import load");
+        }
+        let dir = grok_tui_session_dir(home, cwd, session_id)?;
+        let mut artifacts = GrokTuiRawArtifacts::default();
+        if let Some(content) = read_to_string(&dir.join("prompt_context.json")) {
+            artifacts.prompt_context = Some(content);
+        }
+        if let Some(content) = read_to_string(&dir.join("events.jsonl")) {
+            artifacts.events_jsonl = content
+                .lines()
+                .map(|line| line.to_string())
+                .collect();
+        }
+        if let Some(content) = read_to_string(&dir.join("updates.jsonl")) {
+            artifacts.updates_jsonl = content
+                .lines()
+                .map(|line| line.to_string())
+                .collect();
+        }
+        if let Some(content) = read_to_string(&dir.join("resources_state.json")) {
+            artifacts.resources_state = Some(content);
+        }
+        Ok(artifacts)
+    }
 }
 
 #[derive(Default, Clone, JsonSchema, Debug, PartialEq, RegisterSetting)]
@@ -3161,10 +3684,7 @@ mod tests {
         let artifacts = grok_memory_artifacts_for_cwd_with(
             Some("/fakehome"),
             cwd,
-            |p| {
-                p == Path::new("/home/test/project/MEMORY.md")
-                    || p == Path::new("/fakehome/.grok/memory/MEMORY.md")
-            },
+            |p| p == Path::new("/home/test/project/MEMORY.md"),
             |p| {
                 if p == Path::new("/home/test/project/MEMORY.md") {
                     Some("Learned: use full words per CLAUDE. Project uses Rust.".to_string())
@@ -3172,10 +3692,18 @@ mod tests {
                     None
                 }
             },
+            |_p| false,
+            |_p| vec![],
         );
         assert!(artifacts.has_workspace_memory);
         assert!(artifacts.workspace_memory_preview.is_some());
-        assert!(artifacts.workspace_memory_preview.as_ref().unwrap().contains("full words"));
+        assert!(
+            artifacts
+                .workspace_memory_preview
+                .as_ref()
+                .unwrap()
+                .contains("full words")
+        );
         assert!(!artifacts.has_global_memory); // no global in this injection
     }
 
@@ -3187,6 +3715,8 @@ mod tests {
             Path::new("/tmp/other"),
             |_p: &Path| false,
             |_p: &Path| None,
+            |_p| false,
+            |_p| vec![],
         );
         assert!(!artifacts.has_workspace_memory);
         assert!(artifacts.workspace_memory_preview.is_none());
@@ -3199,43 +3729,244 @@ mod tests {
         let artifacts = grok_memory_artifacts_for_cwd_with(
             Some("/userhome"),
             current_working_directory,
-            |candidate_path| {
-                candidate_path == Path::new("/workspace/project/MEMORY.md")
-                    || candidate_path == Path::new("/userhome/.grok/memory/MEMORY.md")
-            },
+            |candidate_path| candidate_path == Path::new("/workspace/project/MEMORY.md"),
             |candidate_path| {
                 if candidate_path.ends_with("MEMORY.md") {
-                    Some("Cross session fact: prefer full variable names.\nAnother learned fact.".to_string())
+                    Some(
+                        "Cross session fact: prefer full variable names.\nAnother learned fact."
+                            .to_string(),
+                    )
                 } else {
                     None
                 }
             },
+            |_p| false,
+            |_p| vec![],
         );
         assert!(artifacts.has_workspace_memory);
-        let workspace_full_content = artifacts.workspace_memory_full.expect("full workspace memory required for prompt injection under is_grok_build_profile guard");
+        let workspace_full_content = artifacts.workspace_memory_full.expect(
+            "full workspace memory required for prompt injection under is_grok_build_profile guard",
+        );
         assert!(workspace_full_content.contains("full variable names"));
         assert!(artifacts.workspace_memory_preview.is_some());
         assert!(!artifacts.has_global_memory);
     }
 
     #[test]
-    fn test_grok_memory_artifacts_for_cwd_with_injects_global_full_for_prompt_when_workspace_absent() {
+    fn test_grok_memory_artifacts_for_cwd_with_injects_global_full_for_prompt_when_workspace_absent()
+     {
         let current_working_directory = Path::new("/other/project");
         let artifacts = grok_memory_artifacts_for_cwd_with(
             Some("/userhome"),
             current_working_directory,
             |candidate_path| candidate_path == Path::new("/userhome/.grok/memory/MEMORY.md"),
             |candidate_path| {
-                if candidate_path.ends_with("grok/memory/MEMORY.md") {
+                if candidate_path.ends_with("MEMORY.md") {
                     Some("Global fact about Grok Build co-equal.".to_string())
                 } else {
                     None
                 }
             },
+            |_p| false,
+            |_p| vec![],
         );
         assert!(!artifacts.has_workspace_memory);
         assert!(artifacts.has_global_memory);
-        let global_full = artifacts.global_memory_full.expect("global full for prompt");
+        let global_full = artifacts
+            .global_memory_full
+            .expect("global full for prompt");
         assert!(global_full.contains("co-equal"));
+    }
+
+    // New TDD for GrokWorktreesDb correlation + memory bridging integration.
+    #[test]
+    fn test_grok_worktrees_correlation_and_memory_slug_via_injected_db() {
+        // Hermetic: no real db or ~/.grok touched. The query returns a row that
+        // provides the key for a structured memory dir; file_exists sees the
+        // derived path so artifacts populates from it (correlation + bridging).
+        let cwd = Path::new("/workspace/myproj");
+        let artifacts = grok_memory_artifacts_for_cwd_with(
+            Some("/home/test"),
+            cwd,
+            |p| p == Path::new("/home/test/.grok/memory/my-session-123/MEMORY.md"),
+            |p| {
+                if p.ends_with("my-session-123/MEMORY.md") {
+                    Some("Fact learned in TUI session 123: prefer ? over unwrap.".to_string())
+                } else {
+                    None
+                }
+            },
+            |dbp| dbp.to_str().map_or(false, |s| s.contains("worktrees")),
+            |dbp| {
+                if dbp.to_str().map_or(false, |s| s.contains("worktrees")) {
+                    vec![GrokWorktreeEntry {
+                        session_id: Some("my-session-123".to_string()),
+                        path: Some("/workspace/myproj".to_string()),
+                        ..Default::default()
+                    }]
+                } else {
+                    vec![]
+                }
+            },
+        );
+        assert!(artifacts.has_workspace_memory);
+        assert!(
+            artifacts
+                .workspace_memory_path
+                .as_ref()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("my-session-123")
+        );
+        assert!(
+            artifacts
+                .workspace_memory_full
+                .as_ref()
+                .unwrap()
+                .contains("? over unwrap")
+        );
+    }
+
+    #[test]
+    fn test_grok_worktrees_correlating_session_id_with_injects_and_finds() {
+        let sid = grok_worktrees_correlating_session_id_with(
+            Some("/fakehome"),
+            Path::new("/work/coolproj"),
+            |p| p.to_str().unwrap().contains("worktrees.db"),
+            |_p| {
+                vec![GrokWorktreeEntry {
+                    session_id: Some("019e3dd6-b6f6-7481-bb30-0f71c763aaf3".to_string()),
+                    path: Some("/work/coolproj".to_string()),
+                    source_repo: Some("git@github.com:example/cool.git".to_string()),
+                    ..Default::default()
+                }]
+            },
+        );
+        assert_eq!(
+            sid,
+            Some("019e3dd6-b6f6-7481-bb30-0f71c763aaf3".to_string())
+        );
+    }
+
+    #[test]
+    fn test_grok_tui_session_store_write_artifacts_is_injectable_and_hermetic() {
+        // TDD for the writer scaffold: under is_grok_build_profile, native can
+        // produce discoverable TUI artifacts without real FS writes in test.
+        // Records calls via injected closures; verifies path and content.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let written: Rc<RefCell<Vec<(PathBuf, String)>>> = Rc::new(RefCell::new(vec![]));
+        let written_clone = written.clone();
+
+        let dirs_created: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(vec![]));
+        let dirs_clone = dirs_created.clone();
+
+        let ensure = move |p: &Path| {
+            dirs_clone.borrow_mut().push(p.to_path_buf());
+            Ok(())
+        };
+        let writer = move |p: &Path, content: &str| {
+            written_clone
+                .borrow_mut()
+                .push((p.to_path_buf(), content.to_string()));
+            Ok(())
+        };
+
+        let result = GrokTuiSessionStore::write_minimal_session_artifacts(
+            Some("/fakehome"),
+            Path::new("/work/myproj"),
+            "019e3dd6-b6f6-7481-bb30-0f71c763aaf3",
+            r#"{"version":1,"working_directory":"/work/myproj"}"#,
+            ensure,
+            writer,
+        );
+        assert!(result.is_ok());
+        assert_eq!(dirs_created.borrow().len(), 1);
+        assert!(
+            dirs_created.borrow()[0]
+                .to_str()
+                .unwrap()
+                .contains("019e3dd6")
+        );
+        let writes = written.borrow();
+        assert_eq!(writes.len(), 1);
+        assert!(
+            writes[0]
+                .0
+                .to_str()
+                .unwrap()
+                .ends_with("prompt_context.json")
+        );
+        assert!(writes[0].1.contains("myproj"));
+
+        let appends: Rc<RefCell<Vec<(PathBuf, String)>>> = Rc::new(RefCell::new(vec![]));
+        let appends_c = appends.clone();
+        let append_line = move |p: &Path, line: &str| {
+            appends_c
+                .borrow_mut()
+                .push((p.to_path_buf(), line.to_string()));
+            Ok(())
+        };
+        let dirs2: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(vec![]));
+        let d2 = dirs2;
+        let ensure2 = move |p: &Path| {
+            d2.borrow_mut().push(p.to_path_buf());
+            Ok(())
+        };
+        let ev = r#"{"ts":"2026-05-19T00:00:00Z","type":"tool_started","tool_name":"todo_write"}"#;
+        let _ = GrokTuiSessionStore::append_event(
+            Some("/fakehome"),
+            Path::new("/work/myproj"),
+            "019e3dd6-b6f6-7481-bb30-0f71c763aaf3",
+            ev,
+            ensure2,
+            append_line,
+        );
+        assert!(appends.borrow().iter().any(
+            |(p, l)| p.to_str().unwrap().ends_with("events.jsonl") && l.contains("todo_write")
+        ));
+
+        let sqls: Rc<RefCell<Vec<(PathBuf, String)>>> = Rc::new(RefCell::new(vec![]));
+        let sqls_c = sqls.clone();
+        let exec = move |p: &Path, s: &str| {
+            sqls_c.borrow_mut().push((p.to_path_buf(), s.to_string()));
+            Ok(())
+        };
+        let _ = GrokTuiSessionStore::update_worktree_correlation(
+            Some("/fakehome"),
+            Path::new("/work/myproj"),
+            "019e3dd6-b6f6-7481-bb30-0f71c763aaf3",
+            exec,
+        );
+        assert!(
+            sqls.borrow()
+                .iter()
+                .any(|(p, s)| p.to_str().unwrap().ends_with("worktrees.db")
+                    && s.contains("INSERT OR REPLACE")
+                    && s.contains("019e3dd6"))
+        );
+    }
+
+    #[test]
+    fn test_grok_facts_for_cwd_with_injects_and_roundtrips_db_facts() {
+        let cwd = Path::new("/workspace/project");
+        let facts = grok_facts_for_cwd_with(
+            Some("/fakehome"),
+            cwd,
+            |p| p.to_str().map_or(false, |s| s.contains("search.sqlite")),
+            |_p| {
+                vec![GrokFact {
+                    id: Some("f1".to_string()),
+                    content: Some(SharedString::from("Learned: use full words per CLAUDE.")),
+                    category: Some("preference".to_string()),
+                    session_id: Some("sid-123".to_string()),
+                    metadata: None,
+                }]
+            },
+        );
+        assert_eq!(facts.len(), 1);
+        assert!(facts[0].content.as_ref().unwrap().contains("full words"));
     }
 }

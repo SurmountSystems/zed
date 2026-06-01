@@ -73,7 +73,12 @@ use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
-pub use conversation_view::{ConversationView, ZedTodos, ZedTodosComponent, ZedTodosDockPrototype, collect_background_monitor_tool_calls, collect_pending_approval_tool_calls, render_approval_row, render_background_task_row, render_grok_memory_items, render_risk_chip, render_zed_todos_categorized_surface};
+pub use conversation_view::{
+    ConversationView, ZedTodos, ZedTodosComponent, ZedTodosDockPrototype,
+    collect_background_monitor_tool_calls, collect_pending_approval_tool_calls,
+    render_approval_row, render_background_task_row, render_grok_memory_items, render_risk_chip,
+    render_zed_todos_categorized_surface,
+};
 pub use external_source_prompt::ExternalSourcePrompt;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
@@ -316,7 +321,9 @@ pub struct NewExternalAgentThread {
 /// Surfaces "agent: new grok thread" in the command palette making the grok agent
 /// a first-class discoverable peer (G-19 co-equal command surface). Delegates to
 /// NewExternalAgentThread with "grok" id (supports optional resume_session_id for
-/// G-16 roundtrip). Registered alongside other agent actions; uses existing ACP path.
+/// G-16 roundtrip). After selecting Grok Build mode, use "agent: open zed todos surface"
+/// (or the Full Agent Mode / full screen affordance) to access the complete classified
+/// ZT-1 visual interface matching the user's expectation of the full rich experience.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]
 #[serde(deny_unknown_fields)]
@@ -398,6 +405,7 @@ impl Agent {
     pub fn label(&self) -> SharedString {
         match self {
             Self::NativeAgent => "Zed Agent".into(),
+            Self::Custom { id } if id.as_ref() == "grok-native" => "Grok (Native)".into(),
             Self::Custom { id, .. } => id.0.clone(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => "Stub Agent".into(),
@@ -407,6 +415,7 @@ impl Agent {
     pub fn icon(&self) -> Option<IconName> {
         match self {
             Self::NativeAgent => None,
+            Self::Custom { id } if id.as_ref() == "grok-native" => Some(IconName::AiXAi),
             Self::Custom { .. } => Some(IconName::Sparkle),
             #[cfg(any(test, feature = "test-support"))]
             Self::Stub => None,
@@ -420,6 +429,12 @@ impl Agent {
     ) -> Rc<dyn agent_servers::AgentServer> {
         match self {
             Self::NativeAgent => Rc::new(agent::NativeAgentServer::new(fs, thread_store)),
+            Self::Custom {
+                id: agent_identifier,
+            } if agent_identifier.as_ref() == "grok-native" => {
+                // Route to native server (provides the Thread + is_grok_build_profile + event feeding).
+                Rc::new(agent::NativeAgentServer::new(fs, thread_store))
+            }
             Self::Custom { id: name } => {
                 Rc::new(agent_servers::CustomAgentServer::new(name.clone()))
             }

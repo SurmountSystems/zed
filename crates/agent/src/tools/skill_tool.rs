@@ -47,12 +47,19 @@ fn neutralize_envelope_tags(input: &str) -> String {
 pub fn render_skill_envelope(skill: &Skill, body: &str) -> String {
     let source = match &skill.source {
         agent_skills::SkillSource::BuiltIn => "built-in",
+        agent_skills::SkillSource::GrokUser => "user",
         agent_skills::SkillSource::Global => "global",
+        agent_skills::SkillSource::GrokProjectLocal { .. } => "project",
         agent_skills::SkillSource::ProjectLocal { .. } => "project-local",
     };
     let worktree = match &skill.source {
-        agent_skills::SkillSource::BuiltIn | agent_skills::SkillSource::Global => None,
-        agent_skills::SkillSource::ProjectLocal {
+        agent_skills::SkillSource::BuiltIn
+        | agent_skills::SkillSource::GrokUser
+        | agent_skills::SkillSource::Global => None,
+        agent_skills::SkillSource::GrokProjectLocal {
+            worktree_root_name, ..
+        }
+        | agent_skills::SkillSource::ProjectLocal {
             worktree_root_name, ..
         } => Some(worktree_root_name.clone()),
     };
@@ -781,5 +788,35 @@ mod tests {
             matches!(result, Err(SkillToolOutput::Error { .. })),
             "expected denial to surface as an error: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_render_envelope_uses_grok_sources_for_native_grok_roots() {
+        // Grok discovery roots now supply GrokUser / GrokProjectLocal so the
+        // <source> tag distinguishes native grok skills ("user", "project")
+        // from the .agents bridged ones ("global", "project-local").
+        let user_content = "---\nname: review\ndescription: grok review\n---\nBody here.";
+        let grok_user = parse_skill_frontmatter(
+            Path::new("/home/.grok/skills/review/SKILL.md"),
+            user_content,
+            SkillSource::GrokUser,
+        )
+        .unwrap();
+        let out_user = render_skill_envelope(&grok_user, "Body here.");
+        assert!(out_user.contains("<source>user</source>"));
+
+        let proj_content = "---\nname: impl\ndescription: grok impl\n---\nBody.";
+        let grok_proj = parse_skill_frontmatter(
+            Path::new("/p/.grok/skills/impl/SKILL.md"),
+            proj_content,
+            SkillSource::GrokProjectLocal {
+                worktree_id: SkillScopeId(7),
+                worktree_root_name: "p".into(),
+            },
+        )
+        .unwrap();
+        let out_proj = render_skill_envelope(&grok_proj, "Body.");
+        assert!(out_proj.contains("<source>project</source>"));
+        assert!(out_proj.contains("<worktree>p</worktree>"));
     }
 }

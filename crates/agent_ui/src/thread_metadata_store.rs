@@ -28,6 +28,10 @@ use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
+// Database strategy note: Future KV / persistence work in this file (and similar
+// thread metadata stores) should prefer heed3 (LMDB) over the current sqlez +
+// KeyValueStore path, per the ZT-1 / agent panel Database-Strategy item.
+
 use crate::DEFAULT_THREAD_TITLE;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
@@ -1397,6 +1401,11 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        // Index to make ORDER BY updated_at DESC fast for list() / list_ids() used at launch
+        // for the agent thread history sidebar (avoids full table scan + sort on large history).
+        sql!(
+            CREATE INDEX IF NOT EXISTS idx_sidebar_threads_updated_at ON sidebar_threads(updated_at DESC);
+        ),
     ];
 }
 
@@ -1786,6 +1795,7 @@ mod tests {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            native_grok_artifacts: None,
         }
     }
 

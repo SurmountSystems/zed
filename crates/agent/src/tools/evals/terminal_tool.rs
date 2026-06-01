@@ -231,6 +231,11 @@ impl TerminalToolTest {
                 model_name: None,
                 date: chrono::Local::now().format("%Y-%m-%d").to_string(),
                 user_agents_md: None,
+                subagent_persona: None,
+                subagent_capability_mode: None,
+                is_grok_build_profile: false,
+                current_turn_id: None,
+                prior_turn_summary: None,
             };
             template.render(&Templates::new())?
         };
@@ -468,7 +473,7 @@ fn text(text: impl Into<String>) -> MessageContent {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_git_log_uses_no_pager() {
     eval_utils::eval(100, 0.95, eval_utils::NoProcessor, move || {
         run_eval(EvalInput::new(
@@ -487,7 +492,7 @@ fn eval_git_log_uses_no_pager() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_git_rebase_sets_git_editor() {
     eval_utils::eval(100, 0.95, eval_utils::NoProcessor, move || {
         run_eval(EvalInput::new(
@@ -504,7 +509,7 @@ fn eval_git_rebase_sets_git_editor() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_git_rebase_implied_sets_git_editor() {
     eval_utils::eval(100, 0.95, eval_utils::NoProcessor, move || {
         run_eval(EvalInput::new(

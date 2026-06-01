@@ -613,8 +613,10 @@
       // Grok Build (xAI) - Linux first. Provides the complete Grok Build TUI
       // experience (all tools, plan mode, subagents/personas, skills, background
       // monitoring, etc.) rendered visually in the Zed agent panel.
-      // macOS equivalent added (G-08); Windows pending (see AGENTS.md).
+      // macOS NewGrok (G-08) + full surface (this closer); Windows NewGrok (G-19). Full surface key (ctrl-alt-shift-t) Linux (and now mac cmd-alt-shift-t) reference; palette "agent: open full grok surface" + prominent toolbar "Full Agent Mode" button + "Full Grok Surface" menu first-class on all platforms including Windows.
       "ctrl-alt-x": ["agent::NewGrokThread", {}],
+      // Dedicated one-keystroke binding (with command palette "agent: open full grok surface") so that selecting Grok from the agent tab immediately provides obvious access to the complete ZT-1 classified surface via the existing OpenZedTodosSurface / ZedTodosDockPrototype machinery.
+      "ctrl-alt-shift-t": ["agent::OpenFullGrokSurface", {}],
 
       "alt-open": ["projects::OpenRecent", { "create_new_window": false }],
       // Change the default action on `menu::Confirm` by setting the parameter

@@ -25,17 +25,10 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(not(feature = "dynamic_prompts"))]
-mod language_configs_embedded {
-    use rust_embed::RustEmbed;
-
-    #[derive(RustEmbed)]
-    #[folder = "../grammars/src/"]
-    #[include = "*/config.toml"]
-    pub struct LanguageConfigs;
-}
+use include_dir::{include_dir, Dir};
 
 #[cfg(not(feature = "dynamic_prompts"))]
-use language_configs_embedded::LanguageConfigs;
+static LANGUAGE_CONFIGS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../grammars/src");
 
 #[derive(Debug, Deserialize)]
 struct LanguageConfig {
@@ -100,9 +93,9 @@ pub struct FilterLanguagesArgs {
 fn build_extension_to_language_map() -> HashMap<String, String> {
     let mut map = HashMap::default();
 
-    for file_path in LanguageConfigs::iter() {
-        if let Some(content) = LanguageConfigs::get(&file_path) {
-            let content_str = match std::str::from_utf8(&content.data) {
+    for file in LANGUAGE_CONFIGS.files() {
+        if file.path().to_string_lossy().ends_with("config.toml") {
+            let content_str = match std::str::from_utf8(file.contents()) {
                 Ok(s) => s,
                 Err(_) => continue,
             };

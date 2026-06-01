@@ -1,9 +1,12 @@
 mod db;
+mod grok_persistence;
 mod legacy_thread;
 mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 mod templates;
+mod scheduler;
+mod verification;
 #[cfg(test)]
 mod tests;
 mod thread;
@@ -11,6 +14,9 @@ mod thread_store;
 mod tool_permissions;
 mod tools;
 mod user_agents_md;
+mod agent_skills;
+
+use agent_skills::load_skills_from_directory_for_native_agent;
 
 use context_server::ContextServerId;
 pub use db::*;
@@ -20,10 +26,24 @@ pub use pattern_extraction::*;
 pub use shell_command_parser::extract_commands;
 pub use templates::*;
 pub use thread::*;
+
+// Explicit re-exports to restore the flat `crate::` namespace expected by
+// the many tool implementations and db layer after recent refactoring.
+// This addresses the "no `XXX` in the root" errors.
+pub use thread::{
+    AgentMessage, AgentMessageContent, MAX_SUBAGENT_DEPTH, SubagentContext, Thread, ThreadEvent,
+    ToolCallEventStream, ToolInput, ToolInputPayload, ToolPermissionContext, UserMessage,
+    UserMessageContent,
+};
 pub use thread_store::*;
 pub use tool_permissions::*;
 pub use tools::*;
 pub use user_agents_md::{UserAgentsMd, UserAgentsMdState, init as init_user_agents_md};
+pub use verification::{
+    BestOfNCandidate, BestOfNResult, CwdRiskLabel, NATIVE_VERIFICATION_FRAGMENTS,
+    SelfCheckResult, VerificationContext, inject_verification_rules_for_native_profile,
+    perform_best_of_n_verification, run_self_check, validate_grok_build_output_formatting,
+};
 
 use acp_thread::{
     AcpThread, AgentModelSelector, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
@@ -581,12 +601,13 @@ impl NativeAgent {
         let project = thread.project.clone();
         let action_log = thread.action_log.clone();
         let prompt_capabilities_rx = thread.prompt_capabilities_rx.clone();
+        let work_directories = project.read(cx).default_path_list(cx);
         let acp_thread = cx.new(|cx| {
             let mut acp_thread = acp_thread::AcpThread::new(
                 parent_session_id,
                 persona,
                 title,
-                None,
+                Some(work_directories),
                 connection,
                 project.clone(),
                 action_log.clone(),
@@ -847,13 +868,13 @@ impl NativeAgent {
         // skip all on-disk lookups so users see no behavior change.
         let skills_enabled = cx.has_flag::<SkillsFeatureFlag>();
 
-        // Load global skills from both ecosystems for G-10 bridging.
-        // .agents first so it wins name collisions with .grok (same precedence).
+        // Load global skills from both ecosystems.
+        // .agents first so it wins name collisions with .grok (equal precedence).
         let global_skills_task = if skills_enabled {
             let global_skills_dir = global_skills_dir();
             let global_skills_fs = fs.clone();
             cx.background_spawn(async move {
-                load_skills_from_directory(
+                load_skills_from_directory_for_native_agent(
                     &global_skills_fs,
                     &global_skills_dir,
                     SkillSource::Global,
@@ -867,7 +888,7 @@ impl NativeAgent {
             let global_grok_dir = global_grok_skills_dir();
             let global_grok_fs = fs.clone();
             cx.background_spawn(async move {
-                load_skills_from_directory(&global_grok_fs, &global_grok_dir, SkillSource::Global)
+                load_skills_from_directory(&global_grok_fs, &global_grok_dir, SkillSource::GrokUser)
                     .await
             })
         } else {
@@ -880,7 +901,7 @@ impl NativeAgent {
                 load_skills_from_directory(
                     &global_grok_bundled_fs,
                     &global_grok_bundled_dir,
-                    SkillSource::Global,
+                    SkillSource::GrokUser,
                 )
                 .await
             })
@@ -889,21 +910,21 @@ impl NativeAgent {
         };
 
         // Load project-local skills, but only from worktrees the user has
-        // trusted. Skills in `.agents/skills/` (and `.grok/skills/` via G-10
-        // bridge) ship with the project; a freshly cloned untrusted repo can
-        // carry hostile descriptions or bodies, so we keep them out of the
-        // catalog and the slash-command list until trust is granted. The
-        // subscription in `register_project_with_initial_context` triggers a
-        // context refresh when a worktree's trust state changes, so newly
-        // trusted worktrees pick up their skills without restarting.
+        // trusted. Skills in `.agents/skills/` and `.grok/skills/` ship with
+        // the project; a freshly cloned untrusted repo can carry hostile
+        // descriptions or bodies, so we keep them out of the catalog and the
+        // slash-command list until trust is granted. The subscription in
+        // `register_project_with_initial_context` triggers a context refresh
+        // when a worktree's trust state changes, so newly trusted worktrees
+        // pick up their skills without restarting.
         let trusted_worktrees = TrustedWorktrees::try_get_global(cx);
         let worktree_store = project.read(cx).worktree_store();
         let project_skills_task = if skills_enabled {
             // Dual-directory collection for .agents/skills + .grok/skills per
-            // trusted worktree. Both use identical ProjectLocal source (same
-            // precedence); agents dir pushed first so it wins same-name
-            // collisions within a project. Scan capture and trust gating
-            // unchanged.
+            // trusted worktree. .agents uses ProjectLocal, .grok uses
+            // GrokProjectLocal (equal precedence); agents dir pushed first so
+            // it wins same-name collisions within a project. Scan capture and
+            // trust gating unchanged.
             let mut project_skills_futures: Vec<
                 futures::future::BoxFuture<'static, Vec<Result<Skill, SkillLoadError>>>,
             > = Vec::new();
@@ -949,7 +970,7 @@ impl NativeAgent {
                     );
                 }
 
-                // .grok/skills for this worktree (G-10 bridge)
+                // .grok/skills for this worktree (native Grok project root)
                 {
                     let skills_dir = abs_path.join(project_grok_skills_relative_path());
                     let fs = fs.clone();
@@ -966,7 +987,7 @@ impl NativeAgent {
                             load_skills_from_directory(
                                 &fs,
                                 &skills_dir,
-                                SkillSource::ProjectLocal {
+                                SkillSource::GrokProjectLocal {
                                     worktree_id: SkillScopeId(wt_id.to_usize()),
                                     worktree_root_name: root_name,
                                 },
@@ -1040,7 +1061,7 @@ impl NativeAgent {
             let global_grok = global_grok_skills_task.await;
             let global_grok_bundled = global_grok_bundled_skills_task.await;
             // Chain order ensures .agents > ~/.grok/skills > ~/.grok/bundled/skills
-            // for same-prec Global skills (first occurrence wins in apply_skill_overrides).
+            // (first occurrence wins in apply_skill_overrides on equal precedence).
             // This makes a user skill under .grok/skills shadow its bundled counterpart
             // exactly as the grok binary does, while .agents still takes highest global rank.
             let global_skills: Vec<_> = global_agents
@@ -1745,7 +1766,7 @@ impl NativeAgent {
             let body = if let Some(embedded) = skill.embedded_body {
                 embedded.to_string()
             } else {
-                agent_skills::read_skill_body(fs.as_ref(), &skill.skill_file_path)
+                agent_skills::read_skill_body_for_native_agent(fs.as_ref(), &skill.skill_file_path)
                     .await
                     .with_context(|| {
                         format!(
@@ -1959,6 +1980,11 @@ impl NativeAgentConnection {
                                     thread.subagent_spawned(session_id, cx);
                                 })?;
                             }
+                            ThreadEvent::SubagentUpdated(session_id) => {
+                                acp_thread.update(cx, |thread, cx| {
+                                    thread.subagent_updated(session_id, cx);
+                                })?;
+                            }
                             ThreadEvent::Retry(status) => {
                                 acp_thread.update(cx, |thread, cx| {
                                     thread.update_retry_status(status, cx)
@@ -1966,6 +1992,11 @@ impl NativeAgentConnection {
                             }
                             ThreadEvent::Stop(stop_reason) => {
                                 log::debug!("Assistant message complete: {:?}", stop_reason);
+                                if stop_reason == acp::StopReason::EndTurn {
+                                    let _ = acp_thread.update(cx, |t, cx| {
+                                        t.inject_live_diagnostic_continuation_if_needed(cx)
+                                    });
+                                }
                                 return Ok(acp::PromptResponse::new(stop_reason));
                             }
                         }
@@ -2642,7 +2673,8 @@ impl NativeThreadEnvironment {
         }
 
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
-            let mut thread = Thread::new_subagent(&parent_thread_entity, persona, capability_mode, cx);
+            let mut thread =
+                Thread::new_subagent(&parent_thread_entity, persona, capability_mode, cx);
             thread.set_title(label.into(), cx);
             thread
         });
@@ -2769,6 +2801,67 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         self.resume_subagent_thread(session_id, cx)
+    }
+
+    fn get_command_or_subagent_output(
+        &self,
+        task_id: String,
+        _block: bool,
+        _timeout_ms: Option<u64>,
+        cx: &mut AsyncApp,
+    ) -> Task<Result<String>> {
+        let acp_thread = self.acp_thread.clone();
+        let agent = self.agent.clone();
+        cx.spawn(async move |cx| {
+            let terminal_id = acp::TerminalId::new(task_id.clone());
+            if let Some(thread) = acp_thread.upgrade() {
+                if let Ok(term_entity) = thread.update(cx, |t, _| t.terminal(terminal_id.clone())) {
+                    let resp = term_entity.update(cx, |term, c| term.current_output(c));
+                    let exit_status = thread.read_with(cx, |t, _| {
+                        t.terminal_exit_status(&terminal_id)
+                            .map(|e| format!("{:?}", e))
+                    });
+                    let pending_output =
+                        thread.read_with(cx, |t, _| t.pending_terminal_output(&terminal_id));
+                    let status = if let Some(exit) = exit_status {
+                        format!("exited ({})", exit)
+                    } else {
+                        "running".to_string()
+                    };
+                    let mut full_output = resp.output;
+                    if let Some(extra_chunks) = pending_output {
+                        if !extra_chunks.is_empty() {
+                            full_output.push_str("\n[additional pending output]\n");
+                            for chunk in extra_chunks {
+                                if let Ok(text) = std::str::from_utf8(&chunk) {
+                                    full_output.push_str(text);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(format!(
+                        "=== Task {} ===\nStatus: {}\n=== Output ===\n{}",
+                        task_id, status, full_output
+                    ));
+                }
+            }
+            if let Some(ag) = agent.upgrade() {
+                let has = ag.update(cx, |a, _| {
+                    a.sessions
+                        .contains_key(&acp::SessionId::new(task_id.clone()))
+                });
+                if has {
+                    return Ok(format!(
+                        "=== Task {} ===\nStatus: active\n=== Output ===\nsubagent active",
+                        task_id
+                    ));
+                }
+            }
+            Ok(format!(
+                "=== Task {} ===\nStatus: not found\n=== Output ===\n",
+                task_id
+            ))
+        })
     }
 }
 

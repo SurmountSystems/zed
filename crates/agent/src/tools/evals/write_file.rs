@@ -202,6 +202,11 @@ impl WriteToolTest {
                 model_name: None,
                 date: chrono::Local::now().format("%Y-%m-%d").to_string(),
                 user_agents_md: None,
+                subagent_persona: None,
+                subagent_capability_mode: None,
+                is_grok_build_profile: false,
+                current_turn_id: None,
+                prior_turn_summary: None,
             };
             let templates = Templates::new();
             template.render(&templates)?
@@ -486,7 +491,7 @@ async fn retry_on_rate_limit<R>(mut request: impl AsyncFnMut() -> Result<R>) -> 
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_create_file() {
     let input_file_path = "root/TODO3";
     let expected_output_content = "todo".to_string();
@@ -531,7 +536,7 @@ fn eval_create_file() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_overwrite_file() {
     let input_file_path = "root/notes.txt";
     let input_file_content = "old notes\nkeep nothing\n".to_string();

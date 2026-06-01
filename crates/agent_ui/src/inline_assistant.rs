@@ -1795,7 +1795,7 @@ fn merge_ranges(ranges: &mut Vec<Range<Anchor>>, buffer: &MultiBufferSnapshot) {
     }
 }
 
-#[cfg(all(test, feature = "unit-eval"))]
+#[cfg(test)]
 pub mod evals {
     use crate::InlineAssistant;
     use agent::ThreadStore;
@@ -1967,7 +1967,7 @@ pub mod evals {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "unit-eval"), ignore)]
+    #[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
     fn eval_single_cursor_edit() {
         run_eval(
             20,
@@ -1990,7 +1990,7 @@ pub mod evals {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "unit-eval"), ignore)]
+    #[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
     fn eval_cant_do() {
         run_eval(
             20,
@@ -2007,7 +2007,7 @@ pub mod evals {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "unit-eval"), ignore)]
+    #[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
     fn eval_unclear() {
         run_eval(
             20,
@@ -2024,7 +2024,7 @@ pub mod evals {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "unit-eval"), ignore)]
+    #[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
     fn eval_empty_buffer() {
         run_eval(
             20,

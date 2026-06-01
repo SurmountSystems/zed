@@ -123,14 +123,24 @@ pub enum SkillSource {
         worktree_id: SkillScopeId,
         worktree_root_name: Arc<str>,
     },
+    /// From ~/.grok/skills/ (Grok native user/global skills).
+    GrokUser,
+    /// From {project}/.grok/skills/ (Grok native project-local skills).
+    GrokProjectLocal {
+        worktree_id: SkillScopeId,
+        worktree_root_name: Arc<str>,
+    },
 }
 
 impl SkillSource {
     /// Precedence for resolving same-named skills. Higher values shadow
-    /// lower ones: `ProjectLocal` > `Global` > `BuiltIn`. Two sources
-    /// returning equal precedence (e.g. two project-local skills from
-    /// different worktrees) leave the winner up to the caller, which by
-    /// convention keeps the first one in iteration order.
+    /// lower ones: (GrokProjectLocal | ProjectLocal) > (GrokUser | Global) > BuiltIn.
+    /// Grok variants share precedence with their .agents counterparts so
+    /// `.agents > .grok/user > bundled` is enforced purely by load order
+    /// (first wins on equal precedence). Two sources returning equal
+    /// precedence (e.g. two project-local skills from different worktrees)
+    /// leave the winner up to the caller, which by convention keeps the
+    /// first one in iteration order.
     ///
     /// Adding a new `SkillSource` variant should be a one-line change
     /// here — every consumer routes through this method so the hierarchy
@@ -138,8 +148,8 @@ impl SkillSource {
     pub fn precedence(&self) -> u8 {
         match self {
             Self::BuiltIn => 0,
-            Self::Global => 1,
-            Self::ProjectLocal { .. } => 2,
+            Self::GrokUser | Self::Global => 1,
+            Self::GrokProjectLocal { .. } | Self::ProjectLocal { .. } => 2,
         }
     }
 
@@ -160,8 +170,11 @@ impl SkillSource {
     pub fn display_label(&self) -> &str {
         match self {
             Self::BuiltIn => "built-in",
-            Self::Global => "global",
-            Self::ProjectLocal {
+            Self::GrokUser | Self::Global => "global",
+            Self::GrokProjectLocal {
+                worktree_root_name, ..
+            }
+            | Self::ProjectLocal {
                 worktree_root_name, ..
             } => worktree_root_name.as_ref(),
         }
@@ -169,8 +182,11 @@ impl SkillSource {
 
     pub fn scope_prefix(&self) -> &str {
         match self {
-            Self::BuiltIn | Self::Global => "",
-            Self::ProjectLocal {
+            Self::BuiltIn | Self::GrokUser | Self::Global => "",
+            Self::GrokProjectLocal {
+                worktree_root_name, ..
+            }
+            | Self::ProjectLocal {
                 worktree_root_name, ..
             } => worktree_root_name.as_ref(),
         }
@@ -188,8 +204,11 @@ impl SkillSource {
     /// strictness only affects users typing by memory.
     pub fn matches_scope(&self, scope: &str) -> bool {
         match self {
-            Self::BuiltIn | Self::Global => scope.is_empty(),
-            Self::ProjectLocal {
+            Self::BuiltIn | Self::GrokUser | Self::Global => scope.is_empty(),
+            Self::GrokProjectLocal {
+                worktree_root_name, ..
+            }
+            | Self::ProjectLocal {
                 worktree_root_name, ..
             } => !scope.is_empty() && worktree_root_name.as_ref() == scope,
         }
@@ -2022,5 +2041,35 @@ description: A skill with no body content
         assert!(is_agents_skills_path(Path::new(
             "project/.grok/Bundled/Skills/bar"
         )));
+    }
+
+    #[test]
+    fn test_grok_native_skill_sources_precedence_and_scope() {
+        let gu = SkillSource::GrokUser.precedence();
+        let g = SkillSource::Global.precedence();
+        let gp = SkillSource::GrokProjectLocal {
+            worktree_id: SkillScopeId(1),
+            worktree_root_name: "p".into(),
+        }
+        .precedence();
+        let p = SkillSource::ProjectLocal {
+            worktree_id: SkillScopeId(1),
+            worktree_root_name: "p".into(),
+        }
+        .precedence();
+        assert_eq!(gu, g);
+        assert_eq!(gp, p);
+        assert!(SkillSource::BuiltIn.precedence() < gu);
+        assert!(gu < gp);
+        let gu2 = SkillSource::GrokUser;
+        assert!(gu2.matches_scope(""));
+        assert!(!gu2.matches_scope("x"));
+        let gp2 = SkillSource::GrokProjectLocal {
+            worktree_id: SkillScopeId(3),
+            worktree_root_name: "wt".into(),
+        };
+        assert!(gp2.matches_scope("wt"));
+        assert_eq!(gp2.display_label(), "wt");
+        assert_eq!(gp2.scope_prefix(), "wt");
     }
 }

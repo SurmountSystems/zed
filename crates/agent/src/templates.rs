@@ -1,14 +1,11 @@
 use anyhow::Result;
 use gpui::SharedString;
 use handlebars::Handlebars;
-use rust_embed::RustEmbed;
+use include_dir::{include_dir, Dir};
 use serde::Serialize;
 use std::sync::Arc;
 
-#[derive(RustEmbed)]
-#[folder = "src/templates"]
-#[include = "*.hbs"]
-struct Assets;
+static TEMPLATE_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src/templates");
 
 pub struct Templates(Handlebars<'static>);
 
@@ -17,7 +14,16 @@ impl Templates {
         let mut handlebars = Handlebars::new();
         handlebars.set_strict_mode(true);
         handlebars.register_helper("contains", Box::new(contains));
-        handlebars.register_embed_templates::<Assets>().unwrap();
+
+        for file in TEMPLATE_DIR.files() {
+            if let Some(name) = file.path().to_str() {
+                let content = String::from_utf8_lossy(file.contents()).into_owned();
+                handlebars
+                    .register_template_string(name, content)
+                    .expect("failed to register template");
+            }
+        }
+
         Arc::new(Self(handlebars))
     }
 }
@@ -45,6 +51,9 @@ pub struct SystemPromptTemplate<'a> {
     pub user_agents_md: Option<SharedString>,
     pub subagent_persona: Option<String>,
     pub subagent_capability_mode: Option<String>,
+    pub is_grok_build_profile: bool,
+    pub current_turn_id: Option<String>,
+    pub prior_turn_summary: Option<String>,
 }
 
 impl Template for SystemPromptTemplate<'_> {
@@ -91,6 +100,9 @@ mod tests {
             user_agents_md: None,
             subagent_persona: None,
             subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -124,6 +136,9 @@ mod tests {
             user_agents_md: Some("always be concise".into()),
             subagent_persona: None,
             subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -150,9 +165,58 @@ mod tests {
             model_name: Some("test-model".to_string()),
             date: "2026-01-01".to_string(),
             user_agents_md: None,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
         assert!(!rendered.contains("### Personal `AGENTS.md`"));
+    }
+
+    #[test]
+    fn test_grok_turn_id_and_prior_summary_injected_via_conditional_in_system_prompt_hbs() {
+        let project = prompt_store::ProjectContext::default();
+        let template = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["echo".into()],
+            model_name: Some("grok".to_string()),
+            date: "2026-05-19".to_string(),
+            user_agents_md: None,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: true,
+            current_turn_id: Some("T-42".to_string()),
+            prior_turn_summary: Some("Prior assistant response: started task".to_string()),
+        };
+        let templates = Templates::new();
+        let rendered = template.render(&templates).expect("template render must succeed for grok turn injection test");
+        assert!(rendered.contains("Current Turn ID: T-42"), "hbs conditional must emit current TurnId for native grok prompt");
+        assert!(rendered.contains("Recent prior-turn summary: Prior assistant response: started task"), "hbs must emit prior-turn summary when present under is_grok");
+    }
+
+    #[test]
+    fn test_system_prompt_renders_subagent_persona_and_capability_mode_sections() {
+        let project = prompt_store::ProjectContext::default();
+        let template = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["echo".into()],
+            model_name: Some("grok".to_string()),
+            date: "2026-05-19".to_string(),
+            user_agents_md: None,
+            subagent_persona: Some("Implementer".to_string()),
+            subagent_capability_mode: Some("Read-Only".to_string()),
+            is_grok_build_profile: true,
+            current_turn_id: None,
+            prior_turn_summary: None,
+        };
+        let templates = Templates::new();
+        let rendered = template.render(&templates).expect("template render must succeed for subagent persona test");
+        assert!(rendered.contains("## Subagent Persona"), "hbs must emit persona section when subagent_persona provided for native subagent spawn");
+        assert!(rendered.contains("You are operating as a Implementer subagent"), "persona value must be interpolated into subagent role guidance");
+        assert!(rendered.contains("## Capability Mode: Read-Only"), "hbs must emit capability section when mode provided");
+        assert!(rendered.contains("When Read-Only, restrict to analysis"), "capability mode text for read-only restriction must appear to feed prompt for ZT-1 and native fidelity");
     }
 }

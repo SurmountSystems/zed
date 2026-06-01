@@ -1,12 +1,8 @@
 use anyhow::Context as _;
+use include_dir::{include_dir, Dir};
 use language_core::{LanguageConfig, LanguageQueries, QUERY_FILENAME_PREFIXES};
-use rust_embed::RustEmbed;
-use util::asset_str;
 
-#[derive(RustEmbed)]
-#[folder = "src/"]
-#[exclude = "*.rs"]
-struct GrammarDir;
+static GRAMMAR_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src");
 
 /// Register all built-in native tree-sitter grammars with the provided registration function.
 ///
@@ -44,9 +40,10 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
 /// Load and parse the `config.toml` for a given language name.
 pub fn load_config(name: &str) -> LanguageConfig {
     let config_toml = String::from_utf8(
-        GrammarDir::get(&format!("{}/config.toml", name))
+        GRAMMAR_DIR
+            .get_file(&format!("{}/config.toml", name))
             .unwrap_or_else(|| panic!("missing config for language {:?}", name))
-            .data
+            .contents()
             .to_vec(),
     )
     .unwrap();
@@ -78,8 +75,8 @@ pub fn load_config_for_feature(name: &str, grammars_loaded: bool) -> LanguageCon
 /// Get a raw embedded file by path (relative to `src/`).
 ///
 /// Returns the file data as bytes, or `None` if the file does not exist.
-pub fn get_file(path: &str) -> Option<rust_embed::EmbeddedFile> {
-    GrammarDir::get(path)
+pub fn get_file(path: &str) -> Option<&'static [u8]> {
+    GRAMMAR_DIR.get_file(path).map(|f| f.contents())
 }
 
 /// Load all `.scm` query files for a given language name into a `LanguageQueries`.
@@ -88,17 +85,18 @@ pub fn get_file(path: &str) -> Option<rust_embed::EmbeddedFile> {
 /// `highlights_extra.scm`) are concatenated together with their contents appended.
 pub fn load_queries(name: &str) -> LanguageQueries {
     let mut result = LanguageQueries::default();
-    for path in GrammarDir::iter() {
+    for file in GRAMMAR_DIR.files() {
+        let path = file.path().to_string_lossy();
         if let Some(remainder) = path.strip_prefix(name).and_then(|p| p.strip_prefix('/')) {
             if !remainder.ends_with(".scm") {
                 continue;
             }
             for (prefix, query) in QUERY_FILENAME_PREFIXES {
                 if remainder.starts_with(prefix) {
-                    let contents = asset_str::<GrammarDir>(path.as_ref());
+                    let contents = String::from_utf8_lossy(file.contents()).into_owned();
                     match query(&mut result) {
-                        None => *query(&mut result) = Some(contents),
-                        Some(existing) => existing.to_mut().push_str(contents.as_ref()),
+                        None => *query(&mut result) = Some(contents.into()),
+                        Some(existing) => existing.to_mut().push_str(&contents),
                     }
                 }
             }

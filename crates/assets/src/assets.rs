@@ -2,33 +2,27 @@
 
 use anyhow::Context as _;
 use gpui::{App, AssetSource, Result, SharedString};
-use rust_embed::RustEmbed;
+use include_dir::{include_dir, Dir};
 
-#[derive(RustEmbed)]
-#[folder = "../../assets"]
-#[include = "fonts/**/*"]
-#[include = "icons/**/*"]
-#[include = "images/**/*"]
-#[include = "themes/**/*"]
-#[exclude = "themes/src/*"]
-#[include = "sounds/**/*"]
-#[include = "prompts/**/*"]
-#[include = "*.md"]
-#[exclude = "*.DS_Store"]
+static ASSETS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../assets");
+
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        Self::get(path)
-            .map(|f| Some(f.data))
+        ASSETS
+            .get_file(path)
+            .map(|f| Some(f.contents().into()))
             .with_context(|| format!("loading asset at path {path:?}"))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        Ok(Self::iter()
-            .filter_map(|p| {
+        Ok(ASSETS
+            .files()
+            .filter_map(|f| {
+                let p = f.path().to_string_lossy();
                 if p.starts_with(path) {
-                    Some(p.into())
+                    Some(p.into_owned().into())
                 } else {
                     None
                 }

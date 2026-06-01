@@ -19,7 +19,6 @@ use agent::{UserAgentsMdState, init_user_agents_md};
 use agent_ui::AgentDiffToolbar;
 use anyhow::Context as _;
 pub use app_menus::*;
-use assets::Assets;
 
 use breadcrumbs::Breadcrumbs;
 use client::zed_urls;
@@ -84,7 +83,7 @@ use theme_settings::{ThemeSettings, load_user_theme};
 use ui::{Navigable, NavigableEntry, PopoverMenuHandle, TintColor, prelude::*};
 use util::markdown::MarkdownString;
 use util::rel_path::RelPath;
-use util::{ResultExt, asset_str, maybe};
+use util::{ResultExt, maybe};
 use uuid::Uuid;
 use vim_mode_setting::VimModeSetting;
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
@@ -195,7 +194,8 @@ pub fn init(cx: &mut App) {
         with_active_or_new_workspace(cx, |workspace, window, cx| {
             open_bundled_file(
                 workspace,
-                asset_str::<Assets>("licenses.md"),
+                // Hybrid: load from filesystem in the main binary
+std::fs::read_to_string("assets/licenses.md").unwrap().into(),
                 "Open Source License Attribution",
                 "Markdown",
                 window,
@@ -827,6 +827,12 @@ async fn initialize_agent_panel(
             ensure_agent_panel_for_workspace(workspace, None, window, cx)
         })?
         .await?;
+
+    // Ensure the Agent Panel (and therefore the right dock) is visible by default on startup.
+    // This is required for the Grok Build / Full Agent Mode experience the user expects.
+    workspace_handle.update_in(&mut cx, |workspace, window, cx| {
+        workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
+    })?;
 
     workspace_handle.update_in(&mut cx, |workspace, window, cx| {
         cx.observe_global_in::<SettingsStore>(window, move |workspace, window, cx| {
@@ -2523,13 +2529,13 @@ pub(crate) fn eager_load_active_theme_and_icon_theme(fs: Arc<dyn Fs>, cx: &mut A
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assets::Assets;
+    
     use collections::HashSet;
     use editor::{
         DisplayPoint, Editor, MultiBufferOffset, SelectionEffects, display_map::DisplayRow,
     };
     use gpui::{
-        Action, AnyWindowHandle, App, AssetSource, BorrowAppContext, Modifiers, TestAppContext,
+        Action, AnyWindowHandle, App, BorrowAppContext, Modifiers, TestAppContext,
         UpdateGlobal, VisualTestContext, WindowHandle, actions, point, px,
     };
     use language::LanguageRegistry;
@@ -5290,14 +5296,12 @@ mod tests {
     fn test_bundled_settings_and_themes(cx: &mut App) {
         cx.text_system()
             .add_fonts(vec![
-                Assets
-                    .load("fonts/lilex/Lilex-Regular.ttf")
-                    .unwrap()
-                    .unwrap(),
-                Assets
-                    .load("fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf")
-                    .unwrap()
-                    .unwrap(),
+                Cow::Borrowed(include_bytes!(
+                    "../../../assets/fonts/lilex/Lilex-Regular.ttf"
+                )),
+                Cow::Borrowed(include_bytes!(
+                    "../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
+                )),
             ])
             .unwrap();
         let themes = ThemeRegistry::default();

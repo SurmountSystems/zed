@@ -49,6 +49,7 @@ pub struct SessionCapabilities {
     prompt_capabilities: acp::PromptCapabilities,
     available_commands: Vec<acp::AvailableCommand>,
     available_skills: Vec<AvailableSkill>,
+    is_grok_build: bool,
 }
 
 impl SessionCapabilities {
@@ -61,7 +62,12 @@ impl SessionCapabilities {
             prompt_capabilities,
             available_commands,
             available_skills,
+            is_grok_build: false,
         }
+    }
+
+    pub fn is_grok_build(&self) -> bool {
+        self.is_grok_build
     }
 
     pub fn from_acp_commands(
@@ -108,7 +114,8 @@ impl SessionCapabilities {
     }
 
     pub fn completion_commands(&self) -> Vec<AvailableCommand> {
-        self.available_commands
+        let mut commands = self
+            .available_commands
             .iter()
             .map(|command| AvailableCommand {
                 name: command.name.clone().into(),
@@ -116,7 +123,38 @@ impl SessionCapabilities {
                 requires_argument: command.input.is_some(),
                 source: None,
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        if self.is_grok_build {
+            // Grok Build specific quick actions that appear at the top of the slash drawer.
+            // These give first-class, co-equal access to the unique Grok workflow
+            // (plan mode, persona switching, memory) directly from the prompt.
+            let grok_commands = vec![
+                AvailableCommand {
+                    name: "plan".into(),
+                    description: "Enter or toggle Plan Mode for structured Grok Build work".into(),
+                    requires_argument: false,
+                    source: Some("Grok".into()),
+                },
+                AvailableCommand {
+                    name: "persona".into(),
+                    description:
+                        "Switch the current subagent persona (researcher, implementer, etc.)".into(),
+                    requires_argument: false,
+                    source: Some("Grok".into()),
+                },
+                AvailableCommand {
+                    name: "memory".into(),
+                    description: "Show or manage the current Grok memory facts (RO)".into(),
+                    requires_argument: false,
+                    source: Some("Grok".into()),
+                },
+            ];
+            // Prepend so they appear first in the drawer for Grok threads.
+            commands.splice(0..0, grok_commands);
+        }
+
+        commands
     }
 
     pub fn completion_skills(&self) -> Vec<AvailableSkill> {
@@ -133,6 +171,10 @@ impl SessionCapabilities {
 
     pub fn set_available_skills(&mut self, available_skills: Vec<AvailableSkill>) {
         self.available_skills = available_skills;
+    }
+
+    pub fn set_is_grok_build(&mut self, is_grok_build: bool) {
+        self.is_grok_build = is_grok_build;
     }
 }
 
@@ -2207,6 +2249,38 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name.as_ref(), "deploy");
         assert_eq!(skills[0].skill_file_path, skill_file_path);
+    }
+
+    #[test]
+    fn grok_build_prompt_drawer_injects_special_commands() {
+        // When the session is for a Grok Build thread, the prompt drawer
+        // (slash autocomplete) surfaces first-class Grok-specific quick actions.
+        // This is the concrete improvement that makes the drawer feel co-equal
+        // to the standalone Grok TUI command surface.
+        let mut caps = SessionCapabilities::new(acp::PromptCapabilities::default(), vec![], vec![]);
+        caps.set_is_grok_build(true);
+
+        let commands = caps.completion_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.name.as_ref() == "plan" && c.source.as_deref() == Some("Grok"))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.name.as_ref() == "persona" && c.source.as_deref() == Some("Grok"))
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.name.as_ref() == "memory" && c.source.as_deref() == Some("Grok"))
+        );
+
+        // Non-Grok stays clean.
+        caps.set_is_grok_build(false);
+        let normal = caps.completion_commands();
+        assert!(!normal.iter().any(|c| c.source.as_deref() == Some("Grok")));
     }
 
     #[test]

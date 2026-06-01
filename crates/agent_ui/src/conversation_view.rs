@@ -102,7 +102,20 @@ const TOKEN_THRESHOLD: u64 = 250;
 pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 mod thread_view;
-pub use thread_view::*;
+pub use thread_view::{
+    AcpThreadViewEvent,
+    ThreadView,
+    ZedTodos,
+    ZedTodosComponent,
+    ZedTodosDockPrototype,
+    collect_background_monitor_tool_calls,
+    collect_pending_approval_tool_calls,
+    render_approval_row,
+    render_background_task_row,
+    render_grok_memory_items,
+    render_risk_chip,
+    render_zed_todos_categorized_surface,
+};
 
 pub struct QueuedMessage {
     pub content: Vec<acp::ContentBlock>,
@@ -280,6 +293,7 @@ impl Conversation {
                     | AcpThreadEvent::EntriesRemoved(_)
                     | AcpThreadEvent::Retry(_)
                     | AcpThreadEvent::SubagentSpawned(_)
+                    | AcpThreadEvent::SubagentUpdated(_)
                     | AcpThreadEvent::Stopped(_)
                     | AcpThreadEvent::Error
                     | AcpThreadEvent::LoadError(_)
@@ -335,6 +349,7 @@ impl Conversation {
         Some((result_session_id, tool_id.clone(), options))
     }
 
+    #[allow(dead_code)]
     pub fn subagents_awaiting_permission(&self, cx: &App) -> Vec<(acp::SessionId, usize)> {
         self.permission_requests
             .iter()
@@ -479,6 +494,7 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ModeUpdated(_)
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
+        | AcpThreadEvent::SubagentUpdated(_)
         | AcpThreadEvent::PromptUpdated => false,
     }
 }
@@ -1043,6 +1059,9 @@ impl ConversationView {
             thread.read(cx).available_commands().to_vec(),
             available_skills,
         )));
+        if agent_id.as_ref() == "grok" {
+            session_capabilities.write().set_is_grok_build(true);
+        }
 
         let action_log = thread.read(cx).action_log().clone();
 
@@ -1448,19 +1467,11 @@ impl ConversationView {
         }
         match event {
             AcpThreadEvent::NewEntry => {
-                let len = thread.read(cx).entries().len();
-                let index = len - 1;
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
                     entry_view_state.update(cx, |view_state, cx| {
-                        view_state.sync_entry(index, thread, window, cx);
-                        list_state.splice_focusable(
-                            index..index,
-                            [view_state
-                                .entry(index)
-                                .and_then(|entry| entry.focus_handle(cx))],
-                        );
+                        view_state.reconcile_with_thread(thread, list_state, window, cx);
                     });
                     active.update(cx, |active, cx| {
                         active.sync_editor_mode_for_empty_state(cx);
@@ -1493,6 +1504,9 @@ impl ConversationView {
             }
             AcpThreadEvent::SubagentSpawned(subagent_session_id) => {
                 self.load_subagent_session(subagent_session_id.clone(), session_id, window, cx)
+            }
+            AcpThreadEvent::SubagentUpdated(_) => {
+                cx.notify();
             }
             AcpThreadEvent::ToolAuthorizationRequested(_) => {
                 self.notify_with_sound("Waiting for tool confirmation", IconName::Info, window, cx);
@@ -1568,6 +1582,15 @@ impl ConversationView {
                         window,
                         cx,
                     );
+                    if let Some(view) = self.thread_view(&session_id) {
+                        if view.read(cx).is_grok_build_profile(cx) {
+                            let completion_phrase = "All current independent work is complete. No further autonomous actions are possible without additional direction.";
+                            let plan = thread.read(cx).plan();
+                            if !plan.requires_explicit_completion_notification(completion_phrase) {
+                                self.dispatch_grok_completion_system_notification(window, cx);
+                            }
+                        }
+                    }
                 } else {
                     self.send_queued_message_at_index(0, false, window, cx);
                 }
@@ -1660,9 +1683,26 @@ impl ConversationView {
             }
             AcpThreadEvent::TokenUsageUpdated => {
                 if let Some(active) = self.thread_view(&session_id) {
+                    // Snapshot the ring bucket *before* the internal accounting update.
+                    // Only perform a full view notify (which can contend with typing)
+                    // when the visible ring header would actually look different to the user.
+                    // This is the direct mitigation for "UI blocks typing when system is busy building".
+                    let old_bucket = active.read(cx).current_ring_visual_bucket(cx);
+
                     active.update(cx, |active, cx| {
                         active.update_turn_tokens(cx);
                     });
+
+                    let new_bucket = active.read(cx).current_ring_visual_bucket(cx);
+
+                    if old_bucket != new_bucket {
+                        // Real visual change in the ZT-1 ring (threshold cross, sub-agent, todos).
+                        // Safe to notify; the dock prototype and activity bar will pick it up cheaply
+                        // thanks to last_ring_bucket + ring_visual_bucket.
+                        active.update(cx, |_, cx| cx.notify());
+                    }
+                    // If bucket is identical, the internal per-turn token counters were still
+                    // updated (for telemetry / per-turn UI) but we avoided a full re-render storm.
                 }
             }
             AcpThreadEvent::AvailableCommandsUpdated(available_commands) => {
@@ -2526,6 +2566,35 @@ impl ConversationView {
         #[cfg(feature = "audio")]
         self.play_notification_sound(window, cx);
         self.show_notification(caption, icon, window, cx);
+    }
+
+    fn dispatch_grok_completion_system_notification(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.notifications.is_empty() {
+            return;
+        }
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |workspace, cx| {
+                struct GrokCompletionToast;
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        workspace::notifications::NotificationId::unique::<GrokCompletionToast>(),
+                        "Grok: All current independent work is complete. No further autonomous actions are possible without additional direction.",
+                    )
+                    .autohide(),
+                    cx,
+                );
+            });
+        }
+        if let Some(primary) = cx.primary_display() {
+            if let Some(root_view) = self.root_thread_view() {
+                let root_thread = root_view.read(cx).thread.read(cx);
+                let root_work_dirs = root_thread.work_dirs().cloned();
+                let root_title = root_thread.title();
+                let caption: SharedString = "All current independent work is complete. No further autonomous actions are possible without additional direction.".into();
+                let title: SharedString = "Grok".into();
+                self.pop_up(IconName::ZedAssistant, caption, title, self.thread_id, root_work_dirs, root_title, window, primary, cx);
+            }
+        }
     }
 
     fn is_visible(&self, multi_workspace: &Entity<MultiWorkspace>, cx: &Context<Self>) -> bool {

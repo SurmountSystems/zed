@@ -1,18 +1,11 @@
-#[cfg(all(test, feature = "unit-eval"))]
 use futures::future::LocalBoxFuture;
-#[cfg(all(test, feature = "unit-eval"))]
 use gpui::TestAppContext;
-#[cfg(all(test, feature = "unit-eval"))]
 use std::fmt::Display;
 
-#[cfg(all(test, feature = "unit-eval"))]
 mod edit_file;
-#[cfg(all(test, feature = "unit-eval"))]
 mod terminal_tool;
-#[cfg(all(test, feature = "unit-eval"))]
 mod write_file;
 
-#[cfg(all(test, feature = "unit-eval"))]
 fn run_gpui_eval<T>(
     eval: impl for<'a> FnOnce(&'a mut TestAppContext) -> LocalBoxFuture<'a, anyhow::Result<T>>,
     outcome: impl FnOnce(&T) -> eval_utils::OutcomeKind,

@@ -372,6 +372,11 @@ impl EditToolTest {
                 model_name: None,
                 date: chrono::Local::now().format("%Y-%m-%d").to_string(),
                 user_agents_md: None,
+                subagent_persona: None,
+                subagent_capability_mode: None,
+                is_grok_build_profile: false,
+                current_turn_id: None,
+                prior_turn_summary: None,
             };
             let templates = Templates::new();
             template.render(&templates)?
@@ -690,7 +695,7 @@ async fn retry_on_rate_limit<R>(mut request: impl AsyncFnMut() -> Result<R>) -> 
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_delete_function() {
     let input_file_path = "root/blame.rs";
     let input_file_content = include_str!("fixtures/delete_run_git_blame/before.rs");
@@ -750,7 +755,7 @@ fn eval_delete_function() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_extract_handle_command_output() {
     let input_file_path = "root/blame.rs";
     let input_file_content = include_str!("fixtures/extract_handle_command_output/before.rs");
@@ -809,7 +814,7 @@ fn eval_extract_handle_command_output() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_translate_doc_comments() {
     let input_file_path = "root/canvas.rs";
     let input_file_content = include_str!("fixtures/translate_doc_comments/before.rs");
@@ -853,7 +858,7 @@ fn eval_translate_doc_comments() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_use_wasi_sdk_in_compile_parser_to_wasm() {
     let input_file_path = "root/lib.rs";
     let input_file_content =
@@ -956,7 +961,7 @@ fn eval_use_wasi_sdk_in_compile_parser_to_wasm() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_disable_cursor_blinking() {
     let input_file_path = "root/editor.rs";
     let input_file_content = include_str!("fixtures/disable_cursor_blinking/before.rs");
@@ -1019,7 +1024,7 @@ fn eval_disable_cursor_blinking() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_from_pixels_constructor() {
     let input_file_path = "root/canvas.rs";
     let input_file_content = include_str!("fixtures/from_pixels_constructor/before.rs");
@@ -1207,7 +1212,7 @@ fn eval_from_pixels_constructor() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_zode() {
     let input_file_path = "root/zode.py";
     let input_content = None;
@@ -1285,7 +1290,7 @@ fn eval_zode() {
 }
 
 #[test]
-#[cfg_attr(not(feature = "unit-eval"), ignore)]
+#[ignore = "Requires the 'e2e' or 'unit-eval' feature + real Anthropic credentials (claude-sonnet-4-6-latest etc.). These are legacy evals for production LLM integration (not relevant to normal Grok native development runs). Use `cargo test -- --ignored` to force execution."]
 fn eval_add_overwrite_test() {
     let input_file_path = "root/action_log.rs";
     let input_file_content = include_str!("fixtures/add_overwrite_test/before.rs");

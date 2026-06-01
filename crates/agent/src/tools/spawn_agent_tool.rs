@@ -154,11 +154,19 @@ impl AgentTool for SpawnAgentTool {
                 .capability_mode
                 .as_deref()
                 .map(acp_thread::AgentCapabilityMode::from_name);
+
+            let label_for_title = if !input.label.trim().is_empty() {
+                Some(input.label.clone())
+            } else {
+                None
+            };
+
             let (subagent, mut session_info) = cx.update(|cx| {
                 let subagent = if let Some(session_id) = input.session_id {
                     self.environment.resume_subagent(session_id, cx)
                 } else {
-                    self.environment.create_subagent(input.label, persona, capability_mode, cx)
+                    self.environment
+                        .create_subagent(input.label, persona, capability_mode, cx)
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,
@@ -174,8 +182,19 @@ impl AgentTool for SpawnAgentTool {
                 };
 
                 event_stream.subagent_spawned(subagent.id());
+                event_stream.subagent_updated(subagent.id());
+
+                let title = label_for_title.unwrap_or_else(|| {
+                    format!(
+                        "Spawned {} subagent",
+                        session_info
+                            .persona
+                            .map(|p| p.display_name().to_string())
+                            .unwrap_or_else(|| "subagent".to_string())
+                    )
+                });
                 event_stream.update_fields_with_meta(
-                    acp::ToolCallUpdateFields::new(),
+                    acp::ToolCallUpdateFields::new().title(Some(title)),
                     Some(acp::Meta::from_iter([(
                         SUBAGENT_SESSION_INFO_META_KEY.into(),
                         serde_json::json!(&session_info),
@@ -200,6 +219,8 @@ impl AgentTool for SpawnAgentTool {
 
             session_info.message_end_index =
                 cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
+
+            event_stream.subagent_updated(session_info.session_id.clone());
 
             let meta = Some(acp::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),

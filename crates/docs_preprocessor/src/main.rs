@@ -594,8 +594,10 @@ fn chapter_breadcrumbs(chapter: &Chapter) -> String {
 }
 
 fn load_keymap(asset_path: &str) -> Result<KeymapFile> {
-    let content = util::asset_str::<settings::SettingsAssets>(asset_path);
-    KeymapFile::parse(content.as_ref())
+    // Hybrid: load directly from filesystem for the docs preprocessor (build tool)
+    let content = std::fs::read_to_string(format!("../assets/{}", asset_path))
+        .expect("failed to load keymap for docs");
+    KeymapFile::parse(&content)
 }
 
 fn for_each_chapter_mut<F>(book: &mut Book, mut func: F)

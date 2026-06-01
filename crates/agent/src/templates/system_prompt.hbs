@@ -15,7 +15,7 @@ You are operating as a {{subagent_persona}} subagent. Adapt your reasoning, thor
 {{/if}}
 {{#if subagent_capability_mode}}
 ## Capability Mode: {{subagent_capability_mode}}
-When operating in Read-Only mode, restrict to analysis, search, read, and diagnostic tools only. Do not use write, edit, delete, mutating terminal, or other destructive tools. Report findings so the parent can act.
+Follow the rules of this mode. When Read-Only, restrict to analysis, search, read, and diagnostic tools only. Do not use write, edit, delete, mutating terminal, or other destructive tools. Report findings so the parent can act. In Full mode all permitted tools including mutations are available following permissions.
 {{/if}}
 
 ## Formatting Responses
@@ -179,6 +179,10 @@ If the user references a file, function, type, command, or other project-specifi
 Operating System: {{os}}
 Default Shell: {{shell}}
 Today's Date: {{date}}
+{{#if is_grok_build_profile}}
+Current Turn ID: {{current_turn_id}}
+{{#if prior_turn_summary}}Recent prior-turn summary: {{prior_turn_summary}}{{/if}}
+{{/if}}
 
 The current project contains the following root directories:
 

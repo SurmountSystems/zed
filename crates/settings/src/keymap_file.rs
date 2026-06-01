@@ -13,17 +13,18 @@ use std::borrow::Cow;
 use std::{any::TypeId, fmt::Write, rc::Rc, sync::Arc, sync::LazyLock};
 use util::ResultExt as _;
 use util::{
-    asset_str,
     markdown::{MarkdownEscaped, MarkdownInlineCode, MarkdownString},
     schemars::AllowTrailingCommas,
 };
 
-use crate::SettingsAssets;
+use include_dir::{include_dir, Dir};
 use settings_content::{ActionName, ActionWithArguments};
 use settings_json::{
     append_top_level_array_value_in_json_text, parse_json_with_comments,
     replace_top_level_array_value_in_json_text,
 };
+
+static KEYMAPS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../assets/keymaps");
 
 pub trait KeyBindingValidator: Send + Sync {
     fn action_type_id(&self) -> TypeId;
@@ -182,7 +183,13 @@ impl KeymapFile {
         source: Option<KeybindSource>,
         cx: &App,
     ) -> anyhow::Result<Vec<KeyBinding>> {
-        match Self::load(asset_str::<SettingsAssets>(asset_path).as_ref(), cx) {
+        let lookup_path = asset_path.strip_prefix("keymaps/").unwrap_or(asset_path);
+        let file = KEYMAPS_DIR
+            .get_file(lookup_path)
+            .ok_or_else(|| anyhow::anyhow!("built-in keymap not found: {}", asset_path))?;
+        let content = std::str::from_utf8(file.contents())?;
+
+        match Self::load(content, cx) {
             KeymapFileLoadResult::Success { mut key_bindings } => match source {
                 Some(source) => Ok({
                     for key_binding in &mut key_bindings {
@@ -205,7 +212,13 @@ impl KeymapFile {
         asset_path: &str,
         cx: &App,
     ) -> anyhow::Result<Vec<KeyBinding>> {
-        match Self::load(asset_str::<SettingsAssets>(asset_path).as_ref(), cx) {
+        let lookup_path = asset_path.strip_prefix("keymaps/").unwrap_or(asset_path);
+        let file = KEYMAPS_DIR
+            .get_file(lookup_path)
+            .ok_or_else(|| anyhow::anyhow!("built-in keymap not found: {}", asset_path))?;
+        let content = std::str::from_utf8(file.contents())?;
+
+        match Self::load(content, cx) {
             KeymapFileLoadResult::SomeFailedToLoad {
                 key_bindings,
                 error_message,

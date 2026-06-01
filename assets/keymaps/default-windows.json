@@ -616,6 +616,7 @@
       // for first-class dedicated NewGrokThread discoverability across platforms (command palette,
       // direct key, co-equal ACP peer status). Makes grok command surface practical on Win.
       "ctrl-alt-x": ["agent::NewGrokThread", {}],
+      // Full Agent Mode ("agent: open full grok surface", prominent "Full Agent Mode" toolbar ListTodo button, "Full Grok Surface" menu) is first-class on Windows via palette + button + menu (no dedicated ctrl-alt-shift-t key to avoid collision with existing "ctrl-shift-alt-t" pane::CloseOtherItems binding; Linux/mac have the t combo reference).
       // Change to open path modal for existing remote connection by setting the parameter
       // "ctrl-shift-alt-o": "["projects::OpenRemote", { "from_existing_connection": true }]",
       "ctrl-shift-alt-o": ["projects::OpenRemote", { "from_existing_connection": false, "create_new_window": false }],

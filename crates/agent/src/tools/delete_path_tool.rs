@@ -66,7 +66,7 @@ impl AgentTool for DeletePathTool {
         _cx: &mut App,
     ) -> SharedString {
         if let Ok(input) = input {
-            format!("Delete “`{}`”", input.path).into()
+            format!("Delete \"`{}`\"", input.path).into()
         } else {
             "Delete path".into()
         }
