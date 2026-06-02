@@ -478,7 +478,7 @@ async fn contract_subagent_tool_registers_and_respects_feature_flag(cx: &mut Tes
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
     let agent = cx.update(|cx| {
-        NativeAgent::new(thread_store.clone(), Templates::new(), None, fs.clone(), cx)
+        NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx)
     });
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
@@ -632,7 +632,8 @@ fn contract_grok_tui_artifact_writers_roundtrip_with_p4_shapes_and_worktree() {
 // TODO: Re-implement this contract test properly under TDD once the surface + memory + proposed plan
 // paths are fully wired for native Grok. Left as placeholder to keep build green.
 #[test]
-fn test_native_grok_thread_with_proposed_plan_and_memory_populates_full_classified_surface_identically_to_bridged() {
+fn test_native_grok_thread_with_proposed_plan_and_memory_populates_full_classified_surface_identically_to_bridged()
+ {
     // Intentionally left minimal. The previous body had brace/indent issues.
     assert!(true, "placeholder until full contract test is restored");
 }
@@ -826,8 +827,10 @@ fn contract_native_grok_turn_driver_event_consumer_wires_to_full_tui_artifacts_e
 #[test]
 fn contract_turn_identifier_display_serde_roundtrip_type_ascription() {
     let the_turn_identifier: TurnId = TurnId::new(42);
-    let the_serialized_form: String = serde_json::to_string(&the_turn_identifier).expect("turn identifier serialization required for P4-0 addressing fidelity");
-    let the_deserialized_turn: TurnId = serde_json::from_str(&the_serialized_form).expect("turn identifier deserialization required for orchestration roundtrips");
+    let the_serialized_form: String = serde_json::to_string(&the_turn_identifier)
+        .expect("turn identifier serialization required for P4-0 addressing fidelity");
+    let the_deserialized_turn: TurnId = serde_json::from_str(&the_serialized_form)
+        .expect("turn identifier deserialization required for orchestration roundtrips");
     assert_eq!(format!("{}", the_turn_identifier), "T-42");
     assert_eq!(u32::from(the_turn_identifier), 42u32);
     assert_eq!(the_turn_identifier, the_deserialized_turn);
@@ -843,15 +846,26 @@ fn contract_turn_identifier_from_u32_and_addressing_syntax() {
 }
 
 #[gpui::test]
-async fn test_native_grok_orchestration_driver_construction_under_profile_with_turn_identifier(cx: &mut TestAppContext) {
+async fn test_native_grok_orchestration_driver_construction_under_profile_with_turn_identifier(
+    cx: &mut TestAppContext,
+) {
     init_test(cx);
-    let ThreadTest { thread: the_thread_entity, .. } = setup(cx, TestModel::Fake).await;
-    let the_grok_model: Arc<FakeLanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking("x_ai", "grok-beta", "Grok", false));
+    let ThreadTest {
+        thread: the_thread_entity,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let the_grok_model: Arc<FakeLanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
+        "x_ai",
+        "grok-beta",
+        "Grok",
+        false,
+    ));
     the_thread_entity.update(cx, |the_thread, cx| {
         the_thread.set_model(the_grok_model, cx);
     });
     cx.update(|cx| {
-        let the_driver: Option<crate::NativeTurnDriver> = DirectNativeTurnDriverContract::driver_for_grok_native(the_thread_entity.clone(), cx);
+        let the_driver: Option<crate::NativeTurnDriver> =
+            DirectNativeTurnDriverContract::driver_for_grok_native(the_thread_entity.clone(), cx);
         assert!(the_driver.is_some());
         let the_standalone_turn: TurnId = TurnId::new(5);
         assert_eq!(format!("{}", the_standalone_turn), "T-5");
@@ -862,21 +876,38 @@ async fn test_native_grok_orchestration_driver_construction_under_profile_with_t
 }
 
 #[gpui::test]
-async fn test_native_grok_run_turn_e2e_fidelity_to_p4_artifacts_with_cwd_and_profile(cx: &mut TestAppContext) {
+async fn test_native_grok_run_turn_e2e_fidelity_to_p4_artifacts_with_cwd_and_profile(
+    cx: &mut TestAppContext,
+) {
     init_test(cx);
     always_allow_tools(cx);
     let the_harness = NativeGrokTestHarness::new(cx);
-    let ThreadTest { thread: the_thread_entity, .. } = the_harness.grok_thread(cx).await;
-    let the_grok_model: Arc<FakeLanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking("x_ai", "grok-beta", "Grok", false));
+    let ThreadTest {
+        thread: the_thread_entity,
+        ..
+    } = the_harness.grok_thread(cx).await;
+    let the_grok_model: Arc<FakeLanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
+        "x_ai",
+        "grok-beta",
+        "Grok",
+        false,
+    ));
     the_thread_entity.update(cx, |the_thread, cx| {
         the_thread.set_model(the_grok_model, cx);
     });
-    let _the_events = the_thread_entity.update(cx, |the_thread, cx| {
-        the_thread.send(UserMessageId::new(), ["Native orchestration E2E under profile for P4-0 fidelity and CWD"], cx)
-    }).expect("send for native orchestration E2E must propagate");
+    let _the_events = the_thread_entity
+        .update(cx, |the_thread, cx| {
+            the_thread.send(
+                UserMessageId::new(),
+                ["Native orchestration E2E under profile for P4-0 fidelity and CWD"],
+                cx,
+            )
+        })
+        .expect("send for native orchestration E2E must propagate");
     cx.run_until_parked();
     cx.update(|cx| {
-        let the_driver_maybe: Option<crate::NativeTurnDriver> = DirectNativeTurnDriverContract::driver_for_grok_native(the_thread_entity.clone(), cx);
+        let the_driver_maybe: Option<crate::NativeTurnDriver> =
+            DirectNativeTurnDriverContract::driver_for_grok_native(the_thread_entity.clone(), cx);
         assert!(the_driver_maybe.is_some());
     });
     the_thread_entity.read_with(cx, |the_thread, _| {
@@ -897,51 +928,84 @@ fn contract_native_profile_rule_injection_and_kickback_regression_with_turn_iden
 #[gpui::test]
 async fn test_native_grok_turn_driver_event_receiver_and_plan_injection(cx: &mut TestAppContext) {
     init_test(cx);
-    let ThreadTest { thread: the_thread_entity, .. } = setup(cx, TestModel::Fake).await;
-    let the_grok_model: Arc<FakeLanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking("x_ai", "grok-beta", "Grok", false));
-    the_thread_entity.update(cx, |the_thread, cx| { the_thread.set_model(the_grok_model, cx); });
+    let ThreadTest {
+        thread: the_thread_entity,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let the_grok_model: Arc<FakeLanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
+        "x_ai",
+        "grok-beta",
+        "Grok",
+        false,
+    ));
+    the_thread_entity.update(cx, |the_thread, cx| {
+        the_thread.set_model(the_grok_model, cx);
+    });
     cx.update(|cx| {
-        if let Some(the_driver) = DirectNativeTurnDriverContract::driver_for_grok_native(the_thread_entity.clone(), cx) {
-            let _the_receiver_attempt: anyhow::Result<mpsc::UnboundedReceiver<anyhow::Result<crate::ThreadEvent>>> = DirectNativeTurnDriverContract::assert_direct_driver_produces_receiver(&the_driver, cx);
+        if let Some(the_driver) =
+            DirectNativeTurnDriverContract::driver_for_grok_native(the_thread_entity.clone(), cx)
+        {
+            let _the_receiver_attempt: anyhow::Result<
+                mpsc::UnboundedReceiver<anyhow::Result<crate::ThreadEvent>>,
+            > = DirectNativeTurnDriverContract::assert_direct_driver_produces_receiver(
+                &the_driver,
+                cx,
+            );
         }
     });
     let the_plan_turn_ref: TurnId = TurnId::new(2);
     assert!(format!("{}", the_plan_turn_ref).starts_with("T-"));
 }
 
-    // P4-13 Performance validation appended to native contracts (existing test file only).
-    // Extensive harness for O(1) native path measurements, TurnId refs, profile gate,
-    // driver construction, E2E kickback fidelity, proving native lighter than ACP external.
-    // All per strict rules: relative crates/agent/... , fresh reads, CLAUDE, no core edits.
+// P4-13 Performance validation appended to native contracts (existing test file only).
+// Extensive harness for O(1) native path measurements, TurnId refs, profile gate,
+// driver construction, E2E kickback fidelity, proving native lighter than ACP external.
+// All per strict rules: relative crates/agent/... , fresh reads, CLAUDE, no core edits.
 
-    #[test]
-    fn perf_validation_p4_native_grok_driver_and_profile_gate_o1() {
-        use std::time::Instant;
-        // The driver gate itself is O(1) bool check
-        let start = Instant::now();
-        for _ in 0..10000 {
-            // simulate repeated is_grok checks as in UI + send paths
-            let _sim = true; // would be thread.is_grok_build_profile(cx) which is field read
-        }
-        let gate_time = start.elapsed();
-        assert!(gate_time < std::time::Duration::from_millis(5), "profile gate O(1) ns cost; ACP external always spawns");
+#[test]
+fn perf_validation_p4_native_grok_driver_and_profile_gate_o1() {
+    use std::time::Instant;
+    // The driver gate itself is O(1) bool check
+    let start = Instant::now();
+    for _ in 0..10000 {
+        // simulate repeated is_grok checks as in UI + send paths
+        let _sim = true; // would be thread.is_grok_build_profile(cx) which is field read
     }
+    let gate_time = start.elapsed();
+    assert!(
+        gate_time < std::time::Duration::from_millis(5),
+        "profile gate O(1) ns cost; ACP external always spawns"
+    );
+}
 
-    #[gpui::test]
-    async fn perf_validation_native_turn_driver_with_turnid_refs_e2e(cx: &mut TestAppContext) {
-        init_test(cx);
-        let ThreadTest { thread: the_thread_entity, .. } = setup(cx, TestModel::Fake).await;
-        let grok_m: Arc<FakeLanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking("x_ai", "grok-beta", "Grok", false));
-        the_thread_entity.update(cx, |t, cx| { t.set_model(grok_m, cx); });
-        cx.update(|cx| {
-            let driver_opt = DirectNativeTurnDriverContract::driver_for_grok_native(the_thread_entity.clone(), cx);
-            assert!(driver_opt.is_some(), "native driver only for profile");
-            let tid: TurnId = TurnId::new(17);
-            let addr = format!("{}-task-p4-13-perf", tid);
-            assert_eq!(addr, "T-17-task-p4-13-perf");
-        });
-        the_thread_entity.read_with(cx, |t, c| {
-            assert!(t.is_grok_build_profile(c), "P4 native profile active for TurnId + injection");
-        });
-    }
-
+#[gpui::test]
+async fn perf_validation_native_turn_driver_with_turnid_refs_e2e(cx: &mut TestAppContext) {
+    init_test(cx);
+    let ThreadTest {
+        thread: the_thread_entity,
+        ..
+    } = setup(cx, TestModel::Fake).await;
+    let grok_m: Arc<FakeLanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
+        "x_ai",
+        "grok-beta",
+        "Grok",
+        false,
+    ));
+    the_thread_entity.update(cx, |t, cx| {
+        t.set_model(grok_m, cx);
+    });
+    cx.update(|cx| {
+        let driver_opt =
+            DirectNativeTurnDriverContract::driver_for_grok_native(the_thread_entity.clone(), cx);
+        assert!(driver_opt.is_some(), "native driver only for profile");
+        let tid: TurnId = TurnId::new(17);
+        let addr = format!("{}-task-p4-13-perf", tid);
+        assert_eq!(addr, "T-17-task-p4-13-perf");
+    });
+    the_thread_entity.read_with(cx, |t, c| {
+        assert!(
+            t.is_grok_build_profile(c),
+            "P4 native profile active for TurnId + injection"
+        );
+    });
+}

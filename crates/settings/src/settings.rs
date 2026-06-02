@@ -113,8 +113,6 @@ impl fmt::Display for WorktreeId {
     }
 }
 
-
-
 pub fn init(cx: &mut App) {
     let settings = SettingsStore::new(cx, &default_settings());
     cx.set_global(settings);
@@ -126,7 +124,9 @@ pub fn default_settings() -> Cow<'static, str> {
 }
 
 pub fn default_semantic_token_rules() -> Cow<'static, str> {
-    Cow::Borrowed(include_str!("../../../assets/settings/default_semantic_token_rules.json"))
+    Cow::Borrowed(include_str!(
+        "../../../assets/settings/default_semantic_token_rules.json"
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -160,15 +160,21 @@ pub fn vim_keymap() -> Cow<'static, str> {
 }
 
 pub fn initial_user_settings_content() -> Cow<'static, str> {
-    Cow::Borrowed(include_str!("../../../assets/settings/initial_user_settings.json"))
+    Cow::Borrowed(include_str!(
+        "../../../assets/settings/initial_user_settings.json"
+    ))
 }
 
 pub fn initial_server_settings_content() -> Cow<'static, str> {
-    Cow::Borrowed(include_str!("../../../assets/settings/initial_server_settings.json"))
+    Cow::Borrowed(include_str!(
+        "../../../assets/settings/initial_server_settings.json"
+    ))
 }
 
 pub fn initial_project_settings_content() -> Cow<'static, str> {
-    Cow::Borrowed(include_str!("../../../assets/settings/initial_local_settings.json"))
+    Cow::Borrowed(include_str!(
+        "../../../assets/settings/initial_local_settings.json"
+    ))
 }
 
 pub fn initial_keymap_content() -> Cow<'static, str> {
@@ -180,9 +186,13 @@ pub fn initial_tasks_content() -> Cow<'static, str> {
 }
 
 pub fn initial_debug_tasks_content() -> Cow<'static, str> {
-    Cow::Borrowed(include_str!("../../../assets/settings/initial_debug_tasks.json"))
+    Cow::Borrowed(include_str!(
+        "../../../assets/settings/initial_debug_tasks.json"
+    ))
 }
 
 pub fn initial_local_debug_tasks_content() -> Cow<'static, str> {
-    Cow::Borrowed(include_str!("../../../assets/settings/initial_local_debug_tasks.json"))
+    Cow::Borrowed(include_str!(
+        "../../../assets/settings/initial_local_debug_tasks.json"
+    ))
 }

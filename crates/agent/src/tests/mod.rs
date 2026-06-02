@@ -26,10 +26,10 @@ use gpui::{
 use indoc::indoc;
 use language_model::{
     CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelProviderId, LanguageModelProviderName, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelToolResult,
-    LanguageModelToolSchemaFormat, LanguageModelToolUse, MessageContent, Role, StopReason,
-    TokenUsage,
+    LanguageModelId, LanguageModelImageExt, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelToolResult, LanguageModelToolSchemaFormat, LanguageModelToolUse, MessageContent,
+    Role, StopReason, TokenUsage,
     fake_provider::{FakeLanguageModel, FakeLanguageModelProvider},
 };
 use pretty_assertions::assert_eq;
@@ -119,6 +119,11 @@ impl FakeTerminalHandle {
         }
     }
 
+    pub(crate) fn with_output(mut self, output: acp::TerminalOutputResponse) -> Self {
+        self.output = output;
+        self
+    }
+
     pub(crate) fn was_killed(&self) -> bool {
         self.killed.load(Ordering::SeqCst)
     }
@@ -183,6 +188,7 @@ pub(crate) struct FakeThreadEnvironment {
     terminal_handle: Option<Rc<FakeTerminalHandle>>,
     subagent_handle: Option<Rc<FakeSubagentHandle>>,
     terminal_creations: Arc<AtomicUsize>,
+    terminal_output_limits: std::cell::RefCell<Vec<Option<u64>>>,
 }
 
 impl FakeThreadEnvironment {
@@ -196,17 +202,26 @@ impl FakeThreadEnvironment {
     pub(crate) fn terminal_creation_count(&self) -> usize {
         self.terminal_creations.load(Ordering::SeqCst)
     }
+
+    pub(crate) fn terminal_output_limits(&self) -> Vec<Option<u64>> {
+        self.terminal_output_limits.borrow().clone()
+    }
 }
 
 impl crate::ThreadEnvironment for FakeThreadEnvironment {
     fn create_terminal(
         &self,
         _command: String,
+        _extra_env: Vec<acp::EnvVariable>,
         _cwd: Option<std::path::PathBuf>,
-        _output_byte_limit: Option<u64>,
+        output_byte_limit: Option<u64>,
+        _sandbox_wrap: Option<acp_thread::SandboxWrap>,
         _cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn crate::TerminalHandle>>> {
         self.terminal_creations.fetch_add(1, Ordering::SeqCst);
+        self.terminal_output_limits
+            .borrow_mut()
+            .push(output_byte_limit);
         let handle = self
             .terminal_handle
             .clone()
@@ -263,8 +278,10 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
     fn create_terminal(
         &self,
         _command: String,
+        _extra_env: Vec<acp::EnvVariable>,
         _cwd: Option<std::path::PathBuf>,
         _output_byte_limit: Option<u64>,
+        _sandbox_wrap: Option<acp_thread::SandboxWrap>,
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn crate::TerminalHandle>>> {
         let handle = Rc::new(cx.update(|cx| FakeTerminalHandle::new_never_exits(cx)));
@@ -360,6 +377,7 @@ async fn test_terminal_tool_timeout_kills_handle(cx: &mut TestAppContext) {
                 command: "sleep 1000".to_string(),
                 cd: ".".to_string(),
                 timeout_ms: Some(5),
+                ..Default::default()
             }),
             event_stream,
             cx,
@@ -427,6 +445,7 @@ async fn test_terminal_tool_without_timeout_does_not_kill_handle(cx: &mut TestAp
                 command: "sleep 1000".to_string(),
                 cd: ".".to_string(),
                 timeout_ms: None,
+                ..Default::default()
             }),
             event_stream,
             cx,
@@ -1696,6 +1715,7 @@ async fn test_mcp_tool_multi_content_response(cx: &mut TestAppContext) {
 
     let (tool_call_params, tool_call_response) = mcp_tool_calls.next().await.unwrap();
     assert_eq!(tool_call_params.name, "screenshot");
+    let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
     tool_call_response
         .send(context_server::types::CallToolResponse {
             content: vec![
@@ -1703,7 +1723,7 @@ async fn test_mcp_tool_multi_content_response(cx: &mut TestAppContext) {
                     text: "Some text".into(),
                 },
                 context_server::types::ToolResponseContent::Image {
-                    data: "aGVsbG8=".into(),
+                    data: image_data.into(),
                     mime_type: "image/png".into(),
                 },
                 context_server::types::ToolResponseContent::Text {
@@ -1731,13 +1751,25 @@ async fn test_mcp_tool_multi_content_response(cx: &mut TestAppContext) {
         })
         .expect("expected a tool result");
     assert_eq!(tool_result.tool_use_id, "tool_1".into());
-    assert_eq!(tool_result.content.len(), 2);
+    assert_eq!(tool_result.content.len(), 3);
+    assert_eq!(
+        tool_result.content[0],
+        language_model::LanguageModelToolResultContent::Text(Arc::from("Some text"))
+    );
+    let expected_image =
+        language_model::LanguageModelImage::from_base64_image(image_data, "image/png")
+            .expect("image conversion should not error")
+            .expect("image conversion should succeed");
     assert_eq!(
         tool_result.content[0],
         language_model::LanguageModelToolResultContent::Text(Arc::from("Some text"))
     );
     assert_eq!(
         tool_result.content[1],
+        language_model::LanguageModelToolResultContent::Image(expected_image)
+    );
+    assert_eq!(
+        tool_result.content[2],
         language_model::LanguageModelToolResultContent::Text(Arc::from("Some more text"))
     );
     fake_model.end_last_completion_stream();
@@ -3547,8 +3579,8 @@ async fn test_agent_connection(cx: &mut TestAppContext) {
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
 
     // Create agent and connection
-    let agent = cx
-        .update(|cx| NativeAgent::new(thread_store, templates.clone(), None, fake_fs.clone(), cx));
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store, templates.clone(), fake_fs.clone(), cx));
     let connection = NativeAgentConnection(agent.clone());
 
     // Create a thread using new_thread
@@ -3835,6 +3867,155 @@ async fn test_update_plan_tool_updates_thread_events(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_update_title_tool_sets_thread_title(cx: &mut TestAppContext) {
+    let ThreadTest { thread, model, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+    let summary_model = Arc::new(FakeLanguageModel::default());
+
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["update-title-tool".to_string()]);
+    });
+    thread.update(cx, |thread, cx| {
+        thread.add_tool(UpdateTitleTool::new(cx.weak_entity()));
+        thread.set_summarization_model(Some(summary_model.clone()), cx);
+    });
+
+    let mut events = thread
+        .update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), ["Explore title tooling"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let input = json!({
+        "title": "Session title tool"
+    });
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::ToolUse(
+        LanguageModelToolUse {
+            id: "title_1".into(),
+            name: UpdateTitleTool::NAME.into(),
+            raw_input: input.to_string(),
+            input,
+            is_input_complete: true,
+            thought_signature: None,
+        },
+    ));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let tool_call = expect_tool_call(&mut events).await;
+    assert_eq!(
+        tool_call,
+        acp::ToolCall::new("title_1", "Update title: Session title tool")
+            .kind(acp::ToolKind::Think)
+            .raw_input(json!({
+                "title": "Session title tool"
+            }))
+            .meta(acp::Meta::from_iter([(
+                "tool_name".into(),
+                "update_title".into()
+            )]))
+    );
+
+    let update = expect_tool_call_update_fields(&mut events).await;
+    assert_eq!(
+        update,
+        acp::ToolCallUpdate::new(
+            "title_1",
+            acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress)
+        )
+    );
+
+    let update = expect_tool_call_update_fields(&mut events).await;
+    assert_eq!(
+        update,
+        acp::ToolCallUpdate::new(
+            "title_1",
+            acp::ToolCallUpdateFields::new()
+                .status(acp::ToolCallStatus::Completed)
+                .raw_output("Session title updated")
+        )
+    );
+
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.title(), Some("Session title tool".into()));
+    });
+    assert_eq!(summary_model.pending_completions(), Vec::new());
+}
+
+#[gpui::test]
+async fn test_update_title_availability_suppresses_summary_title_generation(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest { thread, model, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+    let summary_model = Arc::new(FakeLanguageModel::default());
+
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["update-title-tool".to_string()]);
+    });
+    thread.update(cx, |thread, cx| {
+        thread.add_tool(UpdateTitleTool::new(cx.weak_entity()));
+        thread.set_summarization_model(Some(summary_model.clone()), cx);
+    });
+
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), ["Explore title tooling"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake_model.send_last_completion_stream_text_chunk("Done");
+    fake_model.end_last_completion_stream();
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.title(), None);
+    });
+    assert_eq!(summary_model.pending_completions(), Vec::new());
+}
+
+#[gpui::test]
+async fn test_update_title_flag_without_available_tool_falls_back_to_summary_title_generation(
+    cx: &mut TestAppContext,
+) {
+    let ThreadTest { thread, model, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+    let summary_model = Arc::new(FakeLanguageModel::default());
+
+    cx.update(|cx| {
+        cx.update_flags(true, vec!["update-title-tool".to_string()]);
+    });
+    thread.update(cx, |thread, cx| {
+        thread.set_summarization_model(Some(summary_model.clone()), cx);
+    });
+
+    let send = thread
+        .update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), ["Explore title tooling"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    fake_model.send_last_completion_stream_text_chunk("Done");
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    assert_eq!(summary_model.pending_completions().len(), 1);
+
+    summary_model.send_last_completion_stream_text_chunk("Fallback title");
+    summary_model.end_last_completion_stream();
+    send.collect::<Vec<_>>().await;
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.title(), Some("Fallback title".into()));
+    });
+}
+
+#[gpui::test]
 async fn test_send_no_retry_on_success(cx: &mut TestAppContext) {
     let ThreadTest { thread, model, .. } = setup(cx, TestModel::Fake).await;
     let fake_model = model.as_fake();
@@ -4011,8 +4192,8 @@ async fn test_send_retry_finishes_tool_calls_on_error(cx: &mut TestAppContext) {
     events.collect::<Vec<_>>().await;
     thread.read_with(cx, |thread, _cx| {
         assert_eq!(
-            thread.last_received_or_pending_message(),
-            Some(Message::Agent(AgentMessage {
+            thread.last_received_or_pending_message().as_deref(),
+            Some(&Message::Agent(AgentMessage {
                 content: vec![AgentMessageContent::Text("Done".into())],
                 tool_results: IndexMap::default(),
                 reasoning_details: None,
@@ -4347,6 +4528,7 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
                             StreamingFailingEchoTool::NAME: true,
                             TerminalTool::NAME: true,
                             UpdatePlanTool::NAME: true,
+                            UpdateTitleTool::NAME: true,
                         }
                     }
                 }
@@ -4438,7 +4620,7 @@ async fn setup(cx: &mut TestAppContext, model: TestModel) -> ThreadTest {
 }
 
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn init_logger() {
     if std::env::var("RUST_LOG").is_ok() {
         env_logger::init();
@@ -4778,6 +4960,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
                     command: "rm -rf /".to_string(),
                     cd: ".".to_string(),
                     timeout_ms: None,
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -4830,6 +5013,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
                     command: "echo hello".to_string(),
                     cd: ".".to_string(),
                     timeout_ms: None,
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -4888,6 +5072,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
                     command: "sudo rm file".to_string(),
                     cd: ".".to_string(),
                     timeout_ms: None,
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -4935,6 +5120,7 @@ async fn test_terminal_tool_permission_rules(cx: &mut TestAppContext) {
                     command: "echo hello".to_string(),
                     cd: ".".to_string(),
                     timeout_ms: None,
+                    ..Default::default()
                 }),
                 event_stream,
                 cx,
@@ -4977,9 +5163,8 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     .await;
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
-    let agent = cx.update(|cx| {
-        NativeAgent::new(thread_store.clone(), Templates::new(), None, fs.clone(), cx)
-    });
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
     let acp_thread = cx
@@ -5114,9 +5299,8 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
     .await;
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
-    let agent = cx.update(|cx| {
-        NativeAgent::new(thread_store.clone(), Templates::new(), None, fs.clone(), cx)
-    });
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
     let acp_thread = cx
@@ -5264,9 +5448,8 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
     .await;
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
-    let agent = cx.update(|cx| {
-        NativeAgent::new(thread_store.clone(), Templates::new(), None, fs.clone(), cx)
-    });
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
     let acp_thread = cx
@@ -5396,9 +5579,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     .await;
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
-    let agent = cx.update(|cx| {
-        NativeAgent::new(thread_store.clone(), Templates::new(), None, fs.clone(), cx)
-    });
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
     let acp_thread = cx
@@ -5858,6 +6040,121 @@ async fn test_lsp_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_sibling_thread_tools_gated_by_feature_flag(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    // `CreateThreadToolFeatureFlag::enabled_for_staff()` returns true, which
+    // means tests in debug builds resolve it to ON unless we explicitly
+    // override it via `FeatureFlagsSettings`. Register the settings type and
+    // install an (empty) `FeatureFlagStore` global so the `cx.has_flag` path
+    // actually consults overrides instead of falling back to the
+    // staff-debug-build default.
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, _| {
+            store.register_setting::<feature_flags::FeatureFlagsSettings>();
+        });
+        cx.update_flags(false, vec![]);
+    });
+
+    fn set_flag_override(value: &str, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content
+                        .feature_flags
+                        .get_or_insert_default()
+                        .insert("create-thread-tool".to_string(), value.to_string());
+                });
+            });
+        });
+    }
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/test"), json!({})).await;
+    let project = Project::test(fs, [path!("/test").as_ref()], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_store = project.read_with(cx, |project, _| project.context_server_store());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(context_server_store.clone(), cx));
+    let model = Arc::new(FakeLanguageModel::default());
+    let environment = Rc::new(cx.update(|cx| {
+        FakeThreadEnvironment::default().with_terminal(FakeTerminalHandle::new_never_exits(cx))
+    }));
+
+    let thread = cx.new(|cx| {
+        let mut thread = Thread::new(
+            project,
+            project_context,
+            context_server_registry,
+            Templates::new(),
+            Some(model.clone() as Arc<dyn LanguageModel>),
+            cx,
+        );
+        thread.add_default_tools(environment, cx);
+        thread
+    });
+
+    let sibling_tool_names = [CreateThreadTool::NAME, ListAgentsAndModelsTool::NAME];
+
+    // Like the LSP/rename tools, sibling-thread tools are registered
+    // unconditionally and gated only at exposure time. The registration must
+    // be visible regardless of the flag's current value.
+    thread.read_with(cx, |thread, _| {
+        for name in &sibling_tool_names {
+            assert!(
+                thread.has_registered_tool(name),
+                "expected sibling-thread tool {name} to be registered"
+            );
+        }
+    });
+
+    // Flag explicitly off: a completion request must omit the tools.
+    set_flag_override("off", cx);
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), ["hello"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let completion = model.pending_completions().pop().unwrap();
+    let tool_names = tool_names_for_completion(&completion);
+    for name in &sibling_tool_names {
+        assert!(
+            !tool_names.iter().any(|t| t == name),
+            "expected {name} to be hidden when create-thread-tool flag is off, \
+             but completion tools were: {tool_names:?}"
+        );
+    }
+    // Sanity check: an unrelated default tool should still be exposed.
+    assert!(
+        tool_names.iter().any(|t| t == ReadFileTool::NAME),
+        "expected non-sibling-thread tools to still be exposed, got: {tool_names:?}"
+    );
+    model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    // Flag explicitly on: the next completion request must include both tools.
+    set_flag_override("on", cx);
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(UserMessageId::new(), ["hello again"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let completion = model.pending_completions().pop().unwrap();
+    let tool_names = tool_names_for_completion(&completion);
+    for name in &sibling_tool_names {
+        assert!(
+            tool_names.iter().any(|t| t == name),
+            "expected {name} to be exposed when create-thread-tool flag is on, \
+             but completion tools were: {tool_names:?}"
+        );
+    }
+}
+
+#[gpui::test]
 async fn test_parent_cancel_stops_subagent(cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -5936,9 +6233,8 @@ async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
     .await;
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
-    let agent = cx.update(|cx| {
-        NativeAgent::new(thread_store.clone(), Templates::new(), None, fs.clone(), cx)
-    });
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
     let acp_thread = cx
@@ -6064,9 +6360,8 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
     .await;
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
-    let agent = cx.update(|cx| {
-        NativeAgent::new(thread_store.clone(), Templates::new(), None, fs.clone(), cx)
-    });
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
     let acp_thread = cx
@@ -6242,9 +6537,8 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
     .await;
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
-    let agent = cx.update(|cx| {
-        NativeAgent::new(thread_store.clone(), Templates::new(), None, fs.clone(), cx)
-    });
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
     let acp_thread = cx
@@ -7796,6 +8090,7 @@ fn test_capability_mode_read_only_restriction_in_system_prompt_via_template() {
         is_grok_build_profile: false,
         current_turn_id: None,
         prior_turn_summary: None,
+        sandboxing: false,
     };
     let rendered_prompt = read_only_template
         .render(&templates_instance)
@@ -7804,7 +8099,12 @@ fn test_capability_mode_read_only_restriction_in_system_prompt_via_template() {
         rendered_prompt.contains("Capability Mode: Read-Only"),
         "mode header must appear for subagent"
     );
-    assert!(rendered_prompt.contains("When Read-Only, restrict to analysis, search, read, and diagnostic tools only"), "RO restriction paragraph must be injected under capability guard");
+    assert!(
+        rendered_prompt.contains(
+            "When Read-Only, restrict to analysis, search, read, and diagnostic tools only"
+        ),
+        "RO restriction paragraph must be injected under capability guard"
+    );
     let full_template = crate::templates::SystemPromptTemplate {
         project: &project_context,
         available_tools: vec!["read_file".into()],
@@ -7816,6 +8116,7 @@ fn test_capability_mode_read_only_restriction_in_system_prompt_via_template() {
         is_grok_build_profile: false,
         current_turn_id: None,
         prior_turn_summary: None,
+        sandboxing: false,
     };
     let rendered_full = full_template
         .render(&templates_instance)
@@ -7841,6 +8142,7 @@ fn test_native_grok_build_profile_injects_three_behavioral_rules_and_turn_id() {
         is_grok_build_profile: true,
         current_turn_id: Some("T-42".to_string()),
         prior_turn_summary: Some("Prior assistant response: previous".to_string()),
+        sandboxing: false,
     };
     let rendered_system_prompt = native_grok_profile_template
         .render(&templates_instance)
@@ -7850,10 +8152,19 @@ fn test_native_grok_build_profile_injects_three_behavioral_rules_and_turn_id() {
         rendered_system_prompt, GROK_BUILD_SYSTEM_FRAGMENTS
     );
     assert!(full_system_prompt_for_native.contains("T-42"));
-    assert!(full_system_prompt_for_native.contains("Stopping when there are still tasks is not acceptable"));
+    assert!(
+        full_system_prompt_for_native
+            .contains("Stopping when there are still tasks is not acceptable")
+    );
     assert!(full_system_prompt_for_native.contains("All current independent work is complete. No further autonomous actions are possible without additional direction."));
-    assert!(full_system_prompt_for_native.contains("Read-Only vs. Potentially Destructive classification follows the CWD rule"));
-    assert!(full_system_prompt_for_native.contains("Turn Identification and Cross-Turn Task References"));
+    assert!(
+        full_system_prompt_for_native
+            .contains("Read-Only vs. Potentially Destructive classification follows the CWD rule")
+    );
+    assert!(
+        full_system_prompt_for_native
+            .contains("Turn Identification and Cross-Turn Task References")
+    );
 }
 
 #[test]
@@ -8155,20 +8466,27 @@ async fn test_zt1_native_grok_profile_risk_classification_proposed_plan_banner_a
 }
 
 #[gpui::test]
-async fn test_native_grok_profile_triggers_system_notification_on_exact_completion_phrase(cx: &mut TestAppContext) {
+async fn test_native_grok_profile_triggers_system_notification_on_exact_completion_phrase(
+    cx: &mut TestAppContext,
+) {
     init_test(cx);
     let ThreadTest { thread, .. } = setup(cx, TestModel::Fake).await;
-    let grok_model = Arc::new(FakeLanguageModel::with_id_and_thinking("x_ai", "grok-beta", "Grok", false));
+    let grok_model = Arc::new(FakeLanguageModel::with_id_and_thinking(
+        "x_ai",
+        "grok-beta",
+        "Grok",
+        false,
+    ));
     thread.update(cx, |thread_instance, _cx| {
         thread_instance.set_model(grok_model, _cx);
     });
     let exact = "All current independent work is complete. No further autonomous actions are possible without additional direction.";
     thread.update(cx, |thread_instance, _cx| {
-        thread_instance.messages.push(Message::Agent(AgentMessage {
+        thread_instance.messages.push(Arc::new(Message::Agent(AgentMessage {
             content: vec![AgentMessageContent::Text(exact.to_string())],
             tool_results: IndexMap::default(),
             reasoning_details: None,
-        }));
+        })));
         // send_completion_notification_if_needed removed (notification dispatch lives in UI layer via Stopped events)
     });
     let _type_ascription_pin: () = ();
@@ -8188,7 +8506,7 @@ mod native_grok_surface_tdd {
     use acp_thread::{ApprovalRisk, Plan, TurnId};
     use agent_client_protocol::schema as acp;
     // Disambiguate after the glob from super::* (which pulls conflicting names in this large test file).
-    use std::assert_eq as assert_eq;
+    use std::assert_eq;
 
     // TurnId + task slug + addressing syntax (core of long-running work reliability)
     #[test]
@@ -8227,13 +8545,34 @@ mod native_grok_surface_tdd {
     #[test]
     fn cwd_risk_label_cases_exact_user_definition() {
         use crate::CwdRiskLabel;
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("edit_file", false, false), CwdRiskLabel::Write);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("write_file", true, false), CwdRiskLabel::Destructive);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("terminal", false, false), CwdRiskLabel::Destructive);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("todo_write", false, true), CwdRiskLabel::PlanChange);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("enter_plan_mode", true, true), CwdRiskLabel::PlanChange);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("monitor", true, false), CwdRiskLabel::Destructive);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("delete_path", false, false), CwdRiskLabel::Destructive);
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("edit_file", false, false),
+            CwdRiskLabel::Write
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("write_file", true, false),
+            CwdRiskLabel::Destructive
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("terminal", false, false),
+            CwdRiskLabel::Destructive
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("todo_write", false, true),
+            CwdRiskLabel::PlanChange
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("enter_plan_mode", true, true),
+            CwdRiskLabel::PlanChange
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("monitor", true, false),
+            CwdRiskLabel::Destructive
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("delete_path", false, false),
+            CwdRiskLabel::Destructive
+        );
     }
 
     #[test]
@@ -8242,9 +8581,23 @@ mod native_grok_surface_tdd {
         // The display_label helper (with tool name) is the source of truth used in ZT-1 rows
         // We exercise the same classification paths the render code uses.
         // Use display_label (the ZT-1 surface API) which applies the user's exact CWD + name-based classification.
-        assert_eq!(acp_thread::approval_risk_for_tool_call(Some(&"edit_file".into()), acp::ToolKind::Edit).display_label(Some(&"edit_file".into())), "Write");
-        assert_eq!(acp_thread::approval_risk_for_tool_call(Some(&"terminal".into()), acp::ToolKind::Execute).display_label(Some(&"terminal".into())), "Destructive");
-        assert_eq!(acp_thread::approval_risk_for_operation("approving plan").display_label(None), "Write");
+        assert_eq!(
+            acp_thread::approval_risk_for_tool_call(Some(&"edit_file".into()), acp::ToolKind::Edit)
+                .display_label(Some(&"edit_file".into())),
+            "Write"
+        );
+        assert_eq!(
+            acp_thread::approval_risk_for_tool_call(
+                Some(&"terminal".into()),
+                acp::ToolKind::Execute
+            )
+            .display_label(Some(&"terminal".into())),
+            "Destructive"
+        );
+        assert_eq!(
+            acp_thread::approval_risk_for_operation("approving plan").display_label(None),
+            "Write"
+        );
     }
 
     // is_grok_build_profile predicate (cheap cached path)
@@ -8283,7 +8636,10 @@ mod native_grok_surface_tdd {
     #[test]
     fn plan_is_proposed_detects_all_pending_fresh_plan() {
         // Phase::Proposed is the explicit signal used by the approval banner path.
-        let p = Plan { entries: vec![], phase: acp_thread::PlanPhase::Proposed };
+        let p = Plan {
+            entries: vec![],
+            phase: acp_thread::PlanPhase::Proposed,
+        };
         assert!(p.is_proposed());
     }
 
@@ -8291,14 +8647,26 @@ mod native_grok_surface_tdd {
     fn plan_has_pending_work_is_true_for_pending_or_in_progress() {
         // The any(Pending | InProgress) check on the (wrapped) entries.
         // We exercise the pure status values the collectors and risk logic use.
-        assert!(matches!(acp::PlanEntryStatus::Pending, acp::PlanEntryStatus::Pending));
-        assert!(matches!(acp::PlanEntryStatus::InProgress, acp::PlanEntryStatus::InProgress));
-        assert!(!matches!(acp::PlanEntryStatus::Completed, acp::PlanEntryStatus::Pending));
+        assert!(matches!(
+            acp::PlanEntryStatus::Pending,
+            acp::PlanEntryStatus::Pending
+        ));
+        assert!(matches!(
+            acp::PlanEntryStatus::InProgress,
+            acp::PlanEntryStatus::InProgress
+        ));
+        assert!(!matches!(
+            acp::PlanEntryStatus::Completed,
+            acp::PlanEntryStatus::Pending
+        ));
     }
 
     #[test]
     fn plan_requires_explicit_completion_notification_when_empty_but_no_phrase() {
-        let p = Plan { entries: vec![], phase: acp_thread::PlanPhase::None };
+        let p = Plan {
+            entries: vec![],
+            phase: acp_thread::PlanPhase::None,
+        };
         assert!(p.requires_explicit_completion_notification("I am done now."));
         assert!(!p.requires_explicit_completion_notification(
             "All current independent work is complete. No further autonomous actions are possible without additional direction."
@@ -8321,11 +8689,19 @@ mod native_grok_surface_tdd {
         assert!(v.get("todos").is_some());
         assert!(v["todos"][0].get("content").is_some());
 
-        let enter = crate::tools::EnterPlanModeInput { plan: vec![], explanation: None };
+        let enter = crate::tools::EnterPlanModeInput {
+            plan: vec![],
+            explanation: None,
+        };
         let v2 = serde_json::to_value(&enter).unwrap();
         assert!(v2.get("plan").is_some());
 
-        let mon = crate::tools::MonitorInput { command: "sleep 5".into(), cd: "/tmp".into(), timeout_ms: None, description: None };
+        let mon = crate::tools::MonitorInput {
+            command: "sleep 5".into(),
+            cd: "/tmp".into(),
+            timeout_ms: None,
+            description: None,
+        };
         let v3 = serde_json::to_value(&mon).unwrap();
         assert_eq!(v3["command"], "sleep 5");
     }
@@ -8334,15 +8710,23 @@ mod native_grok_surface_tdd {
     #[test]
     fn would_violate_autonomous_discipline_covers_many_real_world_phrases() {
         let bad = [
-            "all done", "no more work", "i'm finished", "nothing left", "done for now",
-            "finished for now", "complete", "that's all for now",
+            "all done",
+            "no more work",
+            "i'm finished",
+            "nothing left",
+            "done for now",
+            "finished for now",
+            "complete",
+            "that's all for now",
         ];
         for phrase in bad {
-            assert!(crate::validate_grok_build_output_formatting(phrase).iter().any(|v| v.contains("Premature stop")));
+            assert!(
+                crate::validate_grok_build_output_formatting(phrase)
+                    .iter()
+                    .any(|v| v.contains("Premature stop"))
+            );
         }
     }
-
-
 
     // Many more tiny high-signal assertions for the exact paths added in the 1.3 / P4 wave
     #[test]
@@ -8373,19 +8757,57 @@ mod native_grok_surface_tdd {
     }
 
     // 20+ additional one-line / two-line regression locks for the surfaces the user cares about
-    #[test] fn lock_grok_profile_fragments_have_monitor_guidance() { assert!(crate::thread::GROK_BUILD_SYSTEM_FRAGMENTS.contains("monitor")); }
-    #[test] fn lock_grok_profile_fragments_have_todo_write() { assert!(crate::thread::GROK_BUILD_SYSTEM_FRAGMENTS.contains("todo_write")); }
-    #[test] fn lock_grok_profile_fragments_have_enter_plan_mode() { assert!(crate::thread::GROK_BUILD_SYSTEM_FRAGMENTS.contains("enter_plan_mode")); }
-    #[test] fn lock_persona_variants_include_plan_architect_verifier() { /* exercised via AgentPersona::from_name in other tests */ }
-    #[test] fn lock_approval_risk_for_native_monitor_is_destructive() { assert_eq!(acp_thread::approval_risk_for_tool_call(Some(&"monitor".into()), acp::ToolKind::Execute).label(), "Destructive"); }
-    #[test] fn lock_zt1_collectors_return_empty_vecs_when_no_data() { /* public API contract */ }
-    #[test] fn lock_turn_id_serde_is_stable_across_bridged_and_native() { let t = TurnId::new(99); let j = serde_json::to_string(&t).unwrap(); let b: TurnId = serde_json::from_str(&j).unwrap(); assert_eq!(t, b); }
-    #[test] fn lock_cwd_classification_prefers_plan_change_for_planning_tools() { use crate::CwdRiskLabel; assert_eq!(CwdRiskLabel::from_tool_and_cwd("todo_write", false, true), CwdRiskLabel::PlanChange); }
+    #[test]
+    fn lock_grok_profile_fragments_have_monitor_guidance() {
+        assert!(crate::thread::GROK_BUILD_SYSTEM_FRAGMENTS.contains("monitor"));
+    }
+    #[test]
+    fn lock_grok_profile_fragments_have_todo_write() {
+        assert!(crate::thread::GROK_BUILD_SYSTEM_FRAGMENTS.contains("todo_write"));
+    }
+    #[test]
+    fn lock_grok_profile_fragments_have_enter_plan_mode() {
+        assert!(crate::thread::GROK_BUILD_SYSTEM_FRAGMENTS.contains("enter_plan_mode"));
+    }
+    #[test]
+    fn lock_persona_variants_include_plan_architect_verifier() { /* exercised via AgentPersona::from_name in other tests */
+    }
+    #[test]
+    fn lock_approval_risk_for_native_monitor_is_destructive() {
+        assert_eq!(
+            acp_thread::approval_risk_for_tool_call(
+                Some(&"monitor".into()),
+                acp::ToolKind::Execute
+            )
+            .label(),
+            "Destructive"
+        );
+    }
+    #[test]
+    fn lock_zt1_collectors_return_empty_vecs_when_no_data() { /* public API contract */
+    }
+    #[test]
+    fn lock_turn_id_serde_is_stable_across_bridged_and_native() {
+        let t = TurnId::new(99);
+        let j = serde_json::to_string(&t).unwrap();
+        let b: TurnId = serde_json::from_str(&j).unwrap();
+        assert_eq!(t, b);
+    }
+    #[test]
+    fn lock_cwd_classification_prefers_plan_change_for_planning_tools() {
+        use crate::CwdRiskLabel;
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("todo_write", false, true),
+            CwdRiskLabel::PlanChange
+        );
+    }
     // Real regression locks for native Grok Build surfaces (no fillers)
     #[test]
     fn native_grok_fragments_require_continue_on_pending_work() {
         let f = crate::thread::GROK_BUILD_SYSTEM_FRAGMENTS;
-        assert!(f.contains("never voluntarily stop or yield control back to the user while the living plan"));
+        assert!(f.contains(
+            "never voluntarily stop or yield control back to the user while the living plan"
+        ));
     }
 
     #[test]
@@ -8397,16 +8819,31 @@ mod native_grok_surface_tdd {
     #[test]
     fn cwd_classification_treats_in_project_write_as_write_not_destructive() {
         use crate::CwdRiskLabel;
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("edit_file", false, false), CwdRiskLabel::Write);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("write_file", false, false), CwdRiskLabel::Write);
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("edit_file", false, false),
+            CwdRiskLabel::Write
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("write_file", false, false),
+            CwdRiskLabel::Write
+        );
     }
 
     #[test]
     fn approval_risk_for_todo_write_and_enter_plan_mode_is_plan_change() {
-        let r1 = acp_thread::approval_risk_for_tool_call(Some(&"todo_write".into()), acp::ToolKind::Think);
+        let r1 = acp_thread::approval_risk_for_tool_call(
+            Some(&"todo_write".into()),
+            acp::ToolKind::Think,
+        );
         assert_eq!(r1.display_label(Some(&"todo_write".into())), "Plan Change");
-        let r2 = acp_thread::approval_risk_for_tool_call(Some(&"enter_plan_mode".into()), acp::ToolKind::Think);
-        assert_eq!(r2.display_label(Some(&"enter_plan_mode".into())), "Plan Change");
+        let r2 = acp_thread::approval_risk_for_tool_call(
+            Some(&"enter_plan_mode".into()),
+            acp::ToolKind::Think,
+        );
+        assert_eq!(
+            r2.display_label(Some(&"enter_plan_mode".into())),
+            "Plan Change"
+        );
     }
 
     #[test]
@@ -8427,12 +8864,13 @@ mod native_grok_surface_tdd {
     #[test]
     fn plan_proposed_and_pending_work_helpers_exist_and_behave() {
         // Lightweight shape check: the phase + status values the real collectors feed into Plan.
-        let p = Plan { entries: vec![], phase: acp_thread::PlanPhase::Proposed };
+        let p = Plan {
+            entries: vec![],
+            phase: acp_thread::PlanPhase::Proposed,
+        };
         assert!(p.is_proposed());
         assert!(!p.has_pending_work());
     }
-
-
 
     #[test]
     fn grok_memory_artifacts_helper_is_injectable_for_native_path() {
@@ -8450,7 +8888,13 @@ mod native_grok_surface_tdd {
 
     #[test]
     fn autonomous_discipline_kickback_covers_common_stopping_phrases() {
-        let phrases = ["all done", "no more work", "i'm finished", "nothing left to do", "finished for now"];
+        let phrases = [
+            "all done",
+            "no more work",
+            "i'm finished",
+            "nothing left to do",
+            "finished for now",
+        ];
         for p in phrases {
             let violations = crate::validate_grok_build_output_formatting(p);
             assert!(violations.iter().any(|v| v.contains("Premature stop")));
@@ -8473,10 +8917,19 @@ mod native_grok_surface_tdd {
         let turn = TurnId::new(55);
         let slug = "refactor-auth";
         let meta = acp::Meta::from_iter([
-            ("introduced_in_turn".into(), serde_json::json!(u32::from(turn))),
+            (
+                "introduced_in_turn".into(),
+                serde_json::json!(u32::from(turn)),
+            ),
             ("task_slug".into(), serde_json::json!(slug)),
         ]);
-        assert_eq!(meta.get("introduced_in_turn").unwrap(), &serde_json::json!(55));
-        assert_eq!(meta.get("task_slug").unwrap(), &serde_json::json!("refactor-auth"));
+        assert_eq!(
+            meta.get("introduced_in_turn").unwrap(),
+            &serde_json::json!(55)
+        );
+        assert_eq!(
+            meta.get("task_slug").unwrap(),
+            &serde_json::json!("refactor-auth")
+        );
     }
 }

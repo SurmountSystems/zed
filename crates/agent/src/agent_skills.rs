@@ -7,8 +7,7 @@ use fs::Fs;
 pub use ::agent_skills::{
     MAX_SKILL_DESCRIPTIONS_SIZE, Skill, SkillLoadError, SkillScopeId, SkillSource, SkillSummary,
     builtin_skills, global_grok_bundled_skills_dir, global_grok_skills_dir, global_skills_dir,
-    load_skills_from_directory, project_grok_skills_relative_path, project_skills_relative_path,
-    read_skill_body,
+    load_skills_from_directory, project_skills_relative_path, read_skill_body,
 };
 
 pub fn load_skills_from_directory_for_native_agent(
@@ -19,13 +18,8 @@ pub fn load_skills_from_directory_for_native_agent(
     load_skills_from_directory(fs, directory, source)
 }
 
-pub async fn read_skill_body_for_native_agent(
-    fs: &dyn Fs,
-    path: &Path,
-) -> anyhow::Result<String> {
-    read_skill_body(fs, path)
-        .await
-        .map_err(Into::into)
+pub async fn read_skill_body_for_native_agent(fs: &dyn Fs, path: &Path) -> anyhow::Result<String> {
+    read_skill_body(fs, path).await.map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -38,7 +32,6 @@ mod tests {
         let _ = load_skills_from_directory_for_native_agent;
         let _g = global_grok_skills_dir();
         let _b = global_grok_bundled_skills_dir();
-        let _pg = project_grok_skills_relative_path();
         let _ = SkillSource::Global;
         let _ = SkillSource::GrokUser;
         let _ = SkillSource::BuiltIn;

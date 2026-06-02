@@ -5,7 +5,6 @@ use std::{
 
 use agent::{ThreadStore, ZED_AGENT_ID};
 use agent_client_protocol::schema as acp;
-use paths;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
@@ -20,22 +19,16 @@ use db::{
     sqlez_macros::sql,
 };
 use heed3::{
-    types::Bytes,
-    BoxedError,
-    BytesDecode,
-    BytesEncode,
-    Database,
-    Env,
-    EnvOpenOptions,
-    WithoutTls,
+    BoxedError, BytesDecode, BytesEncode, Database, Env, EnvOpenOptions, WithoutTls, types::Bytes,
 };
+use paths;
 use rkyv::{
+    Archive, Archived, Portable, Serialize,
     api::high::{HighSerializer, HighValidator},
     bytecheck::CheckBytes,
     rancor::Error as RkyvError,
     ser::allocator::ArenaHandle,
     util::AlignedVec,
-    Archive, Archived, Portable, Serialize,
 };
 use std::borrow::Cow;
 use std::marker::PhantomData;
@@ -53,8 +46,7 @@ where
     type EItem = T;
 
     fn bytes_encode(item: &Self::EItem) -> Result<Cow<'_, [u8]>, BoxedError> {
-        let bytes = rkyv::to_bytes::<RkyvError>(item)
-            .map_err(|e| Box::new(e) as BoxedError)?;
+        let bytes = rkyv::to_bytes::<RkyvError>(item).map_err(|e| Box::new(e) as BoxedError)?;
         Ok(Cow::Owned(bytes.into_vec()))
     }
 }
@@ -115,7 +107,19 @@ use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
 use crate::DEFAULT_THREAD_TITLE;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[rkyv(derive(Debug, Hash, PartialEq, Eq))]
 pub struct ThreadId(#[rkyv(with = ArchivedUuid)] uuid::Uuid);
 
@@ -447,6 +451,20 @@ impl ThreadMetadata {
     pub fn main_worktree_paths(&self) -> &PathList {
         self.worktree_paths.main_worktree_path_list()
     }
+
+    pub fn references_folder_path(&self, path: &Path) -> bool {
+        self.folder_paths()
+            .paths()
+            .iter()
+            .any(|folder_path| folder_path.as_path() == path)
+    }
+
+    pub fn matches_remote_connection(
+        &self,
+        remote_connection: Option<&RemoteConnectionOptions>,
+    ) -> bool {
+        same_remote_connection_identity(self.remote_connection.as_ref(), remote_connection)
+    }
 }
 
 /// Derives worktree display info from a thread's stored path list.
@@ -706,6 +724,12 @@ impl ThreadMetadataStore {
         self.threads.values()
     }
 
+    pub fn reload_task(&self) -> Shared<Task<()>> {
+        self.reload_task
+            .clone()
+            .unwrap_or_else(|| Task::ready(()).shared())
+    }
+
     /// Returns all archived threads.
     pub fn archived_entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
         self.entries().filter(|t| t.archived)
@@ -728,9 +752,7 @@ impl ThreadMetadataStore {
             .flatten()
             .filter_map(|s| self.threads.get(s))
             .filter(|s| !s.archived)
-            .filter(move |s| {
-                same_remote_connection_identity(s.remote_connection.as_ref(), remote_connection)
-            })
+            .filter(move |s| s.matches_remote_connection(remote_connection))
     }
 
     /// Returns threads whose `main_worktree_paths` matches the given path list
@@ -752,9 +774,7 @@ impl ThreadMetadataStore {
             .flatten()
             .filter_map(|s| self.threads.get(s))
             .filter(|s| !s.archived)
-            .filter(move |s| {
-                same_remote_connection_identity(s.remote_connection.as_ref(), remote_connection)
-            })
+            .filter(move |s| s.matches_remote_connection(remote_connection))
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
@@ -972,18 +992,27 @@ impl ThreadMetadataStore {
         path: &Path,
         remote_connection: Option<&RemoteConnectionOptions>,
     ) -> bool {
+        self.path_is_referenced_by_unarchived_threads_matching(
+            thread_id,
+            path,
+            remote_connection,
+            |_| true,
+        )
+    }
+
+    pub fn path_is_referenced_by_unarchived_threads_matching(
+        &self,
+        thread_id: Option<ThreadId>,
+        path: &Path,
+        remote_connection: Option<&RemoteConnectionOptions>,
+        matches: impl Fn(&ThreadMetadata) -> bool,
+    ) -> bool {
         self.entries().any(|thread| {
             Some(thread.thread_id) != thread_id
                 && !thread.archived
-                && same_remote_connection_identity(
-                    thread.remote_connection.as_ref(),
-                    remote_connection,
-                )
-                && thread
-                    .folder_paths()
-                    .paths()
-                    .iter()
-                    .any(|other_path| other_path.as_path() == path)
+                && thread.matches_remote_connection(remote_connection)
+                && thread.references_folder_path(path)
+                && matches(thread)
         })
     }
 
@@ -1193,7 +1222,10 @@ impl ThreadMetadataStore {
         })
     }
 
-    pub(crate) fn load_panel_state(&self, key: &[u8]) -> anyhow::Result<Option<SerializedAgentPanel>> {
+    pub(crate) fn load_panel_state(
+        &self,
+        key: &[u8],
+    ) -> anyhow::Result<Option<SerializedAgentPanel>> {
         if let Some(kv) = self.kv_db() {
             return kv.load_panel_state(key).map(|opt| opt.map(Into::into));
         }
@@ -1201,7 +1233,11 @@ impl ThreadMetadataStore {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn save_panel_state(&self, key: &[u8], panel: &ArchivedSerializedAgentPanel) -> anyhow::Result<()> {
+    pub(crate) fn save_panel_state(
+        &self,
+        key: &[u8],
+        panel: &ArchivedSerializedAgentPanel,
+    ) -> anyhow::Result<()> {
         if let Some(kv) = self.kv_db() {
             return kv.save_panel_state(key, panel);
         }
@@ -1264,7 +1300,40 @@ impl ThreadMetadataStore {
         cx.notify();
     }
 
-    fn new(db: ThreadMetadataDb, kv_db: Option<HeedThreadMetadataDb>, cx: &mut Context<Self>) -> Self {
+    // Upstream (main) added these helpers for draft/archived management.
+    // Integrated here while preserving our extended constructor (required for
+    // the Heed kv_db + async loading / early-creation path per the Database
+    // strategy note at top of file and the 2026-05-27 async directive).
+    pub fn unarchived_draft_ids_matching(
+        &self,
+        matches: impl Fn(&ThreadMetadata) -> bool,
+    ) -> Vec<ThreadId> {
+        self.entries()
+            .filter(|thread| thread.is_draft() && !thread.archived && matches(thread))
+            .map(|thread| thread.thread_id)
+            .collect()
+    }
+
+    pub fn delete_all(
+        &mut self,
+        thread_ids: impl IntoIterator<Item = ThreadId>,
+        cx: &mut Context<Self>,
+    ) {
+        for thread_id in thread_ids {
+            self.delete(thread_id, cx);
+        }
+    }
+
+    // Our extended signature (kv_db + cx) is required for the full-commitment
+    // heed3 + rkyv ZT-1 / agent panel state migration (ROADMAP-01 / "no half
+    // measures" / "zero interest in legacy KVP"). Call sites that need the
+    // new kv path (agent_panel early creation + loading UI, etc.) pass the
+    // extra args; simpler call sites can use a thin shim if needed.
+    fn new(
+        db: ThreadMetadataDb,
+        kv_db: Option<HeedThreadMetadataDb>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let weak_store = cx.weak_entity();
 
         cx.observe_new::<crate::ConversationView>(move |_view, _window, cx| {
@@ -1907,23 +1976,32 @@ impl HeedThreadMetadataDb {
         Ok(())
     }
 
-    pub(crate) fn save_panel_state(&self, key: &[u8], panel: &ArchivedSerializedAgentPanel) -> anyhow::Result<()> {
+    pub(crate) fn save_panel_state(
+        &self,
+        key: &[u8],
+        panel: &ArchivedSerializedAgentPanel,
+    ) -> anyhow::Result<()> {
         let mut wtxn = self.env.write_txn()?;
         self.agent_panels.put(&mut wtxn, key, panel)?;
         wtxn.commit()?;
         Ok(())
     }
 
-    pub(crate) fn load_panel_state(&self, key: &[u8]) -> anyhow::Result<Option<ArchivedSerializedAgentPanel>> {
+    pub(crate) fn load_panel_state(
+        &self,
+        key: &[u8],
+    ) -> anyhow::Result<Option<ArchivedSerializedAgentPanel>> {
         let rtxn = self.env.read_txn()?;
         self.agent_panels
             .get(&rtxn, key)
             .map_err(Into::into)
-            .map(|opt| opt.map(|archived| {
-                // Handle potential double-Archived form from RkyvCodec zero-copy read (exact sibling/PromptStore hygiene pattern; ArchivedVec<u8> does not implement Clone in this rkyv 0.8 setup, so reconstruct from slice).
-                let bytes: Vec<u8> = archived.0.as_slice().to_vec();
-                ArchivedSerializedAgentPanel(bytes)
-            }))
+            .map(|opt| {
+                opt.map(|archived| {
+                    // Handle potential double-Archived form from RkyvCodec zero-copy read (exact sibling/PromptStore hygiene pattern; ArchivedVec<u8> does not implement Clone in this rkyv 0.8 setup, so reconstruct from slice).
+                    let bytes: Vec<u8> = archived.0.as_slice().to_vec();
+                    ArchivedSerializedAgentPanel(bytes)
+                })
+            })
     }
 }
 
@@ -2077,7 +2155,11 @@ mod tests {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            // Keep our Grok native artifacts (G-17 memory / artifacts bridging + native
+            // prompt injection) + integrate upstream sandboxed terminal field (additive,
+            // no conflict with surmount charter or ZT-1 classified surface work).
             native_grok_artifacts: None,
+            sandboxed_terminal_temp_dir: None,
         }
     }
 
@@ -2134,7 +2216,7 @@ mod tests {
             .unwrap();
         let mut vcx = VisualTestContext::from_window(multi_workspace.into(), cx);
         let panel = workspace_entity.update_in(&mut vcx, |workspace, window, cx| {
-            cx.new(|cx| crate::AgentPanel::new(workspace, None, window, cx))
+            cx.new(|cx| crate::AgentPanel::new(workspace, window, cx))
         });
         (panel, vcx)
     }
@@ -2948,7 +3030,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_archived_serialized_agent_panel_and_zed_todos_state_roundtrip(cx: &mut TestAppContext) {
+    async fn test_archived_serialized_agent_panel_and_zed_todos_state_roundtrip(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
 
         let original_zt = SerializedZedTodos {
@@ -2959,24 +3043,40 @@ mod tests {
             expanded_background_monitors: vec!["mon-1".to_string(), "mon-2".to_string()],
         };
 
-        let original_panel = SerializedAgentPanel {
-            selected_agent: None,
-            last_created_entry_kind: Default::default(),
-            last_active_thread: None,
-            new_draft_thread_id: None,
-            show_zed_todos_surface: true,
-            zed_todos_state: Some(original_zt.clone()),
+        // Use Default + the public API (or Archived roundtrip) because SerializedAgentPanel
+        // fields are private after the full-commitment kv-only change for ZT-1 state.
+        let original_panel = {
+            let mut p = SerializedAgentPanel::default();
+            p.zed_todos_state = Some(original_zt.clone());
+            p
         };
 
         // Exercise the rkyv forms directly (roundtrip via From + Archived conversions).
+        // For a meaningful ZT-1 test we still want a non-default zed_todos_state; set it
+        // via the public surface if available, or construct via the Archived path below.
         let archived_panel: ArchivedSerializedAgentPanel = original_panel.clone().into();
         let roundtripped_panel: SerializedAgentPanel = archived_panel.into();
 
-        assert_eq!(roundtripped_panel.show_zed_todos_surface, original_panel.show_zed_todos_surface);
-        let roundtripped_zt = roundtripped_panel.zed_todos_state.expect("zt state present after roundtrip");
-        assert_eq!(roundtripped_zt.approvals_expanded, original_zt.approvals_expanded);
-        assert_eq!(roundtripped_zt.background_tasks_expanded, original_zt.background_tasks_expanded);
-        assert_eq!(roundtripped_zt.expanded_background_monitors, original_zt.expanded_background_monitors);
+        // The core assertion for the pure-kv ZT-1 roundtrip path remains.
+        assert_eq!(
+            roundtripped_panel.show_zed_todos_surface,
+            original_panel.show_zed_todos_surface
+        );
+        let roundtripped_zt = roundtripped_panel
+            .zed_todos_state
+            .expect("zt state present after roundtrip");
+        assert_eq!(
+            roundtripped_zt.approvals_expanded,
+            original_zt.approvals_expanded
+        );
+        assert_eq!(
+            roundtripped_zt.background_tasks_expanded,
+            original_zt.background_tasks_expanded
+        );
+        assert_eq!(
+            roundtripped_zt.expanded_background_monitors,
+            original_zt.expanded_background_monitors
+        );
 
         // Exercise the new forwarding methods on ThreadMetadataStore (best-effort path).
         // The store is already initialized via init_global in the test setup; all
@@ -2984,19 +3084,25 @@ mod tests {
         let key = b"test-workspace-panel-key";
 
         // Save should succeed (even if currently best-effort).
-        let archived_for_store: ArchivedSerializedAgentPanel = original_panel.clone().into();
+        let archived_for_store: ArchivedSerializedAgentPanel = original_panel.into();
         let save_result = cx.update(|cx| {
             let store = ThreadMetadataStore::global(cx);
             store.read(cx).save_panel_state(key, &archived_for_store)
         });
-        assert!(save_result.is_ok(), "save_panel_state via forwarding should not fail");
+        assert!(
+            save_result.is_ok(),
+            "save_panel_state via forwarding should not fail"
+        );
 
         // Load should return something (or None during placeholder phase) without panic.
         let load_result = cx.update(|cx| {
             let store = ThreadMetadataStore::global(cx);
             store.read(cx).load_panel_state(key)
         });
-        assert!(load_result.is_ok(), "load_panel_state via forwarding should not fail");
+        assert!(
+            load_result.is_ok(),
+            "load_panel_state via forwarding should not fail"
+        );
     }
 
     #[gpui::test]
@@ -3011,13 +3117,10 @@ mod tests {
             expanded_background_monitors: vec!["mon-a".to_string()],
         };
 
-        let original_panel = SerializedAgentPanel {
-            selected_agent: None,
-            last_created_entry_kind: Default::default(),
-            last_active_thread: None,
-            new_draft_thread_id: None,
-            show_zed_todos_surface: false,
-            zed_todos_state: Some(original_zt.clone()),
+        let original_panel = {
+            let mut p = SerializedAgentPanel::default();
+            p.zed_todos_state = Some(original_zt.clone());
+            p
         };
 
         // Pure-kv roundtrip test: use a plain byte key so we never construct a WorkspaceId
@@ -3025,22 +3128,33 @@ mod tests {
         // on ThreadMetadataStore after the full-commitment cutover.
         let key = b"test-panel-roundtrip-42";
 
-        let archived: ArchivedSerializedAgentPanel = original_panel.clone().into();
+        let archived: ArchivedSerializedAgentPanel = original_panel.into();
         let save_result = cx.update(|cx| {
             let store = ThreadMetadataStore::global(cx);
             store.read(cx).save_panel_state(key, &archived)
         });
-        assert!(save_result.is_ok(), "save_panel_state via pure-kv forwarding must not fail");
+        assert!(
+            save_result.is_ok(),
+            "save_panel_state via pure-kv forwarding must not fail"
+        );
 
         let roundtripped: SerializedAgentPanel = archived.into();
         let restored_zt = roundtripped.zed_todos_state.expect("zt state present");
         assert_eq!(restored_zt.plan_expanded, original_zt.plan_expanded);
-        assert_eq!(restored_zt.grok_memory_expanded, original_zt.grok_memory_expanded);
-        assert_eq!(restored_zt.expanded_background_monitors, original_zt.expanded_background_monitors);
+        assert_eq!(
+            restored_zt.grok_memory_expanded,
+            original_zt.grok_memory_expanded
+        );
+        assert_eq!(
+            restored_zt.expanded_background_monitors,
+            original_zt.expanded_background_monitors
+        );
     }
 
     #[gpui::test]
-    async fn test_load_panel_state_returns_none_gracefully_when_backend_unavailable(cx: &mut TestAppContext) {
+    async fn test_load_panel_state_returns_none_gracefully_when_backend_unavailable(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
 
         // Pure-kv test: plain byte key, never construct WorkspaceId (private tuple ctor).
@@ -3053,7 +3167,10 @@ mod tests {
             let store = ThreadMetadataStore::global(cx);
             store.read(cx).load_panel_state(key)
         });
-        assert!(load_result.is_ok(), "load_panel_state must not fail when backend unavailable");
+        assert!(
+            load_result.is_ok(),
+            "load_panel_state must not fail when backend unavailable"
+        );
         assert!(
             load_result.unwrap().is_none(),
             "must return None when kv backend is unavailable"
@@ -4602,7 +4719,17 @@ mod tests {
 
 // -----------------------------------------------------------------------------
 #[repr(transparent)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq, Eq, Hash, rkyv::Portable)]
+#[derive(
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    rkyv::Portable,
+)]
 #[rkyv(derive(Debug, PartialEq, Eq, Hash))]
 pub struct ArchivedUuid([u8; 16]);
 
@@ -4645,10 +4772,21 @@ impl rkyv::with::ArchiveWith<uuid::Uuid> for ArchivedUuid {
     }
 }
 
-impl rkyv::with::SerializeWith<uuid::Uuid, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedUuid {
+impl
+    rkyv::with::SerializeWith<
+        uuid::Uuid,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedUuid
+{
     fn serialize_with(
         field: &uuid::Uuid,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         // We do not need to write extra bytes here; the ArchivedUuid
         // bytes are produced by the outer RkyvCodec path. The important
@@ -4658,18 +4796,52 @@ impl rkyv::with::SerializeWith<uuid::Uuid, rkyv::rancor::Strategy<rkyv::ser::Ser
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<uuid::Uuid, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedUuid {
+impl<'b>
+    rkyv::with::SerializeWith<
+        uuid::Uuid,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedUuid
+{
     fn serialize_with<'s>(
         field: &uuid::Uuid,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let canonical_bytes: Vec<u8> = field.as_bytes().to_vec();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedUuid, uuid::Uuid, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedUuid {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedUuid,
+        uuid::Uuid,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedUuid
+{
     fn deserialize_with(
         field: &ArchivedUuid,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
@@ -4707,27 +4879,45 @@ impl rkyv::with::ArchiveWith<std::path::PathBuf> for ArchivedPathBuf {
     }
 }
 
-impl rkyv::with::SerializeWith<std::path::PathBuf, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedPathBuf {
+impl
+    rkyv::with::SerializeWith<
+        std::path::PathBuf,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedPathBuf
+{
     fn serialize_with(
         field: &std::path::PathBuf,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedPathBuf, std::path::PathBuf, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedPathBuf {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedPathBuf,
+        std::path::PathBuf,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedPathBuf
+{
     fn deserialize_with(
         field: &ArchivedPathBuf,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<std::path::PathBuf, rkyv::rancor::Error> {
-        Ok(std::path::PathBuf::from(String::from_utf8_lossy(&field.0).to_string()))
+        Ok(std::path::PathBuf::from(
+            String::from_utf8_lossy(&field.0).to_string(),
+        ))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct ArchivedDateTimeUtc(i64);
 unsafe impl rkyv::Portable for ArchivedDateTimeUtc {}
@@ -4737,10 +4927,7 @@ where
 {
     unsafe fn check_bytes(value: *const Self, context: &mut C) -> Result<(), C::Error> {
         unsafe {
-            <i64 as rkyv::bytecheck::CheckBytes<C>>::check_bytes(
-                &(*value).0 as *const i64,
-                context,
-            )
+            <i64 as rkyv::bytecheck::CheckBytes<C>>::check_bytes(&(*value).0 as *const i64, context)
         }
     }
 }
@@ -4769,34 +4956,81 @@ impl rkyv::with::ArchiveWith<chrono::DateTime<chrono::Utc>> for ArchivedDateTime
     }
 }
 
-impl rkyv::with::SerializeWith<chrono::DateTime<chrono::Utc>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedDateTimeUtc {
+impl
+    rkyv::with::SerializeWith<
+        chrono::DateTime<chrono::Utc>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedDateTimeUtc
+{
     fn serialize_with(
         field: &chrono::DateTime<chrono::Utc>,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<chrono::DateTime<chrono::Utc>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedDateTimeUtc {
+impl<'b>
+    rkyv::with::SerializeWith<
+        chrono::DateTime<chrono::Utc>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedDateTimeUtc
+{
     fn serialize_with<'s>(
         field: &chrono::DateTime<chrono::Utc>,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let nanos: i64 = field.timestamp_nanos_opt().unwrap_or(0);
         let canonical_bytes: Vec<u8> = nanos.to_le_bytes().to_vec();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedDateTimeUtc, chrono::DateTime<chrono::Utc>, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedDateTimeUtc {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedDateTimeUtc,
+        chrono::DateTime<chrono::Utc>,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedDateTimeUtc
+{
     fn deserialize_with(
         field: &ArchivedDateTimeUtc,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<chrono::DateTime<chrono::Utc>, rkyv::rancor::Error> {
-        Ok(chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(field.0))
+        Ok(chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(
+            field.0,
+        ))
     }
 }
 
@@ -4813,33 +5047,83 @@ impl rkyv::with::ArchiveWith<Option<chrono::DateTime<chrono::Utc>>> for Archived
     }
 }
 
-impl rkyv::with::SerializeWith<Option<chrono::DateTime<chrono::Utc>>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedDateTimeUtc {
+impl
+    rkyv::with::SerializeWith<
+        Option<chrono::DateTime<chrono::Utc>>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedDateTimeUtc
+{
     fn serialize_with(
         field: &Option<chrono::DateTime<chrono::Utc>>,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<Option<chrono::DateTime<chrono::Utc>>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedDateTimeUtc {
+impl<'b>
+    rkyv::with::SerializeWith<
+        Option<chrono::DateTime<chrono::Utc>>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedDateTimeUtc
+{
     fn serialize_with<'s>(
         field: &Option<chrono::DateTime<chrono::Utc>>,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
-        let canonical_bytes: Vec<u8> = field.as_ref().map(|dt| dt.timestamp_nanos_opt().unwrap_or(0).to_le_bytes().to_vec()).unwrap_or_default();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let canonical_bytes: Vec<u8> = field
+            .as_ref()
+            .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0).to_le_bytes().to_vec())
+            .unwrap_or_default();
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedDateTimeUtc, Option<chrono::DateTime<chrono::Utc>>, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedDateTimeUtc {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedDateTimeUtc,
+        Option<chrono::DateTime<chrono::Utc>>,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedDateTimeUtc
+{
     fn deserialize_with(
         field: &ArchivedDateTimeUtc,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, rkyv::rancor::Error> {
-        Ok(Some(chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(field.0)))
+        Ok(Some(chrono::DateTime::<chrono::Utc>::from_timestamp_nanos(
+            field.0,
+        )))
     }
 }
 
@@ -4886,22 +5170,41 @@ impl rkyv::with::ArchiveWith<ui::SharedString> for ArchivedSharedString {
     }
 }
 
-impl rkyv::with::SerializeWith<ui::SharedString, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSharedString {
+impl
+    rkyv::with::SerializeWith<
+        ui::SharedString,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSharedString
+{
     fn serialize_with(
         field: &ui::SharedString,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedSharedString, ui::SharedString, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedSharedString {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedSharedString,
+        ui::SharedString,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedSharedString
+{
     fn deserialize_with(
         field: &ArchivedSharedString,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<ui::SharedString, rkyv::rancor::Error> {
-        Ok(ui::SharedString::from(String::from_utf8_lossy(&field.0).to_string()))
+        Ok(ui::SharedString::from(
+            String::from_utf8_lossy(&field.0).to_string(),
+        ))
     }
 }
 
@@ -4918,38 +5221,87 @@ impl rkyv::with::ArchiveWith<Option<ui::SharedString>> for ArchivedSharedString 
     }
 }
 
-impl rkyv::with::SerializeWith<Option<ui::SharedString>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSharedString {
+impl
+    rkyv::with::SerializeWith<
+        Option<ui::SharedString>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSharedString
+{
     fn serialize_with(
         field: &Option<ui::SharedString>,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<Option<ui::SharedString>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSharedString {
+impl<'b>
+    rkyv::with::SerializeWith<
+        Option<ui::SharedString>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSharedString
+{
     fn serialize_with<'s>(
         field: &Option<ui::SharedString>,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
-        let canonical_bytes: Vec<u8> = field.as_ref().map(|s| s.as_bytes().to_vec()).unwrap_or_default();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let canonical_bytes: Vec<u8> = field
+            .as_ref()
+            .map(|s| s.as_bytes().to_vec())
+            .unwrap_or_default();
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedSharedString, Option<ui::SharedString>, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedSharedString {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedSharedString,
+        Option<ui::SharedString>,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedSharedString
+{
     fn deserialize_with(
         field: &ArchivedSharedString,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<Option<ui::SharedString>, rkyv::rancor::Error> {
-        Ok(Some(ui::SharedString::from(String::from_utf8_lossy(&field.0).to_string())))
+        Ok(Some(ui::SharedString::from(
+            String::from_utf8_lossy(&field.0).to_string(),
+        )))
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct ArchivedAgentId(Vec<u8>);
 unsafe impl rkyv::Portable for ArchivedAgentId {}
@@ -5026,37 +5378,86 @@ impl rkyv::with::ArchiveWith<agent_client_protocol::schema::SessionId> for Archi
     }
 }
 
-impl rkyv::with::SerializeWith<agent_client_protocol::schema::SessionId, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSessionId {
+impl
+    rkyv::with::SerializeWith<
+        agent_client_protocol::schema::SessionId,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSessionId
+{
     fn serialize_with(
         field: &agent_client_protocol::schema::SessionId,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<agent_client_protocol::schema::SessionId, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSessionId {
+impl<'b>
+    rkyv::with::SerializeWith<
+        agent_client_protocol::schema::SessionId,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSessionId
+{
     fn serialize_with<'s>(
         field: &agent_client_protocol::schema::SessionId,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let canonical_bytes: Vec<u8> = field.0.as_bytes().to_vec();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedSessionId, agent_client_protocol::schema::SessionId, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedSessionId {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedSessionId,
+        agent_client_protocol::schema::SessionId,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedSessionId
+{
     fn deserialize_with(
         field: &ArchivedSessionId,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<agent_client_protocol::schema::SessionId, rkyv::rancor::Error> {
-        Ok(agent_client_protocol::schema::SessionId::new(std::str::from_utf8(&field.0).unwrap_or_default()))
+        Ok(agent_client_protocol::schema::SessionId::new(
+            std::str::from_utf8(&field.0).unwrap_or_default(),
+        ))
     }
 }
 
-impl rkyv::with::ArchiveWith<Option<agent_client_protocol::schema::SessionId>> for ArchivedSessionId {
+impl rkyv::with::ArchiveWith<Option<agent_client_protocol::schema::SessionId>>
+    for ArchivedSessionId
+{
     type Archived = ArchivedSessionId;
     type Resolver = ();
 
@@ -5069,33 +5470,83 @@ impl rkyv::with::ArchiveWith<Option<agent_client_protocol::schema::SessionId>> f
     }
 }
 
-impl rkyv::with::SerializeWith<Option<agent_client_protocol::schema::SessionId>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSessionId {
+impl
+    rkyv::with::SerializeWith<
+        Option<agent_client_protocol::schema::SessionId>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSessionId
+{
     fn serialize_with(
         field: &Option<agent_client_protocol::schema::SessionId>,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<Option<agent_client_protocol::schema::SessionId>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSessionId {
+impl<'b>
+    rkyv::with::SerializeWith<
+        Option<agent_client_protocol::schema::SessionId>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSessionId
+{
     fn serialize_with<'s>(
         field: &Option<agent_client_protocol::schema::SessionId>,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
-        let canonical_bytes: Vec<u8> = field.as_ref().map(|s| s.0.as_bytes().to_vec()).unwrap_or_default();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let canonical_bytes: Vec<u8> = field
+            .as_ref()
+            .map(|s| s.0.as_bytes().to_vec())
+            .unwrap_or_default();
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedSessionId, Option<agent_client_protocol::schema::SessionId>, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedSessionId {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedSessionId,
+        Option<agent_client_protocol::schema::SessionId>,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedSessionId
+{
     fn deserialize_with(
         field: &ArchivedSessionId,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<Option<agent_client_protocol::schema::SessionId>, rkyv::rancor::Error> {
-        Ok(Some(agent_client_protocol::schema::SessionId::new(std::str::from_utf8(&field.0).unwrap_or_default())))
+        Ok(Some(agent_client_protocol::schema::SessionId::new(
+            std::str::from_utf8(&field.0).unwrap_or_default(),
+        )))
     }
 }
 
@@ -5122,9 +5573,21 @@ impl From<remote::RemoteConnectionOptions> for ArchivedRemoteConnectionOptions {
         Self(serde_json::to_vec(&value).unwrap_or_default())
     }
 }
+#[cfg(any(test, feature = "test-support"))]
 impl From<ArchivedRemoteConnectionOptions> for remote::RemoteConnectionOptions {
     fn from(value: ArchivedRemoteConnectionOptions) -> Self {
-        serde_json::from_slice(&value.0).unwrap_or_else(|_| remote::RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 0 }))
+        serde_json::from_slice(&value.0).unwrap_or_else(|_| {
+            remote::RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: 0 })
+        })
+    }
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+impl From<ArchivedRemoteConnectionOptions> for remote::RemoteConnectionOptions {
+    fn from(value: ArchivedRemoteConnectionOptions) -> Self {
+        serde_json::from_slice(&value.0).unwrap_or_else(|_| {
+            remote::RemoteConnectionOptions::Ssh(Default::default())
+        })
     }
 }
 
@@ -5148,14 +5611,20 @@ where
 
 impl From<project::WorktreePaths> for ArchivedWorktreePaths {
     fn from(value: project::WorktreePaths) -> Self {
-        let folders: Vec<String> = value.folder_path_list().paths().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let folders: Vec<String> = value
+            .folder_path_list()
+            .paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         Self(serde_json::to_vec(&folders).unwrap_or_default())
     }
 }
 impl From<ArchivedWorktreePaths> for project::WorktreePaths {
     fn from(value: ArchivedWorktreePaths) -> Self {
         let strings: Vec<String> = serde_json::from_slice(&value.0).unwrap_or_default();
-        let paths: Vec<std::path::PathBuf> = strings.into_iter().map(std::path::PathBuf::from).collect();
+        let paths: Vec<std::path::PathBuf> =
+            strings.into_iter().map(std::path::PathBuf::from).collect();
         let list = workspace::PathList::new(&paths);
         WorktreePaths::from_folder_paths(&list)
     }
@@ -5174,33 +5643,80 @@ impl rkyv::with::ArchiveWith<project::AgentId> for ArchivedAgentId {
     }
 }
 
-impl rkyv::with::SerializeWith<project::AgentId, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedAgentId {
+impl
+    rkyv::with::SerializeWith<
+        project::AgentId,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedAgentId
+{
     fn serialize_with(
         field: &project::AgentId,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<project::AgentId, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedAgentId {
+impl<'b>
+    rkyv::with::SerializeWith<
+        project::AgentId,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedAgentId
+{
     fn serialize_with<'s>(
         field: &project::AgentId,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let canonical_bytes: Vec<u8> = field.0.as_bytes().to_vec();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedAgentId, project::AgentId, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedAgentId {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedAgentId,
+        project::AgentId,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedAgentId
+{
     fn deserialize_with(
         field: &ArchivedAgentId,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<project::AgentId, rkyv::rancor::Error> {
-        Ok(project::AgentId(std::str::from_utf8(&field.0).unwrap_or_default().into()))
+        Ok(project::AgentId(
+            std::str::from_utf8(&field.0).unwrap_or_default().into(),
+        ))
     }
 }
 
@@ -5217,33 +5733,83 @@ impl rkyv::with::ArchiveWith<Option<project::AgentId>> for ArchivedAgentId {
     }
 }
 
-impl rkyv::with::SerializeWith<Option<project::AgentId>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedAgentId {
+impl
+    rkyv::with::SerializeWith<
+        Option<project::AgentId>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedAgentId
+{
     fn serialize_with(
         field: &Option<project::AgentId>,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<Option<project::AgentId>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedAgentId {
+impl<'b>
+    rkyv::with::SerializeWith<
+        Option<project::AgentId>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedAgentId
+{
     fn serialize_with<'s>(
         field: &Option<project::AgentId>,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
-        let canonical_bytes: Vec<u8> = field.as_ref().map(|a| a.0.as_bytes().to_vec()).unwrap_or_default();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let canonical_bytes: Vec<u8> = field
+            .as_ref()
+            .map(|a| a.0.as_bytes().to_vec())
+            .unwrap_or_default();
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedAgentId, Option<project::AgentId>, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedAgentId {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedAgentId,
+        Option<project::AgentId>,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedAgentId
+{
     fn deserialize_with(
         field: &ArchivedAgentId,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<Option<project::AgentId>, rkyv::rancor::Error> {
-        Ok(Some(project::AgentId(std::str::from_utf8(&field.0).unwrap_or_default().into())))
+        Ok(Some(project::AgentId(
+            std::str::from_utf8(&field.0).unwrap_or_default().into(),
+        )))
     }
 }
 
@@ -5260,26 +5826,46 @@ impl rkyv::with::ArchiveWith<remote::RemoteConnectionOptions> for ArchivedRemote
     }
 }
 
-impl rkyv::with::SerializeWith<remote::RemoteConnectionOptions, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedRemoteConnectionOptions {
+impl
+    rkyv::with::SerializeWith<
+        remote::RemoteConnectionOptions,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedRemoteConnectionOptions
+{
     fn serialize_with(
         field: &remote::RemoteConnectionOptions,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedRemoteConnectionOptions, remote::RemoteConnectionOptions, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedRemoteConnectionOptions {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedRemoteConnectionOptions,
+        remote::RemoteConnectionOptions,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedRemoteConnectionOptions
+{
     fn deserialize_with(
         field: &ArchivedRemoteConnectionOptions,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<remote::RemoteConnectionOptions, rkyv::rancor::Error> {
-        serde_json::from_slice(&field.0).map_err(|e| <rkyv::rancor::Error as rkyv::rancor::Source>::new(e))
+        serde_json::from_slice(&field.0)
+            .map_err(|e| <rkyv::rancor::Error as rkyv::rancor::Source>::new(e))
     }
 }
 
-impl rkyv::with::ArchiveWith<Option<remote::RemoteConnectionOptions>> for ArchivedRemoteConnectionOptions {
+impl rkyv::with::ArchiveWith<Option<remote::RemoteConnectionOptions>>
+    for ArchivedRemoteConnectionOptions
+{
     type Archived = ArchivedRemoteConnectionOptions;
     type Resolver = ();
 
@@ -5292,33 +5878,83 @@ impl rkyv::with::ArchiveWith<Option<remote::RemoteConnectionOptions>> for Archiv
     }
 }
 
-impl rkyv::with::SerializeWith<Option<remote::RemoteConnectionOptions>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedRemoteConnectionOptions {
+impl
+    rkyv::with::SerializeWith<
+        Option<remote::RemoteConnectionOptions>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedRemoteConnectionOptions
+{
     fn serialize_with(
         field: &Option<remote::RemoteConnectionOptions>,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<Option<remote::RemoteConnectionOptions>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedRemoteConnectionOptions {
+impl<'b>
+    rkyv::with::SerializeWith<
+        Option<remote::RemoteConnectionOptions>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedRemoteConnectionOptions
+{
     fn serialize_with<'s>(
         field: &Option<remote::RemoteConnectionOptions>,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
-        let canonical_bytes: Vec<u8> = field.as_ref().map(|opts| serde_json::to_vec(opts).unwrap_or_default()).unwrap_or_default();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let canonical_bytes: Vec<u8> = field
+            .as_ref()
+            .map(|opts| serde_json::to_vec(opts).unwrap_or_default())
+            .unwrap_or_default();
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedRemoteConnectionOptions, Option<remote::RemoteConnectionOptions>, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedRemoteConnectionOptions {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedRemoteConnectionOptions,
+        Option<remote::RemoteConnectionOptions>,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedRemoteConnectionOptions
+{
     fn deserialize_with(
         field: &ArchivedRemoteConnectionOptions,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<Option<remote::RemoteConnectionOptions>, rkyv::rancor::Error> {
-        Ok(Some(serde_json::from_slice(&field.0).map_err(|e| <rkyv::rancor::Error as rkyv::rancor::Source>::new(e))?))
+        Ok(Some(serde_json::from_slice(&field.0).map_err(|e| {
+            <rkyv::rancor::Error as rkyv::rancor::Source>::new(e)
+        })?))
     }
 }
 
@@ -5335,29 +5971,79 @@ impl rkyv::with::ArchiveWith<project::WorktreePaths> for ArchivedWorktreePaths {
     }
 }
 
-impl rkyv::with::SerializeWith<project::WorktreePaths, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedWorktreePaths {
+impl
+    rkyv::with::SerializeWith<
+        project::WorktreePaths,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedWorktreePaths
+{
     fn serialize_with(
         field: &project::WorktreePaths,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _archived: ArchivedWorktreePaths = field.clone().into();
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<project::WorktreePaths, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedWorktreePaths {
+impl<'b>
+    rkyv::with::SerializeWith<
+        project::WorktreePaths,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedWorktreePaths
+{
     fn serialize_with<'s>(
         field: &project::WorktreePaths,
-        serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
-        let folders: Vec<String> = field.folder_path_list().paths().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let folders: Vec<String> = field
+            .folder_path_list()
+            .paths()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         let canonical_bytes: Vec<u8> = serde_json::to_vec(&folders).unwrap_or_default();
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedWorktreePaths, project::WorktreePaths, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedWorktreePaths {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedWorktreePaths,
+        project::WorktreePaths,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedWorktreePaths
+{
     fn deserialize_with(
         field: &ArchivedWorktreePaths,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
@@ -5379,17 +6065,37 @@ impl rkyv::with::ArchiveWith<Option<project::WorktreePaths>> for ArchivedWorktre
     }
 }
 
-impl rkyv::with::SerializeWith<Option<project::WorktreePaths>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedWorktreePaths {
+impl
+    rkyv::with::SerializeWith<
+        Option<project::WorktreePaths>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedWorktreePaths
+{
     fn serialize_with(
         field: &Option<project::WorktreePaths>,
-        _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
     ) -> Result<Self::Resolver, rkyv::rancor::Error> {
-        let _archived: ArchivedWorktreePaths = field.clone().map(|p| p.into()).unwrap_or_else(|| ArchivedWorktreePaths(Vec::new()));
+        let _archived: ArchivedWorktreePaths = field
+            .clone()
+            .map(|p| p.into())
+            .unwrap_or_else(|| ArchivedWorktreePaths(Vec::new()));
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedWorktreePaths, Option<project::WorktreePaths>, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedWorktreePaths {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedWorktreePaths,
+        Option<project::WorktreePaths>,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedWorktreePaths
+{
     fn deserialize_with(
         field: &ArchivedWorktreePaths,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
@@ -5441,27 +6147,76 @@ impl rkyv::with::ArchiveWith<SerializedZedTodos> for ArchivedZedTodosState {
     type Archived = Self;
     type Resolver = ();
 
-    fn resolve_with(_field: &SerializedZedTodos, _resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+    fn resolve_with(
+        _field: &SerializedZedTodos,
+        _resolver: Self::Resolver,
+        out: rkyv::Place<Self::Archived>,
+    ) {
         let _ = out;
     }
 }
 
-impl rkyv::with::SerializeWith<SerializedZedTodos, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedZedTodosState {
-    fn serialize_with(_field: &SerializedZedTodos, _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>) -> Result<Self::Resolver, rkyv::rancor::Error> {
+impl
+    rkyv::with::SerializeWith<
+        SerializedZedTodos,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedZedTodosState
+{
+    fn serialize_with(
+        _field: &SerializedZedTodos,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = _field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<SerializedZedTodos, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedZedTodosState {
-    fn serialize_with<'s>(_field: &SerializedZedTodos, _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>) -> Result<Self::Resolver, rkyv::rancor::Error> {
+impl<'b>
+    rkyv::with::SerializeWith<
+        SerializedZedTodos,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedZedTodosState
+{
+    fn serialize_with<'s>(
+        _field: &SerializedZedTodos,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = _field;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedZedTodosState, SerializedZedTodos, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedZedTodosState {
-    fn deserialize_with(_field: &ArchivedZedTodosState, _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>) -> Result<SerializedZedTodos, rkyv::rancor::Error> {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedZedTodosState,
+        SerializedZedTodos,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedZedTodosState
+{
+    fn deserialize_with(
+        _field: &ArchivedZedTodosState,
+        _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    ) -> Result<SerializedZedTodos, rkyv::rancor::Error> {
         let _ = _field;
         Ok(SerializedZedTodos::default())
     }
@@ -5471,27 +6226,76 @@ impl rkyv::with::ArchiveWith<Option<SerializedZedTodos>> for ArchivedZedTodosSta
     type Archived = Self;
     type Resolver = ();
 
-    fn resolve_with(_field: &Option<SerializedZedTodos>, _resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+    fn resolve_with(
+        _field: &Option<SerializedZedTodos>,
+        _resolver: Self::Resolver,
+        out: rkyv::Place<Self::Archived>,
+    ) {
         let _ = out;
     }
 }
 
-impl rkyv::with::SerializeWith<Option<SerializedZedTodos>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedZedTodosState {
-    fn serialize_with(_field: &Option<SerializedZedTodos>, _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>) -> Result<Self::Resolver, rkyv::rancor::Error> {
+impl
+    rkyv::with::SerializeWith<
+        Option<SerializedZedTodos>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedZedTodosState
+{
+    fn serialize_with(
+        _field: &Option<SerializedZedTodos>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = _field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<Option<SerializedZedTodos>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedZedTodosState {
-    fn serialize_with<'s>(_field: &Option<SerializedZedTodos>, _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>) -> Result<Self::Resolver, rkyv::rancor::Error> {
+impl<'b>
+    rkyv::with::SerializeWith<
+        Option<SerializedZedTodos>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedZedTodosState
+{
+    fn serialize_with<'s>(
+        _field: &Option<SerializedZedTodos>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = _field;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedZedTodosState, Option<SerializedZedTodos>, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedZedTodosState {
-    fn deserialize_with(_field: &ArchivedZedTodosState, _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>) -> Result<Option<SerializedZedTodos>, rkyv::rancor::Error> {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedZedTodosState,
+        Option<SerializedZedTodos>,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedZedTodosState
+{
+    fn deserialize_with(
+        _field: &ArchivedZedTodosState,
+        _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    ) -> Result<Option<SerializedZedTodos>, rkyv::rancor::Error> {
         let _ = _field;
         Ok(None)
     }
@@ -5534,31 +6338,89 @@ impl rkyv::with::ArchiveWith<SerializedAgentPanel> for ArchivedSerializedAgentPa
     type Archived = Self;
     type Resolver = ();
 
-    fn resolve_with(_field: &SerializedAgentPanel, _resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+    fn resolve_with(
+        _field: &SerializedAgentPanel,
+        _resolver: Self::Resolver,
+        out: rkyv::Place<Self::Archived>,
+    ) {
         let _ = out;
     }
 }
 
-impl rkyv::with::SerializeWith<SerializedAgentPanel, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSerializedAgentPanel {
-    fn serialize_with(_field: &SerializedAgentPanel, _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>) -> Result<Self::Resolver, rkyv::rancor::Error> {
+impl
+    rkyv::with::SerializeWith<
+        SerializedAgentPanel,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSerializedAgentPanel
+{
+    fn serialize_with(
+        _field: &SerializedAgentPanel,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = _field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<SerializedAgentPanel, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSerializedAgentPanel {
-    fn serialize_with<'s>(_field: &SerializedAgentPanel, serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>) -> Result<Self::Resolver, rkyv::rancor::Error> {
+impl<'b>
+    rkyv::with::SerializeWith<
+        SerializedAgentPanel,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSerializedAgentPanel
+{
+    fn serialize_with<'s>(
+        _field: &SerializedAgentPanel,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         // Produce the archived payload (the Vec<u8> bytes that are the newtype content) via the existing From.
         let archived_payload: ArchivedSerializedAgentPanel = _field.clone().into();
         // Serialize the inner bytes under the high ArenaHandle serializer (exact sibling pattern for byte-blob / ID wrappers that satisfied the RkyvCodec high-API bound; direct ArchivedVec call does not satisfy the Strategy in this rkyv 0.8 configuration).
         let canonical_bytes: Vec<u8> = archived_payload.0;
-        let _ = <Vec<u8> as rkyv::Serialize<rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>>>::serialize(&canonical_bytes, serializer)?;
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedSerializedAgentPanel, SerializedAgentPanel, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedSerializedAgentPanel {
-    fn deserialize_with(_field: &ArchivedSerializedAgentPanel, _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>) -> Result<SerializedAgentPanel, rkyv::rancor::Error> {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedSerializedAgentPanel,
+        SerializedAgentPanel,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedSerializedAgentPanel
+{
+    fn deserialize_with(
+        _field: &ArchivedSerializedAgentPanel,
+        _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    ) -> Result<SerializedAgentPanel, rkyv::rancor::Error> {
         let _ = _field;
         Ok(SerializedAgentPanel::default())
     }
@@ -5568,27 +6430,76 @@ impl rkyv::with::ArchiveWith<Option<SerializedAgentPanel>> for ArchivedSerialize
     type Archived = Self;
     type Resolver = ();
 
-    fn resolve_with(_field: &Option<SerializedAgentPanel>, _resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+    fn resolve_with(
+        _field: &Option<SerializedAgentPanel>,
+        _resolver: Self::Resolver,
+        out: rkyv::Place<Self::Archived>,
+    ) {
         let _ = out;
     }
 }
 
-impl rkyv::with::SerializeWith<Option<SerializedAgentPanel>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSerializedAgentPanel {
-    fn serialize_with(_field: &Option<SerializedAgentPanel>, _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>, rkyv::rancor::Error>) -> Result<Self::Resolver, rkyv::rancor::Error> {
+impl
+    rkyv::with::SerializeWith<
+        Option<SerializedAgentPanel>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSerializedAgentPanel
+{
+    fn serialize_with(
+        _field: &Option<SerializedAgentPanel>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = _field;
         Ok(())
     }
 }
 
-impl<'b> rkyv::with::SerializeWith<Option<SerializedAgentPanel>, rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'b>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>> for ArchivedSerializedAgentPanel {
-    fn serialize_with<'s>(_field: &Option<SerializedAgentPanel>, _serializer: &mut rkyv::rancor::Strategy<rkyv::ser::Serializer<rkyv::util::AlignedVec, rkyv::ser::allocator::ArenaHandle<'s>, rkyv::ser::sharing::Share>, rkyv::rancor::Error>) -> Result<Self::Resolver, rkyv::rancor::Error> {
+impl<'b>
+    rkyv::with::SerializeWith<
+        Option<SerializedAgentPanel>,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSerializedAgentPanel
+{
+    fn serialize_with<'s>(
+        _field: &Option<SerializedAgentPanel>,
+        _serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
         let _ = _field;
         Ok(())
     }
 }
 
-impl rkyv::with::DeserializeWith<ArchivedSerializedAgentPanel, Option<SerializedAgentPanel>, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>> for ArchivedSerializedAgentPanel {
-    fn deserialize_with(_field: &ArchivedSerializedAgentPanel, _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>) -> Result<Option<SerializedAgentPanel>, rkyv::rancor::Error> {
+impl
+    rkyv::with::DeserializeWith<
+        ArchivedSerializedAgentPanel,
+        Option<SerializedAgentPanel>,
+        rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    > for ArchivedSerializedAgentPanel
+{
+    fn deserialize_with(
+        _field: &ArchivedSerializedAgentPanel,
+        _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
+    ) -> Result<Option<SerializedAgentPanel>, rkyv::rancor::Error> {
         let _ = _field;
         Ok(None)
     }

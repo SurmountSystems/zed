@@ -250,21 +250,24 @@ mod tests {
     #[test]
     fn test_grok_plan_item_and_todo_write_input_turnid_task_id_serde_roundtrip() {
         let json = r#"{"todos":[{"content":"investigate error recovery","id":"task-01-turnid-prior","status":"pending","active_form":null}]}"#;
-        let input: TodoWriteInput = serde_json::from_str(json).expect("deserializes observed P4-0 todo_write shape with TurnId task-id");
+        let input: TodoWriteInput = serde_json::from_str(json)
+            .expect("deserializes observed P4-0 todo_write shape with TurnId task-id");
         assert_eq!(input.todos.len(), 1);
         let item: GrokPlanItem = input.todos[0].clone();
         assert_eq!(item.id, "task-01-turnid-prior");
         assert_eq!(item.status, PlanEntryStatus::Pending);
         let serialized = serde_json::to_value(&input).expect("serializes todo input shape");
         assert!(serialized.get("todos").is_some());
-        let reparsed: TodoWriteInput = serde_json::from_str(&serde_json::to_string(&input).expect("str")).expect("reparse");
+        let reparsed: TodoWriteInput =
+            serde_json::from_str(&serde_json::to_string(&input).expect("str")).expect("reparse");
         assert_eq!(reparsed, input);
     }
 
     #[test]
     fn test_enter_plan_mode_input_serde_fidelity_with_turnid_task_ids() {
         let json = r#"{"plan":[{"content":"plan step","id":"task-02-turnid","status":"in_progress"}],"explanation":"per prior TurnId addressing"}"#;
-        let input: EnterPlanModeInput = serde_json::from_str(json).expect("deserializes P4-0 enter_plan_mode shape");
+        let input: EnterPlanModeInput =
+            serde_json::from_str(json).expect("deserializes P4-0 enter_plan_mode shape");
         assert_eq!(input.plan[0].id, "task-02-turnid");
         let value = serde_json::to_value(&input).expect("value shape");
         assert!(value.get("plan").is_some());
@@ -274,7 +277,8 @@ mod tests {
 
     #[test]
     fn test_monitor_input_cwd_label_cases_and_shape() {
-        let json_cd = r#"{"command":"ps aux","cd":"/tmp","timeout_ms":30000,"description":"monitor"}"#;
+        let json_cd =
+            r#"{"command":"ps aux","cd":"/tmp","timeout_ms":30000,"description":"monitor"}"#;
         let m1: MonitorInput = serde_json::from_str(json_cd).expect("cd primary");
         assert_eq!(m1.cd, "/tmp");
         let json_cwd = r#"{"command":"ps aux","cwd":"/tmp"}"#;

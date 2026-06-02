@@ -17,7 +17,7 @@ use util::{
     schemars::AllowTrailingCommas,
 };
 
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use settings_content::{ActionName, ActionWithArguments};
 use settings_json::{
     append_top_level_array_value_in_json_text, parse_json_with_comments,

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use gpui::SharedString;
 use handlebars::Handlebars;
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -51,9 +51,12 @@ pub struct SystemPromptTemplate<'a> {
     pub user_agents_md: Option<SharedString>,
     pub subagent_persona: Option<String>,
     pub subagent_capability_mode: Option<String>,
+    // Grok profile + TurnId + prior summary fields (from our native work)
+    // kept. Upstream sandboxing field integrated.
     pub is_grok_build_profile: bool,
     pub current_turn_id: Option<String>,
     pub prior_turn_summary: Option<String>,
+    pub sandboxing: bool,
 }
 
 impl Template for SystemPromptTemplate<'_> {
@@ -94,7 +97,7 @@ mod tests {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
             project: &project,
-            available_tools: vec!["echo".into(), "update_plan".into()],
+            available_tools: vec!["echo".into(), "update_plan".into(), "update_title".into()],
             model_name: Some("test-model".to_string()),
             date: "2026-01-01".to_string(),
             user_agents_md: None,
@@ -103,6 +106,7 @@ mod tests {
             is_grok_build_profile: false,
             current_turn_id: None,
             prior_turn_summary: None,
+            sandboxing: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -110,6 +114,7 @@ mod tests {
         assert!(rendered.contains("Today's Date: 2026-01-01"));
         assert!(rendered.contains("## Fixing Diagnostics"));
         assert!(rendered.contains("## Planning"));
+        assert!(rendered.contains("## Session Title"));
         assert!(rendered.contains("test-model"));
     }
 
@@ -127,7 +132,7 @@ mod tests {
                 project_entry_id: 1,
             }),
         }];
-        let project = ProjectContext::new(worktrees, Vec::new());
+        let project = ProjectContext::new(worktrees);
         let template = SystemPromptTemplate {
             project: &project,
             available_tools: vec!["echo".into()],
@@ -139,6 +144,7 @@ mod tests {
             is_grok_build_profile: false,
             current_turn_id: None,
             prior_turn_summary: None,
+            sandboxing: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -157,6 +163,93 @@ mod tests {
     }
 
     #[test]
+    fn test_system_prompt_omits_sandbox_section_when_sandboxing_disabled() {
+        let project = prompt_store::ProjectContext::default();
+        let template = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["echo".into()],
+            model_name: Some("test-model".to_string()),
+            date: "2026-01-01".to_string(),
+            user_agents_md: None,
+            sandboxing: false,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
+        };
+        let templates = Templates::new();
+        let rendered = template.render(&templates).unwrap();
+        assert!(!rendered.contains("## Terminal sandbox"));
+        assert!(!rendered.contains("allow_network"));
+    }
+
+    #[test]
+    fn test_system_prompt_renders_sandbox_section_with_worktrees_when_enabled() {
+        use prompt_store::{ProjectContext, WorktreeContext};
+
+        let worktrees = vec![
+            WorktreeContext {
+                root_name: "alpha".to_string(),
+                abs_path: std::path::Path::new("/tmp/alpha").into(),
+                rules_file: None,
+            },
+            WorktreeContext {
+                root_name: "beta".to_string(),
+                abs_path: std::path::Path::new("/tmp/beta").into(),
+                rules_file: None,
+            },
+        ];
+        let project = ProjectContext::new(worktrees);
+        let template = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["echo".into()],
+            model_name: Some("test-model".to_string()),
+            date: "2026-01-01".to_string(),
+            user_agents_md: None,
+            sandboxing: true,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
+        };
+        let templates = Templates::new();
+        let rendered = template.render(&templates).unwrap();
+
+        assert!(rendered.contains("## Terminal sandbox"));
+        assert!(rendered.contains("`/tmp/alpha`"));
+        assert!(rendered.contains("`/tmp/beta`"));
+        assert!(rendered.contains("allow_network: true"));
+        assert!(rendered.contains("allow_fs_write: true"));
+        assert!(rendered.contains("unsandboxed: true"));
+        assert!(rendered.contains("remain in effect for the entire duration"));
+    }
+
+    #[test]
+    fn test_system_prompt_sandbox_section_handles_zero_worktrees() {
+        let project = prompt_store::ProjectContext::default();
+        let template = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["echo".into()],
+            model_name: Some("test-model".to_string()),
+            date: "2026-01-01".to_string(),
+            user_agents_md: None,
+            sandboxing: true,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
+        };
+        let templates = Templates::new();
+        let rendered = template.render(&templates).unwrap();
+
+        assert!(rendered.contains("## Terminal sandbox"));
+        assert!(rendered.contains("No project directories are currently writable"));
+    }
+
+    #[test]
     fn test_system_prompt_omits_user_agents_md_section_when_absent() {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
@@ -170,6 +263,7 @@ mod tests {
             is_grok_build_profile: false,
             current_turn_id: None,
             prior_turn_summary: None,
+            sandboxing: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -190,11 +284,20 @@ mod tests {
             is_grok_build_profile: true,
             current_turn_id: Some("T-42".to_string()),
             prior_turn_summary: Some("Prior assistant response: started task".to_string()),
+            sandboxing: false,
         };
         let templates = Templates::new();
-        let rendered = template.render(&templates).expect("template render must succeed for grok turn injection test");
-        assert!(rendered.contains("Current Turn ID: T-42"), "hbs conditional must emit current TurnId for native grok prompt");
-        assert!(rendered.contains("Recent prior-turn summary: Prior assistant response: started task"), "hbs must emit prior-turn summary when present under is_grok");
+        let rendered = template
+            .render(&templates)
+            .expect("template render must succeed for grok turn injection test");
+        assert!(
+            rendered.contains("Current Turn ID: T-42"),
+            "hbs conditional must emit current TurnId for native grok prompt"
+        );
+        assert!(
+            rendered.contains("Recent prior-turn summary: Prior assistant response: started task"),
+            "hbs must emit prior-turn summary when present under is_grok"
+        );
     }
 
     #[test]
@@ -211,12 +314,50 @@ mod tests {
             is_grok_build_profile: true,
             current_turn_id: None,
             prior_turn_summary: None,
+            sandboxing: false,
         };
         let templates = Templates::new();
-        let rendered = template.render(&templates).expect("template render must succeed for subagent persona test");
-        assert!(rendered.contains("## Subagent Persona"), "hbs must emit persona section when subagent_persona provided for native subagent spawn");
-        assert!(rendered.contains("You are operating as a Implementer subagent"), "persona value must be interpolated into subagent role guidance");
-        assert!(rendered.contains("## Capability Mode: Read-Only"), "hbs must emit capability section when mode provided");
-        assert!(rendered.contains("When Read-Only, restrict to analysis"), "capability mode text for read-only restriction must appear to feed prompt for ZT-1 and native fidelity");
+        let rendered = template
+            .render(&templates)
+            .expect("template render must succeed for subagent persona test");
+        assert!(
+            rendered.contains("## Subagent Persona"),
+            "hbs must emit persona section when subagent_persona provided for native subagent spawn"
+        );
+        assert!(
+            rendered.contains("You are operating as a Implementer subagent"),
+            "persona value must be interpolated into subagent role guidance"
+        );
+        assert!(
+            rendered.contains("## Capability Mode: Read-Only"),
+            "hbs must emit capability section when mode provided"
+        );
+        assert!(
+            rendered.contains("When Read-Only, restrict to analysis"),
+            "capability mode text for read-only restriction must appear to feed prompt for ZT-1 and native fidelity"
+        );
+    }
+
+    #[test]
+    fn test_system_prompt_does_not_render_legacy_zed_rules_section() {
+        let project = prompt_store::ProjectContext::default();
+        let template = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["echo".into()],
+            model_name: Some("test-model".to_string()),
+            date: "2026-01-01".to_string(),
+            user_agents_md: None,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
+            sandboxing: false,
+        };
+        let templates = Templates::new();
+        let rendered = template.render(&templates).unwrap();
+
+        assert!(!rendered.contains("The user has specified the following rules"));
+        assert!(!rendered.contains("Rules title:"));
     }
 }

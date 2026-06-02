@@ -25,7 +25,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(not(feature = "dynamic_prompts"))]
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 
 #[cfg(not(feature = "dynamic_prompts"))]
 static LANGUAGE_CONFIGS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../grammars/src");

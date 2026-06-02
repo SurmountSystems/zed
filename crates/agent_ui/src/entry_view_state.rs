@@ -10,8 +10,7 @@ use gpui::{
     ListState, ScrollHandle, TextStyleRefinement, WeakEntity, Window,
 };
 use language::language_settings::SoftWrap;
-use project::{AgentId, Project};
-use prompt_store::PromptStore;
+use project::{AgentId, Project, project_settings::DiagnosticSeverity};
 use rope::Point;
 use settings::Settings as _;
 use terminal_view::TerminalView;
@@ -25,7 +24,6 @@ pub struct EntryViewState {
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
     thread_store: Option<Entity<ThreadStore>>,
-    prompt_store: Option<Entity<PromptStore>>,
     entries: Vec<Entry>,
     session_capabilities: SharedSessionCapabilities,
     agent_id: AgentId,
@@ -36,7 +34,6 @@ impl EntryViewState {
         workspace: WeakEntity<Workspace>,
         project: WeakEntity<Project>,
         thread_store: Option<Entity<ThreadStore>>,
-        prompt_store: Option<Entity<PromptStore>>,
         session_capabilities: SharedSessionCapabilities,
         agent_id: AgentId,
     ) -> Self {
@@ -44,7 +41,6 @@ impl EntryViewState {
             workspace,
             project,
             thread_store,
-            prompt_store,
             entries: Vec::new(),
             session_capabilities,
             agent_id,
@@ -97,7 +93,6 @@ impl EntryViewState {
                             self.workspace.clone(),
                             self.project.clone(),
                             self.thread_store.clone(),
-                            self.prompt_store.clone(),
                             self.session_capabilities.clone(),
                             self.agent_id.clone(),
                             "Edit message － @ to include context",
@@ -248,6 +243,11 @@ impl EntryViewState {
                     self.set_entry(index, Entry::CompletedPlan);
                 }
             }
+            AgentThreadEntry::ContextCompaction => {
+                if !matches!(self.entries.get(index), Some(Entry::ContextCompaction)) {
+                    self.set_entry(index, Entry::ContextCompaction);
+                }
+            }
         };
     }
 
@@ -268,7 +268,8 @@ impl EntryViewState {
             match entry {
                 Entry::UserMessage { .. }
                 | Entry::AssistantMessage { .. }
-                | Entry::CompletedPlan => {}
+                | Entry::CompletedPlan
+                | Entry::ContextCompaction => {}
                 Entry::ToolCall(ToolCallEntry { content, .. }) => {
                     for view in content.values() {
                         if let Ok(diff_editor) = view.clone().downcast::<Editor>() {
@@ -359,6 +360,7 @@ pub enum Entry {
     AssistantMessage(AssistantMessageEntry),
     ToolCall(ToolCallEntry),
     CompletedPlan,
+    ContextCompaction,
 }
 
 impl Entry {
@@ -367,14 +369,17 @@ impl Entry {
             Self::UserMessage(editor) => Some(editor.read(cx).focus_handle(cx)),
             Self::AssistantMessage(message) => Some(message.focus_handle.clone()),
             Self::ToolCall(tool_call) => Some(tool_call.focus_handle.clone()),
-            Self::CompletedPlan => None,
+            Self::CompletedPlan | Self::ContextCompaction => None,
         }
     }
 
     pub fn message_editor(&self) -> Option<&Entity<MessageEditor>> {
         match self {
             Self::UserMessage(editor) => Some(editor),
-            Self::AssistantMessage(_) | Self::ToolCall(_) | Self::CompletedPlan => None,
+            Self::AssistantMessage(_)
+            | Self::ToolCall(_)
+            | Self::CompletedPlan
+            | Self::ContextCompaction => None,
         }
     }
 
@@ -401,7 +406,10 @@ impl Entry {
     ) -> Option<ScrollHandle> {
         match self {
             Self::AssistantMessage(message) => message.scroll_handle_for_chunk(chunk_ix),
-            Self::UserMessage(_) | Self::ToolCall(_) | Self::CompletedPlan => None,
+            Self::UserMessage(_)
+            | Self::ToolCall(_)
+            | Self::CompletedPlan
+            | Self::ContextCompaction => None,
         }
     }
 
@@ -416,7 +424,10 @@ impl Entry {
     pub fn has_content(&self) -> bool {
         match self {
             Self::ToolCall(ToolCallEntry { content, .. }) => !content.is_empty(),
-            Self::UserMessage(_) | Self::AssistantMessage(_) | Self::CompletedPlan => false,
+            Self::UserMessage(_)
+            | Self::AssistantMessage(_)
+            | Self::CompletedPlan
+            | Self::ContextCompaction => false,
         }
     }
 }
@@ -433,7 +444,7 @@ impl Focusable for Entry {
             Self::UserMessage(editor) => editor.read(cx).focus_handle(cx),
             Self::AssistantMessage(message) => message.focus_handle.clone(),
             Self::ToolCall(tool_call) => tool_call.focus_handle.clone(),
-            Self::CompletedPlan => cx.focus_handle(),
+            Self::CompletedPlan | Self::ContextCompaction => cx.focus_handle(),
         }
     }
 }
@@ -477,7 +488,8 @@ fn create_editor_diff(
             cx,
         );
         editor.set_show_gutter(false, cx);
-        editor.disable_inline_diagnostics();
+        editor.disable_diagnostics(cx);
+        editor.set_max_diagnostics_severity(DiagnosticSeverity::Off, cx);
         editor.disable_expand_excerpt_buttons(cx);
         editor.set_show_vertical_scrollbar(false, cx);
         editor.set_minimap_visibility(MinimapVisibility::Disabled, window, cx);
@@ -578,7 +590,6 @@ mod tests {
                 workspace.downgrade(),
                 project.downgrade(),
                 thread_store,
-                None,
                 Arc::new(RwLock::new(SessionCapabilities::default())),
                 "Test Agent".into(),
             )
@@ -644,19 +655,34 @@ mod tests {
         use ui::px;
 
         #[gpui::test]
-        async fn test_entry_view_state_recovers_from_retained_thread_growth_desync(cx: &mut TestAppContext) {
+        async fn test_entry_view_state_recovers_from_retained_thread_growth_desync(
+            cx: &mut TestAppContext,
+        ) {
             super::init_test(cx);
             let fs = FakeFs::new(cx.executor());
             let project = Project::test(fs, [], cx).await;
-            let (multi_workspace, cx) = cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+            let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+                MultiWorkspace::test_new(project.clone(), window, cx)
+            });
             let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
             let connection = Rc::new(StubAgentConnection::new());
-            let thread = cx.update(|_, cx| connection.clone().new_session(project.clone(), PathList::new(&[] as &[&Path]), cx)).await.unwrap();
+            let thread = cx
+                .update(|_, cx| {
+                    connection.clone().new_session(
+                        project.clone(),
+                        PathList::new(&[] as &[&Path]),
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
             let session_id = thread.update(cx, |thread, _| thread.session_id().clone());
             let thread_store = None;
             let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::default()));
             cx.update(|_, cx| {
-                let tool = acp::ToolCall::new("initial", "Initial").status(acp::ToolCallStatus::Completed).content(vec![]);
+                let tool = acp::ToolCall::new("initial", "Initial")
+                    .status(acp::ToolCallStatus::Completed)
+                    .content(vec![]);
                 connection.send_update(session_id.clone(), acp::SessionUpdate::ToolCall(tool), cx);
             });
             cx.run_until_parked();
@@ -665,7 +691,6 @@ mod tests {
                     workspace.downgrade(),
                     project.downgrade(),
                     thread_store,
-                    None,
                     session_capabilities.clone(),
                     "Test Agent".into(),
                 )
@@ -677,8 +702,14 @@ mod tests {
             });
             for k in 0..12u32 {
                 cx.update(|_, cx| {
-                    let tool = acp::ToolCall::new(format!("growth-{}", k), "Growth").status(acp::ToolCallStatus::Completed).content(vec![]);
-                    connection.send_update(session_id.clone(), acp::SessionUpdate::ToolCall(tool), cx);
+                    let tool = acp::ToolCall::new(format!("growth-{}", k), "Growth")
+                        .status(acp::ToolCallStatus::Completed)
+                        .content(vec![]);
+                    connection.send_update(
+                        session_id.clone(),
+                        acp::SessionUpdate::ToolCall(tool),
+                        cx,
+                    );
                 });
             }
             cx.run_until_parked();

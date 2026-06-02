@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use language_core::{LanguageConfig, LanguageQueries, QUERY_FILENAME_PREFIXES};
 
 static GRAMMAR_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src");

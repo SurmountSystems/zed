@@ -361,7 +361,7 @@ impl EditToolTest {
                 abs_path: Path::new("/path/to/root").into(),
                 rules_file: None,
             }];
-            let project_context = ProjectContext::new(worktrees, Vec::default());
+            let project_context = ProjectContext::new(worktrees);
             let tool_names = tools
                 .iter()
                 .map(|tool| tool.name.clone().into())
@@ -377,6 +377,7 @@ impl EditToolTest {
                 is_grok_build_profile: false,
                 current_turn_id: None,
                 prior_turn_summary: None,
+                sandboxing: false,
             };
             let templates = Templates::new();
             template.render(&templates)?

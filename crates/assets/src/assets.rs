@@ -2,7 +2,7 @@
 
 use anyhow::Context as _;
 use gpui::{App, AssetSource, Result, SharedString};
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 
 static ASSETS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../assets");
 

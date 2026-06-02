@@ -16,7 +16,9 @@ use gpui::{
 };
 use itertools::Itertools;
 use language::language_settings::FormatOnSave;
-use language::{Anchor, Buffer, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff};
+use language::{
+    Anchor, Buffer, BufferEditSource, BufferSnapshot, LanguageRegistry, Point, ToPoint, text_diff,
+};
 use markdown::{Markdown, MarkdownOptions};
 pub use mention::*;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
@@ -439,6 +441,7 @@ pub enum AgentThreadEntry {
     AssistantMessage(AssistantMessage),
     ToolCall(ToolCall),
     CompletedPlan(Vec<PlanEntry>),
+    ContextCompaction,
 }
 
 impl AgentThreadEntry {
@@ -448,6 +451,7 @@ impl AgentThreadEntry {
             Self::AssistantMessage(message) => message.indented,
             Self::ToolCall(_) => false,
             Self::CompletedPlan(_) => false,
+            Self::ContextCompaction => false,
         }
     }
 
@@ -464,6 +468,7 @@ impl AgentThreadEntry {
                 }
                 md
             }
+            Self::ContextCompaction => "--- Context Compacted ---\n\n".to_string(),
         }
     }
 
@@ -923,9 +928,16 @@ impl Display for ToolCallStatus {
 #[derive(Debug, PartialEq, Clone)]
 pub enum ContentBlock {
     Empty,
-    Markdown { markdown: Entity<Markdown> },
-    ResourceLink { resource_link: acp::ResourceLink },
-    Image { image: Arc<gpui::Image> },
+    Markdown {
+        markdown: Entity<Markdown>,
+    },
+    ResourceLink {
+        resource_link: acp::ResourceLink,
+    },
+    Image {
+        image: Arc<gpui::Image>,
+        dimensions: Option<gpui::Size<u32>>,
+    },
 }
 
 impl ContentBlock {
@@ -967,8 +979,8 @@ impl ContentBlock {
                 };
             }
             (ContentBlock::Empty, acp::ContentBlock::Image(image_content)) => {
-                if let Some(image) = Self::decode_image(image_content) {
-                    *self = ContentBlock::Image { image };
+                if let Some((image, dimensions)) = Self::decode_image(image_content) {
+                    *self = ContentBlock::Image { image, dimensions };
                 } else {
                     let new_content = Self::image_md(image_content);
                     *self = Self::create_markdown_block(new_content, language_registry, cx);
@@ -996,14 +1008,36 @@ impl ContentBlock {
         }
     }
 
-    fn decode_image(image_content: &acp::ImageContent) -> Option<Arc<gpui::Image>> {
+    fn decode_image(
+        image_content: &acp::ImageContent,
+    ) -> Option<(Arc<gpui::Image>, Option<gpui::Size<u32>>)> {
         use base64::Engine as _;
 
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(image_content.data.as_bytes())
             .ok()?;
         let format = gpui::ImageFormat::from_mime_type(&image_content.mime_type)?;
-        Some(Arc::new(gpui::Image::from_bytes(format, bytes)))
+        let dimensions = Self::image_dimensions(&bytes, format);
+        Some((Arc::new(gpui::Image::from_bytes(format, bytes)), dimensions))
+    }
+
+    fn image_dimensions(bytes: &[u8], format: gpui::ImageFormat) -> Option<gpui::Size<u32>> {
+        let format = match format {
+            gpui::ImageFormat::Png => image::ImageFormat::Png,
+            gpui::ImageFormat::Jpeg => image::ImageFormat::Jpeg,
+            gpui::ImageFormat::Webp => image::ImageFormat::WebP,
+            gpui::ImageFormat::Gif => image::ImageFormat::Gif,
+            gpui::ImageFormat::Svg => return None,
+            gpui::ImageFormat::Bmp => image::ImageFormat::Bmp,
+            gpui::ImageFormat::Tiff => image::ImageFormat::Tiff,
+            gpui::ImageFormat::Ico => image::ImageFormat::Ico,
+            gpui::ImageFormat::Pnm => image::ImageFormat::Pnm,
+        };
+
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+            .into_dimensions()
+            .ok()
+            .map(|(width, height)| gpui::Size { width, height })
     }
 
     fn create_markdown_block(
@@ -1019,6 +1053,7 @@ impl ContentBlock {
                     None,
                     MarkdownOptions {
                         render_mermaid_diagrams: true,
+                        render_metadata_blocks: true,
                         ..Default::default()
                     },
                     cx,
@@ -1083,9 +1118,9 @@ impl ContentBlock {
         }
     }
 
-    pub fn image(&self) -> Option<&Arc<gpui::Image>> {
+    pub fn image(&self) -> Option<(&Arc<gpui::Image>, Option<gpui::Size<u32>>)> {
         match self {
-            ContentBlock::Image { image } => Some(image),
+            ContentBlock::Image { image, dimensions } => Some((image, *dimensions)),
             _ => None,
         }
     }
@@ -1170,7 +1205,7 @@ impl ToolCallContent {
         }
     }
 
-    pub fn image(&self) -> Option<&Arc<gpui::Image>> {
+    pub fn image(&self) -> Option<(&Arc<gpui::Image>, Option<gpui::Size<u32>>)> {
         match self {
             Self::ContentBlock(content) => content.image(),
             _ => None,
@@ -1426,7 +1461,9 @@ pub struct RetryStatus {
     pub duration: Duration,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct TurnId(u32);
 
@@ -1777,7 +1814,10 @@ impl AcpThread {
             .filter(|e| {
                 if let AgentThreadEntry::ToolCall(tc) = e {
                     tc.is_monitor()
-                        && !matches!(tc.status, ToolCallStatus::Completed | ToolCallStatus::Failed)
+                        && !matches!(
+                            tc.status,
+                            ToolCallStatus::Completed | ToolCallStatus::Failed
+                        )
                 } else {
                     false
                 }
@@ -2012,7 +2052,8 @@ impl AcpThread {
                 }) => return true,
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::ContextCompaction => {}
             }
         }
         false
@@ -2055,7 +2096,8 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::ContextCompaction => {}
             }
         }
 
@@ -2074,7 +2116,8 @@ impl AcpThread {
                 }
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
-                | AgentThreadEntry::CompletedPlan(_) => {}
+                | AgentThreadEntry::CompletedPlan(_)
+                | AgentThreadEntry::ContextCompaction => {}
             }
         }
 
@@ -2125,9 +2168,9 @@ impl AcpThread {
         for entry in self.entries.iter().rev() {
             match entry {
                 AgentThreadEntry::UserMessage(..) => return false,
-                AgentThreadEntry::AssistantMessage(..) | AgentThreadEntry::CompletedPlan(..) => {
-                    continue;
-                }
+                AgentThreadEntry::AssistantMessage(..)
+                | AgentThreadEntry::CompletedPlan(..)
+                | AgentThreadEntry::ContextCompaction => continue,
                 AgentThreadEntry::ToolCall(..) => return true,
             }
         }
@@ -2530,6 +2573,10 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.entries.push(entry);
         cx.emit(AcpThreadEvent::NewEntry);
+    }
+
+    pub fn push_context_compaction(&mut self, cx: &mut Context<Self>) {
+        self.push_entry(AgentThreadEntry::ContextCompaction, cx);
     }
 
     pub fn can_set_title(&mut self, cx: &mut Context<Self>) -> bool {
@@ -3639,7 +3686,9 @@ impl AcpThread {
                 });
 
                 let format_on_save = buffer.update(cx, |buffer, cx| {
+                    buffer.start_transaction();
                     buffer.edit(edits, None, cx);
+                    buffer.end_transaction_with_source(BufferEditSource::Agent, cx);
 
                     let settings =
                         language::language_settings::LanguageSettings::for_buffer(buffer, cx);
@@ -3682,6 +3731,7 @@ impl AcpThread {
         extra_env: Vec<acp::EnvVariable>,
         cwd: Option<PathBuf>,
         output_byte_limit: Option<u64>,
+        sandbox_wrap: Option<SandboxWrap>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let env = match &cwd {
@@ -3722,6 +3772,8 @@ impl AcpThread {
                     ShellBuilder::new(&Shell::Program(shell), is_windows)
                         .redirect_stdin_to_dev_null()
                         .build(Some(command.clone()), &args);
+                let (task_command, task_args, sandbox_config) =
+                    apply_sandbox_wrap(task_command, task_args, sandbox_wrap)?;
                 let terminal = project
                     .update(cx, |project, cx| {
                         project.create_terminal_task(
@@ -3745,6 +3797,7 @@ impl AcpThread {
                         output_byte_limit.map(|l| l as usize),
                         terminal,
                         language_registry,
+                        sandbox_config,
                         cx,
                     )
                 }))
@@ -3838,6 +3891,9 @@ impl AcpThread {
                 output_byte_limit.map(|l| l as usize),
                 terminal,
                 language_registry,
+                // External terminal providers manage their own sandboxing
+                // (if any). We don't wrap their commands.
+                None,
                 cx,
             )
         });
@@ -4233,8 +4289,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
@@ -4314,8 +4369,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
@@ -5937,8 +5991,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
@@ -5984,8 +6037,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
@@ -6045,8 +6097,7 @@ mod tests {
                 0,
                 cx.background_executor(),
                 PathStyle::local(),
-            )
-            .unwrap();
+            );
             builder.subscribe(cx)
         });
 
@@ -7160,7 +7211,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_grok_flagged_thread_open_plan_violating_done_text_injects_exact_correction_with_task_references(cx: &mut gpui::TestAppContext) {
+    async fn test_grok_flagged_thread_open_plan_violating_done_text_injects_exact_correction_with_task_references(
+        cx: &mut gpui::TestAppContext,
+    ) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
@@ -7179,7 +7232,14 @@ mod tests {
             thread.plan.entries.clear();
             thread.plan.entries.push(PlanEntry {
                 id: "T-12-task-kickback-test".to_string(),
-                content: cx.new(|cx| Markdown::new("exercise the full E2E kickback injection path".into(), None, None, cx)),
+                content: cx.new(|cx| {
+                    Markdown::new(
+                        "exercise the full E2E kickback injection path".into(),
+                        None,
+                        None,
+                        cx,
+                    )
+                }),
                 priority: acp::PlanEntryPriority::Medium,
                 status: acp::PlanEntryStatus::Pending,
             });
@@ -7204,18 +7264,27 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_plan_entry_identifier_resolution_via_from_acp_meta_path_and_content_fallback(cx: &mut gpui::TestAppContext) {
+    fn test_plan_entry_identifier_resolution_via_from_acp_meta_path_and_content_fallback(
+        cx: &mut gpui::TestAppContext,
+    ) {
         init_test(cx);
         cx.update(|cx| {
-            let meta_containing_identifier = Some(acp::Meta::from_iter([("id".into(), "explicit-from-meta".into())]));
+            let meta_containing_identifier = Some(acp::Meta::from_iter([(
+                "id".into(),
+                "explicit-from-meta".into(),
+            )]));
             let acp_plan_entry_containing_identifier = acp::PlanEntry::new(
                 "Login user with oauth provider",
                 acp::PlanEntryPriority::High,
                 acp::PlanEntryStatus::Pending,
             )
             .meta(meta_containing_identifier);
-            let resolved_entry_using_meta_identifier = PlanEntry::from_acp(acp_plan_entry_containing_identifier, cx);
-            assert_eq!(resolved_entry_using_meta_identifier.id, "explicit-from-meta");
+            let resolved_entry_using_meta_identifier =
+                PlanEntry::from_acp(acp_plan_entry_containing_identifier, cx);
+            assert_eq!(
+                resolved_entry_using_meta_identifier.id,
+                "explicit-from-meta"
+            );
 
             let meta_without_identifier = None::<acp::Meta>;
             assert_eq!(plan_entry_id_from_meta(&meta_without_identifier), None);
@@ -7225,9 +7294,13 @@ mod tests {
                 acp::PlanEntryPriority::Medium,
                 acp::PlanEntryStatus::InProgress,
             );
-            let resolved_entry_from_content_fallback = PlanEntry::from_acp(acp_plan_entry_for_fallback, cx);
+            let resolved_entry_from_content_fallback =
+                PlanEntry::from_acp(acp_plan_entry_for_fallback, cx);
             assert!(!resolved_entry_from_content_fallback.id.is_empty());
-            assert_ne!(resolved_entry_using_meta_identifier.id, resolved_entry_from_content_fallback.id);
+            assert_ne!(
+                resolved_entry_using_meta_identifier.id,
+                resolved_entry_from_content_fallback.id
+            );
         });
     }
 
@@ -7245,14 +7318,19 @@ mod tests {
             let tid: TurnId = TurnId::new(i);
             let _u: u32 = u32::from(tid);
             let _d = format!("{}", tid); // "T-{}"
-            let ser = serde_json::to_string(&tid).expect("TurnId serde for native P4 TurnId refs in prompt and kickback");
-            let de: TurnId = serde_json::from_str(&ser).expect("roundtrip for E2E regression and ZT-1");
+            let ser = serde_json::to_string(&tid)
+                .expect("TurnId serde for native P4 TurnId refs in prompt and kickback");
+            let de: TurnId =
+                serde_json::from_str(&ser).expect("roundtrip for E2E regression and ZT-1");
             assert_eq!(tid, de);
             assert_eq!(u32::from(de), i);
         }
         let elapsed = start.elapsed();
         // 5k full TurnId lifecycle < 100ms (loose bound for debug/profile variance) guards O(1) property for native Grok vs ACP
-        assert!(elapsed < std::time::Duration::from_millis(100), "TurnId must remain O(1) light for native Grok efficiency vs external ACP");
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "TurnId must remain O(1) light for native Grok efficiency vs external ACP"
+        );
         let _display_pin: TurnId = TurnId::new(1);
     }
 
@@ -7263,6 +7341,9 @@ mod tests {
         let tid = TurnId::new(42);
         assert_eq!(format!("{}", tid), "T-42");
         // The autonomous discipline + formatting validators reference turns; cost is independent of external process.
-        assert!(true, "shared acp_thread substrate for native profile is efficient");
+        assert!(
+            true,
+            "shared acp_thread substrate for native profile is efficient"
+        );
     }
 }

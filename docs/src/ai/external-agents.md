@@ -235,7 +235,7 @@ This can be useful if you're in the middle of developing a new agent that speaks
 
 It's also possible to customize environment variables for registry-installed agents like Claude Agent, Codex, and Gemini CLI by using their registry names (`claude-acp`, `codex-acp`, `gemini`) with `"type": "registry"` in your settings.
 
-### Grok Build (xAI)
+### Grok Build (xAI)  (our P3 bridging + ZT-1 co-equal content preserved)
 
 You can run the full [Grok Build](https://x.ai/cli) TUI agent inside Zed's agent panel via ACP for complete visual access to all Grok capabilities (plan mode, subagents with personas, skills, background tasks, MCP, etc.) while using Zed's rich diff/terminal/plan rendering.
 
@@ -473,10 +473,29 @@ The co-equal bridged story remains accurate: both the ACP "grok" external binary
 **16-Task Swarm + TurnId + CWD Parity + Efficiency Re-audit (TASK-16, 2026-05-20 — Living Docs + Efficiency Specialist):** As TASK-16 (territory: narrow appends to this file after MDs-first fresh relative reads of Grok section 238+ and ZT-1 reuse 263-480), appended full A.1.2. completion reports + efficiency O(1) proofs for the 16-task swarm (parallel execution on 5-phase plan broken to 16 disjoint tasks with relative CWD paths + TurnId/task-id addressing for "revisit T-<n>-task-<x>" decisions across agents/turns), TurnId + CWD parity, post-swarm re-audit. 
 
 O(1) proofs (re-audit): ZT-1 for any consumer (docks/panels) uses owned ZedTodosComponent with bool/HashSet state (O(1) toggles/queries), .when(expanded) gates (no Markdown/TerminalView/allocs on collapsed), collectors thin + post-idle; TurnId (u32 + advance + prompt) + CWD (display_label(tool_name) + _with_tool) are O(1) thin paths with cached guards (no regression on !grok or hot render); swarm refactors (delegate, status match, labels) introduced zero extra cost on LLM/render paths per traces. Full parity bridged/native. See PLAN.md master A.1.2. synthesis + AGENTS.md log for details + todo_write update. All rules (relative, CLAUDE, fresh reads pre-PD, explicit classif, co-equal) followed exactly.
+=======
+## Importing Threads {#importing-threads}
+
+Zed can import existing threads from your external agent so they show up in your [Thread History](./agent-panel.md#multiple-threads) alongside the rest of your threads. This is useful when you've been working with Claude Agent, Codex, or another agent elsewhere and want to continue those conversations in Zed.
+
+### Starting an Import
+
+Open the Threads Sidebar with {#kb multi_workspace::ToggleWorkspaceSidebar} and open Thread History by clicking the clock icon at the bottom of the sidebar (or run {#action agents_sidebar::ToggleThreadHistory} from the Command Palette). Then click the **Import Threads** button (the download icon) in the Thread History toolbar.
+
+This opens the **Import External Agent Threads** dialog, which lists every external agent you have configured. Choose the agents you want to import from, then click **Import Threads**. Zed connects to each selected agent, retrieves its sessions over [ACP](https://agentclientprotocol.com), and adds any that aren't already in your history. When the import finishes, a notification reports how many threads were added.
+
+### What to Expect
+
+- **The agent must be configured in Zed.** Only agents you've already set up (see the sections above and [Add More Agents](#add-more-agents)) appear in the dialog.
+- **Imported threads are archived.** They're added to Thread History as archived entries; open one to restore it and continue where you left off. See [Managing Multiple Threads](./agent-panel.md#multiple-threads).
+- **Only threads tied to a project folder are imported.** Sessions that an agent reports without an associated working directory are skipped.
+- **Re-importing is safe.** Threads you've already imported are skipped, so you can run the import again later to pick up new sessions without creating duplicates.
+- **Local and remote projects are supported.** Threads are gathered from the agents available in your current local and [remote](../remote-development.md) projects.
+>>>>>>> main
 
 ## Debugging Agents
 
-When using external agents in Zed, you can access the debug view via with {#action dev::OpenAcpLogs} from the Command Palette.
+When using external agents in Zed, you can access the debug view via {#action dev::OpenAcpLogs} from the Command Palette.
 This lets you see the messages being sent and received between Zed and the agent.
 
 ![The debug view for ACP logs.](https://zed.dev/img/acp/acp-logs.webp)

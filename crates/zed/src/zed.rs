@@ -15,7 +15,7 @@ pub mod visual_tests;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
 
-use agent::{UserAgentsMdState, init_user_agents_md};
+use agent_settings::{UserAgentsMdState, init_user_agents_md};
 use agent_ui::AgentDiffToolbar;
 use anyhow::Context as _;
 pub use app_menus::*;
@@ -34,6 +34,7 @@ use futures::{StreamExt, channel::mpsc, select_biased};
 use git_ui::commit_view::CommitViewToolbar;
 use git_ui::git_panel::GitPanel;
 use git_ui::project_diff::{BranchDiffToolbar, ProjectDiffToolbar};
+use git_ui::solo_diff_view::{SoloDiffGitToolbar, SoloDiffStyleToolbar};
 use gpui::{
     Action, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, DismissEvent,
     Element, Entity, FocusHandle, Focusable, Image, ImageFormat, KeyBinding, ParentElement,
@@ -49,7 +50,6 @@ use language_tools::lsp_log_view::LspLogToolbarItemView;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use migrate::{MigrationBanner, MigrationEvent, MigrationNotification, MigrationType};
 use migrator::migrate_keymap;
-use onboarding::DOCS_URL;
 use onboarding::multibuffer_hint::MultibufferHint;
 pub use open_listener::*;
 use outline_panel::OutlinePanel;
@@ -100,8 +100,11 @@ use workspace::{
 use workspace::{Pane, notifications::DetachAndPromptErr};
 use zed_actions::{
     About, OpenAccountSettings, OpenBrowser, OpenDocs, OpenServerSettings, OpenSettingsFile,
-    OpenZedUrl, Quit,
+    OpenStatusPage, OpenZedUrl, Quit,
 };
+
+const DOCS_URL: &str = "https://zed.dev/docs/";
+const STATUS_URL: &str = "https://status.zed.dev";
 
 pub struct CrashHandler(pub Arc<crashes::Client>);
 
@@ -196,7 +199,9 @@ pub fn init(cx: &mut App) {
             open_bundled_file(
                 workspace,
                 // Hybrid: load from filesystem in the main binary
-std::fs::read_to_string("assets/licenses.md").unwrap().into(),
+                std::fs::read_to_string("assets/licenses.md")
+                    .unwrap()
+                    .into(),
                 "Open Source License Attribution",
                 "Markdown",
                 window,
@@ -813,26 +818,25 @@ fn ensure_agent_panel_for_workspace(
     // rule from the directive.
     let kvp = Some(KeyValueStore::global(cx));
 
-    let task = setup_or_teardown_ai_panel(workspace, window, cx, move |workspace_weak, mut async_cx| {
-        // We receive a WeakEntity here (per setup_or_teardown_ai_panel contract).
-        // Upgrade it to obtain a real &Workspace so new_in_loading_state can be called.
-        // Note: we cannot use `?` directly here because this closure must return
-        // `Task<anyhow::Result<...>>`, not a raw Result.
-        match workspace_weak.update_in(&mut async_cx, |workspace, window, cx| {
-            cx.new(|cx| {
-                agent_ui::AgentPanel::new_in_loading_state(
-                    workspace,
-                    None,
-                    kvp.clone(),
-                    window,
-                    cx,
-                )
-            })
-        }) {
-            Ok(panel) => Task::ready(Ok(panel)),
-            Err(e) => Task::ready(Err(e)),
-        }
-    });
+    let task = setup_or_teardown_ai_panel(
+        workspace,
+        window,
+        cx,
+        move |workspace_weak, mut async_cx| {
+            // We receive a WeakEntity here (per setup_or_teardown_ai_panel contract).
+            // Upgrade it to obtain a real &Workspace so new_in_loading_state can be called.
+            // Note: we cannot use `?` directly here because this closure must return
+            // `Task<anyhow::Result<...>>`, not a raw Result.
+            match workspace_weak.update_in(&mut async_cx, |workspace, window, cx| {
+                cx.new(|cx| {
+                    agent_ui::AgentPanel::new_in_loading_state(workspace, kvp.clone(), window, cx)
+                })
+            }) {
+                Ok(panel) => Task::ready(Ok(panel)),
+                Err(e) => Task::ready(Err(e)),
+            }
+        },
+    );
 
     cx.spawn_in(window, async move |workspace, cx| {
         task.await?;
@@ -896,6 +900,7 @@ fn register_actions(
 ) {
     workspace
         .register_action(|_, _: &OpenDocs, _, cx| cx.open_url(DOCS_URL))
+        .register_action(|_, _: &OpenStatusPage, _, cx| cx.open_url(STATUS_URL))
         .register_action(
             |workspace: &mut Workspace,
              _: &input_latency_ui::DumpInputLatencyHistogram,
@@ -1338,6 +1343,8 @@ fn initialize_pane(
         pane.toolbar().update(cx, |toolbar, cx| {
             let multibuffer_hint = cx.new(|_| MultibufferHint::new());
             toolbar.add_item(multibuffer_hint, window, cx);
+            let solo_diff_style_toolbar = cx.new(SoloDiffStyleToolbar::new);
+            toolbar.add_item(solo_diff_style_toolbar, window, cx);
             let breadcrumbs = cx.new(|_| Breadcrumbs::new());
             toolbar.add_item(breadcrumbs, window, cx);
             let buffer_search_bar = cx.new(|cx| {
@@ -1376,6 +1383,8 @@ fn initialize_pane(
             toolbar.add_item(project_diff_toolbar, window, cx);
             let branch_diff_toolbar = cx.new(BranchDiffToolbar::new);
             toolbar.add_item(branch_diff_toolbar, window, cx);
+            let solo_diff_git_toolbar = cx.new(SoloDiffGitToolbar::new);
+            toolbar.add_item(solo_diff_git_toolbar, window, cx);
             let commit_view_toolbar = cx.new(|_| CommitViewToolbar::new());
             toolbar.add_item(commit_view_toolbar, window, cx);
             let agent_diff_toolbar = cx.new(AgentDiffToolbar::new);
@@ -1587,7 +1596,7 @@ fn open_about_window(cx: &mut App) {
             window_bounds: Some(WindowBounds::centered(window_size, cx)),
             is_resizable: false,
             is_minimizable: false,
-            kind: WindowKind::Normal,
+            kind: WindowKind::Floating,
             app_id: Some(ReleaseChannel::global(cx).app_id().to_owned()),
             ..Default::default()
         },
@@ -1915,8 +1924,8 @@ fn init_cursor_hide_mode(cx: &mut App) {
 /// Starts watching `~/.config/zed/AGENTS.md` (or the platform equivalent) and
 /// surfaces any read errors using the same notification UI as settings errors.
 ///
-/// The file itself is loaded into [`agent::UserAgentsMd`] for inclusion in the
-/// native agent's system prompt.
+/// The file itself is loaded into [`agent_settings::UserAgentsMd`] for inclusion
+/// in prompts.
 pub fn watch_user_agents_md(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     struct UserAgentsMdParseError;
     let notification_id = NotificationId::unique::<UserAgentsMdParseError>();
@@ -2559,14 +2568,14 @@ pub(crate) fn eager_load_active_theme_and_icon_theme(fs: Arc<dyn Fs>, cx: &mut A
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     use collections::HashSet;
     use editor::{
         DisplayPoint, Editor, MultiBufferOffset, SelectionEffects, display_map::DisplayRow,
     };
     use gpui::{
-        Action, AnyWindowHandle, App, BorrowAppContext, Modifiers, TestAppContext,
-        UpdateGlobal, VisualTestContext, WindowHandle, actions, point, px,
+        Action, AnyWindowHandle, App, BorrowAppContext, Modifiers, TestAppContext, UpdateGlobal,
+        VisualTestContext, WindowHandle, actions, point, px,
     };
     use language::LanguageRegistry;
     use languages::{markdown_lang, rust_lang};
@@ -4211,7 +4220,7 @@ mod tests {
         let (editor_1, buffer) = workspace.update_in(cx, |_, window, cx| {
             pane_1.update(cx, |pane_1, cx| {
                 let editor = pane_1.active_item().unwrap().downcast::<Editor>().unwrap();
-                assert_eq!(editor.project_path(cx), Some(file1.clone()));
+                assert_eq!(editor.read(cx).active_project_path(cx), Some(file1.clone()));
                 let buffer = editor.update(cx, |editor, cx| {
                     editor.insert("dirt", window, cx);
                     editor.buffer().downgrade()
@@ -4767,7 +4776,7 @@ mod tests {
                     let scroll_position = editor_ref.scroll_position(cx);
 
                     (
-                        editor_ref.project_path(cx).unwrap(),
+                        editor_ref.active_project_path(cx).unwrap(),
                         selections[0].start,
                         scroll_position.y,
                     )
@@ -5285,10 +5294,10 @@ mod tests {
                 "recent_projects",
                 "remote_debug",
                 "repl",
-                "rules_library",
                 "search",
                 "settings_editor",
                 "settings_profile_selector",
+                "skill_creator",
                 "snippets",
                 "stash_picker",
                 "svg",

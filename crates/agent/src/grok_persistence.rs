@@ -249,12 +249,18 @@ mod tests {
         let json = serde_json::to_string(&original_turn).expect("TurnId must serialize");
         let roundtripped: acp_thread::TurnId =
             serde_json::from_str(&json).expect("TurnId must deserialize");
-        assert_eq!(u32::from(roundtripped), 17u32, "TurnId roundtrip value preserved");
+        assert_eq!(
+            u32::from(roundtripped),
+            17u32,
+            "TurnId roundtrip value preserved"
+        );
 
         // CWD / id validity cases exercised via is_valid (from session tools)
         assert!(project::agent_server_store::is_valid_grok_tui_session_id(
             "019e3dd6-b6f6-7481-bb30-0f71c763aaf3"
         ));
-        assert!(!project::agent_server_store::is_valid_grok_tui_session_id("short-id"));
+        assert!(!project::agent_server_store::is_valid_grok_tui_session_id(
+            "short-id"
+        ));
     }
 }

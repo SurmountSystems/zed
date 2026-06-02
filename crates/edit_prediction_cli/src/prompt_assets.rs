@@ -26,7 +26,7 @@ pub fn get_prompt(name: &'static str) -> Cow<'static, str> {
 
 #[cfg(not(feature = "dynamic_prompts"))]
 pub fn get_prompt(name: &'static str) -> Cow<'static, str> {
-    use include_dir::{include_dir, Dir};
+    use include_dir::{Dir, include_dir};
 
     static PROMPTS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src/prompts");
 
