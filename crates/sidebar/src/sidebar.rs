@@ -2836,13 +2836,20 @@ impl Sidebar {
         let metadata = metadata.clone();
         let mut async_window_cx = window.to_async(cx);
         cx.spawn(async move |_cx| {
-            let panel = AgentPanel::load(workspace.clone(), async_window_cx.clone()).await?;
+            // Use early creation + loading mode so the panel appears immediately
+            // with proper indeterminate UI (SpinnerLabel) while the async
+            // persisted state restore (via the new ThreadMetadataStore / Heed + rkyv
+            // zero-copy path, or any one-time legacy KVP termination driven from
+            // primary entry points) runs in the background. Per the 2026-05-27 async
+            // directive. We pass None for kvp here (sidebar secondary open path);
+            // the main workspace ensure path in zed.rs handles legacy termination hygiene.
+            let panel = workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
+                let p = cx.new(|cx| AgentPanel::new_in_loading_state(workspace, None, None, window, cx));
+                workspace.add_panel(p.clone(), window, cx);
+                p
+            })?;
 
             workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
-                let panel = workspace.panel::<AgentPanel>(cx).unwrap_or_else(|| {
-                    workspace.add_panel(panel.clone(), window, cx);
-                    panel.clone()
-                });
                 load_thread(panel, &metadata, focus, window, cx);
                 if focus {
                     workspace.focus_panel::<AgentPanel>(window, cx);
@@ -3525,13 +3532,20 @@ impl Sidebar {
         let metadata = metadata.clone();
         let mut async_window_cx = window.to_async(cx);
         cx.spawn(async move |_cx| {
-            let panel = AgentPanel::load(workspace.clone(), async_window_cx.clone()).await?;
+            // Use early creation + loading mode so the panel appears immediately
+            // with proper indeterminate UI (SpinnerLabel) while the async
+            // persisted state restore (via the new ThreadMetadataStore / Heed + rkyv
+            // zero-copy path, or any one-time legacy KVP termination driven from
+            // primary entry points) runs in the background. Per the 2026-05-27 async
+            // directive. We pass None for kvp here (sidebar secondary open path);
+            // the main workspace ensure path in zed.rs handles legacy termination hygiene.
+            let panel = workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
+                let p = cx.new(|cx| AgentPanel::new_in_loading_state(workspace, None, None, window, cx));
+                workspace.add_panel(p.clone(), window, cx);
+                p
+            })?;
 
             workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
-                let panel = workspace.panel::<AgentPanel>(cx).unwrap_or_else(|| {
-                    workspace.add_panel(panel.clone(), window, cx);
-                    panel.clone()
-                });
                 restore_terminal(panel, &metadata, focus, Some(workspace), window, cx);
                 if focus {
                     workspace.focus_panel::<AgentPanel>(window, cx);

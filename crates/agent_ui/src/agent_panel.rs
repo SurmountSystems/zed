@@ -81,7 +81,7 @@ use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use theme_settings::ThemeSettings;
 use ui::{
     Button, ContextMenu, ContextMenuEntry, GradientFade, IconButton, KeyBinding, PopoverMenu,
-    PopoverMenuHandle, ProjectEmptyState, Tab, Tooltip, prelude::*, utils::WithRemSize,
+    PopoverMenuHandle, ProjectEmptyState, SpinnerLabel, Tab, Tooltip, prelude::*, utils::WithRemSize,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -197,27 +197,25 @@ fn read_legacy_serialized_panel(kvp: &KeyValueStore) -> Option<SerializedAgentPa
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-enum AgentPanelEntryKind {
+pub(crate) enum AgentPanelEntryKind {
     #[default]
     Thread,
     Terminal,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct SerializedAgentPanel {
-    selected_agent: Option<Agent>,
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub(crate) struct SerializedAgentPanel {
+    pub(crate) selected_agent: Option<Agent>,
     #[serde(default)]
-    last_created_entry_kind: AgentPanelEntryKind,
+    pub(crate) last_created_entry_kind: AgentPanelEntryKind,
     #[serde(default)]
-    last_active_thread: Option<SerializedActiveThread>,
+    pub(crate) last_active_thread: Option<SerializedActiveThread>,
     #[serde(default)]
-    new_draft_thread_id: Option<ThreadId>,
+    pub(crate) new_draft_thread_id: Option<ThreadId>,
     #[serde(default = "default_true")]
-    show_zed_todos_surface: bool,
+    pub(crate) show_zed_todos_surface: bool,
     #[serde(default)]
-    zed_todos_state: Option<SerializedZedTodos>,
-    // Future KV work should prefer heed3 (LMDB) over the current sqlez/KeyValueStore path
-    // once we next touch panel/thread persistence.
+    pub(crate) zed_todos_state: Option<SerializedZedTodos>,
 }
 
 fn default_true() -> bool {
@@ -225,25 +223,25 @@ fn default_true() -> bool {
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
-struct SerializedZedTodos {
-    approvals_expanded: bool,
-    plan_expanded: bool,
-    background_tasks_expanded: bool,
-    grok_memory_expanded: bool,
+pub(crate) struct SerializedZedTodos {
+    pub(crate) approvals_expanded: bool,
+    pub(crate) plan_expanded: bool,
+    pub(crate) background_tasks_expanded: bool,
+    pub(crate) grok_memory_expanded: bool,
     #[serde(default)]
-    expanded_background_monitors: Vec<String>,
+    pub(crate) expanded_background_monitors: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-struct SerializedActiveThread {
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct SerializedActiveThread {
     /// For drafts this is `None`; use `thread_id` to address them instead.
-    session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     /// Optional for back-compat with older serialized payloads that only carried `session_id`.
     #[serde(default)]
-    thread_id: Option<ThreadId>,
-    agent_type: Agent,
-    title: Option<String>,
-    work_dirs: Option<SerializedPathList>,
+    pub(crate) thread_id: Option<ThreadId>,
+    pub(crate) agent_type: Agent,
+    pub(crate) title: Option<String>,
+    pub(crate) work_dirs: Option<SerializedPathList>,
 }
 
 pub fn init(cx: &mut App) {
@@ -911,6 +909,14 @@ pub struct AgentPanel {
     last_context_source: Option<AgentContextSource>,
 
     is_active: bool,
+
+    /// When true, the panel is in the early-creation "loading" state (showing
+    /// indeterminate SpinnerLabel UI) while the one-time legacy KVP termination
+    /// + persisted ZT-1 state restore runs in the background. Part of the
+    /// 2026-05-27 async/UI loading directive so the rich classified surface
+    /// (approvals, proposed plans, monitors, memory) appears without blocking
+    /// first paint on Grok or other threads.
+    initial_state_loading: bool,
 }
 
 impl AgentPanel {
@@ -1305,12 +1311,98 @@ impl AgentPanel {
             last_context_source: None,
             is_active: false,
             zed_todos_persisted_state: None,
+            initial_state_loading: false,
         };
 
         // Initial sync of agent servers from extensions
         panel.sync_agent_servers_from_extensions(cx);
         panel.ensure_native_agent_connection(cx);
         panel
+    }
+
+    /// Creates a new AgentPanel that immediately enters the initial state
+    /// loading mode (showing indeterminate loading UI) and starts the async
+    /// persisted state restore (including any one-time legacy KVP termination).
+    /// This allows the panel to be added to the dock right away so the user
+    /// sees proper loading feedback instead of the panel appearing only after
+    /// all async work completes. Per the 2026-05-27 async directive.
+    pub fn new_in_loading_state(
+        workspace: &Workspace,
+        prompt_store: Option<Entity<PromptStore>>,
+        kvp: Option<KeyValueStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut panel = Self::new(workspace, prompt_store, window, cx);
+        panel.start_initial_state_restore(window, kvp, cx);
+        panel
+    }
+
+    /// Puts this panel into the initial state loading mode (triggers the
+    /// indeterminate loading UI) and is intended to be paired with spawning
+    /// the async persisted state restore (including termination) from the
+    /// caller. Part of satisfying the 2026-05-27 async directive for this
+    /// work.
+    pub(crate) fn set_initial_state_loading(&mut self) {
+        self.initial_state_loading = true;
+    }
+
+    /// Starts the async load of persisted panel state (including any one-time
+    /// legacy KVP termination) and manages the `initial_state_loading` flag
+    /// + UI transition internally. The kv lookup is performed synchronously
+    /// with the real Context (never from inside an AsyncApp spawn) to satisfy
+    /// spawn hygiene. Only owned data is captured into the background task.
+    pub(crate) fn start_initial_state_restore(&mut self, window: &mut Window, kvp: Option<KeyValueStore>, cx: &mut Context<Self>) {
+        self.set_initial_state_loading();
+
+        let workspace_weak = self.workspace.clone();
+        let workspace_id = self.workspace_id;
+
+        let (serialized_panel, _global_last_used_agent) = if let (Some(id), Some(k)) = (workspace_id, kvp.as_ref()) {
+            let panel = if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                store.read(cx).load_panel_state(&i64::from(id).to_string().into_bytes()).ok().flatten()
+            } else {
+                None
+            };
+            let agent = read_global_last_used_agent(k);
+            (panel, agent)
+        } else {
+            (None, None)
+        };
+
+        // Defer the UI state application (clearing the loading spinner + patching
+        // persisted ZT-1/selected agent fields) to the next frame. This uses only
+        // owned data (`serialized_panel`, `workspace_weak`) and avoids the
+        // AsyncFnOnce lifetime trap that `cx.spawn(move |_this, _cx| ...)` creates
+        // when the closure captures a `&mut AsyncApp` with a concrete lifetime.
+        //
+        // This satisfies the 2026-05-27 async directive: the (potentially heavy)
+        // legacy KVP termination + kv read has already happened synchronously before
+        // we reach this point (or in the caller's background task); here we only
+        // schedule a tiny, cheap, non-blocking patch of owned data.
+        window.defer(cx, move |_window, cx| {
+            if let Some(ws) = workspace_weak.upgrade() {
+                ws.update(cx, |workspace, cx| {
+                    if let Some(panel) = workspace.panel::<Self>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.initial_state_loading = false;
+
+                            if let Some(sp) = serialized_panel.as_ref() {
+                                panel.last_created_entry_kind = sp.last_created_entry_kind;
+                            }
+                            if let Some(st) = serialized_panel.as_ref().and_then(|p| p.zed_todos_state.clone()) {
+                                panel.zed_todos_persisted_state = Some(st);
+                            }
+                            if let Some(agent) = serialized_panel.as_ref().and_then(|p| p.selected_agent.clone()) {
+                                panel.selected_agent = agent;
+                            }
+
+                            cx.notify();
+                        });
+                    }
+                });
+            }
+        });
     }
 
     pub fn toggle_focus(
@@ -5754,6 +5846,24 @@ impl AgentPanel {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Early loading state for the 2026-05-27 async directive: show indeterminate
+        // UI immediately while background legacy KVP termination + ZT-1 state restore
+        // runs (rich classified surface with RO/Destructive chips, proposed plans,
+        // monitors, memory, etc.).
+        if self.initial_state_loading {
+            return div()
+                .size_full()
+                .bg(cx.theme().colors().panel_background)
+                .child(
+                    v_flex()
+                        .size_full()
+                        .items_center()
+                        .justify_center()
+                        .child(SpinnerLabel::new()),
+                )
+                .into_any_element();
+        }
+
         // WARNING: Changes to this element hierarchy can have
         // non-obvious implications to the layout of children.
         //

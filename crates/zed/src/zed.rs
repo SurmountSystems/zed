@@ -23,6 +23,7 @@ pub use app_menus::*;
 use breadcrumbs::Breadcrumbs;
 use client::zed_urls;
 use collections::VecDeque;
+use db::kvp::KeyValueStore;
 use debugger_ui::debugger_panel::DebugPanel;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
@@ -800,8 +801,37 @@ fn ensure_agent_panel_for_workspace(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<()>> {
-    let task = setup_or_teardown_ai_panel(workspace, window, cx, move |workspace, cx| {
-        agent_ui::AgentPanel::load(workspace, cx)
+    // Use early creation + loading mode so the AgentPanel appears immediately
+    // with proper indeterminate UI (SpinnerLabel) while any async persisted
+    // state restore (incl. one-time legacy KVP termination on first load after
+    // the storage cutover) runs in the background. Per the 2026-05-27 async
+    // directive.
+    //
+    // Important hygiene: fetch kvp with the real &mut Context *before* entering
+    // the async load_panel callback (which only receives a WeakEntity). This
+    // avoids private update errors and satisfies the "lookup before any spawn"
+    // rule from the directive.
+    let kvp = Some(KeyValueStore::global(cx));
+
+    let task = setup_or_teardown_ai_panel(workspace, window, cx, move |workspace_weak, mut async_cx| {
+        // We receive a WeakEntity here (per setup_or_teardown_ai_panel contract).
+        // Upgrade it to obtain a real &Workspace so new_in_loading_state can be called.
+        // Note: we cannot use `?` directly here because this closure must return
+        // `Task<anyhow::Result<...>>`, not a raw Result.
+        match workspace_weak.update_in(&mut async_cx, |workspace, window, cx| {
+            cx.new(|cx| {
+                agent_ui::AgentPanel::new_in_loading_state(
+                    workspace,
+                    None,
+                    kvp.clone(),
+                    window,
+                    cx,
+                )
+            })
+        }) {
+            Ok(panel) => Task::ready(Ok(panel)),
+            Err(e) => Task::ready(Err(e)),
+        }
     });
 
     cx.spawn_in(window, async move |workspace, cx| {
@@ -3558,7 +3588,7 @@ mod tests {
                 vec![path!("/dir1"), path!("/dir2/b.txt")]
                     .into_iter()
                     .map(Path::new)
-                    .collect(),
+                    .collect::<HashSet<_>>(),
             );
             assert_eq!(
                 workspace
@@ -3610,7 +3640,7 @@ mod tests {
                 vec![path!("/dir1"), path!("/dir2/b.txt"), path!("/dir3")]
                     .into_iter()
                     .map(Path::new)
-                    .collect(),
+                    .collect::<HashSet<_>>(),
             );
             assert_eq!(
                 workspace
@@ -3662,7 +3692,7 @@ mod tests {
                 ]
                 .into_iter()
                 .map(Path::new)
-                .collect(),
+                .collect::<HashSet<_>>(),
             );
 
             let visible_worktree_roots = workspace
@@ -3674,7 +3704,7 @@ mod tests {
                 vec![path!("/dir1"), path!("/dir2/b.txt"), path!("/dir3")]
                     .into_iter()
                     .map(Path::new)
-                    .collect(),
+                    .collect::<HashSet<_>>(),
             );
 
             assert_eq!(

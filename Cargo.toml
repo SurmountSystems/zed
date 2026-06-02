@@ -598,6 +598,8 @@ handlebars = "4.3"
 heck = "0.5"
 hdrhistogram = "7"
 heed = { version = "0.21.0", features = ["read-txn-no-tls"] }
+heed3 = "=0.22.1"
+rkyv = { version = "0.8", features = ["unaligned"] }
 hex = "0.4.3"
 human_bytes = "0.4.1"
 html5ever = "0.27.0"

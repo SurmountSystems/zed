@@ -642,9 +642,11 @@ impl Editor {
                                 let row_start =
                                     buffer.point_to_offset(Point::new(start_point.row, 0));
                                 let tab_size = buffer.language_settings_at(start, cx).tab_size;
-                                let tab_size_indent = IndentSize::spaces(tab_size.get());
-                                let reduced_indent =
-                                    existing_indent.with_delta(Ordering::Less, tab_size_indent);
+                                let reduction = match existing_indent.kind {
+                                    IndentKind::Tab => IndentSize::tab(),
+                                    IndentKind::Space => IndentSize::spaces(tab_size.get()),
+                                };
+                                let reduced_indent = existing_indent.with_delta(Ordering::Less, reduction);
                                 let mut new_text = String::new();
                                 new_text.extend(reduced_indent.chars());
                                 new_text.push_str(continuation);
