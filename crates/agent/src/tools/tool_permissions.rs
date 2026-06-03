@@ -125,8 +125,8 @@ fn is_within_any_worktree(canonical_path: &Path, canonical_worktree_roots: &[Pat
 }
 
 /// If `path` is an absolute path under any global skills directory
-/// (`.agents/skills`, `.grok/skills`, or `.grok/bundled/skills` via G-15
-/// multi-root), return the canonicalized form. None outside the trees.
+/// (`.agents/skills`, `.grok/skills`, or `.grok/bundled/skills`),
+/// return the canonicalized form. None outside the trees.
 ///
 /// Gate for read_file/list_directory on global skill resources (including
 /// those inside bundled skills, whose bodies reference e.g. shared/ files
@@ -203,14 +203,12 @@ async fn expand_home_prefix(path: &Path, fs: &dyn Fs) -> Option<PathBuf> {
         return None;
     }
 
-    // Lexical ~ expansion using the same home_dir() basis as the G-15 global
-    // skills roots (agent_skills::global_skills_dir, global_grok_skills_dir,
-    // global_grok_bundled_skills_dir). This must happen before any FS
-    // canonicalize so that creatable (non-existent) tilde paths and the three
-    // global skill trees are all supported uniformly. The previous direct
-    // fs.canonicalize on a literal "~" component never worked for real or
-    // FakeFs and short-circuited the ancestor-walking logic needed for
-    // creatable paths.
+    // Lexical ~ expansion using the same home_dir() basis as the global
+    // skills roots. This must happen before any FS canonicalize so that
+    // creatable (non-existent) tilde paths and the global skill trees are
+    // all supported uniformly. The previous direct fs.canonicalize on a
+    // literal "~" component never worked for real or FakeFs and short-circuited
+    // the ancestor-walking logic needed for creatable paths.
     let home = paths::home_dir();
     let absolute_path: PathBuf = home.join(components.collect::<PathBuf>());
 
@@ -218,8 +216,7 @@ async fn expand_home_prefix(path: &Path, fs: &dyn Fs) -> Option<PathBuf> {
     // mirroring the guard in resolve_creatable_global_skill_path. This catches
     // escaped ~ paths containing "skills/.." (or sibling/other-home under the
     // lexical skills root) for creatable paths, so they are rejected before
-    // the canonical + starts_with checks on the skills dirs (Existing Features
-    // First replication of the G-15 lexical guard + normalize timing pattern).
+    // the canonical + starts_with checks on the skills dirs.
     let cleaned = normalize_path(&absolute_path);
     if !is_agents_skills_path(&cleaned) {
         return None;
@@ -243,19 +240,21 @@ async fn expand_home_prefix(path: &Path, fs: &dyn Fs) -> Option<PathBuf> {
     }
 
     let canonical_skills_dir = canonical_global_skills_dir(fs).await?;
-    if let Some(target) = is_in_linked_global_skill_dir(&cleaned, &canonical_path, &canonical_skills_dir, fs).await {
+    if let Some(target) =
+        is_in_linked_global_skill_dir(&cleaned, &canonical_path, &canonical_skills_dir, fs).await
+    {
         return Some(target);
     }
     None
 }
 
 /// If `path` names one of the global skills directories (`.agents/skills`,
-/// `.grok/skills`, or `.grok/bundled/skills` via G-15 multi-root) or one of
-/// its descendants, return a canonical absolute path for it. Unlike
-/// [`resolve_global_skill_path`], the target path may or may not exist on
-/// disk yet — the caller decides whether to read, write, or create it.
-/// Returns `None` for any other path, including siblings of the global skills
-/// trees or paths that would escape them with `..` or symlinks.
+/// `.grok/skills`, or `.grok/bundled/skills`) or one of its descendants,
+/// return a canonical absolute path for it. Unlike [`resolve_global_skill_path`],
+/// the target path may or may not exist on disk yet — the caller decides whether
+/// to read, write, or create it. Returns `None` for any other path, including
+/// siblings of the global skills trees or paths that would escape them with `..`
+/// or symlinks.
 pub async fn resolve_creatable_global_skill_path(path: &Path, fs: &dyn Fs) -> Option<PathBuf> {
     let claim = lexical_skill_claim_cleaned(path);
     if claim.is_none() {
@@ -280,7 +279,10 @@ pub async fn resolve_creatable_global_skill_path(path: &Path, fs: &dyn Fs) -> Op
         }
     }
 
-    if let Some(target) = is_in_linked_global_skill_dir(&claim.unwrap(), &canonical_path, &canonical_skills_dir, fs).await {
+    if let Some(target) =
+        is_in_linked_global_skill_dir(&claim.unwrap(), &canonical_path, &canonical_skills_dir, fs)
+            .await
+    {
         return Some(target);
     }
     None
@@ -338,7 +340,7 @@ pub async fn resolve_creatable_global_skill_descendant_path(
 
 /// Returns the kind of sensitive settings or agent skills location this path targets, if any:
 /// either inside a `.zed/` local-settings directory, inside `.agents/skills/`, `.grok/skills/`,
-/// or `.grok/bundled/skills/` (G-15 multi-root), or inside the global config dir.
+/// or `.grok/bundled/skills/`, or inside the global config dir.
 ///
 /// `canonical_worktree_roots` should be the result of
 /// [`canonicalize_worktree_roots`]; it's used to re-check the local
@@ -377,7 +379,7 @@ pub async fn sensitive_settings_kind(
     }
 
     if is_agents_skills_path(path) {
-        // Covers .agents/skills + .grok/skills + .grok/bundled/skills (G-15).
+        // Covers .agents/skills + .grok/skills + .grok/bundled/skills.
         return Some(SensitiveSettingsKind::AgentSkills);
     }
 
@@ -396,7 +398,7 @@ pub async fn sensitive_settings_kind(
                 return Some(SensitiveSettingsKind::Local);
             }
             if is_agents_skills_path(relative) {
-                // Covers .agents/skills + .grok/skills + .grok/bundled/skills (G-15).
+                // Covers .agents/skills + .grok/skills + .grok/bundled/skills.
                 return Some(SensitiveSettingsKind::AgentSkills);
             }
 
@@ -415,15 +417,13 @@ pub async fn sensitive_settings_kind(
                 return Some(SensitiveSettingsKind::AgentSkills);
             }
         }
-        // G-15 full multi-root completion (RO classification extension):
         // Add bundled canonical check for symmetry with resolve_global_skill_path
         // and the three-dir global load. Although raw `is_agents_skills_path`
-        // catches early (RO, no I/O), this ensures canonicalized paths for
-        // bundled skills (e.g. writes/PD edits) are classified AgentSkills
+        // catches early (no I/O), this ensures canonicalized paths for
+        // bundled skills (e.g. writes) are classified AgentSkills
         // (explicit "(agent skills)" prompt) rather than falling through to
-        // weaker Global/config. Permission-resilient: RO reads of bundled
-        // resources stay fast; PD writes get correct gating. Classifies this
-        // path as part of AgentSkills sensitive (not config).
+        // weaker Global/config. RO reads of bundled resources stay fast;
+        // PD writes get correct gating.
         if let Some(canonical_bundled_dir) = canonical_global_grok_bundled_skills_dir(fs).await {
             if canonical_path.starts_with(&canonical_bundled_dir) {
                 return Some(SensitiveSettingsKind::AgentSkills);

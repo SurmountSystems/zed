@@ -71,7 +71,10 @@ use uuid::Uuid;
 /// Init starts loading the PromptStore in the background and assigns
 /// a shared future to a global.
 pub fn init(cx: &mut App) {
-    let db_path = paths::prompts_dir().join("prompts-library-db.0.mdb");
+    // Use a directory (not a legacy ".mdb" file path) as the heed3 LMDB env root.
+    // This matches the agent_kv sibling and prevents MDB_INVALID when an old
+    // single-file DB (SQLite or prior data.mdb) shares the historical name on disk.
+    let db_path = paths::prompts_dir().join("prompts-library-db");
     let prompt_store_task = PromptStore::new(db_path, cx);
     let prompt_store_entity_task = cx
         .spawn(async move |cx| {
@@ -619,9 +622,9 @@ impl Iterator for RkyvMetadataLendingIter {
     }
 }
 
-/// PS-05 (lending experiment, hoisted): Tiny private GAT-style view type.
-/// The iterator is now an owning form (materialized inside the txn scope for
-/// hygiene) so the view does not need to carry a txn lifetime for the return.
+/// Private view type for the test-only lending iterator experiment.
+/// The iterator is materialized inside the transaction scope (for lifetime hygiene)
+/// so the view does not need to carry a transaction lifetime for the return value.
 #[cfg(test)]
 #[allow(dead_code)]
 struct LendingMetadataView {
@@ -740,31 +743,22 @@ impl MetadataCache {
         Ok(())
     }
 
-    /// PS-05: Primary population path from the new zero-copy view-backed metadata database.
-    /// Converts ArchivedPromptMetadata entries once at startup into the owned cache form.
-    /// Builtins are still injected for any that are missing. This becomes the preferred
-    /// source after a successful V1->V2 upgrade seeding.
+    /// Primary population path from the view-backed metadata database.
+    /// Converts archived metadata entries once at startup into the owned cache form.
+    /// Built-in prompts are injected for any that are missing. This becomes the
+    /// preferred source after a successful upgrade from the previous database format.
     #[allow(dead_code)]
     fn from_rkyv_db(
         db: Database<Bytes, RkyvCodec<ArchivedPromptMetadata>>,
         txn: &RoTxn,
     ) -> Result<Self> {
-        // PS-05-sub-11/12: Stream directly from the DB iterator (or future zero-copy
-        // view iterators such as iter_borrowed_metadata() or LendingMetadataView +
-        // for_each_borrowed) into the centralized helpers. Use
-        // `from_borrowed_view_iter` or `from_raw_lending_view_iter` when
-        // feeding from the matured views for zero extra owned collection.
-        // The DB iterator yields raw bytes + ArchivedArchivedPromptMetadata.
-        // Wrap with the adapter that produces the owned (PromptId, PromptMetadata) form
-        // the centralized helper expects (same pattern as from_borrowed_view_iter).
+        // Stream from the database iterator into the centralized population helper.
+        // Use the adapter that produces the owned (PromptId, PromptMetadata) form
+        // the helper expects.
         let items = db.iter(txn)?.filter_map(|res| {
             res.ok().map(|(key_bytes, archived)| {
-                // Direct ArchivedPromptId tuple construction + From<ArchivedPromptId> for PromptId.
-                // Exact same sibling pattern as the 571/824/1050 fixes.
                 let archived_pid = ArchivedPromptId(key_bytes.to_vec());
                 let prompt_id: PromptId = archived_pid.into();
-                // Same double-Archived hygiene as the 576 site: use the reference directly
-                // (From<&double> now exists; previous .clone() on &double was a no-op).
                 let single: ArchivedPromptMetadata = archived.into();
                 let meta: PromptMetadata = single.into();
                 (prompt_id, meta)
@@ -773,11 +767,9 @@ impl MetadataCache {
         Self::from_view_items(items)
     }
 
-    /// PS-05-sub-10: Helper that centralizes population from any source that can
-    /// produce (PromptId, PromptMetadata) pairs (including zero-copy views that
-    /// yield &ArchivedPromptMetadata converted on the fly via iter_borrowed_metadata,
-    /// LendingMetadataView + for_each_borrowed, etc.). Accepts lazy iterators
-    /// directly — no forced intermediate owned Vec allocation in the caller.
+    /// Helper that centralizes population from any source that can produce
+    /// (PromptId, PromptMetadata) pairs. Accepts lazy iterators directly so
+    /// callers do not force an intermediate owned collection.
     #[allow(dead_code)]
     fn from_view_items<I>(items: I) -> Result<Self>
     where
@@ -801,7 +793,7 @@ impl MetadataCache {
         Ok(cache)
     }
 
-    /// PS-05-sub-11/12: Adapter that accepts the exact borrowed iterator yield from
+    /// Adapter that accepts the exact borrowed iterator yield from
     /// the matured non-lending zero-copy view (`iter_borrowed_metadata()` returns
     /// items of this shape after the outer Result). Enables direct feeding from
     /// the view with zero extra owned collection layer in the caller. See sibling
@@ -833,11 +825,9 @@ impl MetadataCache {
         Ok(cache)
     }
 
-    /// PS-05-sub-12: Symmetric adapter for the raw lending view output
-    /// (`next_borrowed` / `for_each_borrowed` on LendingMetadataView yield items
-    /// of this shape). Uses the id embedded inside the ArchivedPromptMetadata
-    /// value (authoritative) so raw-key cases still populate correctly with
-    /// zero extra owned collection in the caller.
+    /// Adapter for the raw lending view output. Uses the id embedded inside
+    /// the archived metadata value (the authoritative source) so that cases
+    /// with only a raw key still populate the cache correctly.
     #[allow(dead_code)]
     fn from_raw_lending_view_iter<I>(items: I) -> Result<Self>
     where
@@ -897,11 +887,10 @@ impl PromptStore {
         async move { store.await.map_err(|err| anyhow!(err)) }
     }
 
-    /// PS-05 preparation: Encapsulates the RwLock<MetadataCache> so that internal hot paths
+    /// Encapsulates the RwLock<MetadataCache> so that internal hot paths
     /// can be migrated to a borrowed view (under the guard) without changing any public API
     /// signatures. The public methods continue to return owned values for full transition
-    /// compatibility. Future sub-slices can change the inner representation or offer an
-    /// Archived-backed view through this single helper.
+    /// compatibility.
     fn with_metadata_cache<R>(&self, f: impl FnOnce(&MetadataCache) -> R) -> R {
         let guard = self.metadata_cache.read();
         f(&guard)
@@ -930,9 +919,9 @@ impl PromptStore {
         Ok(())
     }
 
-    /// PS-05: First infrastructure for zero-copy reads against the view-backed metadata store.
+    /// Infrastructure for zero-copy reads against the view-backed metadata store.
     /// Allows internal hot paths (when the view is primary) to work directly with
-    /// &'a ArchivedPromptMetadata under a read transaction, following the same
+    /// &'a archived data under a read transaction, following the same
     /// encapsulation pattern as with_metadata_cache. Public API remains owned values.
     fn with_borrowed_metadata<R>(
         &self,
@@ -942,10 +931,10 @@ impl PromptStore {
         f(&txn, self.rkyv_metadata)
     }
 
-    /// PS-05: Convenience lookup for a single prompt's metadata from the view-backed store.
-    /// Performs the double-to-single conversion inside the txn scope so the returned
-    /// value is owned and does not borrow the RoTxn. Callers get the single
-    /// ArchivedPromptMetadata and convert onward to PromptMetadata as needed.
+    /// Convenience lookup for a single prompt's metadata from the view-backed store.
+    /// Performs the double-to-single conversion inside the transaction scope so the returned
+    /// value is owned and does not borrow the transaction. Callers get the single
+    /// archived value and convert onward to PromptMetadata as needed.
     /// Public API of PromptStore remains owned values.
     fn get_borrowed_metadata(&self, id: &PromptId) -> Result<Option<ArchivedPromptMetadata>> {
         self.with_borrowed_metadata(|txn, db| {
@@ -961,8 +950,8 @@ impl PromptStore {
         })
     }
 
-    /// PS-05: Higher-level borrowed view API foundation.
-    /// Returns an iterator over &'a ArchivedPromptMetadata directly from the view-backed store.
+    /// Higher-level borrowed view API foundation.
+    /// Returns an iterator over &'a archived metadata directly from the view-backed store.
     /// Enables list-style zero-copy operations for internal hot paths when the view is primary.
     /// Public API remains owned values.
     fn iter_borrowed_metadata(
@@ -970,19 +959,9 @@ impl PromptStore {
     ) -> Result<impl Iterator<Item = Result<(PromptId, ArchivedPromptMetadata)>>> {
         self.with_borrowed_metadata(|txn, db| {
             // Streaming over the view-backed store. Key bytes are converted using the
-            // same safe ArchivedPromptId(tuple) + From pattern as the rest of the wave.
-            // Manual raw high-API decode on the value bytes (exact sibling pattern from
-            // thread_metadata_store.rs that cleared the identical double-Archived decode
-            // symptom). This bypasses the generic RkyvCodec newtype that was producing
-            // the double form on zero-copy read from db.iter(). The consumers at the
-            // merge/population/find/upgrade sites now see single-level ArchivedPromptMetadata.
-            // Non-lending production iter: the map produces owned items (via the From
-            // from the double the DB layer gives), but the FilterMap<RoIter> adapter
-            // still carries the txn borrow. Materialize a fully owned iterator inside
-            // the closure (exact pattern used successfully earlier in the wave for
-            // non-lending iters that must be returned from with_borrowed_metadata).
-            // This makes the returned iterator a vec::IntoIter that does not borrow
-            // the txn, solving the lifetime escape at the Ok(iter) return.
+            // ArchivedPromptId newtype + From pattern. Manual decode on the value bytes
+            // to get single-level archived form. The map produces owned items so the
+            // returned iterator does not borrow the transaction.
             let iter = db
                 .iter(txn)?
                 .filter_map(|res| {
@@ -999,7 +978,7 @@ impl PromptStore {
         })
     }
 
-    /// PS-05-sub-13: Private helper that performs full zero-copy MetadataCache
+    /// Private helper that performs full zero-copy MetadataCache
     /// population using the matured non-lending borrowed view. This makes
     /// `iter_borrowed_metadata()` + `from_borrowed_view_iter` the direct source
     /// for cache construction/refresh (no raw DB access in the caller).
@@ -1008,7 +987,7 @@ impl PromptStore {
         MetadataCache::from_borrowed_view_iter(iter)
     }
 
-    /// PS-05 (experiment): Returns a lending-style iterator guard over the view-backed metadata.
+    /// Returns a lending-style iterator guard over the view-backed metadata.
     /// The yielded references are valid for the lifetime of the returned guard.
     /// This is the first small step toward reducing temporary owned conversions inside loops.
     #[cfg(test)]
@@ -1043,7 +1022,7 @@ impl PromptStore {
         })
     }
 
-    /// PS-05 (lending experiment): Small private demonstration of consuming the lending
+    /// Small private demonstration of consuming the lending
     /// iterator to perform a "collect defaults" operation. This shows the pattern and
     /// current ergonomics of the lending guard. Still performs owned conversion on
     /// yielded items for the result (as expected in this early experiment stage);
@@ -1066,7 +1045,7 @@ impl PromptStore {
         Ok(out)
     }
 
-    /// PS-05: Thin convenience wrapper on the higher-level borrowed iterator view.
+    /// Thin convenience wrapper on the higher-level borrowed iterator view.
     /// Finds a single prompt's metadata by title using zero-copy iteration over the view-backed store
     /// when it is the primary source. Used to support fast paths for title-based lookups.
     /// Returns owned PromptMetadata (the thin wrapper materializes one item for title match);
@@ -1090,7 +1069,7 @@ impl PromptStore {
         })
     }
 
-    /// PS-05 (lending experiment): Lending-aware variant of the title finder that
+    /// Lending-aware variant of the title finder that
     /// consumes the experimental lending iterator. This demonstrates using the
     /// lending guard directly for the iteration, avoiding the non-lending
     /// closure for the loop body. Still performs the
@@ -1101,7 +1080,7 @@ impl PromptStore {
         &self,
         title: &str,
     ) -> Result<Option<PromptMetadata>> {
-        // PS-05 (lending experiment): Using the new GAT-style view type's
+        // Using the new GAT-style view type's
         // `for_each_borrowed` closure driver (symmetric to the prior next_borrowed
         // wiring). This demonstrates consuming the view's full-iteration borrowed
         // ergonomics path inside a real experiment method.
@@ -1121,7 +1100,7 @@ impl PromptStore {
         Ok(found)
     }
 
-    /// PS-05: Thin convenience wrapper on the higher-level borrowed iterator view for
+    /// Thin convenience wrapper on the higher-level borrowed iterator view for
     /// the common "collect defaults" pattern. Returns owned values (for public API
     /// compatibility) while doing the filter work against the borrowed Archived data
     /// when the view is primary.
@@ -1147,13 +1126,13 @@ impl PromptStore {
         Ok(out)
     }
 
-    /// PS-05 (lending experiment): Lending-aware variant of the defaults collector
+    /// Lending-aware variant of the defaults collector
     /// that consumes the experimental lending iterator. Symmetric to the lending-aware
     /// title finder. Still performs the temporary owned conversion on yielded items
     /// (as expected in this early stage of the experiment).
     #[cfg(test)]
     fn __experiment_collect_defaults_from_view_via_lending(&self) -> Result<Vec<PromptMetadata>> {
-        // PS-05 (lending experiment): Using the new GAT-style view type's
+        // Using the new GAT-style view type's
         // `for_each_borrowed` closure driver inside this experiment method (symmetric
         // to the title finder update and to the prior next_borrowed wiring). This
         // demonstrates consuming the view's full-iteration borrowed ergonomics path.
@@ -1171,7 +1150,7 @@ impl PromptStore {
         Ok(out)
     }
 
-    /// PS-05 (lending experiment): Constructor for the tiny GAT-style view.
+    /// Constructor for the tiny GAT-style view.
     /// This is the entry point for the view type experiment.
     #[cfg(test)]
     #[allow(dead_code)]
@@ -1180,7 +1159,7 @@ impl PromptStore {
         Ok(LendingMetadataView::from_lending_iter(lending_iter))
     }
 
-    /// PS-05 (lending experiment): Small private demonstration of using the
+    /// Small private demonstration of using the
     /// GAT-style view type. This shows the ergonomics of the view (one object
     /// providing multiple methods backed by the lending iterator) compared to
     /// the raw iterator or the older thin wrappers. Still returns owned values
@@ -1231,7 +1210,7 @@ impl PromptStore {
 
             let txn = db_env.read_txn()?;
 
-            // PS-05: Prefer the zero-copy view path as the primary population source for the
+            // Prefer the zero-copy view path as the primary population source for the
             // metadata cache once any data has been seeded (post V1->V2 upgrade). This makes
             // the view-backed database the source of truth for hot cache-backed queries
             // (all_prompt_metadata, search, etc.). Fall back to the old Serde path only for
@@ -1241,7 +1220,7 @@ impl PromptStore {
             // `refresh_metadata_cache_from_view()` (and the raw-lending variant) for all
             // subsequent population and refresh work.
             let metadata_cache = if rkyv_metadata.iter(&txn)?.next().is_some() {
-                // PS-05-sub-16: Use the modern borrowed view adapters for the initial
+                // Use the modern borrowed view adapters for the initial
                 // population when the view-backed database has data. This makes the
                 // high-level zero-copy path the source even during construction.
                 // Use the same safe conversion pattern inside the filter_map that cleared
@@ -1266,7 +1245,7 @@ impl PromptStore {
                 ))?
             } else {
                 let mut cache = MetadataCache::from_db(metadata, &txn)?;
-                // PS-05-sub-16: The merge still uses the legacy helper during transition;
+                // The merge still uses the legacy helper during transition;
                 // long-term this path shrinks as the view-backed database becomes the only source.
                 let _ = cache.merge_from_view_db(rkyv_metadata, &txn);
                 cache
@@ -1283,7 +1262,7 @@ impl PromptStore {
                 rkyv_bodies,
             };
 
-            // PS-05-sub-16: Immediately after construction, refresh the cache from the
+            // Immediately after construction, refresh the cache from the
             // high-level view helper to demonstrate the modern zero-copy path.
             let _ = store.refresh_metadata_cache_from_view();
 
@@ -1494,14 +1473,14 @@ impl PromptStore {
 
         cx.spawn(async move |this, cx| {
             task.await?;
-            // PS-05-sub-14: After a successful delete, refresh the MetadataCache
+            // After a successful delete, refresh the MetadataCache
             // directly from the zero-copy view so the RwLock-backed cache stays
             // authoritative from the view-backed store (instead of only doing the narrow
             // in-memory remove).
             if let Some(this) = this.upgrade() {
                 let _ = this.read_with(cx, |this, _cx| this.refresh_metadata_cache_from_view());
             }
-            // TODO: restore proper PromptsUpdatedEvent emission after merge + PS-05 port
+            // TODO: restore proper PromptsUpdatedEvent emission after merge + view-backed port
             // this.update(cx, |_, cx| cx.emit(...)).ok();
             let _ = this; // keep the closure compiling for now
             anyhow::Ok(())
@@ -1509,7 +1488,7 @@ impl PromptStore {
     }
 
     pub fn metadata(&self, id: PromptId) -> Option<PromptMetadata> {
-        // PS-05: Zero-copy fast path when the view is primary.
+        // Zero-copy fast path when the view is primary.
         // Falls back to the owned cache (which may itself have been populated from the view).
         if let Ok(Some(archived)) = self.get_borrowed_metadata(&id) {
             return Some(archived.into()); // no clone needed; helper now returns owned single
@@ -1522,7 +1501,7 @@ impl PromptStore {
     }
 
     pub fn id_for_title(&self, title: &str) -> Option<PromptId> {
-        // PS-05: Zero-copy fast path via the thin title-finder wrapper on the higher-level borrowed view.
+        // Zero-copy fast path via the thin title-finder wrapper on the higher-level borrowed view.
         if let Ok(Some(archived)) = self.find_metadata_by_title_from_view(title) {
             return Some(archived.id); // already owned PromptMetadata; no clone + no useless .into() needed
         }
@@ -1541,7 +1520,7 @@ impl PromptStore {
         cancellation_flag: Arc<AtomicBool>,
         cx: &App,
     ) -> Task<Vec<PromptMetadata>> {
-        // PS-05: Strong zero-copy fast path using the matured borrowed view (iter_borrowed_metadata).
+        // Strong zero-copy fast path using the matured borrowed view (iter_borrowed_metadata).
         // Still materializes owned PromptMetadata for fuzzy matching (public API contract), but avoids
         // cloning the full owned cache when the view can supply the data.
         let cached_metadata = if let Ok(iter) = self.iter_borrowed_metadata() {
@@ -1650,13 +1629,13 @@ impl PromptStore {
 
         cx.spawn(async move |this, cx| {
             task.await?;
-            // PS-05-sub-14: After a successful save, refresh the MetadataCache
+            // After a successful save, refresh the MetadataCache
             // directly from the zero-copy view so the RwLock-backed cache stays
             // authoritative from the view-backed store.
             if let Some(this) = this.upgrade() {
                 let _ = this.read_with(cx, |this, _cx| this.refresh_metadata_cache_from_view());
             }
-            // TODO: restore proper PromptsUpdatedEvent emission after merge + PS-05 port
+            // TODO: restore proper PromptsUpdatedEvent emission after merge + view-backed port
             // this.update(cx, |_, cx| cx.emit(...)).ok();
             let _ = this; // keep the closure compiling for now
             anyhow::Ok(())
@@ -1709,12 +1688,12 @@ impl PromptStore {
 
         cx.spawn(async move |this, cx| {
             task.await?;
-            // PS-05-sub-14: After a successful metadata-only save, refresh the
+            // After a successful metadata-only save, refresh the
             // MetadataCache directly from the zero-copy view.
             if let Some(this) = this.upgrade() {
                 let _ = this.read_with(cx, |this, _cx| this.refresh_metadata_cache_from_view());
             }
-            // TODO: restore proper PromptsUpdatedEvent emission after merge + PS-05 port
+            // TODO: restore proper PromptsUpdatedEvent emission after merge + view-backed port
             // this.update(cx, |_, cx| cx.emit(...)).ok();
             let _ = this; // keep the closure compiling for now
             anyhow::Ok(())

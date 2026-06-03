@@ -8482,11 +8482,13 @@ async fn test_native_grok_profile_triggers_system_notification_on_exact_completi
     });
     let exact = "All current independent work is complete. No further autonomous actions are possible without additional direction.";
     thread.update(cx, |thread_instance, _cx| {
-        thread_instance.messages.push(Arc::new(Message::Agent(AgentMessage {
-            content: vec![AgentMessageContent::Text(exact.to_string())],
-            tool_results: IndexMap::default(),
-            reasoning_details: None,
-        })));
+        thread_instance
+            .messages
+            .push(Arc::new(Message::Agent(AgentMessage {
+                content: vec![AgentMessageContent::Text(exact.to_string())],
+                tool_results: IndexMap::default(),
+                reasoning_details: None,
+            })));
         // send_completion_notification_if_needed removed (notification dispatch lives in UI layer via Stopped events)
     });
     let _type_ascription_pin: () = ();

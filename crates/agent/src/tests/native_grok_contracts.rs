@@ -477,9 +477,8 @@ async fn contract_subagent_tool_registers_and_respects_feature_flag(cx: &mut Tes
     fs.insert_tree("/", json!({"a": {"b.md": "x"}})).await;
     let project = Project::test(fs.clone(), [path!("/a").as_ref()], cx).await;
     let thread_store = cx.new(|cx| ThreadStore::new(cx));
-    let agent = cx.update(|cx| {
-        NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx)
-    });
+    let agent =
+        cx.update(|cx| NativeAgent::new(thread_store.clone(), Templates::new(), fs.clone(), cx));
     let connection = Rc::new(NativeAgentConnection(agent.clone()));
 
     let acp_thread = cx

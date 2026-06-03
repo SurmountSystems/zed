@@ -685,10 +685,9 @@ impl ThreadMetadataStore {
         cx.set_global(GlobalThreadMetadataStore(thread_store));
     }
 
-    // (obsolete test-only kv constructors removed per "We do 1" full-commitment decision —
-    // see AGENTS.md 2026-05-30 LMDB recovery entry and the "no half measures" directive.
-    // The one-time legacy KVP termination path is gone; pure-kv tests use the standard
-    // GPUI test setup + ThreadMetadataStore::global / save/load_panel_state forwarding.)
+    // Test-only kv constructors removed. Pure-kv tests use the standard
+    // GPUI test setup plus ThreadMetadataStore::global and the public
+    // save/load_panel_state forwarding methods.
 
     pub fn try_global(cx: &App) -> Option<Entity<Self>> {
         cx.try_global::<GlobalThreadMetadataStore>()
@@ -1324,11 +1323,10 @@ impl ThreadMetadataStore {
         }
     }
 
-    // Our extended signature (kv_db + cx) is required for the full-commitment
-    // heed3 + rkyv ZT-1 / agent panel state migration (ROADMAP-01 / "no half
-    // measures" / "zero interest in legacy KVP"). Call sites that need the
-    // new kv path (agent_panel early creation + loading UI, etc.) pass the
-    // extra args; simpler call sites can use a thin shim if needed.
+    // The extended signature (kv_db + cx) supports call sites that construct
+    // the store with the kv backend already open (for example agent_panel
+    // early creation and loading UI paths). Simpler call sites use the
+    // thin shim that opens the backend internally.
     fn new(
         db: ThreadMetadataDb,
         kv_db: Option<HeedThreadMetadataDb>,
@@ -1887,12 +1885,13 @@ struct HeedThreadMetadataDb {
 
 #[allow(dead_code)]
 impl HeedThreadMetadataDb {
-    /// Best-effort constructor for the kv backend (agent panel + ZT-1 state).
+    /// Best-effort constructor for the kv backend used by the agent panel
+    /// and the classified persistent agent surface (approvals, plans, monitors).
     /// Returns an error instead of panicking so callers can handle the case where
     /// the backend is not yet available (e.g. very early startup).
     pub fn try_open() -> anyhow::Result<Self> {
         // Real on-disk path using the canonical Zed convention (data_dir / agent_kv).
-        // This is the kv backend for agent metadata, including the ZT-1 classified
+        // This is the kv backend for agent metadata, including the classified
         // persistent surface and thread metadata.
         let path = paths::data_dir().join("agent_kv");
         std::fs::create_dir_all(&path)?;
@@ -2236,10 +2235,8 @@ mod tests {
         cx.run_until_parked();
     }
 
-    // (final obsolete legacy KVP termination test helpers excised per "We do 1"
-    // full-commitment decision — see AGENTS.md 2026-05-30 LMDB recovery entry and
-    // the "no half measures" directive. The one-time hook + marker + legacy reader
-    // are gone; only pure-kv panel state paths remain.)
+    // Obsolete legacy KVP termination test helpers were removed when the
+    // panel state path moved to the kv backend. Only the pure-kv paths remain.
 
     #[test]
     fn test_thread_metadata_title_prefers_override() {
@@ -3044,7 +3041,7 @@ mod tests {
         };
 
         // Use Default + the public API (or Archived roundtrip) because SerializedAgentPanel
-        // fields are private after the full-commitment kv-only change for ZT-1 state.
+        // fields are private after the move to the kv-only path for the surface state.
         let original_panel = {
             let mut p = SerializedAgentPanel::default();
             p.zed_todos_state = Some(original_zt.clone());
@@ -3052,12 +3049,12 @@ mod tests {
         };
 
         // Exercise the rkyv forms directly (roundtrip via From + Archived conversions).
-        // For a meaningful ZT-1 test we still want a non-default zed_todos_state; set it
+        // For a meaningful test we still want a non-default zed_todos_state; set it
         // via the public surface if available, or construct via the Archived path below.
         let archived_panel: ArchivedSerializedAgentPanel = original_panel.clone().into();
         let roundtripped_panel: SerializedAgentPanel = archived_panel.into();
 
-        // The core assertion for the pure-kv ZT-1 roundtrip path remains.
+        // The core assertion for the pure-kv roundtrip path remains.
         assert_eq!(
             roundtripped_panel.show_zed_todos_surface,
             original_panel.show_zed_todos_surface
@@ -3125,7 +3122,7 @@ mod tests {
 
         // Pure-kv roundtrip test: use a plain byte key so we never construct a WorkspaceId
         // (whose tuple constructor is private). This exercises only the public forwarding API
-        // on ThreadMetadataStore after the full-commitment cutover.
+        // on ThreadMetadataStore after the move to the kv-only path for panel state.
         let key = b"test-panel-roundtrip-42";
 
         let archived: ArchivedSerializedAgentPanel = original_panel.into();
@@ -4459,21 +4456,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // (legacy KVP termination tests excised per "We do 1" full-commitment decision —
-    // see AGENTS.md 2026-05-30 LMDB test recovery entry and the "no half measures"
-    // directive. The one-time hook + marker + legacy reader are gone; only pure-kv
-    // panel state paths remain.)
-
-    // (The original test_panel_migration_marker_roundtrip and the following
-    // migration hook tests were removed in this slice.)
-
-    // (final obsolete legacy KVP termination test excised per "We do 1" — see AGENTS.md 2026-06-01 entry. The marker query test was part of the one-time termination hook scaffolding.)
-
-    // (final remaining dangling obsolete legacy KVP termination test fragments excised
-    // per "We do 1" — see AGENTS.md 2026-05-30 LMDB recovery entry. The hook + marker +
-    // direct KVP paths no longer exist after full-commitment cutover.)
-
-    // (obsolete legacy KVP termination test excised per "We do 1" — see AGENTS.md 2026-05-30 entry)
+    // Legacy KVP termination tests and helpers were removed when panel state
+    // moved exclusively to the kv backend. Only pure-kv paths and their tests remain.
 
     /// Regression test: archiving a thread created in a git worktree must
     /// preserve the thread's folder paths so that restoring it later does
@@ -5585,9 +5569,8 @@ impl From<ArchivedRemoteConnectionOptions> for remote::RemoteConnectionOptions {
 #[cfg(not(any(test, feature = "test-support")))]
 impl From<ArchivedRemoteConnectionOptions> for remote::RemoteConnectionOptions {
     fn from(value: ArchivedRemoteConnectionOptions) -> Self {
-        serde_json::from_slice(&value.0).unwrap_or_else(|_| {
-            remote::RemoteConnectionOptions::Ssh(Default::default())
-        })
+        serde_json::from_slice(&value.0)
+            .unwrap_or_else(|_| remote::RemoteConnectionOptions::Ssh(Default::default()))
     }
 }
 
@@ -6104,13 +6087,10 @@ impl
     }
 }
 
-// ROADMAP-01: rkyv form for ZT-1 classified surface state (SerializedZedTodos).
-// This is the first step toward moving agent panel + persistent Todos state
-// off the old KeyValueStore (sqlez) path onto heed3 + rkyv, following the
-// exact safe patterns established for PromptStore and ThreadMetadataStore.
-// Dual-path will be introduced in follow-on slices so the rich classified
-// surface (RO/Destructive chips, proposed plans, monitors, memory) can
-// benefit from zero-copy reads in native Grok Build threads.
+// rkyv form for the classified persistent agent surface state
+// (approvals, plans, background monitors, memory). This struct
+// and its adapters let the agent panel and related UI use the
+// kv backend for that data.
 
 pub struct ArchivedZedTodosState(Vec<u8>);
 

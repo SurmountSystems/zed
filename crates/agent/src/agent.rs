@@ -302,6 +302,8 @@ impl LanguageModels {
                                 "copilot_chat" => {
                                     // Copilot Chat returns an error if Copilot is not enabled, so we don't log those errors.
                                 }
+                                // Legacy OpenAI/ChatGPT providers can fail auth in harmless ways (e.g. subscription not active for ChatGPT models). Silence the error log here, matching the pattern used for other local/optional providers like lmstudio, ollama, and copilot_chat. This prevents noisy startup logs when those providers are configured but not fully set up.
+                                "openai" | "chatgpt" => {}
                                 _ => {
                                     log::error!(
                                         "Failed to authenticate provider: {}: {err:#}",

@@ -334,7 +334,7 @@ mod tests {
         );
         assert!(
             rendered.contains("When Read-Only, restrict to analysis"),
-            "capability mode text for read-only restriction must appear to feed prompt for ZT-1 and native fidelity"
+            "capability mode text for read-only restriction must appear to feed prompt for the classified agent surface and native fidelity"
         );
     }
 

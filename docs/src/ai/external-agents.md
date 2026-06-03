@@ -237,7 +237,7 @@ It's also possible to customize environment variables for registry-installed age
 
 ### Grok Build (xAI)  (our P3 bridging + ZT-1 co-equal content preserved)
 
-You can run the full [Grok Build](https://x.ai/cli) TUI agent inside Zed's agent panel via ACP for complete visual access to all Grok capabilities (plan mode, subagents with personas, skills, background tasks, MCP, etc.) while using Zed's rich diff/terminal/plan rendering.
+You can run the full [Grok Build](https://x.ai/cli) TUI agent inside Zed's agent panel via ACP for complete visual access to all Grok capabilities (plan mode, subagents with personas, skills, background tasks, MCP, etc.) while using Zed's rich diff/terminal/plan rendering. (Experience note: sub-agents have not been particularly useful in practice for Grok Build; they often confuse worktree boundaries, spin into unproductive loops, waste tokens and exhaust limits. Prefer main-agent flows.)
 
 Install Grok Build with the official script, then configure:
 
