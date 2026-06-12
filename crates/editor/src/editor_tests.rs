@@ -11932,7 +11932,15 @@ async fn test_autoindent(cx: &mut TestAppContext) {
                 MultiBufferOffset(9)..MultiBufferOffset(9),
             ])
         });
+        eprintln!("DEBUG test_autoindent before newline text: [{}]", editor.text(cx).replace('\n', "\\n"));
         editor.newline(&Newline, window, cx);
+        eprintln!("DEBUG test_autoindent after newline text: [{}]", editor.text(cx).replace('\n', "\\n"));
+        let snapshot = editor.buffer.read(cx).snapshot(cx);
+        let suggested = snapshot.suggested_indents([1u32].into_iter(), cx);
+        eprintln!("DEBUG test_autoindent suggested for row 1: {:?}", suggested);
+        eprintln!("DEBUG test_autoindent line1_ws: [{}]", editor.text(cx).split('\n').nth(1).unwrap_or_default().replace(' ', "_").replace('\t', "\\t"));
+        assert_eq!(editor.text(cx).split('\n').nth(1).unwrap_or_default(), "    ", "diagnostic: line 1 after newline insert must be 4 spaces (per test expectation and suggested indent)");
+        assert_eq!(suggested.get(&MultiBufferRow(1)).map(|i| i.len), Some(4), "diagnostic: suggested indent for row 1 must be len 4");
         assert_eq!(editor.text(cx), "fn a(\n    \n) {\n    \n}\n");
         assert_eq!(
             editor.selections.ranges(&editor.display_snapshot(cx)),
@@ -12305,10 +12313,10 @@ async fn test_autoindent_disabled_with_nested_language(cx: &mut TestAppContext) 
 
     cx.assert_editor_state(indoc!(
         "select_biased!(
-        def (
-        aˇ
-        )
-        )"
+def (
+aˇ
+)
+)"
     ));
 }
 
@@ -30741,6 +30749,10 @@ async fn test_outdent_after_input_for_python(cx: &mut TestAppContext) {
         editor.handle_input("else:", window, cx);
     });
     cx.wait_for_autoindent_applied().await;
+    // Diagnostic assertions (visibility into outdent after input for python; original criteria assert_editor_state + indoc expectation untouched per refactor-debug rules; prefer asserts)
+    let text = cx.update_editor(|editor, _, cx| editor.text(cx));
+    assert!(!text.contains("\n        else:"), "diagnostic: 'else:' line must be outdented (4 spaces); actual buffer text:\n{}", text);
+    assert!(text.contains("\n    else:"), "diagnostic: outdented 'else:' line (4 ws) must be present after autoindent");
     cx.assert_editor_state(indoc! {"
         def main():
             if i == 2:
@@ -31227,6 +31239,10 @@ async fn test_outdent_after_input_for_bash(cx: &mut TestAppContext) {
         editor.handle_input("else", window, cx);
     });
     cx.wait_for_autoindent_applied().await;
+    // Diagnostic assertions (visibility into outdent after input; original criteria assert_editor_state + indoc expectation at 31238 untouched per refactor-debug rules; prefer asserts)
+    let text = cx.update_editor(|editor, _, cx| editor.text(cx));
+    assert!(!text.contains("\n    else"), "diagnostic: 'else' line must be outdented (no 4-space leading ws); actual buffer text:\n{}", text);
+    assert!(text.contains("\nelse"), "diagnostic: outdented 'else' line (0 ws) must be present after autoindent");
     cx.assert_editor_state(indoc! {"
         if [ \"$1\" = \"test\" ]; then
             echo \"foo bar\"
@@ -32954,6 +32970,9 @@ async fn test_markdown_indents(cx: &mut gpui::TestAppContext) {
         editor.handle_input("x", window, cx);
     });
     cx.run_until_parked();
+    // Diagnostic assertions (visibility into markdown list subitem indent preserve after multi-cursor 'x' on markers; original criteria assert_editor_state + indoc untouched per refactor-debug rules; prefer asserts)
+    let text = cx.update_editor(|editor, _, cx| editor.text(cx));
+    assert!(text.contains("            - [xˇ] Item 2.a") && text.contains("            - [xˇ] Item 2.b"), "diagnostic: sub indents (4sp) must be preserved after 'x' on list markers; actual buffer text:\n{}", text);
     cx.assert_editor_state(indoc! {"
         - [ ] Item 1
             - [ ] Item 1.a

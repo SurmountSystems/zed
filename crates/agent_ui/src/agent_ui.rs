@@ -746,24 +746,17 @@ fn show_rules_to_skills_migration_toast(
 }
 
 fn maybe_backfill_editor_layout(fs: Arc<dyn Fs>, is_new_install: bool, cx: &mut App) {
-    let kvp = db::kvp::KeyValueStore::global(cx);
-    let already_backfilled =
-        util::ResultExt::log_err(kvp.read_kvp(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY))
-            .flatten()
-            .is_some();
+    let already_backfilled = thread_metadata_store::ThreadMetadataStore::global(cx)
+        .read(cx)
+        .load_agent_kv_bool(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY)
+        .unwrap_or(false);
 
     if !already_backfilled {
         if !is_new_install {
             AgentSettings::backfill_editor_layout(fs, cx);
         }
-
-        db::write_and_log(cx, move || async move {
-            kvp.write_kvp(
-                PARALLEL_AGENT_LAYOUT_BACKFILL_KEY.to_string(),
-                "1".to_string(),
-            )
-            .await
-        });
+        let store = thread_metadata_store::ThreadMetadataStore::global(cx);
+        let _ = store.read(cx).set_agent_kv_bool(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY, true);
     }
 }
 
@@ -923,7 +916,6 @@ mod tests {
     use super::*;
     use agent_settings::{AgentProfileId, AgentSettings};
     use command_palette_hooks::CommandPaletteFilter;
-    use db::kvp::KeyValueStore;
     use editor::actions::AcceptEditPrediction;
     use gpui::{BorrowAppContext, TestAppContext, px};
     use project::DisableAiSettings;
@@ -1110,6 +1102,7 @@ mod tests {
             AgentSettings::register(cx);
             DisableAiSettings::register(cx);
             cx.set_staff(true);
+            thread_metadata_store::ThreadMetadataStore::init_global(cx);
         });
 
         fs
@@ -1120,11 +1113,12 @@ mod tests {
         let fs = setup_backfill_test(cx).await;
 
         cx.update(|cx| {
-            let kvp = KeyValueStore::global(cx);
+            let store = thread_metadata_store::ThreadMetadataStore::global(cx);
             assert!(
-                kvp.read_kvp(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY)
-                    .unwrap()
-                    .is_none()
+                !store
+                    .read(cx)
+                    .load_agent_kv_bool(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY)
+                    .unwrap_or(false)
             );
 
             maybe_backfill_editor_layout(fs.clone(), false, cx);
@@ -1132,13 +1126,13 @@ mod tests {
 
         cx.run_until_parked();
 
-        let kvp = cx.update(|cx| KeyValueStore::global(cx));
-        assert!(
-            kvp.read_kvp(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY)
-                .unwrap()
-                .is_some(),
-            "flag should be set after backfill"
-        );
+        let backfilled = cx.update(|cx| {
+            thread_metadata_store::ThreadMetadataStore::global(cx)
+                .read(cx)
+                .load_agent_kv_bool(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY)
+                .unwrap_or(false)
+        });
+        assert!(backfilled, "flag should be set after backfill");
     }
 
     #[gpui::test]
@@ -1151,11 +1145,14 @@ mod tests {
 
         cx.run_until_parked();
 
-        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        let backfilled = cx.update(|cx| {
+            thread_metadata_store::ThreadMetadataStore::global(cx)
+                .read(cx)
+                .load_agent_kv_bool(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY)
+                .unwrap_or(false)
+        });
         assert!(
-            kvp.read_kvp(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY)
-                .unwrap()
-                .is_some(),
+            backfilled,
             "flag should be set even for new installs"
         );
 

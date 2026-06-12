@@ -23,7 +23,6 @@ pub use app_menus::*;
 use breadcrumbs::Breadcrumbs;
 use client::zed_urls;
 use collections::VecDeque;
-use db::kvp::KeyValueStore;
 use debugger_ui::debugger_panel::DebugPanel;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
@@ -807,16 +806,7 @@ fn ensure_agent_panel_for_workspace(
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<()>> {
     // Use early creation + loading mode so the AgentPanel appears immediately
-    // with proper indeterminate UI (SpinnerLabel) while any async persisted
-    // state restore (incl. one-time legacy KVP termination on first load after
-    // the storage cutover) runs in the background. Per the 2026-05-27 async
-    // directive.
-    //
-    // Important hygiene: fetch kvp with the real &mut Context *before* entering
-    // the async load_panel callback (which only receives a WeakEntity). This
-    // avoids private update errors and satisfies the "lookup before any spawn"
-    // rule from the directive.
-    let kvp = Some(KeyValueStore::global(cx));
+    // Persisted state restore uses the heed3/rkyv path (no kvp).
 
     let task = setup_or_teardown_ai_panel(
         workspace,
@@ -829,7 +819,7 @@ fn ensure_agent_panel_for_workspace(
             // `Task<anyhow::Result<...>>`, not a raw Result.
             match workspace_weak.update_in(&mut async_cx, |workspace, window, cx| {
                 cx.new(|cx| {
-                    agent_ui::AgentPanel::new_in_loading_state(workspace, kvp.clone(), window, cx)
+                    agent_ui::AgentPanel::new_in_loading_state(workspace, window, cx)
                 })
             }) {
                 Ok(panel) => Task::ready(Ok(panel)),
@@ -866,6 +856,7 @@ async fn initialize_agent_panel(
     // This is required for the Grok Build / Full Agent Mode experience the user expects.
     workspace_handle.update_in(&mut cx, |workspace, window, cx| {
         workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
+        window.dispatch_action(zed_actions::agent::OpenFullGrokSurface.boxed_clone(), cx);
     })?;
 
     workspace_handle.update_in(&mut cx, |workspace, window, cx| {

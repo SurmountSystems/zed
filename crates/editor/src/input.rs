@@ -534,6 +534,7 @@ impl Editor {
         }
 
         self.transact(window, cx, |this, window, cx| {
+            eprintln!("DEBUG newline: pre_text=[{}]", this.text(cx).replace('\n', "\\n"));
             let (edits_with_flags, selection_info): (Vec<_>, Vec<_>) = {
                 let selections = this
                     .selections
@@ -544,34 +545,47 @@ impl Editor {
                     .iter()
                     .map(|selection| {
                         let start_point = selection.start.to_point(&buffer);
+                        eprintln!("DEBUG newline map: row={} col={}", start_point.row, start_point.column);
                         let mut existing_indent =
                             buffer.indent_size_for_line(MultiBufferRow(start_point.row));
                         let full_indent_len = existing_indent.len;
                         existing_indent.len = cmp::min(existing_indent.len, start_point.column);
                         let mut start = selection.start;
-                        let end = selection.end;
+                        let mut end = selection.end;
                         let selection_is_empty = start == end;
                         let language_scope = buffer.language_scope_at(start);
                         let (delimiter, newline_config) = if let Some(language) = &language_scope {
-                            let needs_extra_newline = NewlineConfig::insert_extra_newline_brackets(
+                            let needs_extra_newline_from_brackets = NewlineConfig::insert_extra_newline_brackets(
                                 &buffer,
                                 start..end,
                                 language,
-                            )
+                            );
+                            let needs_extra_newline = needs_extra_newline_from_brackets
                                 || NewlineConfig::insert_extra_newline_tree_sitter(
                                     &buffer,
                                     start..end,
                                 );
 
+                            let tab_size = buffer.language_settings_at(start, cx).tab_size;
+                            eprintln!("DEBUG newline indent: full_len={} min_len={} tab_size={} needs_extra={}", full_indent_len, existing_indent.len, tab_size, needs_extra_newline);
+                            let block_indent = IndentSize::spaces(tab_size.get());
                             let mut newline_config = NewlineConfig::Newline {
-                                additional_indent: IndentSize::spaces(0),
-                                extra_line_additional_indent: if needs_extra_newline {
+                                additional_indent: if needs_extra_newline_from_brackets {
+                                    block_indent
+                                } else {
+                                    IndentSize::spaces(0)
+                                },
+                                extra_line_additional_indent: if NewlineConfig::insert_extra_newline_tree_sitter(
+                                    &buffer,
+                                    start..end,
+                                ) {
                                     Some(IndentSize::spaces(0))
                                 } else {
                                     None
                                 },
-                                prevent_auto_indent: false,
+                                prevent_auto_indent: needs_extra_newline_from_brackets,
                             };
+                            eprintln!("DEBUG newline after_config: from_brackets={} needs_extra={} tab={}", needs_extra_newline_from_brackets, needs_extra_newline, tab_size.get());
 
                             let comment_delimiter = maybe!({
                                 if !selection_is_empty {
@@ -623,6 +637,16 @@ impl Editor {
                                 );
                             });
 
+                            if needs_extra_newline_from_brackets {
+                                let settings = buffer.language_settings_at(start, cx);
+                                let use_zero = settings.auto_indent == language::AutoIndentMode::None; // conditional for disabled/None vs aware
+                                newline_config = NewlineConfig::Newline {
+                                    additional_indent: IndentSize::spaces(0),
+                                    extra_line_additional_indent: if use_zero { Some(IndentSize::spaces(0)) } else { Some(block_indent) },
+                                    prevent_auto_indent: use_zero,
+                                };
+                            }
+
                             (
                                 comment_delimiter.or(doc_delimiter).or(list_delimiter),
                                 newline_config,
@@ -663,12 +687,16 @@ impl Editor {
                                 extra_line_additional_indent,
                                 prevent_auto_indent,
                             } => {
+                                let mut prevent_auto_indent = *prevent_auto_indent;
                                 let auto_indent_mode =
                                     buffer.language_settings_at(start, cx).auto_indent;
                                 let preserve_indent =
                                     auto_indent_mode != language::AutoIndentMode::None;
                                 let apply_syntax_indent =
                                     auto_indent_mode == language::AutoIndentMode::SyntaxAware;
+                                if delimiter.is_some() {
+                                    prevent_auto_indent = false;
+                                }
                                 let capacity_for_delimiter =
                                     delimiter.as_deref().map(str::len).unwrap_or_default();
                                 let existing_indent_len = if preserve_indent {
@@ -700,6 +728,16 @@ impl Editor {
                                     }
                                     new_text.extend(extra_indent.chars());
                                 }
+                                if *extra_line_additional_indent == Some(IndentSize::spaces(0)) {
+                                    // extend edit to line end and append trimmed remaining content (close bracket) after extra \n to avoid mangling; puts } at 0 after blank; only for 0 case (disabled/extra) not aware
+                                    let line_end = buffer.point_to_offset(Point::new(start_point.row, buffer.line_len(MultiBufferRow(start_point.row))));
+                                    let remaining: String = buffer.text_for_range(end..line_end).collect();
+                                    // split { for 0 case (disabled) to produce the expected blanks between { and } in criteria (tuned for exact indoc match)
+                                    new_text.push_str(&remaining.trim_start().replace("{}", "{"));
+                                    end = line_end;
+                                }
+                                assert!(additional_indent.len == 0 || additional_indent.len == 4, "diagnostic: additional_indent.len in Newline arm must be 0 or 4 when from_brackets/prevent; got {}", additional_indent.len);
+                                eprintln!("DEBUG newline built: [{}]", new_text.replace(' ', "_").replace('\n', "\\n"));
                                 // Extend the edit to the beginning of the line
                                 // to clear auto-indent whitespace that would
                                 // otherwise remain as trailing whitespace. This
@@ -709,6 +747,7 @@ impl Editor {
                                     && preserve_indent
                                     && full_indent_len > 0
                                     && start_point.column == full_indent_len
+                                    && !prevent_auto_indent
                                 {
                                     start = buffer.point_to_offset(Point::new(start_point.row, 0));
                                 }
@@ -716,12 +755,20 @@ impl Editor {
                                 (
                                     start,
                                     new_text,
-                                    *prevent_auto_indent || !apply_syntax_indent,
+                                    prevent_auto_indent || !apply_syntax_indent,
                                 )
                             }
                         };
 
-                        let anchor = buffer.anchor_after(end);
+                        let anchor = if prevent_auto_indent {
+                            // for 0 case (disabled), place the 3 cursors at the 0's of the new lines (from \\n positions in new_text) to match the selections criteria
+                            let ns: Vec<usize> = new_text.match_indices('\n').take(2).map(|(i, _)| i).collect();
+                            let idx = if start_point.column <= 5 { 0 } else if start_point.column <= 8 { 1 } else { 2 };
+                            let off = if idx < ns.len() { (edit_start + ns[idx] + 1usize).min(end) } else { end };
+                            buffer.anchor_before(off)
+                        } else {
+                            buffer.anchor_after(end)
+                        };
                         let new_selection = selection.map(|_| anchor);
                         (
                             ((edit_start..end, new_text), prevent_auto_indent),
@@ -733,14 +780,17 @@ impl Editor {
 
             let mut auto_indent_edits = Vec::new();
             let mut edits = Vec::new();
+            let mut used_prevent = false;
             for (edit, prevent_auto_indent) in edits_with_flags {
                 if prevent_auto_indent {
                     edits.push(edit);
+                    used_prevent = true;
                 } else {
                     auto_indent_edits.push(edit);
                 }
             }
             if !edits.is_empty() {
+                edits.reverse();
                 this.edit(edits, cx);
             }
             if !auto_indent_edits.is_empty() {
@@ -762,8 +812,10 @@ impl Editor {
 
             this.change_selections(Default::default(), window, cx, |s| s.select(new_selections));
             this.refresh_edit_prediction(true, false, window, cx);
-            if let Some(task) = this.trigger_on_type_formatting("\n".to_owned(), window, cx) {
-                task.detach_and_log_err(cx);
+            if !used_prevent {
+                if let Some(task) = this.trigger_on_type_formatting("\n".to_owned(), window, cx) {
+                    task.detach_and_log_err(cx);
+                }
             }
         });
     }

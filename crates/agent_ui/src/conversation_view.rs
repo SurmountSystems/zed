@@ -1055,6 +1055,7 @@ impl ConversationView {
                             }),
                             cx,
                         );
+                        cx.notify();
                     }
                     Err(err) => {
                         this.handle_load_error(

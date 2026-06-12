@@ -11,8 +11,7 @@
 use agent::ZED_AGENT_ID;
 use agent_client_protocol::schema as acp;
 use anyhow::Context as _;
-use db::kvp::KeyValueStore;
-use gpui::{App, AppContext as _, Entity, Task};
+use gpui::{App, Entity, Task};
 use itertools::Itertools;
 use project::AgentId;
 use ui::SharedString;
@@ -20,41 +19,43 @@ use util::ResultExt as _;
 use workspace::Workspace;
 
 use crate::AgentPanel;
-use crate::thread_metadata_store::ThreadId;
-
-const NAMESPACE: &str = "agent_draft_prompts";
+use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
 
 /// Maximum length (in characters) of a draft label rendered in the sidebar.
 const MAX_LABEL_CHARS: usize = 250;
 
 pub fn read(thread_id: ThreadId, cx: &App) -> Option<Vec<acp::ContentBlock>> {
-    let kvp = KeyValueStore::global(cx);
-    let raw = kvp
-        .scoped(NAMESPACE)
-        .read(&thread_id.to_key_string())
-        .log_err()
-        .flatten()?;
+    let key = thread_id.to_key_string();
+    let raw = ThreadMetadataStore::global(cx)
+        .read(cx)
+        .load_agent_kv_string(&key)?;
     serde_json::from_str(&raw).log_err()
 }
 
 pub fn write(
     thread_id: ThreadId,
     prompt: &[acp::ContentBlock],
-    cx: &App,
+    cx: &mut App,
 ) -> Task<anyhow::Result<()>> {
-    let kvp = KeyValueStore::global(cx);
     let key = thread_id.to_key_string();
     let payload = match serde_json::to_string(prompt).context("serializing draft prompt") {
         Ok(payload) => payload,
         Err(err) => return Task::ready(Err(err)),
     };
-    cx.background_spawn(async move { kvp.scoped(NAMESPACE).write(key, payload).await })
+    let store = ThreadMetadataStore::global(cx);
+    let _ = store.update(cx, |s, _| {
+        let _ = s.set_agent_kv_string(&key, &payload);
+    });
+    Task::ready(Ok(()))
 }
 
-pub fn delete(thread_id: ThreadId, cx: &App) -> Task<anyhow::Result<()>> {
-    let kvp = KeyValueStore::global(cx);
+pub fn delete(thread_id: ThreadId, cx: &mut App) -> Task<anyhow::Result<()>> {
     let key = thread_id.to_key_string();
-    cx.background_spawn(async move { kvp.scoped(NAMESPACE).delete(key).await })
+    let store = ThreadMetadataStore::global(cx);
+    let _ = store.update(cx, |s, _| {
+        let _ = s.delete_agent_kv(&key);
+    });
+    Task::ready(Ok(()))
 }
 
 pub fn draft_has_user_content<'a>(

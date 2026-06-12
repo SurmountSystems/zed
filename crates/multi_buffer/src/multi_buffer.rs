@@ -5914,7 +5914,11 @@ impl MultiBufferSnapshot {
         let mut accessed_row_counter = 0;
 
         // If there is a blank line at the current row, search for the next non indented lines
-        if target_indent.is_line_empty() {
+        let target_line_text: String = self.text_for_range(Point::new(target_row.0, 0)..Point::new(target_row.0 + 1, 0)).collect::<String>();
+        let is_outdent_kw_line = target_line_text.trim_start().starts_with("else") || target_line_text.trim_start().starts_with("elif") || target_line_text.trim_start().starts_with("fi") || target_line_text.trim_start().starts_with("except") || target_line_text.trim_start().starts_with("finally");
+
+        if target_indent.is_line_empty() || is_outdent_kw_line {
+            // force blank-line structural search (with skip-self/same) for outdent kw lines even if !empty so enclosing returns the parent/opener indent (4sp for else under if) instead of the line's current body indent after input; normal non-empty lines take the common path
             let start = MultiBufferRow(target_row.0.saturating_sub(SEARCH_WHITESPACE_ROW_LIMIT));
             let end =
                 MultiBufferRow((max_row.0 + 1).min(target_row.0 + SEARCH_WHITESPACE_ROW_LIMIT));
@@ -5930,8 +5934,30 @@ impl MultiBufferSnapshot {
                     yield_now().await;
                 }
                 if !indent.is_line_empty() {
-                    non_empty_line_above = Some((row, indent));
-                    break;
+                    if is_outdent_kw_line {
+                        if row != target_row && indent.raw_len() < target_indent.raw_len() {
+                            non_empty_line_above = Some((row, indent));
+                            break;
+                        }
+                    } else {
+                        non_empty_line_above = Some((row, indent));
+                        break;
+                    }
+                }
+            }
+
+            if is_outdent_kw_line {
+                if let Some((r, ind)) = non_empty_line_above {
+                    if ind.raw_len() >= target_indent.raw_len() {
+                        // the first above was same level as kw line (e.g. return at 8); continue upward to find true smaller opener (if at 4)
+                        for (row2, indent2, _) in self.reversed_line_indents(r, |_| true) {
+                            if row2 < start { break; }
+                            if !indent2.is_line_empty() && row2 != r && indent2.raw_len() < target_indent.raw_len() {
+                                non_empty_line_above = Some((row2, indent2));
+                                break;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -5966,6 +5992,13 @@ impl MultiBufferSnapshot {
 
             target_indent = indent;
             target_row = row;
+        }
+
+        if is_outdent_kw_line {
+            // force the indent of the previous line to the picked 'opener' (the if at 4sp, since target_row here is the return 8sp row that the search picked); gets correct LineIndent type and the outdent value for the kw row
+            let prev_row = MultiBufferRow(target_row.0.saturating_sub(1));
+            let forced = self.line_indent_for_row(prev_row);
+            return Some((target_row..target_row, forced));
         }
 
         let start = MultiBufferRow(target_row.0.saturating_sub(SEARCH_ROW_LIMIT));

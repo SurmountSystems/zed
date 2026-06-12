@@ -1428,6 +1428,18 @@ mod tests {
             // update_title updates UI-visible session metadata but
             // does not use tool permission rules.
             "update_title",
+            // enter_plan_mode controls plan-mode workflow entry (meta control
+            // surface) but does not use tool permission rules.
+            "enter_plan_mode",
+            // monitor starts background monitors for logs/events (meta/dev
+            // tool) but does not use tool permission rules.
+            "monitor",
+            // get_command_or_subagent_output retrieves output from background
+            // tasks/subagents (meta/dev tool) but does not use tool permission rules.
+            "get_command_or_subagent_output",
+            // todo_write creates/manages structured task lists for the agent
+            // (meta control) but does not use tool permission rules.
+            "todo_write",
         ];
 
         let tool_info_ids: Vec<&str> = TOOLS.iter().map(|t| t.id).collect();

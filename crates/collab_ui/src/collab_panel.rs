@@ -1205,7 +1205,7 @@ impl CollabPanel {
         .into();
 
         ListItem::new(project_id as usize)
-            .height(rems_from_px(24.))
+            .height(rems_from_px(24_f32))
             .toggle_state(is_selected)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.workspace
@@ -1246,7 +1246,7 @@ impl CollabPanel {
         let id = peer_id.map_or(usize::MAX, |id| id.as_u64() as usize);
 
         ListItem::new(("screen", id))
-            .height(rems_from_px(24.))
+            .height(rems_from_px(24_f32))
             .toggle_state(is_selected)
             .start_slot(
                 h_flex()
@@ -1293,7 +1293,7 @@ impl CollabPanel {
         let has_channel_buffer_changed = channel_store.has_channel_buffer_changed(channel_id);
 
         ListItem::new("channel-notes")
-            .height(rems_from_px(24.))
+            .height(rems_from_px(24_f32))
             .toggle_state(is_selected)
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_channel_notes(channel_id, window, cx);
@@ -3310,7 +3310,7 @@ impl CollabPanel {
             (IconName::Star, Color::Default, "Add to Favorites")
         };
 
-        let height = rems_from_px(24.);
+        let height = rems_from_px(24_f32);
 
         h_flex()
             .id(ix)

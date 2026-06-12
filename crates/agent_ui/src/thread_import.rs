@@ -3,7 +3,6 @@ use agent::ThreadStore;
 use agent_client_protocol::schema as acp;
 use chrono::Utc;
 use collections::HashSet;
-use db::kvp::Dismissable;
 use db::sqlez;
 use fs::Fs;
 use futures::FutureExt as _;
@@ -34,30 +33,34 @@ pub struct CrossChannelImportOnboarding;
 
 impl AcpThreadImportOnboarding {
     pub fn dismissed(cx: &App) -> bool {
-        <Self as Dismissable>::dismissed(cx)
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .load_agent_kv_bool("dismissed-acp-thread-import")
+            .unwrap_or(false)
     }
 
     pub fn dismiss(cx: &mut App) {
-        <Self as Dismissable>::set_dismissed(true, cx);
+        let store = ThreadMetadataStore::global(cx);
+        let _ = store.update(cx, |s, _| {
+            let _ = s.set_agent_kv_bool("dismissed-acp-thread-import", true);
+        });
     }
-}
-
-impl Dismissable for AcpThreadImportOnboarding {
-    const KEY: &'static str = "dismissed-acp-thread-import";
 }
 
 impl CrossChannelImportOnboarding {
     pub fn dismissed(cx: &App) -> bool {
-        <Self as Dismissable>::dismissed(cx)
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .load_agent_kv_bool("dismissed-cross-channel-thread-import")
+            .unwrap_or(false)
     }
 
     pub fn dismiss(cx: &mut App) {
-        <Self as Dismissable>::set_dismissed(true, cx);
+        let store = ThreadMetadataStore::global(cx);
+        let _ = store.update(cx, |s, _| {
+            let _ = s.set_agent_kv_bool("dismissed-cross-channel-thread-import", true);
+        });
     }
-}
-
-impl Dismissable for CrossChannelImportOnboarding {
-    const KEY: &'static str = "dismissed-cross-channel-thread-import";
 }
 
 /// Returns the list of non-Dev, non-current release channels that have
@@ -402,7 +405,7 @@ impl Render for ThreadImportModal {
                         Section::new().child(
                             v_flex()
                                 .id("thread-import-agent-list")
-                                .max_h(rems_from_px(320.))
+                                .max_h(rems_from_px(320_f32))
                                 .pb_1()
                                 .overflow_y_scroll()
                                 .when(has_agents, |this| this.children(agent_rows))
@@ -431,7 +434,7 @@ impl Render for ThreadImportModal {
                                     .disabled(disabled_import_thread)
                                     .key_binding(
                                         KeyBinding::for_action(&menu::SecondaryConfirm, cx)
-                                            .map(|kb| kb.size(rems_from_px(12.))),
+                                            .map(|kb| kb.size(rems_from_px(12_f32))),
                                     )
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.import_threads(&menu::SecondaryConfirm, window, cx);

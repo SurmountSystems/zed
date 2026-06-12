@@ -179,7 +179,7 @@ fn test_rules_to_skills_migration_resilient_on_prompt_store_load_failure() {
     // PromptStore::new plus the one-time hook. This test asserts the error branch
     // contract directly.
     let default_result = MigrationResult::default();
-    assert!(default_result.migrated_count == 0 && default_result.errors.is_empty());
+    assert!(default_result.is_empty());
 }
 
 async fn run_rules_to_skills_migration(

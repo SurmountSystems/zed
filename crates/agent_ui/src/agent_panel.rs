@@ -16,7 +16,6 @@ use agent_client_protocol::schema as acp;
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
 use collections::HashSet;
-use db::kvp::{Dismissable, KeyValueStore};
 use itertools::Itertools;
 use project::AgentId;
 use serde::{Deserialize, Serialize};
@@ -43,7 +42,7 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{ArchivedSerializedAgentPanel, ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
 use crate::{
     AddContextServer,
     AgentDiffPane,
@@ -117,10 +116,9 @@ use workspace::{
     item::ItemEvent,
 };
 
-const AGENT_PANEL_KEY: &str = "agent_panel";
 const MIN_PANEL_WIDTH: Pixels = px(300.);
-const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
-const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
+/// Panel identity key for dock/workspace layout.
+const AGENT_PANEL_KEY: &str = "agent_panel";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
@@ -216,29 +214,25 @@ struct LastCreatedEntryKind {
     entry_kind: AgentPanelEntryKind,
 }
 
-/// Reads the most recently used agent across all workspaces. Used as a fallback
-/// when opening a workspace that has no per-workspace agent preference yet.
-fn read_global_last_used_agent(kvp: &KeyValueStore) -> Option<Agent> {
-    kvp.read_kvp(LAST_USED_AGENT_KEY)
-        .log_err()
-        .flatten()
-        .and_then(|json| serde_json::from_str::<LastUsedAgent>(&json).log_err())
+fn read_global_last_used_agent(cx: &App) -> Option<Agent> {
+    ThreadMetadataStore::try_global(cx)
+        .and_then(|store| store.read(cx).load_global_json(b"last_used_agent"))
+        .and_then(|json| serde_json::from_str::<LastUsedAgent>(&json).ok())
         .map(|entry| entry.agent)
 }
 
-async fn write_global_last_used_agent(kvp: KeyValueStore, agent: Agent) {
-    if let Some(json) = serde_json::to_string(&LastUsedAgent { agent }).log_err() {
-        kvp.write_kvp(LAST_USED_AGENT_KEY.to_string(), json)
-            .await
-            .log_err();
+fn write_global_last_used_agent(agent: Agent, cx: &App) {
+    if let Some(json) = serde_json::to_string(&LastUsedAgent { agent }).ok() {
+        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+            let _ = store.read(cx).save_global_json(b"last_used_agent", json);
+        }
     }
 }
 
-fn read_global_last_created_entry_kind(kvp: &KeyValueStore) -> Option<AgentPanelEntryKind> {
-    kvp.read_kvp(LAST_CREATED_ENTRY_KIND_KEY)
-        .log_err()
-        .flatten()
-        .and_then(|json| serde_json::from_str::<LastCreatedEntryKind>(&json).log_err())
+fn read_global_last_created_entry_kind(cx: &App) -> Option<AgentPanelEntryKind> {
+    ThreadMetadataStore::try_global(cx)
+        .and_then(|store| store.read(cx).load_global_last_created_entry_kind_json())
+        .and_then(|json| serde_json::from_str::<LastCreatedEntryKind>(&json).ok())
         .map(|entry| entry.entry_kind)
 }
 
@@ -296,45 +290,47 @@ fn open_project_rules(workspace: &mut Workspace, window: &mut Window, cx: &mut C
     }
 }
 
-async fn write_global_last_created_entry_kind(kvp: KeyValueStore, entry_kind: AgentPanelEntryKind) {
-    if let Some(json) = serde_json::to_string(&LastCreatedEntryKind { entry_kind }).log_err() {
-        kvp.write_kvp(LAST_CREATED_ENTRY_KIND_KEY.to_string(), json)
-            .await
-            .log_err();
+fn write_global_last_created_entry_kind(entry_kind: AgentPanelEntryKind, cx: &App) {
+    if let Some(json) = serde_json::to_string(&LastCreatedEntryKind { entry_kind }).ok() {
+        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+            let _ = store.read(cx).save_global_last_created_entry_kind_json(json);
+        }
+    }
+}
+
+fn dismissed(key: &str, cx: &App) -> bool {
+    ThreadMetadataStore::try_global(cx)
+        .and_then(|s| s.read(cx).load_global_json(key.as_bytes()))
+        .is_some_and(|v| v == "1")
+}
+
+fn set_dismissed(key: &str, is_d: bool, cx: &App) {
+    if let Some(store) = ThreadMetadataStore::try_global(cx) {
+        let val = if is_d { "1" } else { "0" };
+        let _ = store.read(cx).save_global_json(key.as_bytes(), val.to_string());
     }
 }
 
 fn read_serialized_panel(
     workspace_id: workspace::WorkspaceId,
-    kvp: &KeyValueStore,
+    cx: &App,
 ) -> Option<SerializedAgentPanel> {
-    let scope = kvp.scoped(AGENT_PANEL_KEY);
-    let key = i64::from(workspace_id).to_string();
-    scope
-        .read(&key)
-        .log_err()
-        .flatten()
-        .and_then(|json| serde_json::from_str::<SerializedAgentPanel>(&json).log_err())
+    let key = i64::from(workspace_id).to_string().into_bytes();
+    ThreadMetadataStore::try_global(cx)
+        .and_then(|store| store.read(cx).load_panel_state(&key).ok().flatten())
 }
 
-async fn save_serialized_panel(
+fn save_serialized_panel(
     workspace_id: workspace::WorkspaceId,
     panel: SerializedAgentPanel,
-    kvp: KeyValueStore,
+    cx: &App,
 ) -> Result<()> {
-    let scope = kvp.scoped(AGENT_PANEL_KEY);
-    let key = i64::from(workspace_id).to_string();
-    scope.write(key, serde_json::to_string(&panel)?).await?;
+    let key = i64::from(workspace_id).to_string().into_bytes();
+    if let Some(store) = ThreadMetadataStore::try_global(cx) {
+        let archived: ArchivedSerializedAgentPanel = panel.into();
+        let _ = store.read(cx).save_panel_state(&key, &archived);
+    }
     Ok(())
-}
-
-/// Migration: reads the original single-panel format stored under the
-/// `"agent_panel"` KVP key before per-workspace keying was introduced.
-fn read_legacy_serialized_panel(kvp: &KeyValueStore) -> Option<SerializedAgentPanel> {
-    kvp.read_kvp(AGENT_PANEL_KEY)
-        .log_err()
-        .flatten()
-        .and_then(|json| serde_json::from_str::<SerializedAgentPanel>(&json).log_err())
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -561,10 +557,10 @@ pub fn init(cx: &mut App) {
                                 .store(false, Ordering::Release);
                         });
                     }
-                    OnboardingUpsell::set_dismissed(false, cx);
+                    set_dismissed("dismissed-trial-upsell", false, cx);
                 })
                 .register_action(|_workspace, _: &ResetTrialEndUpsell, _window, cx| {
-                    TrialEndUpsell::set_dismissed(false, cx);
+                    set_dismissed("dismissed-trial-end-upsell", false, cx);
                 })
                 .register_action(|_workspace, _: &ResetFastModeWarnings, _window, cx| {
                     reset_fast_mode_warnings(cx);
@@ -1281,31 +1277,26 @@ impl AgentPanel {
 
         let zed_todos_state_for_serialize = self.zed_todos_persisted_state.clone();
 
-        let kvp = KeyValueStore::global(cx);
-        self.pending_serialization = Some(cx.background_spawn(async move {
-            save_serialized_panel(
-                workspace_id,
-                SerializedAgentPanel {
-                    selected_agent: Some(selected_agent),
-                    last_created_entry_kind,
-                    last_active_thread,
-                    last_active_terminal_id,
-                    new_draft_thread_id,
-                    show_zed_todos_surface,
-                    zed_todos_state: zed_todos_state_for_serialize,
-                },
-                kvp,
-            )
-            .await?;
-            anyhow::Ok(())
-        }));
+        let _ = save_serialized_panel(
+            workspace_id,
+            SerializedAgentPanel {
+                selected_agent: Some(selected_agent),
+                last_created_entry_kind,
+                last_active_thread,
+                last_active_terminal_id,
+                new_draft_thread_id,
+                show_zed_todos_surface,
+                zed_todos_state: zed_todos_state_for_serialize,
+            },
+            cx,
+        );
+        self.pending_serialization = None;
     }
 
     pub fn load(
         workspace: WeakEntity<Workspace>,
-        mut cx: AsyncWindowContext,
+        cx: AsyncWindowContext,
     ) -> Task<Result<Entity<Self>>> {
-        let kvp = cx.update(|_window, cx| KeyValueStore::global(cx)).ok();
         cx.spawn(async move |cx| {
             let workspace_id = workspace
                 .read_with(cx, |workspace, _| workspace.database_id())
@@ -1313,20 +1304,13 @@ impl AgentPanel {
                 .flatten();
 
             let (serialized_panel, global_last_used_agent, global_last_created_entry_kind) = cx
-                .background_spawn(async move {
-                    match kvp {
-                        Some(kvp) => {
-                            let panel = workspace_id
-                                .and_then(|id| read_serialized_panel(id, &kvp))
-                                .or_else(|| read_legacy_serialized_panel(&kvp));
-                            let global_agent = read_global_last_used_agent(&kvp);
-                            let global_entry_kind = read_global_last_created_entry_kind(&kvp);
-                            (panel, global_agent, global_entry_kind)
-                        }
-                        None => (None, None, None),
-                    }
+                .update(|_w, cx| {
+                    let panel = workspace_id.and_then(|id| read_serialized_panel(id, cx));
+                    let global_agent = read_global_last_used_agent(cx);
+                    let global_entry_kind = read_global_last_created_entry_kind(cx);
+                    (panel, global_agent, global_entry_kind)
                 })
-                .await;
+                .unwrap_or((None, None, None));
 
             let has_open_project = workspace
                 .read_with(cx, |workspace, cx| !workspace.root_paths(cx).is_empty())
@@ -1671,7 +1655,7 @@ impl AgentPanel {
             selected_agent: Agent::default(),
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
-            new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
+            new_user_onboarding_upsell_dismissed: AtomicBool::new(dismissed("dismissed-trial-upsell", cx)),
             _base_view_observation: None,
             _draft_editor_observation: None,
             _active_draft_reclaim_observation: None,
@@ -1688,39 +1672,36 @@ impl AgentPanel {
 
     /// Creates a new AgentPanel that immediately enters the initial state
     /// loading mode (showing indeterminate loading UI) and starts the async
-    /// persisted state restore (including any one-time legacy KVP termination).
+    /// persisted state restore.
     /// This allows the panel to be added to the dock right away so the user
     /// sees proper loading feedback instead of the panel appearing only after
-    /// all async work completes. Per the 2026-05-27 async directive.
+    /// all async work completes.
     pub fn new_in_loading_state(
         workspace: &Workspace,
-        kvp: Option<KeyValueStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut panel = Self::new(workspace, window, cx);
-        panel.start_initial_state_restore(window, kvp, cx);
+        panel.start_initial_state_restore(window, cx);
         panel
     }
 
     /// Puts this panel into the initial state loading mode (triggers the
     /// indeterminate loading UI) and is intended to be paired with spawning
     /// the async persisted state restore (including termination) from the
-    /// caller. Part of satisfying the 2026-05-27 async directive for this
-    /// work.
+    /// caller.
     pub(crate) fn set_initial_state_loading(&mut self) {
         self.initial_state_loading = true;
     }
 
     /// Starts the async load of persisted panel state (including any one-time
-    /// legacy KVP termination) and manages the `initial_state_loading` flag
+    /// and manages the `initial_state_loading` flag
     /// + UI transition internally. The kv lookup is performed synchronously
     /// with the real Context (never from inside an AsyncApp spawn) to satisfy
     /// spawn hygiene. Only owned data is captured into the background task.
     pub(crate) fn start_initial_state_restore(
         &mut self,
         window: &mut Window,
-        kvp: Option<KeyValueStore>,
         cx: &mut Context<Self>,
     ) {
         self.set_initial_state_loading();
@@ -1728,33 +1709,21 @@ impl AgentPanel {
         let workspace_weak = self.workspace.clone();
         let workspace_id = self.workspace_id;
 
-        let (serialized_panel, _global_last_used_agent) =
-            if let (Some(id), Some(k)) = (workspace_id, kvp.as_ref()) {
-                let panel = if let Some(store) = ThreadMetadataStore::try_global(cx) {
+        let (serialized_panel, _global_last_used_agent) = if let Some(id) = workspace_id {
+            let panel = ThreadMetadataStore::try_global(cx)
+                .and_then(|store| {
                     store
                         .read(cx)
                         .load_panel_state(&i64::from(id).to_string().into_bytes())
                         .ok()
                         .flatten()
-                } else {
-                    None
-                };
-                let agent = read_global_last_used_agent(k);
-                (panel, agent)
-            } else {
-                (None, None)
-            };
+                });
+            let agent = read_global_last_used_agent(cx);
+            (panel, agent)
+        } else {
+            (None, None)
+        };
 
-        // Defer the UI state application (clearing the loading spinner + patching
-        // persisted ZT-1/selected agent fields) to the next frame. This uses only
-        // owned data (`serialized_panel`, `workspace_weak`) and avoids the
-        // AsyncFnOnce lifetime trap that `cx.spawn(move |_this, _cx| ...)` creates
-        // when the closure captures a `&mut AsyncApp` with a concrete lifetime.
-        //
-        // This satisfies the 2026-05-27 async directive: the (potentially heavy)
-        // legacy KVP termination + kv read has already happened synchronously before
-        // we reach this point (or in the caller's background task); here we only
-        // schedule a tiny, cheap, non-blocking patch of owned data.
         window.defer(cx, move |_window, cx| {
             if let Some(ws) = workspace_weak.upgrade() {
                 ws.update(cx, |workspace, cx| {
@@ -2058,7 +2027,7 @@ impl AgentPanel {
     }
 
     /// Reattaches the panel's new-draft slot to the persisted `thread_id`,
-    /// seeding the editor with any prompt text from the draft-prompt kvp
+    /// seeding the editor with any prompt text from the draft-prompt storage
     /// store.
     ///
     /// If the active view already holds this thread — because the user's
@@ -2206,13 +2175,7 @@ impl AgentPanel {
             self.serialize(cx);
         }
 
-        cx.background_spawn({
-            let kvp = KeyValueStore::global(cx);
-            async move {
-                write_global_last_created_entry_kind(kvp, entry_kind).await;
-            }
-        })
-        .detach();
+        write_global_last_created_entry_kind(entry_kind, cx);
     }
 
     fn spawn_terminal(
@@ -3339,14 +3302,7 @@ impl AgentPanel {
             if self.selected_agent != original {
                 self.selected_agent = original.clone();
                 self.serialize(cx);
-                // Restore the last-used-agent in persistent storage as well.
-                cx.background_spawn({
-                    let kvp = KeyValueStore::global(cx);
-                    async move {
-                        write_global_last_used_agent(kvp, original).await;
-                    }
-                })
-                .detach();
+                write_global_last_used_agent(original, cx);
             }
         }
         let thread_id = thread.conversation_view.read(cx).thread_id;
@@ -4917,8 +4873,7 @@ impl AgentPanel {
 
         // Not in memory. Build a fresh ConversationView. For drafts we
         // also seed the message editor with any prompt text the user had
-        // typed before closing the window (persisted in the scoped kvp
-        // draft-prompt store).
+        // typed before closing the window (persisted in the draft-prompt store).
         let is_draft = ThreadMetadataStore::try_global(cx)
             .and_then(|store| store.read(cx).entry(thread_id).map(|m| m.is_draft()))
             .unwrap_or(false);
@@ -5033,14 +4988,7 @@ impl AgentPanel {
             self.serialize(cx);
         }
 
-        cx.background_spawn({
-            let kvp = KeyValueStore::global(cx);
-            let agent = agent.clone();
-            async move {
-                write_global_last_used_agent(kvp, agent).await;
-            }
-        })
-        .detach();
+        write_global_last_used_agent(agent.clone(), cx);
 
         let server = server_override
             .unwrap_or_else(|| agent.server(self.fs.clone(), self.thread_store.clone()));
@@ -5085,6 +5033,12 @@ impl AgentPanel {
                 } else {
                     cx.emit(AgentPanelEvent::EntryChanged);
                 }
+                if this.is_grok_build_context(cx)
+                    && server_view.read(cx).root_thread(cx).is_some()
+                    && !matches!(this.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
+                {
+                    this.ensure_grok_categorized_surface(window, cx);
+                }
                 cx.notify();
             },
         )
@@ -5114,6 +5068,15 @@ impl AgentPanel {
             )
             .detach();
         }
+
+        cx.subscribe_in(
+            &conversation_view,
+            window,
+            |this, _view, _event: &RootThreadUpdated, window, cx| {
+                this.ensure_grok_categorized_surface(window, cx);
+            },
+        )
+        .detach();
 
         AgentThread { conversation_view }
     }
@@ -6836,7 +6799,7 @@ impl AgentPanel {
     }
 
     fn should_render_trial_end_upsell(&self, cx: &mut Context<Self>) -> bool {
-        if TrialEndUpsell::dismissed(cx) {
+        if dismissed("dismissed-trial-end-upsell", cx) {
             return false;
         }
 
@@ -6866,7 +6829,7 @@ impl AgentPanel {
     fn dismiss_ai_onboarding(&mut self, cx: &mut Context<Self>) {
         self.new_user_onboarding_upsell_dismissed
             .store(true, Ordering::Release);
-        OnboardingUpsell::set_dismissed(true, cx);
+        set_dismissed("dismissed-trial-upsell", true, cx);
         cx.notify();
     }
 
@@ -6953,7 +6916,7 @@ impl AgentPanel {
                     let this = cx.entity();
                     move |_, cx| {
                         this.update(cx, |_this, cx| {
-                            TrialEndUpsell::set_dismissed(true, cx);
+                            set_dismissed("dismissed-trial-end-upsell", true, cx);
                             cx.notify();
                         });
                     }
@@ -7116,10 +7079,9 @@ impl AgentPanel {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Early loading state for the 2026-05-27 async directive: show indeterminate
-        // UI immediately while the persisted classified agent surface state
-        // (approvals with risk chips, plans, monitors, memory) is restored
-        // in the background.
+        // Early loading state: show indeterminate UI immediately while the
+        // persisted classified agent surface state (approvals with risk chips,
+        // plans, monitors, memory) is restored in the background.
         if self.initial_state_loading {
             return div()
                 .size_full()
@@ -7216,17 +7178,9 @@ impl Render for AgentPanel {
     }
 }
 
-struct OnboardingUpsell;
 
-impl Dismissable for OnboardingUpsell {
-    const KEY: &'static str = "dismissed-trial-upsell";
-}
 
-struct TrialEndUpsell;
 
-impl Dismissable for TrialEndUpsell {
-    const KEY: &'static str = "dismissed-trial-end-upsell";
-}
 
 /// Test-only helper methods
 #[cfg(any(test, feature = "test-support"))]
@@ -7236,7 +7190,7 @@ impl AgentPanel {
     }
 
     /// Drops a thread's `ConversationView` from `retained_threads` without
-    /// deleting its metadata or kvp state. Simulates the post-restart
+    /// deleting its metadata or state. Simulates the post-restart
     pub fn test_unload_retained_thread(&mut self, id: ThreadId) -> bool {
         self.retained_threads.remove(&id).is_some()
     }
@@ -7786,10 +7740,8 @@ mod tests {
         let workspace_a_id = workspace_a
             .read_with(cx, |workspace, _cx| workspace.database_id())
             .expect("workspace A should have a database id");
-        let kvp = cx.update(|_window, cx| KeyValueStore::global(cx));
         let serialized_a: SerializedAgentPanel = cx
-            .background_spawn(async move { read_serialized_panel(workspace_a_id, &kvp) })
-            .await
+            .update(|_w, cx| read_serialized_panel(workspace_a_id, cx))
             .expect("workspace A should serialize panel state");
         assert!(
             serialized_a.last_active_thread.is_some(),
@@ -7799,10 +7751,6 @@ mod tests {
             serialized_a.last_active_terminal_id.is_none(),
             "active thread serialization should not also include a terminal restore target"
         );
-
-        cx.update(|_window, cx| {
-            ThreadMetadataStore::init_global(cx);
-        });
 
         // Load fresh panels for each workspace and verify independent state.
         let async_cx = cx.update(|window, cx| window.to_async(cx));
@@ -7877,11 +7825,20 @@ mod tests {
         });
         let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
 
+        let _stub_connection =
+            crate::test_support::set_stub_agent_connection(StubAgentConnection::new());
+
         let panel = workspace.update_in(cx, |workspace, window, cx| {
             let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
             workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<AgentPanel>(window, cx);
             panel
         });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            Editor::new_file(workspace, &Default::default(), window, cx);
+        });
+        cx.run_until_parked();
 
         // Replicate the dispatch sequence from the working e2e grok full agent mode test in this file
         // (test_e2e_full_agent_mode_complete_user_flow... at ~13787): cx.dispatch_action(NewGrokThread)
@@ -7893,14 +7850,33 @@ mod tests {
         // Followed by extra parks as in sibling roundtrips. This makes the hermetic red TDD pass the
         // surface + pre-expanded asserts while exercising the real prod paths for the mandated Grok default
         // (fully maximized ZT-1 overlay). The sibling pure-load guard test remains untouched.
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<AgentPanel>(window, cx);
+        });
+        cx.run_until_parked();
         cx.dispatch_action(NewGrokThread {
             resume_session_id: None,
         });
         cx.run_until_parked();
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_external_thread_with_server(
+                Rc::new(StubAgentServer::default_response()),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, _cx| {
+            panel.selected_agent = Agent::Custom { id: "grok".into() };
+        });
+        cx.run_until_parked();
         cx.dispatch_action(OpenFullGrokSurface);
         cx.run_until_parked();
-        for _ in 0..4 {
+        for _ in 0..50 {
             cx.run_until_parked();
+            if panel.read_with(cx, |p, _| matches!(p.overlay_view, Some(OverlayView::ZedTodosSurface(_)))) {
+                break;
+            }
         }
 
         panel.read_with(cx, |panel, _cx| {
@@ -7976,7 +7952,7 @@ mod tests {
 
         loaded.read_with(cx, |panel, _cx| {
             // In the hermetic test context the serialized state is constructed locally but
-            // not persisted to the kvp that load actually reads, so selected_agent restoration
+            // not persisted to the store that load actually reads, so selected_agent restoration
             // for the "grok" Custom case is not exercised here. The important behavior under test
             // is the "do not force the heavy categorized surface on pure load" (to prevent the
             // documented hang of doom). The restoration for Grok serialized state + Grok ZT-1
@@ -8006,6 +7982,7 @@ mod tests {
     #[gpui::test]
     async fn test_active_terminal_serialize_and_load_round_trip(cx: &mut TestAppContext) {
         init_test(cx);
+        crate::test_support::init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
             TerminalThreadMetadataStore::init_global(cx);
@@ -8047,10 +8024,8 @@ mod tests {
         let workspace_id = workspace
             .read_with(cx, |workspace, _cx| workspace.database_id())
             .expect("workspace should have a database id");
-        let kvp = cx.update(|_window, cx| KeyValueStore::global(cx));
         let serialized: SerializedAgentPanel = cx
-            .background_spawn(async move { read_serialized_panel(workspace_id, &kvp) })
-            .await
+            .update(|_w, cx| read_serialized_panel(workspace_id, cx))
             .expect("workspace should serialize panel state");
         assert_eq!(
             serialized.last_active_terminal_id,
@@ -8156,19 +8131,12 @@ mod tests {
         // subsequent read in test KVP setups where spawn+detach+park may not have landed the
         // value deterministically).
         cx.update(|_, cx| {
-            let kvp = KeyValueStore::global(cx);
-            cx.background_spawn({
-                let kvp = kvp;
-                async move {
-                    write_global_last_created_entry_kind(kvp, AgentPanelEntryKind::Thread).await;
-                }
-            })
-            .detach();
+            write_global_last_created_entry_kind(AgentPanelEntryKind::Thread, cx);
         });
         cx.run_until_parked();
         cx.update(|_, cx| {
             assert_eq!(
-                read_global_last_created_entry_kind(&KeyValueStore::global(cx)),
+                read_global_last_created_entry_kind(cx),
                 Some(AgentPanelEntryKind::Thread)
             );
         });
@@ -8202,19 +8170,12 @@ mod tests {
         // this test KVP setup; the restore must not have updated the global preference as a
         // "user creation action").
         cx.update(|_, cx| {
-            let kvp = KeyValueStore::global(cx);
-            cx.background_spawn({
-                let kvp = kvp;
-                async move {
-                    write_global_last_created_entry_kind(kvp, AgentPanelEntryKind::Thread).await;
-                }
-            })
-            .detach();
+            write_global_last_created_entry_kind(AgentPanelEntryKind::Thread, cx);
         });
         cx.run_until_parked();
         cx.update(|_, cx| {
             assert_eq!(
-                read_global_last_created_entry_kind(&KeyValueStore::global(cx)),
+                read_global_last_created_entry_kind(cx),
                 Some(AgentPanelEntryKind::Thread),
                 "restoring a terminal should not change the global new-entry default"
             );
@@ -8262,25 +8223,16 @@ mod tests {
             .expect("test terminal should be inserted");
         cx.run_until_parked();
 
-        // Force the global KVP write in the test context so the subsequent read sees the value
-        // (block the write for deterministic visibility in test KVP setups; the production
-        // set_last from insert_test_terminal schedules a background write that may not have
-        // landed without explicit waiting).
+        // Force the global write in test context for deterministic visibility (production
+        // path is direct; tests previously relied on KVP bg write landing).
         cx.update(|_window, cx| {
-            let kvp = KeyValueStore::global(cx);
-            cx.background_spawn({
-                let kvp = kvp;
-                async move {
-                    write_global_last_created_entry_kind(kvp, AgentPanelEntryKind::Terminal).await;
-                }
-            })
-            .detach();
+            write_global_last_created_entry_kind(AgentPanelEntryKind::Terminal, cx);
         });
         cx.run_until_parked();
 
         cx.update(|_window, cx| {
             assert_eq!(
-                read_global_last_created_entry_kind(&KeyValueStore::global(cx)),
+                read_global_last_created_entry_kind(cx),
                 Some(AgentPanelEntryKind::Terminal)
             );
         });
@@ -8473,14 +8425,12 @@ mod tests {
         });
 
         // Serialize while in LoadError. Before the fix this wrote
-        // `session_id=None` to the KVP and permanently lost the session.
+        // `session_id=None` to the persisted store and permanently lost the session.
         panel.update(cx, |panel, cx| panel.serialize(cx));
         cx.run_until_parked();
 
-        let kvp = cx.update(|_window, cx| KeyValueStore::global(cx));
         let serialized: Option<SerializedAgentPanel> = cx
-            .background_spawn(async move { read_serialized_panel(workspace_id, &kvp) })
-            .await;
+            .update(|_w, cx| read_serialized_panel(workspace_id, cx));
         let serialized_session_id = serialized
             .as_ref()
             .and_then(|p| p.last_active_thread.as_ref())
@@ -8490,7 +8440,7 @@ mod tests {
             Some(resume_session_id.0.to_string()),
             "serialize() must preserve the restored session id even while the \
              ConversationView is in LoadError; otherwise the bug survives a \
-             restart because the KVP has been wiped"
+             restart because the persisted state has been wiped"
         );
     }
 
@@ -11923,10 +11873,11 @@ mod tests {
             id: "my-preferred-agent".into(),
         };
 
-        // Write a known agent to the global KVP to simulate a user who has
+        // Write a known agent to the global store to simulate a user who has
         // previously used this agent in another workspace.
-        let kvp = cx.update(|cx| KeyValueStore::global(cx));
-        write_global_last_used_agent(kvp, custom_agent.clone()).await;
+        cx.update(|cx| {
+            write_global_last_used_agent(custom_agent.clone(), cx);
+        });
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs.clone(), [], cx).await;

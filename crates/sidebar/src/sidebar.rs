@@ -3307,11 +3307,8 @@ impl Sidebar {
             // with proper indeterminate UI (SpinnerLabel) while the async
             // persisted state restore (via the new ThreadMetadataStore / Heed + rkyv
             // zero-copy path, or any one-time legacy KVP termination driven from
-            // primary entry points) runs in the background. Per the 2026-05-27 async
-            // directive. We pass None for kvp here (sidebar secondary open path);
-            // the main workspace ensure path in zed.rs handles legacy termination hygiene.
             let panel = workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
-                let p = cx.new(|cx| AgentPanel::new_in_loading_state(workspace, None, window, cx));
+                let p = cx.new(|cx| AgentPanel::new_in_loading_state(workspace, window, cx));
                 workspace.add_panel(p.clone(), window, cx);
                 p
             })?;
@@ -4003,11 +4000,8 @@ impl Sidebar {
             // with proper indeterminate UI (SpinnerLabel) while the async
             // persisted state restore (via the new ThreadMetadataStore / Heed + rkyv
             // zero-copy path, or any one-time legacy KVP termination driven from
-            // primary entry points) runs in the background. Per the 2026-05-27 async
-            // directive. We pass None for kvp here (sidebar secondary open path);
-            // the main workspace ensure path in zed.rs handles legacy termination hygiene.
             let panel = workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
-                let p = cx.new(|cx| AgentPanel::new_in_loading_state(workspace, None, window, cx));
+                let p = cx.new(|cx| AgentPanel::new_in_loading_state(workspace, window, cx));
                 workspace.add_panel(p.clone(), window, cx);
                 p
             })?;

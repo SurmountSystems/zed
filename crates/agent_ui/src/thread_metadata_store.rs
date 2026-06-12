@@ -9,7 +9,6 @@ use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
 use db::{
-    kvp::KeyValueStore,
     sqlez::{
         bindable::{Bind, Column},
         domain::Domain,
@@ -74,37 +73,6 @@ use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
-
-// Database strategy note: Future KV / persistence work in this file (and similar
-// thread metadata stores) should prefer heed3 (LMDB) over the current sqlez +
-// KeyValueStore path, per the ZT-1 / agent panel Database-Strategy item.
-//
-// Zero-copy deserialization is the primary performance win (as opposed to
-// serialization). heed3 exposes LMDB memory-mapped pages directly via the
-// BytesDecode<'a> trait. Using heed3::types::Bytes (or a custom impl that
-// returns types borrowing from the input &[u8] for the lifetime of the RoTxn)
-// allows list() / entry_by_session() / reload hot paths to return borrowed
-// data with zero allocations and zero copies for the common read case.
-// The existing ThreadMetadata struct (and ArchivedGitWorktree) will be
-// encoded to postcard (or rkyv archived form with unaligned) on write and
-// decoded with a custom BytesDecode on read. This directly addresses the
-// deserialization overhead that was the dominant cost in the previous
-// SQLite + sqlez Bind/Column path.
-//
-// One-time backfill on first open: detect any remaining old "sidebar_threads"
-// data (or marker) and perform a bulk load into the heed3 environment, then
-// mark completion so the old SQLite path is never used again for this store.
-// The old tables can be left in place for downgrades or removed after a
-// sufficient number of releases.
-//
-// All existing tests in the mod tests block below (the 20+ #[gpui::test]
-// functions covering save/reload, title override, backfills from WorkspaceDb,
-// archive/unarchive, path filtering, remote connection identity, drafts,
-// subagents, etc.) must continue to pass against the new implementation.
-// The public API of ThreadMetadataStore and ThreadMetadata is deliberately
-// kept stable so call sites in agent_panel, thread_view (ZT-1 surfaces),
-// conversation_view, threads_archive_view, etc. require no mechanical changes.
-
 use crate::DEFAULT_THREAD_TITLE;
 
 #[derive(
@@ -282,17 +250,20 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
 fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::Result<()>>) {
     let store = ThreadMetadataStore::global(cx);
     let db = store.read(cx).db.clone();
-    let kvp = KeyValueStore::global(cx);
     let workspace_db = WorkspaceDb::global(cx);
     let fs = <dyn Fs>::global(cx);
 
     cx.spawn(async move |cx| -> anyhow::Result<()> {
         migration_task.await?;
 
-        if kvp
-            .read_kvp(THREAD_REMOTE_CONNECTION_MIGRATION_KEY)?
-            .is_some()
-        {
+        let already_migrated = cx
+            .update(|cx| {
+                store
+                    .read(cx)
+                    .load_global_json(THREAD_REMOTE_CONNECTION_MIGRATION_KEY.as_bytes())
+                    .is_some()
+            });
+        if already_migrated {
             return Ok(());
         }
 
@@ -349,11 +320,12 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
             .then_some(store.update(cx, |store, cx| store.reload(cx)))
             .unwrap_or(Task::ready(()).shared());
 
-        kvp.write_kvp(
-            THREAD_REMOTE_CONNECTION_MIGRATION_KEY.to_string(),
-            "1".to_string(),
-        )
-        .await?;
+        let _ = cx.update(|cx| {
+            store.read(cx).save_global_json(
+                THREAD_REMOTE_CONNECTION_MIGRATION_KEY.as_bytes(),
+                "1".to_string(),
+            )
+        });
         reloaded_task.await;
 
         Ok(())
@@ -364,10 +336,16 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
 fn migrate_thread_ids(cx: &mut App) {
     let store = ThreadMetadataStore::global(cx);
     let db = store.read(cx).db.clone();
-    let kvp = KeyValueStore::global(cx);
 
     cx.spawn(async move |cx| -> anyhow::Result<()> {
-        if kvp.read_kvp(THREAD_ID_MIGRATION_KEY)?.is_some() {
+        let already_migrated = cx
+            .update(|cx| {
+                store
+                    .read(cx)
+                    .load_global_json(THREAD_ID_MIGRATION_KEY.as_bytes())
+                    .is_some()
+            });
+        if already_migrated {
             return Ok(());
         }
 
@@ -381,8 +359,12 @@ fn migrate_thread_ids(cx: &mut App) {
             .then_some(store.update(cx, |store, cx| store.reload(cx)))
             .unwrap_or(Task::ready(()).shared());
 
-        kvp.write_kvp(THREAD_ID_MIGRATION_KEY.to_string(), "1".to_string())
-            .await?;
+        let _ = cx.update(|cx| {
+            store.read(cx).save_global_json(
+                THREAD_ID_MIGRATION_KEY.as_bytes(),
+                "1".to_string(),
+            )
+        });
         reloaded_task.await;
 
         Ok(())
@@ -676,6 +658,9 @@ impl ThreadMetadataStore {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn init_global(cx: &mut App) {
+        if cx.has_global::<Self>() {
+            return;
+        }
         let db_name = TestMetadataDbName::global(cx);
         let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
         // In hermetic tests we usually stay on the old path unless a test
@@ -1231,6 +1216,66 @@ impl ThreadMetadataStore {
         Ok(None)
     }
 
+    pub fn load_fast_mode_warning_dismissed(&self, key: &str) -> Option<bool> {
+        if let Some(kv) = self.kv_db() {
+            kv.load_bool(key.as_bytes())
+        } else {
+            None
+        }
+    }
+
+    pub fn set_fast_mode_warning_dismissed(&self, key: &str, dismissed: bool) -> anyhow::Result<()> {
+        if let Some(kv) = self.kv_db() {
+            kv.save_bool(key.as_bytes(), dismissed)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn reset_fast_mode_warnings(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    pub fn load_agent_kv_bool(&self, key: &str) -> Option<bool> {
+        if let Some(kv) = self.kv_db() {
+            kv.load_bool(key.as_bytes())
+        } else {
+            None
+        }
+    }
+
+    pub fn set_agent_kv_bool(&self, key: &str, val: bool) -> anyhow::Result<()> {
+        if let Some(kv) = self.kv_db() {
+            kv.save_bool(key.as_bytes(), val)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn load_agent_kv_string(&self, key: &str) -> Option<String> {
+        if let Some(kv) = self.kv_db() {
+            kv.load_string(key.as_bytes())
+        } else {
+            None
+        }
+    }
+
+    pub fn set_agent_kv_string(&self, key: &str, val: &str) -> anyhow::Result<()> {
+        if let Some(kv) = self.kv_db() {
+            kv.save_string(key.as_bytes(), val)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn delete_agent_kv(&self, key: &str) -> anyhow::Result<()> {
+        if let Some(kv) = self.kv_db() {
+            kv.delete_kv(key.as_bytes())
+        } else {
+            Ok(())
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn save_panel_state(
         &self,
@@ -1243,6 +1288,43 @@ impl ThreadMetadataStore {
         Ok(())
     }
 
+    pub(crate) fn load_global_json(&self, key: &[u8]) -> Option<String> {
+        self.kv_db().and_then(|kv| kv.load_global_json(key))
+    }
+
+    pub(crate) fn save_global_json(&self, key: &[u8], json: String) -> anyhow::Result<()> {
+        if let Some(kv) = self.kv_db() {
+            let wrapper = ArchivedSerializedAgentPanel(json.into_bytes());
+            kv.save_global_json(key, &wrapper)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn delete_global(&self, key: &[u8]) -> anyhow::Result<()> {
+        if let Some(kv) = self.kv_db() {
+            kv.delete_global(key)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn load_global_last_created_entry_kind_json(&self) -> Option<String> {
+        let key = b"global:last_created_entry_kind";
+        self.kv_db().and_then(|kv| kv.load_global_json(key))
+    }
+
+    pub(crate) fn save_global_last_created_entry_kind_json(&self, json: String) -> anyhow::Result<()> {
+        let key = b"global:last_created_entry_kind";
+        if let Some(kv) = self.kv_db() {
+            let wrapper = ArchivedSerializedAgentPanel(json.into_bytes());
+            kv.save_global_json(key, &wrapper)
+        } else {
+            Ok(())
+        }
+    }
+
     fn kv_db(&self) -> Option<&HeedThreadMetadataDb> {
         self.kv_db.as_ref()
     }
@@ -1251,9 +1333,14 @@ impl ThreadMetadataStore {
     /// Returns None if construction fails so callers can handle the case where
     /// the backend is not yet available.
     fn open_kv_db() -> Option<HeedThreadMetadataDb> {
-        // Uses the new fallible try_open. Any failure (permissions, disk, path)
-        // is treated as "kv backend not yet available for this workspace".
-        HeedThreadMetadataDb::try_open().ok()
+        if cfg!(any(test, feature = "test-support")) {
+            // In tests we require the kv for panel state roundtrips; surface any open error.
+            Some(HeedThreadMetadataDb::try_open().expect("kv backend must open in tests"))
+        } else {
+            // Uses the new fallible try_open. Any failure (permissions, disk, path)
+            // is treated as "kv backend not yet available for this workspace".
+            HeedThreadMetadataDb::try_open().ok()
+        }
     }
 
     pub fn get_all_archived_branch_names(
@@ -1295,14 +1382,13 @@ impl ThreadMetadataStore {
         self.pending_thread_ops_tx
             .try_send(DbOperation::Delete(thread_id))
             .log_err();
-        crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
+        self.delete_agent_kv(&thread_id.to_key_string()).log_err();
         cx.notify();
     }
 
     // Upstream (main) added these helpers for draft/archived management.
     // Integrated here while preserving our extended constructor (required for
-    // the Heed kv_db + async loading / early-creation path per the Database
-    // strategy note at top of file and the 2026-05-27 async directive).
+    // the Heed kv_db + async loading / early-creation path).
     pub fn unarchived_draft_ids_matching(
         &self,
         matches: impl Fn(&ThreadMetadata) -> bool,
@@ -1485,7 +1571,7 @@ impl ThreadMetadataStore {
             // Draft has been promoted: drop its persisted prompt since the
             // promoted thread now owns its prompt state via the native
             // agent's thread database.
-            crate::draft_prompt_store::delete(thread_id, cx).detach_and_log_err(cx);
+            self.delete_agent_kv(&thread_id.to_key_string()).log_err();
         }
 
         let metadata = ThreadMetadata {
@@ -1874,6 +1960,7 @@ impl ThreadMetadataDb {
 // The old SQLite path remains for one release transition to perform the
 // automatic bulk migration on first open after the heed3 env is created.
 
+#[derive(Clone)]
 #[allow(dead_code)]
 struct HeedThreadMetadataDb {
     env: Env<WithoutTls>,
@@ -1881,6 +1968,11 @@ struct HeedThreadMetadataDb {
     archived_worktrees: Database<Bytes, RkyvCodec<ArchivedGitWorktree>>,
     thread_to_archived: Database<Bytes, Bytes>,
     agent_panels: Database<Bytes, RkyvCodec<ArchivedSerializedAgentPanel>>,
+    agent_kv: Database<Bytes, Bytes>,
+}
+
+thread_local! {
+    static TEST_AGENT_KV: std::cell::RefCell<Option<HeedThreadMetadataDb>> = const { std::cell::RefCell::new(None) };
 }
 
 #[allow(dead_code)]
@@ -1890,16 +1982,22 @@ impl HeedThreadMetadataDb {
     /// Returns an error instead of panicking so callers can handle the case where
     /// the backend is not yet available (e.g. very early startup).
     pub fn try_open() -> anyhow::Result<Self> {
+        if cfg!(any(test, feature = "test-support")) {
+            if let Some(cached) = TEST_AGENT_KV.with(|c| c.borrow().clone()) {
+                return Ok(cached);
+            }
+        }
         // Real on-disk path using the canonical Zed convention (data_dir / agent_kv).
         // This is the kv backend for agent metadata, including the classified
         // persistent surface and thread metadata.
-        let path = paths::data_dir().join("agent_kv");
+        let path = if cfg!(any(test, feature = "test-support")) { let p = std::env::temp_dir().join(format!("zed-test-agent-kv-{}", std::thread::current().name().unwrap_or("unknown_test"))); let _ = std::fs::remove_dir_all(&p); p } else { paths::data_dir().join("agent_kv") };
         std::fs::create_dir_all(&path)?;
 
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(1 << 40)
                 .max_readers(256)
+                .max_dbs(128)
                 .clone()
                 .read_txn_without_tls()
                 .open(&path)?
@@ -1913,15 +2011,22 @@ impl HeedThreadMetadataDb {
         let thread_to_archived = env.create_database(&mut wtxn, Some("thread_to_archived"))?;
         let agent_panels: Database<Bytes, RkyvCodec<ArchivedSerializedAgentPanel>> =
             env.create_database(&mut wtxn, Some("agent_panels"))?;
+        let agent_kv: Database<Bytes, Bytes> =
+            env.create_database(&mut wtxn, Some("agent_kv"))?;
         wtxn.commit()?;
 
-        Ok(Self {
+        let this = Self {
             env,
             threads,
             archived_worktrees,
             thread_to_archived,
             agent_panels,
-        })
+            agent_kv,
+        };
+        if cfg!(any(test, feature = "test-support")) {
+            TEST_AGENT_KV.with(|c| *c.borrow_mut() = Some(this.clone()));
+        }
+        Ok(this)
     }
 
     pub fn global(_cx: &mut App) -> Self {
@@ -1996,11 +2101,82 @@ impl HeedThreadMetadataDb {
             .map_err(Into::into)
             .map(|opt| {
                 opt.map(|archived| {
-                    // Handle potential double-Archived form from RkyvCodec zero-copy read (exact sibling/PromptStore hygiene pattern; ArchivedVec<u8> does not implement Clone in this rkyv 0.8 setup, so reconstruct from slice).
                     let bytes: Vec<u8> = archived.0.as_slice().to_vec();
                     ArchivedSerializedAgentPanel(bytes)
                 })
             })
+    }
+
+    fn load_global_json(&self, key: &[u8]) -> Option<String> {
+        let rtxn = self.env.read_txn().ok()?;
+        self.agent_panels
+            .get(&rtxn, key)
+            .ok()
+            .flatten()
+            .and_then(|a| String::from_utf8(a.0.as_slice().to_vec()).ok())
+    }
+
+    fn save_global_json(&self, key: &[u8], val: &ArchivedSerializedAgentPanel) -> anyhow::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.agent_panels.put(&mut wtxn, key, val)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_bool(&self, key: &[u8]) -> Option<bool> {
+        let rtxn = self.env.read_txn().ok()?;
+        self.agent_kv
+            .get(&rtxn, key)
+            .ok()
+            .flatten()
+            .and_then(|bytes| {
+                rkyv::access::<rkyv::Archived<bool>, rkyv::rancor::Error>(bytes)
+                    .ok()
+                    .copied()
+            })
+    }
+
+    pub(crate) fn save_bool(&self, key: &[u8], val: bool) -> anyhow::Result<()> {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&val)?;
+        let mut wtxn = self.env.write_txn()?;
+        self.agent_kv.put(&mut wtxn, key, bytes.as_slice())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_kv(&self, key: &[u8]) -> anyhow::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.agent_kv.delete(&mut wtxn, key)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn load_string(&self, key: &[u8]) -> Option<String> {
+        let rtxn = self.env.read_txn().ok()?;
+        self.agent_kv
+            .get(&rtxn, key)
+            .ok()
+            .flatten()
+            .and_then(|bytes| {
+                rkyv::access::<rkyv::Archived<String>, rkyv::rancor::Error>(bytes)
+                    .ok()
+                    .map(|archived| archived.as_str().to_string())
+            })
+    }
+
+    pub(crate) fn save_string(&self, key: &[u8], val: &str) -> anyhow::Result<()> {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&val.to_string())?;
+        let mut wtxn = self.env.write_txn()?;
+        self.agent_kv.put(&mut wtxn, key, bytes.as_slice())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    fn delete_global(&self, key: &[u8]) -> anyhow::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.agent_panels.delete(&mut wtxn, key)?;
+        wtxn.commit()?;
+        Ok(())
     }
 }
 
@@ -2221,9 +2397,11 @@ mod tests {
     }
 
     fn clear_thread_metadata_remote_connection_backfill(cx: &mut TestAppContext) {
-        let kvp = cx.update(|cx| KeyValueStore::global(cx));
-        gpui::block_on(kvp.delete_kvp("thread-metadata-remote-connection-backfill".to_string()))
-            .unwrap();
+        cx.update(|cx| {
+            if let Some(store) = ThreadMetadataStore::try_global(cx) {
+                let _ = store.read(cx).delete_global(b"thread-metadata-remote-connection-backfill");
+            }
+        });
     }
 
     fn run_store_migrations(cx: &mut TestAppContext) {
@@ -2234,9 +2412,6 @@ mod tests {
         });
         cx.run_until_parked();
     }
-
-    // Obsolete legacy KVP termination test helpers were removed when the
-    // panel state path moved to the kv backend. Only the pure-kv paths remain.
 
     #[test]
     fn test_thread_metadata_title_prefers_override() {
@@ -4455,9 +4630,6 @@ mod tests {
         let result = WorktreePaths::from_path_lists(main, folder);
         assert!(result.is_err());
     }
-
-    // Legacy KVP termination tests and helpers were removed when panel state
-    // moved exclusively to the kv backend. Only pure-kv paths and their tests remain.
 
     /// Regression test: archiving a thread created in a git worktree must
     /// preserve the thread's folder paths so that restoring it later does

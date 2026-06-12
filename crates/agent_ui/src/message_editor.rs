@@ -3037,6 +3037,7 @@ mod tests {
     #[gpui::test]
     async fn test_context_completion_provider_mentions(cx: &mut TestAppContext) {
         init_test(cx);
+        crate::test_support::init_test(cx);
 
         let app_state = cx.update(AppState::test);
 

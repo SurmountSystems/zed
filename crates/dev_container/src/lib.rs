@@ -422,7 +422,7 @@ impl PickerDelegate for TemplatePickerDelegate {
                     Button::new("run-action", "Continue")
                         .key_binding(
                             KeyBinding::for_action(&menu::Confirm, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                         .on_click(|_, window, cx| {
                             window.dispatch_action(menu::Confirm.boxed_clone(), cx)
@@ -615,7 +615,7 @@ impl PickerDelegate for FeaturePickerDelegate {
                     Button::new("run-action", "Select Feature")
                         .key_binding(
                             KeyBinding::for_action(&menu::Confirm, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                         .on_click(|_, window, cx| {
                             window.dispatch_action(menu::Confirm.boxed_clone(), cx)
@@ -625,7 +625,7 @@ impl PickerDelegate for FeaturePickerDelegate {
                     Button::new("run-action-secondary", "Confirm Selections")
                         .key_binding(
                             KeyBinding::for_action(&menu::SecondaryConfirm, cx)
-                                .map(|kb| kb.size(rems_from_px(12.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                         .on_click(|_, window, cx| {
                             window.dispatch_action(menu::SecondaryConfirm.boxed_clone(), cx)

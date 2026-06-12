@@ -1620,9 +1620,10 @@ pub(crate) async fn restore_or_create_workspace(
                             WorkspaceSettings::get_global(cx).restore_on_startup;
                         match restore_on_startup {
                             workspace::RestoreOnStartupBehavior::Launchpad => {}
-                            _ => {
+                            workspace::RestoreOnStartupBehavior::EmptyTab => {
                                 Editor::new_file(workspace, &Default::default(), window, cx);
                             }
+                            _ => {}
                         }
                     },
                 )
@@ -1641,9 +1642,10 @@ pub(crate) async fn restore_or_create_workspace(
                     let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
                     match restore_on_startup {
                         workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
+                        workspace::RestoreOnStartupBehavior::EmptyTab => {
                             Editor::new_file(workspace, &Default::default(), window, cx);
                         }
+                        _ => {}
                     }
                 },
             )
