@@ -5914,8 +5914,14 @@ impl MultiBufferSnapshot {
         let mut accessed_row_counter = 0;
 
         // If there is a blank line at the current row, search for the next non indented lines
-        let target_line_text: String = self.text_for_range(Point::new(target_row.0, 0)..Point::new(target_row.0 + 1, 0)).collect::<String>();
-        let is_outdent_kw_line = target_line_text.trim_start().starts_with("else") || target_line_text.trim_start().starts_with("elif") || target_line_text.trim_start().starts_with("fi") || target_line_text.trim_start().starts_with("except") || target_line_text.trim_start().starts_with("finally");
+        let target_line_text: String = self
+            .text_for_range(Point::new(target_row.0, 0)..Point::new(target_row.0 + 1, 0))
+            .collect::<String>();
+        let is_outdent_kw_line = target_line_text.trim_start().starts_with("else")
+            || target_line_text.trim_start().starts_with("elif")
+            || target_line_text.trim_start().starts_with("fi")
+            || target_line_text.trim_start().starts_with("except")
+            || target_line_text.trim_start().starts_with("finally");
 
         if target_indent.is_line_empty() || is_outdent_kw_line {
             // force blank-line structural search (with skip-self/same) for outdent kw lines even if !empty so enclosing returns the parent/opener indent (4sp for else under if) instead of the line's current body indent after input; normal non-empty lines take the common path
@@ -5951,8 +5957,13 @@ impl MultiBufferSnapshot {
                     if ind.raw_len() >= target_indent.raw_len() {
                         // the first above was same level as kw line (e.g. return at 8); continue upward to find true smaller opener (if at 4)
                         for (row2, indent2, _) in self.reversed_line_indents(r, |_| true) {
-                            if row2 < start { break; }
-                            if !indent2.is_line_empty() && row2 != r && indent2.raw_len() < target_indent.raw_len() {
+                            if row2 < start {
+                                break;
+                            }
+                            if !indent2.is_line_empty()
+                                && row2 != r
+                                && indent2.raw_len() < target_indent.raw_len()
+                            {
                                 non_empty_line_above = Some((row2, indent2));
                                 break;
                             }

@@ -818,9 +818,7 @@ fn ensure_agent_panel_for_workspace(
             // Note: we cannot use `?` directly here because this closure must return
             // `Task<anyhow::Result<...>>`, not a raw Result.
             match workspace_weak.update_in(&mut async_cx, |workspace, window, cx| {
-                cx.new(|cx| {
-                    agent_ui::AgentPanel::new_in_loading_state(workspace, window, cx)
-                })
+                cx.new(|cx| agent_ui::AgentPanel::new_in_loading_state(workspace, window, cx))
             }) {
                 Ok(panel) => Task::ready(Ok(panel)),
                 Err(e) => Task::ready(Err(e)),

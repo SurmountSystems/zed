@@ -512,8 +512,6 @@ aho-corasick = "1.1"
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
 any_vec = "0.14"
 anyhow = "1.0.86"
-heed3 = "0.20"
-rkyv = { version = "0.7", features = ["std", "alloc"] }
 ashpd = { version = "0.13", default-features = false, features = [
     "async-io",
     "notification",
@@ -606,8 +604,8 @@ handlebars = "4.3"
 heck = "0.5"
 hdrhistogram = "7"
 heed = { version = "0.21.0", features = ["read-txn-no-tls"] }
-heed3 = "=0.22.1"
-rkyv = { version = "0.8", features = ["unaligned"] }
+heed3 = "0.22.1"
+rkyv = { version = "0.8.16", features = ["unaligned"] }
 hex = "0.4.3"
 human_bytes = "0.4.1"
 html5ever = "0.27.0"

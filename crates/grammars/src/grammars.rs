@@ -85,19 +85,31 @@ pub fn get_file(path: &str) -> Option<&'static [u8]> {
 /// `highlights_extra.scm`) are concatenated together with their contents appended.
 pub fn load_queries(name: &str) -> LanguageQueries {
     let mut result = LanguageQueries::default();
+    for (prefix, query) in QUERY_FILENAME_PREFIXES {
+        if let Some(file) = GRAMMAR_DIR.get_file(&format!("{name}/{prefix}.scm")) {
+            let contents = String::from_utf8_lossy(file.contents()).into_owned();
+            *query(&mut result) = Some(contents.into());
+        }
+    }
+
+    let language_path_prefix = format!("{name}/");
     for file in GRAMMAR_DIR.files() {
         let path = file.path().to_string_lossy();
-        if let Some(remainder) = path.strip_prefix(name).and_then(|p| p.strip_prefix('/')) {
-            if !remainder.ends_with(".scm") {
+        let Some(remainder) = path.strip_prefix(&language_path_prefix) else {
+            continue;
+        };
+        if !remainder.ends_with(".scm") {
+            continue;
+        }
+        for (prefix, query) in QUERY_FILENAME_PREFIXES {
+            if remainder == format!("{prefix}.scm") {
                 continue;
             }
-            for (prefix, query) in QUERY_FILENAME_PREFIXES {
-                if remainder.starts_with(prefix) {
-                    let contents = String::from_utf8_lossy(file.contents()).into_owned();
-                    match query(&mut result) {
-                        None => *query(&mut result) = Some(contents.into()),
-                        Some(existing) => existing.to_mut().push_str(&contents),
-                    }
+            if remainder.starts_with(prefix) {
+                let contents = String::from_utf8_lossy(file.contents()).into_owned();
+                match query(&mut result) {
+                    None => *query(&mut result) = Some(contents.into()),
+                    Some(existing) => existing.to_mut().push_str(&contents),
                 }
             }
         }

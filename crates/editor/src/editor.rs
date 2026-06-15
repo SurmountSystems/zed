@@ -4945,13 +4945,6 @@ impl Editor {
             if let Some(suggested_indent) =
                 suggested_indents.get(&MultiBufferRow(cursor.row)).copied()
             {
-                    // If current indent is more than suggested indent
-                // only move cursor to current indent and skip indent
-                if cursor.column < current_indent.len && current_indent.len > suggested_indent.len {
-                    selection.start = Point::new(cursor.row, current_indent.len);
-                    selection.end = selection.start;
-                    continue;
-                }
                 // Don't do anything if already at suggested indent
                 // and there is any other cursor which is not
                 if has_some_cursor_in_whitespace
@@ -4963,7 +4956,9 @@ impl Editor {
 
                 // Adjust line and move cursor to suggested indent
                 // if cursor is not at suggested indent
-                if cursor.column != suggested_indent.len
+                if cursor.column < suggested_indent.len
+                    && cursor.column <= current_indent.len
+                    && current_indent.len <= suggested_indent.len
                 {
                     selection.start = Point::new(cursor.row, suggested_indent.len);
                     selection.end = selection.start;
@@ -4980,25 +4975,8 @@ impl Editor {
 
                 // If current indent is more than suggested indent
                 // only move cursor to current indent and skip indent
-                let language = snapshot.language_scope_at(Point::new(cursor.row, 0));
-                if let Some(language) = language {
-                    if input::is_list_prefix_row(MultiBufferRow(cursor.row), &snapshot, &language) {
-                        continue;
-                    }
-                }
-                // also skip for markdown task list markers (e.g. "- [x]") so their nesting indent (current) is preserved and not reduced to suggested 0
-                let line_text: String = snapshot.text_for_range(Point::new(cursor.row, 0)..Point::new(cursor.row + 1, 0)).collect();
-                if line_text.trim_start().starts_with("- [") || line_text.trim_start().starts_with("* [") || line_text.trim_start().starts_with("+ [") {
-                    continue;
-                }
                 if cursor.column < current_indent.len && current_indent.len > suggested_indent.len {
-                    // allow ws reduction (edit_for) even in this branch for outdent-after-input cases (e.g. 'else:'/'fi' keep suggested < current); previously only moved sel and skipped reduce
-                    edits.extend(Buffer::edit_for_indent_size_adjustment(
-                        cursor.row,
-                        current_indent,
-                        suggested_indent,
-                    ));
-                    selection.start = Point::new(cursor.row, suggested_indent.len);
+                    selection.start = Point::new(cursor.row, current_indent.len);
                     selection.end = selection.start;
                     continue;
                 }

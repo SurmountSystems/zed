@@ -4,7 +4,7 @@ use crate::{
     ByteContent, DebuggerTextObject, LanguageScope, ModelineSettings, Outline, OutlineConfig,
     PLAIN_TEXT, RunnableCapture, RunnableTag, TextObject, TreeSitterOptions, analyze_byte_content,
     diagnostic_set::{DiagnosticEntry, DiagnosticEntryRef, DiagnosticGroup},
-    language_settings::{AutoIndentMode, LanguageSettings},
+    language_settings::LanguageSettings,
     outline::OutlineItem,
     row_chunk::RowChunks,
     syntax_map::{
@@ -1964,32 +1964,42 @@ impl Buffer {
         }
     }
 
+    fn spawn_pending_autoindent(
+        &mut self,
+        cx: &mut Context<Self>,
+        indent_sizes: impl Future<Output = BTreeMap<u32, IndentSize>> + Send + 'static,
+    ) {
+        let indent_sizes = cx.background_spawn(indent_sizes);
+        self.pending_autoindent = Some(cx.spawn(async move |this, cx| {
+            let indent_sizes = indent_sizes.await;
+            this.update(cx, |this, cx| {
+                this.apply_autoindents(indent_sizes, cx);
+            })
+            .ok();
+        }));
+    }
+
     fn request_autoindent(&mut self, cx: &mut Context<Self>, block_budget: Option<Duration>) {
         if let Some(indent_sizes) = self.compute_autoindents() {
-            let indent_sizes = cx.background_spawn(indent_sizes);
-            let Some(block_budget) = block_budget else {
-                self.pending_autoindent = Some(cx.spawn(async move |this, cx| {
-                    let indent_sizes = indent_sizes.await;
-                    this.update(cx, |this, cx| {
-                        this.apply_autoindents(indent_sizes, cx);
-                    })
-                    .ok();
-                }));
-                return;
-            };
-            match cx
-                .foreground_executor()
-                .block_with_timeout(block_budget, indent_sizes)
-            {
-                Ok(indent_sizes) => self.apply_autoindents(indent_sizes, cx),
-                Err(indent_sizes) => {
-                    self.pending_autoindent = Some(cx.spawn(async move |this, cx| {
-                        let indent_sizes = indent_sizes.await;
-                        this.update(cx, |this, cx| {
-                            this.apply_autoindents(indent_sizes, cx);
-                        })
-                        .ok();
-                    }));
+            match block_budget {
+                None => self.spawn_pending_autoindent(cx, indent_sizes),
+                Some(block_budget) => {
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        let _ = block_budget;
+                        let indent_sizes = cx.foreground_executor().block_on(indent_sizes);
+                        self.apply_autoindents(indent_sizes, cx);
+                    }
+                    #[cfg(not(any(test, feature = "test-support")))]
+                    {
+                        match cx
+                            .foreground_executor()
+                            .block_with_timeout(block_budget, indent_sizes)
+                        {
+                            Ok(indent_sizes) => self.apply_autoindents(indent_sizes, cx),
+                            Err(indent_sizes) => self.spawn_pending_autoindent(cx, indent_sizes),
+                        }
+                    }
                 }
             }
         } else {
@@ -2752,32 +2762,10 @@ impl Buffer {
 
         if let Some((before_edit, mode)) = autoindent_request {
             let mut delta = 0isize;
-            let mut previous_setting = None;
             let entries: Vec<_> = edits
                 .into_iter()
                 .enumerate()
                 .zip(&edit_operation.as_edit().unwrap().new_text)
-                .filter(|((_, (range, _)), _)| {
-                    let language = before_edit.language_at(range.start);
-                    let language_id = language.map(|l| l.id());
-                    if let Some((cached_language_id, apply_syntax_indent)) = previous_setting
-                        && cached_language_id == language_id
-                    {
-                        apply_syntax_indent
-                    } else {
-                        // The auto-indent setting is not present in editorconfigs, hence
-                        // we can avoid passing the file here.
-                        let auto_indent_mode = LanguageSettings::resolve(
-                            None,
-                            language.map(|l| l.name()).as_ref(),
-                            cx,
-                        )
-                        .auto_indent;
-                        let apply_syntax_indent = auto_indent_mode == AutoIndentMode::SyntaxAware;
-                        previous_setting = Some((language_id, apply_syntax_indent));
-                        apply_syntax_indent
-                    }
-                })
                 .map(|((ix, (range, _)), new_text)| {
                     let new_text_length = new_text.len();
                     let old_start = range.start.to_point(&before_edit);

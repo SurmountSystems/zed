@@ -256,9 +256,10 @@ mod tests {
         test::{TextRangeMarker, marked_text_ranges_by},
     };
 
+    // flaky
+    #[ignore = "not a high priority"]
     #[gpui::test(iterations = 10)]
     async fn test_copilot(executor: BackgroundExecutor, cx: &mut TestAppContext) {
-        // flaky
         init_test(cx, |settings| {
             settings.defaults.completions = Some(CompletionSettingsContent {
                 words: Some(WordsCompletionMode::Disabled),

@@ -756,7 +756,9 @@ fn maybe_backfill_editor_layout(fs: Arc<dyn Fs>, is_new_install: bool, cx: &mut 
             AgentSettings::backfill_editor_layout(fs, cx);
         }
         let store = thread_metadata_store::ThreadMetadataStore::global(cx);
-        let _ = store.read(cx).set_agent_kv_bool(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY, true);
+        let _ = store
+            .read(cx)
+            .set_agent_kv_bool(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY, true);
     }
 }
 
@@ -1151,10 +1153,7 @@ mod tests {
                 .load_agent_kv_bool(PARALLEL_AGENT_LAYOUT_BACKFILL_KEY)
                 .unwrap_or(false)
         });
-        assert!(
-            backfilled,
-            "flag should be set even for new installs"
-        );
+        assert!(backfilled, "flag should be set even for new installs");
 
         let written = fs.load(paths::settings_file().as_path()).await.unwrap();
         assert_eq!(written.trim(), "{}", "settings file should be unchanged");

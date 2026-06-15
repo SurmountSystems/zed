@@ -42,7 +42,9 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ArchivedSerializedAgentPanel, ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    ArchivedSerializedAgentPanel, ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent,
+};
 use crate::{
     AddContextServer,
     AgentDiffPane,
@@ -293,7 +295,9 @@ fn open_project_rules(workspace: &mut Workspace, window: &mut Window, cx: &mut C
 fn write_global_last_created_entry_kind(entry_kind: AgentPanelEntryKind, cx: &App) {
     if let Some(json) = serde_json::to_string(&LastCreatedEntryKind { entry_kind }).ok() {
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
-            let _ = store.read(cx).save_global_last_created_entry_kind_json(json);
+            let _ = store
+                .read(cx)
+                .save_global_last_created_entry_kind_json(json);
         }
     }
 }
@@ -307,7 +311,9 @@ fn dismissed(key: &str, cx: &App) -> bool {
 fn set_dismissed(key: &str, is_d: bool, cx: &App) {
     if let Some(store) = ThreadMetadataStore::try_global(cx) {
         let val = if is_d { "1" } else { "0" };
-        let _ = store.read(cx).save_global_json(key.as_bytes(), val.to_string());
+        let _ = store
+            .read(cx)
+            .save_global_json(key.as_bytes(), val.to_string());
     }
 }
 
@@ -1655,7 +1661,10 @@ impl AgentPanel {
             selected_agent: Agent::default(),
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
-            new_user_onboarding_upsell_dismissed: AtomicBool::new(dismissed("dismissed-trial-upsell", cx)),
+            new_user_onboarding_upsell_dismissed: AtomicBool::new(dismissed(
+                "dismissed-trial-upsell",
+                cx,
+            )),
             _base_view_observation: None,
             _draft_editor_observation: None,
             _active_draft_reclaim_observation: None,
@@ -1710,14 +1719,13 @@ impl AgentPanel {
         let workspace_id = self.workspace_id;
 
         let (serialized_panel, _global_last_used_agent) = if let Some(id) = workspace_id {
-            let panel = ThreadMetadataStore::try_global(cx)
-                .and_then(|store| {
-                    store
-                        .read(cx)
-                        .load_panel_state(&i64::from(id).to_string().into_bytes())
-                        .ok()
-                        .flatten()
-                });
+            let panel = ThreadMetadataStore::try_global(cx).and_then(|store| {
+                store
+                    .read(cx)
+                    .load_panel_state(&i64::from(id).to_string().into_bytes())
+                    .ok()
+                    .flatten()
+            });
             let agent = read_global_last_used_agent(cx);
             (panel, agent)
         } else {
@@ -7178,10 +7186,6 @@ impl Render for AgentPanel {
     }
 }
 
-
-
-
-
 /// Test-only helper methods
 #[cfg(any(test, feature = "test-support"))]
 impl AgentPanel {
@@ -7874,7 +7878,9 @@ mod tests {
         cx.run_until_parked();
         for _ in 0..50 {
             cx.run_until_parked();
-            if panel.read_with(cx, |p, _| matches!(p.overlay_view, Some(OverlayView::ZedTodosSurface(_)))) {
+            if panel.read_with(cx, |p, _| {
+                matches!(p.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
+            }) {
                 break;
             }
         }
@@ -8429,8 +8435,8 @@ mod tests {
         panel.update(cx, |panel, cx| panel.serialize(cx));
         cx.run_until_parked();
 
-        let serialized: Option<SerializedAgentPanel> = cx
-            .update(|_w, cx| read_serialized_panel(workspace_id, cx));
+        let serialized: Option<SerializedAgentPanel> =
+            cx.update(|_w, cx| read_serialized_panel(workspace_id, cx));
         let serialized_session_id = serialized
             .as_ref()
             .and_then(|p| p.last_active_thread.as_ref())

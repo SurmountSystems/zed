@@ -1445,8 +1445,8 @@ impl Terminal {
                 // we might respond with out of date value if a "set color" sequence is immediately
                 // followed by a color request sequence.
 
-                let color = self.term.lock().colors()[index]
-                    .unwrap_or_else(|| to_vte_rgb(Hsla::default()));
+                let color =
+                    self.term.lock().colors()[index].unwrap_or_else(|| to_vte_rgb(Hsla::default()));
                 self.write_to_pty(format(color).into_bytes());
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
@@ -3266,7 +3266,8 @@ mod tests {
         cx.executor().allow_parking();
 
         let (completion_tx, completion_rx) = async_channel::unbounded();
-        let (program, args) = ShellBuilder::new(&Shell::System, false)
+        let (program, args) = ShellBuilder::new(&Shell::Program("/bin/bash".into()), false)
+            .non_interactive()
             .build(Some("asdasdasdasd".to_owned()), &["@@@@@".to_owned()]);
         let builder = cx
             .update(|cx| {
@@ -3306,7 +3307,7 @@ mod tests {
             }
         })
         .detach();
-        let completion_check_task = cx.background_spawn(async move {
+        cx.background_spawn(async move {
             // The channel may be closed if the terminal is dropped before sending
             // the completion signal, which can happen with certain task scheduling orders.
             let exit_status = completion_rx.recv().await.ok().flatten();
@@ -3320,9 +3321,10 @@ mod tests {
                 #[cfg(not(target_os = "windows"))]
                 assert_eq!(exit_status.code(), Some(127)); // code 127 means "command not found" on Unix
             }
-        });
+        })
+        .detach();
 
-        completion_check_task.await;
+        cx.run_until_parked();
         cx.executor().timer(Duration::from_millis(500)).await;
 
         assert!(

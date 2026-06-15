@@ -1,5 +1,5 @@
-pub mod query;
 pub mod kvp;
+pub mod query;
 
 // Re-export
 pub use anyhow;

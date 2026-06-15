@@ -64,6 +64,7 @@ where
     }
 }
 
+use crate::DEFAULT_THREAD_TITLE;
 use fs::Fs;
 use futures::{FutureExt, future::Shared};
 use gpui::{AppContext as _, Entity, Global, Subscription, Task, TaskExt};
@@ -73,7 +74,6 @@ use remote::{RemoteConnectionOptions, same_remote_connection_identity};
 use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::ResultExt as _;
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
-use crate::DEFAULT_THREAD_TITLE;
 
 #[derive(
     Clone,
@@ -256,13 +256,12 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
     cx.spawn(async move |cx| -> anyhow::Result<()> {
         migration_task.await?;
 
-        let already_migrated = cx
-            .update(|cx| {
-                store
-                    .read(cx)
-                    .load_global_json(THREAD_REMOTE_CONNECTION_MIGRATION_KEY.as_bytes())
-                    .is_some()
-            });
+        let already_migrated = cx.update(|cx| {
+            store
+                .read(cx)
+                .load_global_json(THREAD_REMOTE_CONNECTION_MIGRATION_KEY.as_bytes())
+                .is_some()
+        });
         if already_migrated {
             return Ok(());
         }
@@ -338,13 +337,12 @@ fn migrate_thread_ids(cx: &mut App) {
     let db = store.read(cx).db.clone();
 
     cx.spawn(async move |cx| -> anyhow::Result<()> {
-        let already_migrated = cx
-            .update(|cx| {
-                store
-                    .read(cx)
-                    .load_global_json(THREAD_ID_MIGRATION_KEY.as_bytes())
-                    .is_some()
-            });
+        let already_migrated = cx.update(|cx| {
+            store
+                .read(cx)
+                .load_global_json(THREAD_ID_MIGRATION_KEY.as_bytes())
+                .is_some()
+        });
         if already_migrated {
             return Ok(());
         }
@@ -360,10 +358,9 @@ fn migrate_thread_ids(cx: &mut App) {
             .unwrap_or(Task::ready(()).shared());
 
         let _ = cx.update(|cx| {
-            store.read(cx).save_global_json(
-                THREAD_ID_MIGRATION_KEY.as_bytes(),
-                "1".to_string(),
-            )
+            store
+                .read(cx)
+                .save_global_json(THREAD_ID_MIGRATION_KEY.as_bytes(), "1".to_string())
         });
         reloaded_task.await;
 
@@ -1224,7 +1221,11 @@ impl ThreadMetadataStore {
         }
     }
 
-    pub fn set_fast_mode_warning_dismissed(&self, key: &str, dismissed: bool) -> anyhow::Result<()> {
+    pub fn set_fast_mode_warning_dismissed(
+        &self,
+        key: &str,
+        dismissed: bool,
+    ) -> anyhow::Result<()> {
         if let Some(kv) = self.kv_db() {
             kv.save_bool(key.as_bytes(), dismissed)
         } else {
@@ -1315,7 +1316,10 @@ impl ThreadMetadataStore {
         self.kv_db().and_then(|kv| kv.load_global_json(key))
     }
 
-    pub(crate) fn save_global_last_created_entry_kind_json(&self, json: String) -> anyhow::Result<()> {
+    pub(crate) fn save_global_last_created_entry_kind_json(
+        &self,
+        json: String,
+    ) -> anyhow::Result<()> {
         let key = b"global:last_created_entry_kind";
         if let Some(kv) = self.kv_db() {
             let wrapper = ArchivedSerializedAgentPanel(json.into_bytes());
@@ -1990,7 +1994,16 @@ impl HeedThreadMetadataDb {
         // Real on-disk path using the canonical Zed convention (data_dir / agent_kv).
         // This is the kv backend for agent metadata, including the classified
         // persistent surface and thread metadata.
-        let path = if cfg!(any(test, feature = "test-support")) { let p = std::env::temp_dir().join(format!("zed-test-agent-kv-{}", std::thread::current().name().unwrap_or("unknown_test"))); let _ = std::fs::remove_dir_all(&p); p } else { paths::data_dir().join("agent_kv") };
+        let path = if cfg!(any(test, feature = "test-support")) {
+            let p = std::env::temp_dir().join(format!(
+                "zed-test-agent-kv-{}",
+                std::thread::current().name().unwrap_or("unknown_test")
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            p
+        } else {
+            paths::data_dir().join("agent_kv")
+        };
         std::fs::create_dir_all(&path)?;
 
         let env = unsafe {
@@ -2011,8 +2024,7 @@ impl HeedThreadMetadataDb {
         let thread_to_archived = env.create_database(&mut wtxn, Some("thread_to_archived"))?;
         let agent_panels: Database<Bytes, RkyvCodec<ArchivedSerializedAgentPanel>> =
             env.create_database(&mut wtxn, Some("agent_panels"))?;
-        let agent_kv: Database<Bytes, Bytes> =
-            env.create_database(&mut wtxn, Some("agent_kv"))?;
+        let agent_kv: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some("agent_kv"))?;
         wtxn.commit()?;
 
         let this = Self {
@@ -2116,7 +2128,11 @@ impl HeedThreadMetadataDb {
             .and_then(|a| String::from_utf8(a.0.as_slice().to_vec()).ok())
     }
 
-    fn save_global_json(&self, key: &[u8], val: &ArchivedSerializedAgentPanel) -> anyhow::Result<()> {
+    fn save_global_json(
+        &self,
+        key: &[u8],
+        val: &ArchivedSerializedAgentPanel,
+    ) -> anyhow::Result<()> {
         let mut wtxn = self.env.write_txn()?;
         self.agent_panels.put(&mut wtxn, key, val)?;
         wtxn.commit()?;
@@ -2399,7 +2415,9 @@ mod tests {
     fn clear_thread_metadata_remote_connection_backfill(cx: &mut TestAppContext) {
         cx.update(|cx| {
             if let Some(store) = ThreadMetadataStore::try_global(cx) {
-                let _ = store.read(cx).delete_global(b"thread-metadata-remote-connection-backfill");
+                let _ = store
+                    .read(cx)
+                    .delete_global(b"thread-metadata-remote-connection-backfill");
             }
         });
     }

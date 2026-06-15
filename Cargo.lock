@@ -11459,6 +11459,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "memory_palace"
+version = "0.1.0"
+dependencies = [
+ "heed3",
+ "rkyv 0.8.16",
+]
+
+[[package]]
 name = "menu"
 version = "0.1.0"
 dependencies = [
