@@ -1,0 +1,3 @@
+[submodule "ref/vibe-palace"]
+	path = ref/vibe-palace
+	url = https://github.com/suykerbuyk/vibe-palace

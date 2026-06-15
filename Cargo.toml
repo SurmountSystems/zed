@@ -8,6 +8,7 @@ members = [
     "crates/agent",
     "crates/agent_servers",
     "crates/agent_settings",
+    "crates/vibe_palace",
     "crates/agent_skills",
     "crates/agent_ui",
     "crates/ai_onboarding",
@@ -511,6 +512,8 @@ aho-corasick = "1.1"
 alacritty_terminal = { git = "https://github.com/zed-industries/alacritty", rev = "fcf32feacb367b75ec84dd40f041e4fd411d3cc1" }
 any_vec = "0.14"
 anyhow = "1.0.86"
+heed3 = "0.20"
+rkyv = { version = "0.7", features = ["std", "alloc"] }
 ashpd = { version = "0.13", default-features = false, features = [
     "async-io",
     "notification",

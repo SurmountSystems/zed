@@ -1,0 +1,13 @@
+[package]
+name = "memory_palace"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/vibe_palace.rs"
+
+[dependencies]
+heed3 = { workspace = true }
+rkyv = { workspace = true }
