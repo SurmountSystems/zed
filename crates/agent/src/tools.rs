@@ -97,7 +97,7 @@ pub use write_file_tool::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct GrokPlanItem {
-    /// Human-readable description of the task (P4-0 observed shape for todo_write and enter_plan_mode inputs uses "content").
+    /// Human-readable description of the task (ACP capture harness observed shape for todo_write and enter_plan_mode inputs uses "content").
     pub content: String,
     /// Stable short slug for cross-turn task references (TurnId-based task-ids from prior work, e.g. "task-17-..." style) in Grok Build sessions.
     pub id: String,
@@ -120,7 +120,7 @@ impl From<GrokPlanItem> for acp::PlanEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct TodoWriteInput {
-    /// List of todos (matches P4-0 captured todo_write input shape with "todos" containing content/status/active_form items using TurnId task-ids in the "id" fields per prior work).
+    /// List of todos (matches ACP captured todo_write input shape with "todos" containing content/status/active_form items using TurnId task-ids in the "id" fields per prior work).
     pub todos: Vec<GrokPlanItem>,
 }
 
@@ -178,9 +178,9 @@ impl MonitorTool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct MonitorInput {
-    /// The command to execute for background monitoring (matches P4-0 observed monitor tool input shape for native dispatch fidelity).
+    /// The command to execute for background monitoring (matches ACP capture harness observed monitor tool input shape for native dispatch fidelity).
     pub command: String,
-    /// Working directory to use for the command. Primary key "cd" (to match terminal tool); "cwd" alias supports current working directory label variants observed in P4-0 tool calls for exact deserialization and schema roundtrip fidelity.
+    /// Working directory to use for the command. Primary key "cd" (to match terminal tool); "cwd" alias supports current working directory label variants observed in ACP capture harness tool calls for exact deserialization and schema roundtrip fidelity.
     #[serde(alias = "cwd")]
     pub cd: String,
     /// Optional timeout in milliseconds for the monitor command.
@@ -285,13 +285,92 @@ impl AgentTool for MonitorTool {
     }
 }
 
+pub struct RememberTool {
+    project: Entity<Project>,
+}
+
+impl RememberTool {
+    pub fn new(project: Entity<Project>) -> Self {
+        Self { project }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RememberInput {
+    /// Fact or preference to persist in native memory_palace for this project.
+    pub content: String,
+    /// When true, store in global memory instead of project-scoped memory.
+    #[serde(default)]
+    pub global: bool,
+}
+
+impl AgentTool for RememberTool {
+    type Input = RememberInput;
+    type Output = String;
+
+    const NAME: &'static str = "remember";
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Think
+    }
+
+    fn initial_title(
+        &self,
+        input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        if let Ok(parsed) = input {
+            let preview: String = parsed.content.chars().take(48).collect();
+            format!("Remember: {preview}").into()
+        } else {
+            "Remember".into()
+        }
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        _event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        let project = self.project.clone();
+        cx.spawn(async move |cx| {
+            let parsed = input.recv().await.map_err(|e| e.to_string())?;
+            let record_id = cx
+                .update(|cx| {
+                    let cwd = project
+                        .read(cx)
+                        .worktrees(cx)
+                        .next()
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                        .ok_or_else(|| "no active worktree for memory_palace".to_string())?;
+                    let mut store = memory_palace::MemoryPalaceStore::open_for_cwd(&cwd)
+                        .map_err(|error| error.to_string())?;
+                    if parsed.global {
+                        store
+                            .global
+                            .record_observation(parsed.content.clone())
+                            .map_err(|error| error.to_string())
+                    } else {
+                        store
+                            .project
+                            .record_observation(parsed.content.clone())
+                            .map_err(|error| error.to_string())
+                    }
+                })
+                .map_err(|e: String| e)?;
+            Ok(format!("Remembered as observation #{record_id}"))
+        })
+    }
+}
+
 pub struct EnterPlanModeTool;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct EnterPlanModeInput {
-    /// Plan entries for enter_plan_mode (uses content/status shape for P4-0 fidelity match on Grok's plan tool inputs).
+    /// Plan entries for enter_plan_mode (uses content/status shape for ACP capture harness fidelity match on Grok's plan tool inputs).
     pub plan: Vec<GrokPlanItem>,
-    /// Optional explanation for entering plan mode (supports P4-0 observed optional field shape in enter_plan_mode inputs).
+    /// Optional explanation for entering plan mode (supports ACP capture harness observed optional field shape in enter_plan_mode inputs).
     #[serde(default)]
     pub explanation: Option<String>,
 }
@@ -496,6 +575,7 @@ tools! {
     ListAgentsAndModelsTool,
     ListDirectoryTool,
     MonitorTool,
+    RememberTool,
     GetCommandOrSubagentOutputTool,
     MovePathTool,
     ReadFileTool,

@@ -34,7 +34,7 @@ pub struct PlanItem {
     pub step: String,
     /// The current status of this task.
     pub status: PlanEntryStatus,
-    /// Optional active form (Grok P4-0 observed shape for todo_write/enter_plan_mode fidelity; ignored for acp PlanEntry).
+    /// Optional active form (Grok ACP capture harness observed shape for todo_write/enter_plan_mode fidelity; ignored for acp PlanEntry).
     #[serde(default, alias = "active_form", skip_serializing)]
     pub active_form: Option<String>,
 }
@@ -76,11 +76,11 @@ impl UpdatePlanTool {
     }
 
     /// Helper for enter_plan_mode shim (Grok fidelity).
-    /// Produces a "proposed" plan (all pending) so ZT-1 can detect it via `Plan::is_proposed`.
+    /// Produces a "proposed" plan (all pending) so categorized todos surface can detect it via `Plan::is_proposed`.
     pub(crate) fn enter_plan_proposed(items: Vec<PlanItem>) -> acp::Plan {
         // Current implementation simply wraps the items. The "proposed" detection
         // happens via the heuristic in `Plan::is_proposed` (no completed / in_progress entries).
-        // See AGENTS.md G-18 and the plan approval work for future refinements.
+        // See AGENTS.md plan approval refinements and the plan approval work for future refinements.
         acp::Plan::new(items.into_iter().map(Into::into).collect())
     }
 }
@@ -250,8 +250,9 @@ mod tests {
     #[test]
     fn test_grok_plan_item_and_todo_write_input_turnid_task_id_serde_roundtrip() {
         let json = r#"{"todos":[{"content":"investigate error recovery","id":"task-01-turnid-prior","status":"pending","active_form":null}]}"#;
-        let input: TodoWriteInput = serde_json::from_str(json)
-            .expect("deserializes observed P4-0 todo_write shape with TurnId task-id");
+        let input: TodoWriteInput = serde_json::from_str(json).expect(
+            "deserializes observed ACP capture harness todo_write shape with TurnId task-id",
+        );
         assert_eq!(input.todos.len(), 1);
         let item: GrokPlanItem = input.todos[0].clone();
         assert_eq!(item.id, "task-01-turnid-prior");
@@ -266,8 +267,8 @@ mod tests {
     #[test]
     fn test_enter_plan_mode_input_serde_fidelity_with_turnid_task_ids() {
         let json = r#"{"plan":[{"content":"plan step","id":"task-02-turnid","status":"in_progress"}],"explanation":"per prior TurnId addressing"}"#;
-        let input: EnterPlanModeInput =
-            serde_json::from_str(json).expect("deserializes P4-0 enter_plan_mode shape");
+        let input: EnterPlanModeInput = serde_json::from_str(json)
+            .expect("deserializes ACP capture harness enter_plan_mode shape");
         assert_eq!(input.plan[0].id, "task-02-turnid");
         let value = serde_json::to_value(&input).expect("value shape");
         assert!(value.get("plan").is_some());

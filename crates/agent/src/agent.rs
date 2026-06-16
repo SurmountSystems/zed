@@ -1038,7 +1038,7 @@ impl NativeAgent {
         let worktree_store = project.read(cx).worktree_store();
 
         // Project skills loading with trusted worktree filtering (upstream structure
-        // accepted; our G-15 multi-root .grok project support is handled via the
+        // accepted; our multi-root .grok project support is handled via the
         // load_worktree_skills paths and global bridging above).
         let project_skills_task = {
             let project = project.clone();

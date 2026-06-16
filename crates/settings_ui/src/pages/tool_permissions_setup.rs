@@ -1440,6 +1440,9 @@ mod tests {
             // todo_write creates/manages structured task lists for the agent
             // (meta control) but does not use tool permission rules.
             "todo_write",
+            // remember persists observations to memory_palace (native Grok memory)
+            // but does not use tool permission rules.
+            "remember",
         ];
 
         let tool_info_ids: Vec<&str> = TOOLS.iter().map(|t| t.id).collect();

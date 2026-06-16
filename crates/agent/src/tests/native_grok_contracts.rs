@@ -10,7 +10,7 @@
 //! - SQLite session compatibility (GrokTuiSession discovery + is_valid_grok_tui_session_id)
 //!
 //! These tests are written to guide and lock the observable behavior required for
-//! co-equal bridging with the standalone Grok TUI (ACP roundtrip, P4-0 fidelity).
+//! co-equal bridging with the standalone Grok TUI (ACP roundtrip, ACP capture harness fidelity).
 //! They follow the existing patterns: injectable closures for hermetic FS/SQLite,
 //! GPUI TestAppContext for entity tests, and explicit error propagation.
 
@@ -97,7 +97,7 @@ impl PlanModeStateMachineContract {
         )
     }
 
-    /// Asserts the heuristic used by the rest of the system (ZT-1 banner, approval risk, etc.).
+    /// Asserts the heuristic used by the rest of the system (categorized todos surface banner, approval risk, etc.).
     #[allow(dead_code)]
     pub fn assert_is_proposed(plan: &acp_thread::Plan) {
         assert!(
@@ -167,7 +167,7 @@ impl MemoryLayerContract {
 /// Provides the predicates and discovery mocking contracts for Grok TUI session
 /// discovery. Worktrees.db correlation (GrokWorktreesDb + _with helpers) is now
 /// implemented (TDD, injectable, RO) for memory bridging + session linkage.
-/// Full jsonl replay still behind gated todo per G-16/Efficiency rules.
+/// Full jsonl replay still behind gated todo per session resume scaffold/Efficiency rules.
 pub struct SqliteSessionCompatibilityContract;
 
 impl SqliteSessionCompatibilityContract {
@@ -226,7 +226,7 @@ impl SqliteSessionCompatibilityContract {
 /// Provides the TDD harness contracts for the direct native `Thread` turn
 /// driver (`NativeTurnDriver`) + raw `ThreadEvent` assertion. This enables
 /// testing of the pure Grok-native path (bypassing `NativeAgentConnection` /
-/// ACP translation) so that ZT-1 collectors, plan rendering, etc. can be
+/// ACP translation) so that ZedTodos collectors, plan rendering, etc. can be
 /// validated against the canonical events emitted by the orchestration loop
 /// under the `is_grok_build_profile` gate.
 ///
@@ -261,13 +261,14 @@ impl DirectNativeTurnDriverContract {
 
 #[test]
 fn contract_tool_calling_all_grok_native_tools_are_registered() {
-    // Critical for P4-0 fidelity: the native agent must expose the same tool surface
+    // Critical for ACP capture harness fidelity: the native agent must expose the same tool surface
     // that the real grok binary uses via ACP (todo_write, enter_plan_mode, monitor, spawn_agent, etc.)
     ToolCallingContract::assert_tool_registered("update_plan");
     ToolCallingContract::assert_tool_registered("enter_plan_mode");
     ToolCallingContract::assert_tool_registered("spawn_agent");
     ToolCallingContract::assert_tool_registered("monitor");
     ToolCallingContract::assert_tool_registered("todo_write");
+    ToolCallingContract::assert_tool_registered("remember");
 
     // Sanity: the registry is non-empty and does not contain accidental duplicates in the macro.
     let names = ToolCallingContract::registered_tool_names();
@@ -284,7 +285,7 @@ fn contract_tool_calling_all_grok_native_tools_are_registered() {
 fn contract_plan_mode_enter_plan_mode_produces_all_pending_acp_plan() {
     // The enter_plan_mode tool (via UpdatePlanTool::enter_plan_proposed) must emit
     // an acp::Plan whose entries are all Pending. The higher-level "is_proposed"
-    // classification (used for ZT-1 banners and approval gating) is applied after
+    // classification (used for the categorized todos surface banners and approval gating) is applied after
     // the AcpThread wraps these entries; we only assert the raw contract shape here.
     use acp::PlanEntryStatus;
     let plan = PlanModeStateMachineContract::proposed_plan(vec![
@@ -420,7 +421,7 @@ fn contract_sqlite_session_discovery_is_hermetic_and_light() {
 #[gpui::test]
 async fn contract_tool_calling_enter_plan_mode_emits_proposed_plan(cx: &mut TestAppContext) {
     // End-to-end observable contract: invoking enter_plan_mode through the tool
-    // produces a Plan that the rest of the system (ZT-1, approval UI) classifies as proposed.
+    // produces a Plan that the rest of the system (categorized todos, approval UI) classifies as proposed.
     init_test(cx);
     let fs = fs::FakeFs::new(cx.executor());
     let _project = Project::test(fs, [], cx).await;
@@ -538,8 +539,8 @@ fn contract_p4_fidelity_tool_input_roundtrips() {
         serde_json::from_value(get_output_sample)
             .expect("get_command_or_subagent_output deserial matches harness observed input shape");
     let monitor_sample = serde_json::json!({"command":"cargo check","cd":"/home/hunter/Projects/surmount/zed","timeout_ms":120000,"description":"build verification"});
-    let _: crate::tools::MonitorInput =
-        serde_json::from_value(monitor_sample).expect("monitor input shape from P4-0");
+    let _: crate::tools::MonitorInput = serde_json::from_value(monitor_sample)
+        .expect("monitor input shape from ACP capture harness");
     let plan_item_sample = serde_json::json!({"content":"Verify harness fixtures","id":"verify-harness","status":"pending","active_form":"Verifying harness fixtures"});
     let _: crate::tools::GrokPlanItem = serde_json::from_value(plan_item_sample.clone())
         .expect("GrokPlanItem from plan-and-todo-samples");
@@ -631,7 +632,7 @@ fn contract_grok_tui_artifact_writers_roundtrip_with_p4_shapes_and_worktree() {
 // TODO: Re-implement this contract test properly under TDD once the surface + memory + proposed plan
 // paths are fully wired for native Grok. Left as placeholder to keep build green.
 #[test]
-fn test_native_grok_thread_with_proposed_plan_and_memory_populates_full_classified_surface_identically_to_bridged()
+fn test_native_grok_thread_with_proposed_plan_and_memory_populates_full_categorized_surface_identically_to_bridged()
  {
     // Intentionally left minimal. The previous body had brace/indent issues.
     assert!(true, "placeholder until full contract test is restored");
@@ -810,7 +811,7 @@ fn contract_native_grok_turn_driver_event_consumer_wires_to_full_tui_artifacts_e
     let _ = xai_grok_model_selection;
     let grok_native_inprocess_registration = "grok-native";
     let _ = grok_native_inprocess_registration;
-    let memory_artifacts_for_classified_zt1_grok_memory = project::GrokMemoryArtifacts {
+    let memory_artifacts_for_categorized_todos_grok_memory = project::GrokMemoryArtifacts {
         has_workspace_memory: true,
         workspace_memory_preview: None,
         workspace_memory_path: Some(std::path::PathBuf::from("/cwd/.grok/memory/019e3dd6")),
@@ -820,14 +821,15 @@ fn contract_native_grok_turn_driver_event_consumer_wires_to_full_tui_artifacts_e
         global_memory_full: None,
         facts_from_db: vec![],
     };
-    assert!(memory_artifacts_for_classified_zt1_grok_memory.has_workspace_memory);
+    assert!(memory_artifacts_for_categorized_todos_grok_memory.has_workspace_memory);
 }
 
 #[test]
 fn contract_turn_identifier_display_serde_roundtrip_type_ascription() {
     let the_turn_identifier: TurnId = TurnId::new(42);
-    let the_serialized_form: String = serde_json::to_string(&the_turn_identifier)
-        .expect("turn identifier serialization required for P4-0 addressing fidelity");
+    let the_serialized_form: String = serde_json::to_string(&the_turn_identifier).expect(
+        "turn identifier serialization required for ACP capture harness addressing fidelity",
+    );
     let the_deserialized_turn: TurnId = serde_json::from_str(&the_serialized_form)
         .expect("turn identifier deserialization required for orchestration roundtrips");
     assert_eq!(format!("{}", the_turn_identifier), "T-42");
@@ -898,7 +900,7 @@ async fn test_native_grok_run_turn_e2e_fidelity_to_p4_artifacts_with_cwd_and_pro
         .update(cx, |the_thread, cx| {
             the_thread.send(
                 UserMessageId::new(),
-                ["Native orchestration E2E under profile for P4-0 fidelity and CWD"],
+                ["Native orchestration E2E under profile for ACP capture harness fidelity and CWD"],
                 cx,
             )
         })
@@ -910,7 +912,7 @@ async fn test_native_grok_run_turn_e2e_fidelity_to_p4_artifacts_with_cwd_and_pro
         assert!(the_driver_maybe.is_some());
     });
     the_thread_entity.read_with(cx, |the_thread, _| {
-        assert!(the_thread.last_received_or_pending_message().is_some() || true);
+        assert!(the_thread.last_received_or_pending_message().is_some());
     });
 }
 
@@ -956,7 +958,7 @@ async fn test_native_grok_turn_driver_event_receiver_and_plan_injection(cx: &mut
     assert!(format!("{}", the_plan_turn_ref).starts_with("T-"));
 }
 
-// P4-13 Performance validation appended to native contracts (existing test file only).
+// native path performance validation Performance validation appended to native contracts (existing test file only).
 // Extensive harness for O(1) native path measurements, TurnId refs, profile gate,
 // driver construction, E2E kickback fidelity, proving native lighter than ACP external.
 // All per strict rules: relative crates/agent/... , fresh reads, CLAUDE, no core edits.
@@ -1004,7 +1006,7 @@ async fn perf_validation_native_turn_driver_with_turnid_refs_e2e(cx: &mut TestAp
     the_thread_entity.read_with(cx, |t, c| {
         assert!(
             t.is_grok_build_profile(c),
-            "P4 native profile active for TurnId + injection"
+            "native Grok profile active for TurnId + injection"
         );
     });
 }

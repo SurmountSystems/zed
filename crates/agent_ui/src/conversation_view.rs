@@ -1736,7 +1736,7 @@ impl ConversationView {
                     let new_bucket = active.read(cx).current_ring_visual_bucket(cx);
 
                     if old_bucket != new_bucket {
-                        // Real visual change in the ZT-1 ring (threshold cross, sub-agent, todos).
+                        // Real visual change in the activity ring (threshold cross, sub-agent, todos).
                         // Safe to notify; the dock prototype and activity bar will pick it up cheaply
                         // thanks to last_ring_bucket + ring_visual_bucket.
                         active.update(cx, |_, cx| cx.notify());

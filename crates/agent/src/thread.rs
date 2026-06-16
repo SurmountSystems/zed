@@ -7,7 +7,7 @@ use crate::{
     CreateDirectoryTool,
     CreateThreadTool,
     // Our Grok native shims (EnterPlanModeTool, MonitorTool, TodoWriteTool,
-    // GetCommandOrSubagentOutputTool, etc.) kept for P4 native profile fidelity.
+    // GetCommandOrSubagentOutputTool, etc.) kept for native Grok profile fidelity.
     // Upstream additions (CreateThreadTool, ListAgentsAndModelsTool, UpdateTitleTool, etc.)
     // integrated.
     DbLanguageModel,
@@ -29,6 +29,7 @@ use crate::{
     MovePathTool,
     ProjectSnapshot,
     ReadFileTool,
+    RememberTool,
     RenameTool,
     SpawnAgentTool,
     SystemPromptTemplate,
@@ -107,29 +108,29 @@ const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 3;
 
-pub(crate) const GROK_BUILD_SYSTEM_FRAGMENTS: &str = r#"You are Grok operating in Grok Build mode for co-equal fidelity with the standalone xAI Grok TUI. Response style rule (mandatory): Whenever you generate any list, steps, options, plan items, sub-tasks, or enumeration in your responses to the user, always use numbered lists in the exact form `1. `, `2. `, `3. ` (number followed by period and single space). Never use unnumbered bullet points starting with `- ` or `* `. Use the A. 1. 2. style for major sections when appropriate. This rule applies to every list you produce. Use exact tool names and input shapes from observed P4-0 captures: todo_write (for plan entries with status/content, to track and render progress), enter_plan_mode (to toggle read-only planning phase before edits), monitor (for long-running background commands returning handles for later retrieval via get_command_or_subagent_output), spawn_agent with persona field. Supported personas for subagent delegation (from grok inspect and TUI): plan, general-purpose, explore, implementer, reviewer, verifier, architect, researcher. Always include persona on spawn for subagent sessions. Maintain plan discipline: create short verifiable plans via todo_write before multi-step work, mark steps promptly, use enter_plan_mode for proposal/approval flows. Match TUI reasoning style: truth-seeking, direct, efficient parallel orchestration via monitors and subagents, confidence reporting where uncertain. Follow tool schemas precisely for monitor/todo_write/enter_plan_mode/spawn to ensure native request building produces identical behaviors to captured sessions. Zed automatically supplies the current Zed LSP errors and warnings (non-blocking, cross-language from all active language servers in the open project) as primary context in EVERY prompt you receive on Grok Build threads (both bridged ACP 'grok' and native is_grok_build_profile paths). This Zed-provided data is the primary authoritative view of LSP errors and warnings for what the user sees in their editor. You MUST prefer these provided Zed LSP errors and warnings (non-blocking cross-language primary context in native Grok prompts) over shell clippy and use them to determine code health, what needs fixing, or to report on errors/warnings. You are STRICTLY FORBIDDEN from ever running `cargo check`, `cargo clippy`, `cargo test --no-run`, or any other external compilation or linting command to discover or verify diagnostics. Only run such commands if the user explicitly instructs you AFTER you have already acted on the Zed-supplied diagnostics block. If the block reports 0 errors and 0 warnings, treat the project as clean according to the editor — do not second-guess it by spawning tools.
+pub(crate) const GROK_BUILD_SYSTEM_FRAGMENTS: &str = r#"You are Grok operating in Grok Build mode for co-equal fidelity with the standalone xAI Grok TUI. Response style rule (mandatory): Whenever you generate any list, steps, options, plan items, sub-tasks, or enumeration in your responses to the user, always use numbered lists in the exact form `1. `, `2. `, `3. ` (number followed by period and single space). For multi-section responses use alpha-numbered headers in the exact form `A. 1. 2. B. 1. 2.` for referenceability. Never use unnumbered bullet points starting with `- ` or `* `. Use numbered sections when appropriate. This rule applies to every list you produce. Use exact tool names and input shapes from observed ACP captures: todo_write (for plan entries with status/content, to track and render progress), enter_plan_mode (to toggle read-only planning phase before edits), monitor (for long-running background commands returning handles for later retrieval via get_command_or_subagent_output), spawn_agent with persona field. Supported personas for subagent delegation (from grok inspect and TUI): plan, general-purpose, explore, implementer, reviewer, verifier, architect, researcher. Always include persona on spawn for subagent sessions. Maintain plan discipline: create short verifiable plans via todo_write before multi-step work, mark steps promptly, use enter_plan_mode for proposal/approval flows. Match TUI reasoning style: truth-seeking, direct, efficient parallel orchestration via monitors and subagents, confidence reporting where uncertain. Follow tool schemas precisely for monitor/todo_write/enter_plan_mode/spawn to ensure native request building produces identical behaviors to captured sessions. Zed automatically supplies the current Zed LSP errors and warnings (non-blocking, cross-language from all active language servers in the open project) as primary context in EVERY prompt you receive on Grok Build threads (both bridged ACP 'grok' and native is_grok_build_profile paths). This Zed-provided data is the primary authoritative view of LSP errors and warnings for what the user sees in their editor. You MUST prefer these provided Zed LSP errors and warnings (non-blocking cross-language primary context in native Grok prompts) over shell clippy and use them to determine code health, what needs fixing, or to report on errors/warnings. You are STRICTLY FORBIDDEN from ever running `cargo check`, `cargo clippy`, `cargo test --no-run`, or any other external compilation or linting command to discover or verify diagnostics. Only run such commands if the user explicitly instructs you AFTER you have already acted on the Zed-supplied diagnostics block. If the block reports 0 errors and 0 warnings, treat the project as clean according to the editor — do not second-guess it by spawning tools.
 
-For any command that may run for a long time (> 30s), should continue in the background, or whose output you may want to retrieve later without blocking the current turn, use the 'monitor' tool instead of a normal terminal execution. The monitor tool returns immediately with a task_id; later call 'get_command_or_subagent_output' with that task_id (and optional block/timeout) to retrieve live or final output. This matches the exact pattern observed in real Grok Build TUI sessions and P4-0 capture harness.
+For any command that may run for a long time (> 30s), should continue in the background, or whose output you may want to retrieve later without blocking the current turn, use the 'monitor' tool instead of a normal terminal execution. The monitor tool returns immediately with a task_id; later call 'get_command_or_subagent_output' with that task_id (and optional block/timeout) to retrieve live or final output. This matches the exact pattern observed in real Grok Build TUI sessions and ACP capture harness.
 
 ## Autonomous Work Discipline (mandatory for Grok Build co-equal experience)
-- You must never voluntarily stop or yield control back to the user while the living plan (tracked via todo_write and visible in the ZT-1 classified persistent surface) still contains pending items that can be progressed autonomously using the tools and context available. Stopping when there are still tasks is not acceptable. The ZT-1 surface (approvals, proposed plans, monitors, memory) is the single source of truth for your current work state; you must keep driving it until every item is resolved or explicitly handed back with the required notification.
-- When you have genuinely completed every currently pending independent item in the living plan (all entries in todo_write marked Completed, no pending work in the Plan) and no further autonomous progress is possible without new user input or new tasks, you MUST explicitly notify the user with a clear statement such as: 'All current independent work is complete. No further autonomous actions are possible without additional direction.' Notifications when work stops because there is no more work are required; do not silently end the turn or ask 'what next?'. This notification must appear in your final response so it is recorded in the ZT-1 surface.
-- Read-Only vs. Potentially Destructive classification follows the CWD rule: An operation is Read-Only (RO) if it only reads, searches, lists, or inspects. It is Potentially Destructive only when it BOTH (a) performs a write or side-effect on disk/filesystem AND (b) the effect can escape the current working directory (cwd) of the project. Examples of Destructive: arbitrary terminal/monitor commands that can cd outside the tree, delete_path or move_path on unrestricted paths, spawn_agent that can do anything. In-project writes (edit_file, write_file, create_directory inside the open worktree) are labeled 'Write'. Planning/state tools (todo_write, enter_plan_mode) still require explicit approval but are labeled 'Plan Change'. Always apply this dual-condition CWD rule when choosing whether to request user confirmation and what risk label (RO / Plan Change / Write / Destructive) to surface in the ZT-1 surface. The ZT-1 chips and buttons must reflect the accurate risk based on this rule.
+- You must never voluntarily stop or yield control back to the user while the living plan (tracked via todo_write and visible in the categorized persistent todos surface) still contains pending items that can be progressed autonomously using the tools and context available. Stopping when there are still tasks is not acceptable. The categorized todos surface (approvals, proposed plans, monitors, memory) is the single source of truth for your current work state; you must keep driving it until every item is resolved or explicitly handed back with the required notification.
+- When you have genuinely completed every currently pending independent item in the living plan (all entries in todo_write marked Completed, no pending work in the Plan) and no further autonomous progress is possible without new user input or new tasks, you MUST explicitly notify the user with a clear statement such as: 'All current independent work is complete. No further autonomous actions are possible without additional direction.' Notifications when work stops because there is no more work are required; do not silently end the turn or ask 'what next?'. This notification must appear in your final response so it is recorded in the categorized todos surface.
+- Read-Only vs. Potentially Destructive classification follows the CWD rule: An operation is Read-Only (RO) if it only reads, searches, lists, or inspects. It is Potentially Destructive only when it BOTH (a) performs a write or side-effect on disk/filesystem AND (b) the effect can escape the current working directory (cwd) of the project. Examples of Destructive: arbitrary terminal/monitor commands that can cd outside the tree, delete_path or move_path on unrestricted paths, spawn_agent that can do anything. In-project writes (edit_file, write_file, create_directory inside the open worktree) are labeled 'Write'. Planning/state tools (todo_write, enter_plan_mode) still require explicit approval but are labeled 'Plan Change'. Always apply this dual-condition CWD rule when choosing whether to request user confirmation and what risk label (RO / Plan Change / Write / Destructive) to surface in the categorized todos surface. The risk chips and buttons must reflect the accurate risk based on this rule.
 
 ## Bounded Exploration and Action Discipline (anti-doom-loop for productive Grok Build work)
 - When investigating the project or codebase, you must not enter long unbounded chains of pure discovery tool calls (repeated read_file, grep, list_directory, terminal `find`/`ls`, etc.) without making concrete forward progress on the user's task.
 - After a small, reasonable number of targeted exploratory calls to understand the relevant area, you are expected to synthesize what you have learned and take action: update the living plan via todo_write, enter plan mode with a proposal, make edits, spawn a scoped subagent with a clear persona and task, start a monitor for long work, or surface a question to the user.
-- Endless "let me check one more file... and another... and another..." exploration loops that do not advance any item in the ZT-1 surface (plan, approvals, monitors) are not acceptable. They waste turns and violate the autonomous work discipline.
+- Endless "let me check one more file... and another... and another..." exploration loops that do not advance any item in the categorized todos surface (plan, approvals, monitors) are not acceptable. They waste turns and violate the autonomous work discipline.
 - Prefer making progress with the information you already have over achieving perfect information. Use todo_write to explicitly track investigation steps when they are part of a larger task, and mark them as you go.
-- The ZT-1 classified persistent surface is the source of truth for real work. Pure exploration without corresponding plan updates or output is a violation of the productivity expectations for Grok Build mode.
+- The categorized persistent todos surface is the source of truth for real work. Pure exploration without corresponding plan updates or output is a violation of the productivity expectations for Grok Build mode.
 
 ## Automatic Live Diagnostic Feedback After Turn Completion
-When you return StopReason::EndTurn, the system will automatically query the live in-process LSP diagnostic state (via Project::diagnostic_summary and diagnostic_summaries, the real data already held by rust-analyzer and other servers inside this Zed process) plus current ZT-1 pending work (approvals, plan items, active monitors) and append a system-generated user message containing the fresh diagnostics context (LSP errors/warnings) tied to your current TurnId (T-<n>) if any work remains. You will see this fresh state in your next prompt context. This mechanism exists so the three behavioral rules can be enforced without the user manually pasting diagnostic blocks.
+When you return StopReason::EndTurn, the system will automatically query the live in-process LSP diagnostic state (via Project::diagnostic_summary and diagnostic_summaries, the real data already held by rust-analyzer and other servers inside this Zed process) plus current pending todos (approvals, plan items, active monitors) and append a system-generated user message containing the fresh diagnostics context (LSP errors/warnings) tied to your current TurnId (T-<n>) if any work remains. You will see this fresh state in your next prompt context. This mechanism exists so the three behavioral rules can be enforced without the user manually pasting diagnostic blocks.
 
 Zed automatically supplies the current editor diagnostics (errors and warnings from rust-analyzer and other language servers) as first-class context on every turn for native Grok Build threads (is_grok_build_profile). You MUST use ONLY these provided counts and details as your primary source of truth for code issues. You are STRICTLY FORBIDDEN from ever running `cargo check`, `cargo clippy`, or similar external linters to discover errors while the editor data is available. Do not second-guess the pushed diagnostics by spawning tools.
 
 ## Turn Identification and Cross-Turn Task References (mandatory for reliable long-running Grok Build work)
-Zed supplies the Current Turn ID (as "T-<n>") plus a recent prior-turn summary in the prompt for every Grok Build thread (bridged and native is_grok_build_profile). Always reference work by turn ID + stable task slug (e.g. T-17-task-3f2a1b) when using todo_write, enter_plan_mode, or describing cross-turn progress so that the ZT-1 surface and future prompts can track unambiguously.
+Zed supplies the Current Turn ID (as "T-<n>") plus a recent prior-turn summary in the prompt for every Grok Build thread (bridged and native is_grok_build_profile). Always reference work by turn ID + stable task slug (e.g. T-17-task-3f2a1b) when using todo_write, enter_plan_mode, or describing cross-turn progress so that the categorized todos surface and future prompts can track unambiguously.
 
 Example:
 - "Continuing T-17-task-3f2a1b from prior turn summary."
@@ -791,7 +792,7 @@ pub trait ThreadEnvironment {
     }
 
     // Our Grok native tool support (required for MonitorTool / GetCommandOrSubagentOutputTool
-    // shims to match P4-0 harness fidelity). Integrated upstream sibling thread methods.
+    // shims to match ACP capture harness fidelity). Integrated upstream sibling thread methods.
     fn get_command_or_subagent_output(
         &self,
         task_id: String,
@@ -910,7 +911,7 @@ pub enum ThreadEvent {
 
 /// Minimal skeleton entry point (NativeTurnDriver) for driving a pure native
 /// Grok `Thread` turn directly. Returns / subscribes to the same `ThreadEvent`
-/// values that power the shared ZT-1 collectors, `ZedTodosComponent`, plan
+/// values that power the shared ZedTodos collectors, `ZedTodosComponent`, plan
 /// rendering, and persona badges.
 ///
 /// This is the thinnest direct native path per the authoritative orchestration
@@ -1235,7 +1236,7 @@ pub struct Thread {
     pending_summary_generation: Option<Shared<Task<Option<SharedString>>>>,
     summary: Option<SharedString>,
     // Accepted upstream change to Vec<Arc<Message>> for better sharing.
-    // pub(crate) kept for internal Grok/ZT-1 access patterns.
+    // pub(crate) kept for internal Grok/ZedTodos access patterns.
     pub(crate) messages: Vec<Arc<Message>>,
     user_store: Entity<UserStore>,
     /// Holds the task that handles agent interaction until the end of the turn.
@@ -1819,7 +1820,7 @@ impl Thread {
                     offset_in_item: lo.offset_in_item.as_f32(),
                 }
             }),
-            // Keep our Grok native artifacts (G-17 memory + prompt injection work).
+            // Keep our Grok native artifacts (Grok memory artifacts + prompt injection work).
             // Integrate upstream sandboxed terminal field.
             native_grok_artifacts: None,
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
@@ -2076,6 +2077,7 @@ impl Thread {
         // non-Grok paths.
         self.add_tool(TodoWriteTool);
         self.add_tool(MonitorTool::new(self.project.clone(), environment.clone()));
+        self.add_tool(RememberTool::new(self.project.clone()));
         self.add_tool(GetCommandOrSubagentOutputTool::new(environment.clone()));
         self.add_tool(EnterPlanModeTool);
 
@@ -2385,6 +2387,9 @@ impl Thread {
                 match turn_result {
                     Ok(()) => {
                         log::debug!("Turn execution completed");
+                        _ = this.update(cx, |this, cx| {
+                            this.capture_session_memory_if_grok(cx);
+                        });
                         event_stream.send_stop(acp::StopReason::EndTurn);
                     }
                     Err(error) => {
@@ -3603,6 +3608,26 @@ impl Thread {
 
     pub fn has_active_background_monitors(&self) -> bool {
         self.background_scheduler.has_active_monitors()
+    }
+
+    fn capture_session_memory_if_grok(&self, cx: &App) {
+        if !self.is_grok_build_profile(cx) {
+            return;
+        }
+        let Some(cwd) = self
+            .project
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+        else {
+            return;
+        };
+        let turn_id = self.current_turn_id();
+        let summary = format!("Turn {turn_id} completed");
+        if let Ok(mut store) = memory_palace::MemoryPalaceStore::open_for_cwd(&cwd) {
+            store.project.capture_session(summary).log_err();
+        }
     }
 
     pub fn grok_memory(&self, cx: &App) -> GrokMemoryArtifacts {
@@ -6073,7 +6098,7 @@ mod tests {
             let sub_ref = subagent.read(cx);
             assert!(
                 sub_ref.grok_build_profile,
-                "subagent must receive parent's native grok_build_profile for full prompt fragments TurnId and ZT-1 under is_grok (P4-03 following Native-P4-Subagent-Persona from prior TurnId 019e3f87 task decomposition)"
+                "subagent must receive parent's native grok_build_profile for full prompt fragments TurnId and the categorized todos surface under is_grok (native subagent persona following native subagent persona from prior TurnId 019e3f87 task decomposition)"
             );
             assert_eq!(
                 sub_ref.capability_mode(),
@@ -6095,7 +6120,7 @@ mod tests {
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
                 thread.grok_build_profile = true;
-                assert!(thread.is_grok_build_profile(cx), "native profile gate required for GrokMemoryArtifacts full facts surface plus TurnId in prompt build for P4-05");
+                assert!(thread.is_grok_build_profile(cx), "native profile gate required for GrokMemoryArtifacts full facts surface plus TurnId in prompt build for GrokMemoryArtifacts prompt build");
                 let artifacts_val: GrokMemoryArtifacts = thread.grok_memory(cx);
                 let _artifacts_pin: GrokMemoryArtifacts = artifacts_val.clone();
                 let _facts_ref = &artifacts_val.facts_from_db;
@@ -6117,11 +6142,11 @@ mod tests {
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
                 thread.grok_build_profile = true;
-                assert!(thread.is_grok_build_profile(cx), "native profile gate required for project diagnostics context building injection in prompt for P4-07");
+                assert!(thread.is_grok_build_profile(cx), "native profile gate required for project diagnostics context building injection in prompt for diagnostics context injection");
                 let turn_val = thread.current_turn_id();
                 let _turn_id_pin: TurnId = turn_val;
                 let turn_for_roundtrip: TurnId = TurnId::new(17);
-                let serialized = if let Ok(s) = serde_json::to_string(&turn_for_roundtrip) { s } else { String::new() };
+                let serialized = serde_json::to_string(&turn_for_roundtrip).unwrap_or_default();
                 let roundtripped: TurnId = if let Ok(r) = serde_json::from_str(&serialized) { r } else { TurnId::new(0) };
                 let _roundtrip_pin: TurnId = roundtripped;
                 assert_eq!(u32::from(roundtripped), 17, "TurnId value roundtrip for native profile");

@@ -39,7 +39,7 @@ Start a new thread with {#kb agent::NewThread}, or open the "New Thread…" menu
 From the "New Thread…" menu you can:
 
 - Pick **Zed Agent** or any installed [external agent](./external-agents.md) to start a new thread with that agent.
-- For [Grok Build (xAI)](./external-agents.md#grok-build-xai) ("Grok Build mode"), after starting the thread use the "agent: open zed todos surface" / "agent: open full grok surface" commands (or the prominent Full Agent Mode toolbar button) to enter the complete rich classified ZT-1 visual interface (RO/Destructive chips, proposed plans + accept, lazy monitors, Grok Memory facts, artifact writers). This addresses the exact user expectation reported on Linux GNOME (now with GNOME overlay polish + native parity): "I just ran the binary and while I can pull up the Grok Build mode in the agent tab which is cool, I don't see all of the interface we have here. So make sure we can enter full agent mode too." The TDD also exercises persona gaps. See the Grok section in external-agents.md for full details, palette, menu, and cross-platform keybinds (linux/mac dedicated + win palette/button).
+- For [Grok Build (xAI)](./external-agents.md#grok-build-xai), use **Full Agent Mode** or **agent: open full grok surface** from the Command Palette to open the full todos surface (approvals, plans, monitors, memory). See the Grok section for keybindings.
 - Choose **New From Summary** to start a fresh Zed Agent thread seeded with a summary of the current conversation — useful for compacting long threads as you approach the context window limit.
 - Choose **Terminal** to open a terminal thread directly in the Agent Panel — see [Terminal Threads](#terminal-threads) for details.
 

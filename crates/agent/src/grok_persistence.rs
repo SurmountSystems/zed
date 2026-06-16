@@ -45,7 +45,7 @@ pub struct GrokSessionArtifacts {
     pub terminal_logs: HashMap<String, String>,
     /// Recovered turn identifier from TUI session for full fidelity migration
     /// into native Thread (see TurnId in acp_thread + thread.rs current_turn_id).
-    /// P4-14 import tooling populates this so native Grok threads resume at the
+    /// TUI session import import tooling populates this so native Grok threads resume at the
     /// exact turn state from ~/.grok/sessions.
     pub turn_id: Option<u32>,
 }
@@ -93,7 +93,7 @@ impl GrokSessionStore for InMemoryGrokSessionStore {
     }
 }
 
-/// P4-14 migration / import tooling entry point (agent import + session tools).
+/// TUI session import migration / import tooling entry point (agent import + session tools).
 /// Loads TUI session from ~/.grok/sessions (via project session store load_raw)
 /// into native-compatible GrokSessionArtifacts including recovered turn_id for
 /// full fidelity restore into Zed native Grok Thread (preserves plan/monitor/
@@ -124,7 +124,7 @@ pub fn migrate_grok_tui_session(
         .iter()
         .rev()
         .find_map(|line| {
-            // Non-panicking parse; real would use serde on known shapes from P4-0.
+            // Non-panicking parse; real would use serde on known shapes from ACP capture harness.
             if let Some(pos) = line.find("turn") {
                 let tail = &line[pos..];
                 tail.split(|c: char| !c.is_ascii_digit())
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn migrate_tui_session_to_native_preserves_turn_id_and_supports_cwd_cases() {
         // Injectable RO reader simulates TUI ~/.grok/sessions layout (hermetic,
-        // no real FS, per G-11 patterns and CLAUDE TDD). Covers CWD encoded path.
+        // no real FS, per hermetic injectable patterns patterns and CLAUDE TDD). Covers CWD encoded path.
         let read_closure = |path: &Path| -> Option<String> {
             match path.file_name().and_then(|n| n.to_str()) {
                 Some("prompt_context.json") => Some(
@@ -244,7 +244,7 @@ mod tests {
         // turn recovered for native Thread fidelity (TurnId::new will be called by caller)
         assert_eq!(artifacts.turn_id, Some(42));
 
-        // TurnId serde roundtrip test (required by spec for P4 migration fidelity)
+        // TurnId serde roundtrip test (required by spec for TUI session migration fidelity)
         let original_turn: acp_thread::TurnId = acp_thread::TurnId::new(17);
         let json = serde_json::to_string(&original_turn).expect("TurnId must serialize");
         let roundtripped: acp_thread::TurnId =

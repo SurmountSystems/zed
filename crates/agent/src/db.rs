@@ -82,7 +82,7 @@ pub struct DbThread {
     #[serde(default)]
     pub ui_scroll_position: Option<SerializedScrollPosition>,
     #[serde(default)]
-    // Keep Grok artifacts (G-17) + integrate upstream sandbox terminal field.
+    // Keep Grok artifacts (Grok memory artifacts) + integrate upstream sandbox terminal field.
     pub native_grok_artifacts: Option<serde_json::Value>,
     pub sandboxed_terminal_temp_dir: Option<PathBuf>,
 }
@@ -1289,7 +1289,7 @@ mod tests {
         });
         let artifacts_for_kickback: ::serde_json::Value = serde_json::json!({
             "current_turn_id": serde_json::to_value(current_native_grok_turn_identifier).expect("TurnId into kickback artifact"),
-            "plans": [kickback_plan_entry.clone()],
+            "plans": [kickback_plan_entry],
             "memory": {"injected_rules": "native profile kickback for T-N-task-slug references"}
         });
         let native_grok_profile = Some(AgentProfileId("grok-build".to_string().into()));
@@ -1299,7 +1299,7 @@ mod tests {
             messages: vec![],
             updated_at: Utc.with_ymd_and_hms(2024, 5, 19, 0, 0, 0).unwrap(),
             model: None,
-            profile: native_grok_profile.clone(),
+            profile: native_grok_profile,
             native_grok_artifacts: Some(artifacts_for_kickback.clone()),
             version: SharedThread::VERSION.to_string(),
         };

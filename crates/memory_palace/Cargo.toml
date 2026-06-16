@@ -6,8 +6,13 @@ publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [lib]
-path = "src/vibe_palace.rs"
+path = "src/memory_palace.rs"
 
 [dependencies]
 heed3 = { workspace = true }
+paths = { workspace = true }
 rkyv = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

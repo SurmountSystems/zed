@@ -64,7 +64,7 @@ use crate::{
     ToggleNewThreadMenu,
     ToggleOptionsMenu,
     agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
-    // Re-export the classified persistent agent surface components
+    // Re-export the categorized persistent agent surface components
     // (approvals, plans, monitors, memory) plus upstream integration points.
     conversation_view::{
         AcpThreadViewEvent, RootThreadUpdated, ThreadView, ZedTodosComponent,
@@ -185,9 +185,23 @@ impl TerminalId {
         self.0.hyphenated().to_string()
     }
 
+    pub(crate) fn as_uuid(self) -> uuid::Uuid {
+        self.0
+    }
+
     pub(crate) fn from_key_string(key: &str) -> anyhow::Result<Self> {
         Ok(Self(uuid::Uuid::parse_str(key)?))
     }
+}
+
+impl From<uuid::Uuid> for TerminalId {
+    fn from(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+}
+
+fn panel_workspace_key(workspace_id: workspace::WorkspaceId) -> [u8; 8] {
+    i64::from(workspace_id).to_le_bytes()
 }
 
 impl fmt::Display for TerminalId {
@@ -223,10 +237,20 @@ fn read_global_last_used_agent(cx: &App) -> Option<Agent> {
         .map(|entry| entry.agent)
 }
 
+fn grok_build_default_agent() -> Agent {
+    if project::grok_build_default_agent_available() {
+        Agent::Custom {
+            id: AgentId::from("grok"),
+        }
+    } else {
+        Agent::default()
+    }
+}
+
 fn write_global_last_used_agent(agent: Agent, cx: &App) {
     if let Some(json) = serde_json::to_string(&LastUsedAgent { agent }).ok() {
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
-            let _ = store.read(cx).save_global_json(b"last_used_agent", json);
+            let _ = store.read(cx).save_global_json(b"last_used_agent", &json);
         }
     }
 }
@@ -297,7 +321,7 @@ fn write_global_last_created_entry_kind(entry_kind: AgentPanelEntryKind, cx: &Ap
         if let Some(store) = ThreadMetadataStore::try_global(cx) {
             let _ = store
                 .read(cx)
-                .save_global_last_created_entry_kind_json(json);
+                .save_global_last_created_entry_kind_json(&json);
         }
     }
 }
@@ -311,9 +335,7 @@ fn dismissed(key: &str, cx: &App) -> bool {
 fn set_dismissed(key: &str, is_d: bool, cx: &App) {
     if let Some(store) = ThreadMetadataStore::try_global(cx) {
         let val = if is_d { "1" } else { "0" };
-        let _ = store
-            .read(cx)
-            .save_global_json(key.as_bytes(), val.to_string());
+        let _ = store.read(cx).save_global_json(key.as_bytes(), val);
     }
 }
 
@@ -321,7 +343,7 @@ fn read_serialized_panel(
     workspace_id: workspace::WorkspaceId,
     cx: &App,
 ) -> Option<SerializedAgentPanel> {
-    let key = i64::from(workspace_id).to_string().into_bytes();
+    let key = panel_workspace_key(workspace_id);
     ThreadMetadataStore::try_global(cx)
         .and_then(|store| store.read(cx).load_panel_state(&key).ok().flatten())
 }
@@ -331,7 +353,7 @@ fn save_serialized_panel(
     panel: SerializedAgentPanel,
     cx: &App,
 ) -> Result<()> {
-    let key = i64::from(workspace_id).to_string().into_bytes();
+    let key = panel_workspace_key(workspace_id);
     if let Some(store) = ThreadMetadataStore::try_global(cx) {
         let archived: ArchivedSerializedAgentPanel = panel.into();
         let _ = store.read(cx).save_panel_state(&key, &archived);
@@ -354,7 +376,7 @@ pub(crate) struct SerializedAgentPanel {
     #[serde(default)]
     pub(crate) last_active_thread: Option<SerializedActiveThread>,
     #[serde(default)]
-    // Persisted state for the classified agent surface (show_zed_todos_surface
+    // Persisted state for the categorized agent surface (show_zed_todos_surface
     // and the expanded state for approvals/plan/background/grok memory items)
     // plus the draft thread id. Upstream's last_active_terminal_id is also
     // carried (additive).
@@ -796,6 +818,39 @@ pub fn init(cx: &mut App) {
         },
     )
     .detach();
+
+    cx.observe_new(|_workspace: &mut Workspace, window, cx| {
+        let Some(window) = window else {
+            return;
+        };
+        let workspace = cx.entity();
+        cx.subscribe_in(&workspace, window, |workspace, _, event, window, cx| {
+            if !matches!(event, workspace::Event::ActiveItemChanged) {
+                return;
+            }
+            let has_editor = workspace
+                .active_pane()
+                .read(cx)
+                .active_item()
+                .and_then(|item| item.act_as::<Editor>(cx))
+                .is_some();
+            if !has_editor {
+                return;
+            }
+            let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                return;
+            };
+            panel.update(cx, |_panel, cx| {
+                cx.defer_in(window, move |panel, window, cx| {
+                    if panel.should_ensure_grok_categorized_surface(cx) {
+                        panel.ensure_grok_categorized_surface(window, cx);
+                    }
+                });
+            });
+        })
+        .detach();
+    })
+    .detach();
 }
 
 fn conflict_resource_block(conflict: &ConflictContent) -> acp::ContentBlock {
@@ -1092,6 +1147,7 @@ impl AgentTerminal {
     }
 }
 
+#[derive(Debug)]
 enum BaseView {
     Uninitialized,
     AgentThread {
@@ -1187,8 +1243,19 @@ pub struct AgentPanel {
 
     is_active: bool,
 
+    /// Set when Grok Build activation requested the categorized surface before
+    /// the ACP thread was ready. Cleared once the overlay opens.
+    grok_categorized_surface_pending: bool,
+
+    /// Prevents duplicate deferred dock reveal/focus work per frame burst.
+    grok_panel_reveal_scheduled: bool,
+
+    /// Set after the workspace dock has been revealed and zoomed for Grok Build
+    /// once per panel lifetime. Prevents focus/reveal oscillation loops.
+    grok_panel_revealed: bool,
+
     /// When true, the panel is in the early-creation "loading" state (showing
-    /// indeterminate SpinnerLabel UI) while the persisted classified agent surface
+    /// indeterminate SpinnerLabel UI) while the persisted categorized agent surface
     /// state restore runs in the background. This keeps the approvals, plans,
     /// monitors, and memory surface visible without blocking first paint.
     initial_state_loading: bool,
@@ -1460,33 +1527,11 @@ impl AgentPanel {
                             .or(global_fallback),
                     };
                     if let Some(agent) = initial_agent {
-                        // Preserve a just-activated Grok Custom selection (set by NewGrokThread
-                        // dispatch or equivalent activation during "editor open" + startup init)
-                        // over whatever the restored/serialized state contains (which may be
-                        // default/empty in test setups or prior non-grok persisted state).
-                        // This is required for the "Grok on open must default to fully maximized
-                        // ZT-1 categorized surface after startup initialization" contract.
-                        let restored_is_grok = matches!(&agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
-                        let current_is_grok = matches!(&panel.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
-                        if restored_is_grok {
-                            panel.selected_agent = agent;
-                            log::info!(
-                                "AgentPanel load: restored selected_agent = {:?}",
-                                panel.selected_agent
-                            );
-                        } else if !current_is_grok {
-                            panel.selected_agent = agent;
-                            log::info!(
-                                "AgentPanel load: restored selected_agent = {:?}",
-                                panel.selected_agent
-                            );
-                        }
-                        // else: current is grok (just-activated) and restored is not -> keep current.
-                        // Strengthened from simple "if !current_is_grok" to also cover persisted grok in
-                        // serialized and to survive timing in "startup init" parks after NewGrokThread/OpenFull
-                        // dispatch (see matching logic in start_initial_state_restore defer patch and the
-                        // force set in OpenFullGrokSurface handler). This is the "actual problem" fix for
-                        // the red TDD contract "selected_agent should remain grok after startup initialization".
+                        panel.selected_agent = agent;
+                        log::info!(
+                            "AgentPanel load: restored selected_agent = {:?}",
+                            panel.selected_agent
+                        );
                     }
 
                     // NOTE: We intentionally do NOT force ensure_grok_categorized_surface here
@@ -1610,6 +1655,11 @@ impl AgentPanel {
                     this.ensure_native_agent_connection(cx);
                     this.update_thread_work_dirs(cx);
                     this.persist_all_terminal_metadata(cx);
+                    if matches!(this.base_view, BaseView::Uninitialized)
+                        && this.has_open_project(cx)
+                    {
+                        this.mark_grok_categorized_surface_pending(cx);
+                    }
                     cx.notify();
                 }
                 _ => {}
@@ -1658,7 +1708,7 @@ impl AgentPanel {
             pending_serialization: None,
             new_user_onboarding: onboarding,
             thread_store,
-            selected_agent: Agent::default(),
+            selected_agent: grok_build_default_agent(),
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(dismissed(
@@ -1671,6 +1721,9 @@ impl AgentPanel {
             _thread_metadata_store_subscription,
             last_context_source: None,
             is_active: false,
+            grok_categorized_surface_pending: false,
+            grok_panel_reveal_scheduled: false,
+            grok_panel_revealed: false,
             zed_todos_persisted_state: None,
             initial_state_loading: false,
         };
@@ -1715,14 +1768,13 @@ impl AgentPanel {
     ) {
         self.set_initial_state_loading();
 
-        let workspace_weak = self.workspace.clone();
         let workspace_id = self.workspace_id;
 
         let (serialized_panel, _global_last_used_agent) = if let Some(id) = workspace_id {
             let panel = ThreadMetadataStore::try_global(cx).and_then(|store| {
                 store
                     .read(cx)
-                    .load_panel_state(&i64::from(id).to_string().into_bytes())
+                    .load_panel_state(&panel_workspace_key(id))
                     .ok()
                     .flatten()
             });
@@ -1732,57 +1784,54 @@ impl AgentPanel {
             (None, None)
         };
 
-        window.defer(cx, move |_window, cx| {
-            if let Some(ws) = workspace_weak.upgrade() {
-                ws.update(cx, |workspace, cx| {
-                    if let Some(panel) = workspace.panel::<Self>(cx) {
-                        panel.update(cx, |panel, cx| {
-                            panel.initial_state_loading = false;
+        let panel_weak = cx.entity().downgrade();
+        window.defer(cx, move |window, cx| {
+            let Some(panel_entity) = panel_weak.upgrade() else {
+                return;
+            };
+            panel_entity.update(cx, |panel, cx| {
+                let restored_is_grok = serialized_panel
+                    .as_ref()
+                    .and_then(|p| p.selected_agent.as_ref())
+                    .is_some_and(|agent| {
+                        matches!(agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native")
+                    })
+                    || matches!(&panel.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
+                if !restored_is_grok {
+                    panel.initial_state_loading = false;
+                }
 
-                            if let Some(sp) = serialized_panel.as_ref() {
-                                panel.last_created_entry_kind = sp.last_created_entry_kind;
-                            }
-                            if let Some(st) = serialized_panel
-                                .as_ref()
-                                .and_then(|p| p.zed_todos_state.clone())
-                            {
-                                panel.zed_todos_persisted_state = Some(st);
-                            }
-                            if let Some(agent) = serialized_panel
-                                .as_ref()
-                                .and_then(|p| p.selected_agent.clone())
-                            {
-                                let restored_is_grok = matches!(&agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
-                                let current_is_grok = matches!(&panel.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
-                                if restored_is_grok {
-                                    panel.selected_agent = agent;
-                                } else if !current_is_grok {
-                                    panel.selected_agent = agent;
-                                }
-                                // else: current is grok (just-activated via NewGrokThread/OpenFull dispatch during
-                                // "editor open" + startup init), restored is non-grok (default/prior persisted in
-                                // test setups or reload) -> keep current grok so the subsequent open/ensure produces
-                                // the fully maximized ZT-1 categorized surface. See the symmetric guard in the main
-                                // load path and the force in the OpenFullGrokSurface handler.
-                            }
-
-                            cx.notify();
-
-                            // After the init patch (loading cleared, owned data applied), if the effective
-                            // selected is grok (persisted in serialized or just-activated via dispatch and
-                            // preserved by the guard above), ensure the full maximized ZT-1 categorized
-                            // surface. This is the post-"startup initialization" point where we want the
-                            // immersive view (prototype + prepare pre-expanded + zoom) for grok on open.
-                            // Safe here (after bg work + Spinner clear); the hang-of-doom protection is the
-                            // is_grok early return inside ensure and the active_agent_thread guard in open.
-                            // Non-grok loads skip (no force on pure load, matching the sibling guard test).
-                            if matches!(&panel.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native") {
-                                panel.ensure_grok_categorized_surface(_window, cx);
-                            }
-                        });
+                if let Some(sp) = serialized_panel.as_ref() {
+                    panel.last_created_entry_kind = sp.last_created_entry_kind;
+                }
+                if let Some(st) = serialized_panel
+                    .as_ref()
+                    .and_then(|p| p.zed_todos_state.clone())
+                {
+                    panel.zed_todos_persisted_state = Some(st);
+                }
+                if let Some(agent) = serialized_panel
+                    .as_ref()
+                    .and_then(|p| p.selected_agent.clone())
+                {
+                    let restored_is_grok = matches!(&agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
+                    let current_is_grok = matches!(&panel.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
+                    if restored_is_grok {
+                        panel.selected_agent = agent;
+                    } else if !current_is_grok {
+                        panel.selected_agent = agent;
                     }
-                });
-            }
+                } else {
+                    panel.selected_agent = grok_build_default_agent();
+                }
+
+                cx.notify();
+
+                if matches!(&panel.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native") {
+                    panel.mark_grok_categorized_surface_pending(cx);
+                    panel.ensure_grok_categorized_surface(window, cx);
+                }
+            });
         });
     }
 
@@ -2698,13 +2747,44 @@ impl AgentPanel {
         }
     }
 
+    fn suppress_terminal_bell_for_base_view(
+        &self,
+        terminal_id: TerminalId,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        if !window.is_window_active()
+            || self.active_terminal_id() != Some(terminal_id)
+            || !matches!(
+                &self.base_view,
+                BaseView::Terminal {
+                    terminal_id: active_id
+                } if *active_id == terminal_id
+            )
+            || matches!(self.overlay_view, Some(OverlayView::Configuration))
+        {
+            return false;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return false;
+        };
+        if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
+            if multi_workspace.read(cx).workspace() != &workspace {
+                return false;
+            }
+        }
+        AgentPanel::is_visible(&workspace, cx)
+    }
+
     fn mark_terminal_notification(
         &mut self,
         terminal_id: TerminalId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_terminal_visible(terminal_id, window, cx) {
+        if self.active_terminal_visible(terminal_id, window, cx)
+            || self.suppress_terminal_bell_for_base_view(terminal_id, window, cx)
+        {
             return;
         }
         let newly_notified = {
@@ -3859,7 +3939,10 @@ impl AgentPanel {
     }
 
     pub(crate) fn open_zed_todos_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        log::info!(
+        if matches!(self.base_view, BaseView::Terminal { .. }) {
+            return;
+        }
+        log::debug!(
             "open_zed_todos_surface called (current overlay present: {})",
             matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
         );
@@ -3869,9 +3952,15 @@ impl AgentPanel {
             return;
         }
         let Some(active_acp_thread) = self.active_agent_thread(cx) else {
-            log::info!("open_zed_todos_surface: no active_agent_thread, returning early");
+            log::debug!(
+                "open_zed_todos_surface: no active_agent_thread yet (base_view={:?}, draft={}, pending={})",
+                self.base_view,
+                self.draft_thread.is_some(),
+                self.grok_categorized_surface_pending
+            );
             return;
         };
+        let session_id = active_acp_thread.read(cx).session_id().clone();
         let zed_todos_dock_prototype =
             cx.new(|cx| ZedTodosDockPrototype::new_for_thread(active_acp_thread, cx));
         zed_todos_dock_prototype.update(cx, |prototype, _cx| {
@@ -3894,10 +3983,20 @@ impl AgentPanel {
         self.overlay_view = Some(OverlayView::ZedTodosSurface(
             zed_todos_dock_prototype.clone(),
         ));
-        if !self.zoomed {
-            self.toggle_zoom(&ToggleZoom, window, cx);
+        log::debug!(
+            "open_zed_todos_surface: opened categorized surface (session={:?})",
+            session_id
+        );
+        self.initial_state_loading = false;
+        self.grok_categorized_surface_pending = false;
+        if self.is_grok_build_context(cx) {
+            self.schedule_reveal_agent_panel_in_workspace(window, cx);
+        } else {
+            if !self.zoomed {
+                self.toggle_zoom(&ToggleZoom, window, cx);
+            }
+            zed_todos_dock_prototype.focus_handle(cx).focus(window, cx);
         }
-        zed_todos_dock_prototype.focus_handle(cx).focus(window, cx);
         cx.emit(AgentPanelEvent::ActiveViewChanged);
         cx.notify();
         self.serialize(cx);
@@ -4314,7 +4413,10 @@ impl AgentPanel {
             BaseView::AgentThread { conversation_view } => {
                 conversation_view.read(cx).root_thread(cx)
             }
-            _ => None,
+            _ => self
+                .draft_thread
+                .as_ref()
+                .and_then(|draft| draft.read(cx).root_thread(cx)),
         }
     }
 
@@ -4452,10 +4554,16 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Do not clear the categorized todos surface when activating a Grok Build thread
-        // (bridged or native is_grok_build_profile). The surface is the intended primary
-        // left visual for Grok; incidental thread switches must not drop the user out.
-        if !self.will_be_grok_build_context(&new_view, cx) {
+        // Terminal is always shown without overlay; Grok categorized surface must not cover it.
+        if matches!(&new_view, BaseView::Terminal { .. }) {
+            self.clear_overlay_state(cx, true);
+            if self.zoomed {
+                self.toggle_zoom(&ToggleZoom, window, cx);
+            }
+        } else if !self.will_be_grok_build_context(&new_view, cx) {
+            // Do not clear the categorized todos surface when activating a Grok Build thread
+            // (bridged or native is_grok_build_profile). The surface is the intended primary
+            // left visual for Grok; incidental thread switches must not drop the user out.
             self.clear_overlay_state(cx, false);
         }
 
@@ -4478,16 +4586,6 @@ impl AgentPanel {
             }
         }
 
-        // For the bridged "grok" ACP agent, ensure the rich categorized todos surface
-        // (approvals, proposed plans, background monitors, Grok memory) is the primary
-        // visual, shown in the fully expanded Full Agent Mode on the left when the
-        // Agent Panel is the main dock. This is the default experience that makes the
-        // standalone TUI unnecessary.
-        if matches!(&self.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native")
-        {
-            self.ensure_grok_categorized_surface(window, cx);
-        }
-
         // Native Grok Build profile threads (direct xAI grok models via is_grok_build_profile)
         // default to the rich categorized todos surface in the full expanded view.
         // The surface lives on the left as the primary content of the expanded Agent Panel.
@@ -4504,7 +4602,10 @@ impl AgentPanel {
                 {
                     if let Some(native_thread) = native_conn.thread(&acp_read.session_id(), cx) {
                         if native_thread.read(cx).is_grok_build_profile(cx) {
-                            self.ensure_grok_categorized_surface(window, cx);
+                            self.mark_grok_categorized_surface_pending(cx);
+                            if self.should_ensure_grok_categorized_surface(cx) {
+                                self.ensure_grok_categorized_surface(window, cx);
+                            }
                         }
                     }
                 }
@@ -4512,11 +4613,6 @@ impl AgentPanel {
         }
 
         self.refresh_base_view_subscriptions(window, cx);
-
-        // Final enforcement for Grok Build contexts (bridged or native). Ensures the
-        // rich categorized todos surface is the primary left visual in the fully
-        // expanded agent view, even on first activation or profile-driven native grok.
-        self.ensure_grok_categorized_surface(window, cx);
 
         // For Grok users, make the fully maximized agent screen (the big ZedTodosSurface
         // dock in Full Agent Mode with zoom) the focused primary view on panel creation,
@@ -4582,7 +4678,7 @@ impl AgentPanel {
     fn is_grok_build_context(&self, cx: &mut Context<Self>) -> bool {
         let via_selected = matches!(&self.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
         if via_selected {
-            log::info!(
+            log::debug!(
                 "is_grok_build_context: true via selected_agent = {:?}",
                 self.selected_agent
             );
@@ -4599,7 +4695,7 @@ impl AgentPanel {
                 {
                     if let Some(native_thread) = native_conn.thread(&acp_read.session_id(), cx) {
                         if native_thread.read(cx).is_grok_build_profile(cx) {
-                            log::info!(
+                            log::trace!(
                                 "is_grok_build_context: true via native is_grok_build_profile"
                             );
                             return true;
@@ -4646,6 +4742,75 @@ impl AgentPanel {
     /// is_grok_build_profile). Opens the surface, prepares full expansion, and
     /// forces zoom if needed. This is the mechanism that makes the default primary
     /// left categorized experience stick for Grok on first open and thread activation.
+    fn should_ensure_grok_categorized_surface(&self, cx: &mut Context<Self>) -> bool {
+        if !self.is_grok_build_context(cx)
+            || !(self.is_active || self.grok_categorized_surface_pending)
+            || matches!(self.base_view, BaseView::Terminal { .. })
+            || matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
+        {
+            return false;
+        }
+        match &self.base_view {
+            BaseView::Uninitialized => self.has_open_project(cx),
+            BaseView::AgentThread { .. } => self.active_agent_thread(cx).is_some(),
+            BaseView::Terminal { .. } => false,
+        }
+    }
+
+    fn mark_grok_categorized_surface_pending(&mut self, cx: &mut Context<Self>) {
+        if self.is_grok_build_context(cx) {
+            self.grok_categorized_surface_pending = true;
+        }
+    }
+
+    fn schedule_reveal_agent_panel_in_workspace(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.grok_panel_revealed || self.grok_panel_reveal_scheduled {
+            return;
+        }
+        self.grok_panel_reveal_scheduled = true;
+        let workspace = self.workspace.clone();
+        let panel = cx.entity().downgrade();
+        window.defer(cx, move |window, cx| {
+            let revealed = if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.reveal_panel::<Self>(window, cx);
+                    if let Some(panel) = workspace.panel::<Self>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            if !panel.zoomed {
+                                panel.toggle_zoom(&ToggleZoom, window, cx);
+                            }
+                        });
+                    }
+                    workspace.focus_panel::<Self>(window, cx);
+                });
+                true
+            } else {
+                false
+            };
+            if let Some(panel) = panel.upgrade() {
+                panel.update(cx, |panel, _cx| {
+                    panel.grok_panel_reveal_scheduled = false;
+                    if revealed {
+                        panel.grok_panel_revealed = true;
+                    }
+                });
+            }
+            if revealed {
+                log::debug!(
+                    "schedule_reveal_agent_panel_in_workspace: opened and focused agent panel dock"
+                );
+            } else {
+                log::debug!(
+                    "schedule_reveal_agent_panel_in_workspace: workspace handle unavailable"
+                );
+            }
+        });
+    }
+
     fn ensure_grok_categorized_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let is_grok = self.is_grok_build_context(cx);
         log::debug!(
@@ -4659,16 +4824,29 @@ impl AgentPanel {
         if !is_grok {
             return;
         }
+        if matches!(self.base_view, BaseView::Terminal { .. }) {
+            return;
+        }
+
+        if self.active_agent_thread(cx).is_none() && self.has_open_project(cx) {
+            self.ensure_draft(AgentThreadSource::AgentPanel, window, cx);
+        }
 
         if !matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))) {
             self.open_zed_todos_surface(window, cx);
         }
-        if let Some(OverlayView::ZedTodosSurface(dock)) = &self.overlay_view {
-            dock.update(cx, |prototype, _cx| {
-                prototype.prepare_for_full_agent_mode();
-            });
-        }
-        if !self.zoomed {
+        let Some(OverlayView::ZedTodosSurface(dock)) = &self.overlay_view else {
+            log::debug!(
+                "ensure_grok_categorized_surface: deferring zoom until categorized surface opens (active_agent_thread={}, pending={})",
+                self.active_agent_thread(cx).is_some(),
+                self.grok_categorized_surface_pending
+            );
+            return;
+        };
+        dock.update(cx, |prototype, _cx| {
+            prototype.prepare_for_full_agent_mode();
+        });
+        if !self.zoomed && !self.is_grok_build_context(cx) {
             self.toggle_zoom(&ToggleZoom, window, cx);
         }
     }
@@ -4693,9 +4871,7 @@ impl AgentPanel {
                     cx.emit(AgentPanelEvent::ActiveViewChanged);
                     this.serialize(cx);
                     cx.notify();
-                    if this.is_grok_build_context(cx)
-                        && !matches!(this.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
-                    {
+                    if this.should_ensure_grok_categorized_surface(cx) {
                         this.ensure_grok_categorized_surface(window, cx);
                     }
                 }))
@@ -5031,19 +5207,20 @@ impl AgentPanel {
             &conversation_view,
             window,
             |this, server_view, window, cx| {
-                let is_active = this
+                let is_active_view = this
                     .active_conversation_view()
                     .is_some_and(|active| active.entity_id() == server_view.entity_id());
-                if is_active {
+                if is_active_view {
                     cx.emit(AgentPanelEvent::ActiveViewChanged);
                     this.serialize(cx);
-                    this.ensure_grok_categorized_surface(window, cx);
+                    if this.should_ensure_grok_categorized_surface(cx) {
+                        this.ensure_grok_categorized_surface(window, cx);
+                    }
                 } else {
                     cx.emit(AgentPanelEvent::EntryChanged);
                 }
-                if this.is_grok_build_context(cx)
+                if this.should_ensure_grok_categorized_surface(cx)
                     && server_view.read(cx).root_thread(cx).is_some()
-                    && !matches!(this.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
                 {
                     this.ensure_grok_categorized_surface(window, cx);
                 }
@@ -5080,8 +5257,17 @@ impl AgentPanel {
         cx.subscribe_in(
             &conversation_view,
             window,
-            |this, _view, _event: &RootThreadUpdated, window, cx| {
-                this.ensure_grok_categorized_surface(window, cx);
+            |this, view, _event: &RootThreadUpdated, window, cx| {
+                if this.should_ensure_grok_categorized_surface(cx)
+                    && view.read(cx).root_thread(cx).is_some()
+                {
+                    log::debug!(
+                        "RootThreadUpdated: ensuring grok categorized surface (is_active={}, pending={})",
+                        this.is_active,
+                        this.grok_categorized_surface_pending
+                    );
+                    this.ensure_grok_categorized_surface(window, cx);
+                }
             },
         )
         .detach();
@@ -5503,22 +5689,25 @@ impl Panel for AgentPanel {
     }
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
-        log::info!("AgentPanel set_active called: active={}", active);
+        log::debug!("AgentPanel set_active called: active={}", active);
         self.is_active = active;
-        if active {
-            let was_grok = matches!(&self.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
-            log::info!(
-                "AgentPanel set_active: was_grok={} based on selected_agent",
-                was_grok
-            );
-            self.ensure_thread_initialized(window, cx);
+        if !active {
+            return;
+        }
+        let was_grok = matches!(&self.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
+        log::trace!(
+            "AgentPanel set_active: was_grok={} based on selected_agent",
+            was_grok
+        );
+        self.mark_grok_categorized_surface_pending(cx);
+        self.ensure_thread_initialized(window, cx);
+        if !was_grok {
+            return;
+        }
+        if matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))) {
+            self.schedule_reveal_agent_panel_in_workspace(window, cx);
+        } else {
             self.ensure_grok_categorized_surface(window, cx);
-            if was_grok {
-                // Force the categorized surface again after draft/thread initialization.
-                // This closes the window where a temporary non-Grok draft could have
-                // dropped the primary left visual for Grok Build users.
-                self.ensure_grok_categorized_surface(window, cx);
-            }
         }
     }
 
@@ -7088,9 +7277,11 @@ impl AgentPanel {
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Early loading state: show indeterminate UI immediately while the
-        // persisted classified agent surface state (approvals with risk chips,
+        // persisted categorized agent surface state (approvals with risk chips,
         // plans, monitors, memory) is restored in the background.
-        if self.initial_state_loading {
+        if self.initial_state_loading
+            && !matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
+        {
             return div()
                 .size_full()
                 .bg(cx.theme().colors().panel_background)
@@ -7190,7 +7381,9 @@ impl Render for AgentPanel {
 #[cfg(any(test, feature = "test-support"))]
 impl AgentPanel {
     pub fn test_new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new(workspace, window, cx)
+        let mut panel = Self::new(workspace, window, cx);
+        panel.selected_agent = Agent::default();
+        panel
     }
 
     /// Drops a thread's `ConversationView` from `retained_threads` without
@@ -7803,7 +7996,7 @@ mod tests {
     // async fn test_grok_selected_agent_protects_categorized_surface_on_focus_and_draft_activation(...) { ... }
 
     #[gpui::test]
-    async fn test_grok_build_must_default_to_fully_maximized_zt1_categorized_surface_on_editor_open_red_tdd(
+    async fn test_grok_build_must_default_to_fully_maximized_categorized_surface_on_editor_open(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -7844,47 +8037,6 @@ mod tests {
         });
         cx.run_until_parked();
 
-        // Replicate the dispatch sequence from the working e2e grok full agent mode test in this file
-        // (test_e2e_full_agent_mode_complete_user_flow... at ~13787): cx.dispatch_action(NewGrokThread)
-        // + run_until_parked + dispatch OpenFullGrokSurface + parks. This is the user path for
-        // "grok on open/activation" (NewGrokThread action does focus + new_external + open; OpenFullGrokSurface
-        // does focus + open). The e2e uses identical setup (setup_panel ~ equivalent to red test setup here)
-        // and successfully produces the ZedTodosSurface with prepare pre-expansion. Dispatch pumps the
-        // VisualTestContext/window so the draft CV's root_thread is populated for the open guard.
-        // Followed by extra parks as in sibling roundtrips. This makes the hermetic red TDD pass the
-        // surface + pre-expanded asserts while exercising the real prod paths for the mandated Grok default
-        // (fully maximized ZT-1 overlay). The sibling pure-load guard test remains untouched.
-        workspace.update_in(cx, |workspace, window, cx| {
-            workspace.focus_panel::<AgentPanel>(window, cx);
-        });
-        cx.run_until_parked();
-        cx.dispatch_action(NewGrokThread {
-            resume_session_id: None,
-        });
-        cx.run_until_parked();
-        panel.update_in(cx, |panel, window, cx| {
-            panel.open_external_thread_with_server(
-                Rc::new(StubAgentServer::default_response()),
-                window,
-                cx,
-            );
-        });
-        cx.run_until_parked();
-        panel.update(cx, |panel, _cx| {
-            panel.selected_agent = Agent::Custom { id: "grok".into() };
-        });
-        cx.run_until_parked();
-        cx.dispatch_action(OpenFullGrokSurface);
-        cx.run_until_parked();
-        for _ in 0..50 {
-            cx.run_until_parked();
-            if panel.read_with(cx, |p, _| {
-                matches!(p.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
-            }) {
-                break;
-            }
-        }
-
         panel.read_with(cx, |panel, _cx| {
             assert!(
                 matches!(&panel.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok"),
@@ -7892,7 +8044,7 @@ mod tests {
             );
 
             // When a Grok Build context is active (selected "grok" or native profile),
-            // opening the panel must produce the maximized classified surface overlay
+            // opening the panel must produce the maximized categorized surface overlay
             // with sections pre-expanded (approvals, plan, background monitors, memory)
             // and focus so the experience feels immersive rather than a side panel.
             // Guards for early return and load protections can prevent the surface in
@@ -7909,7 +8061,7 @@ mod tests {
                         && state.plan_expanded
                         && state.background_tasks_expanded
                         && state.grok_memory_expanded,
-                    "prepare_for_full_agent_mode must pre-expand all ZT-1 sections for the default full agent mode on grok open"
+                    "prepare_for_full_agent_mode must pre-expand all categorized surface sections for the default full agent mode on grok open"
                 );
             }
         });
@@ -7961,7 +8113,7 @@ mod tests {
             // not persisted to the store that load actually reads, so selected_agent restoration
             // for the "grok" Custom case is not exercised here. The important behavior under test
             // is the "do not force the heavy categorized surface on pure load" (to prevent the
-            // documented hang of doom). The restoration for Grok serialized state + Grok ZT-1
+            // documented hang of doom). The restoration for Grok serialized state + Grok todos surface
             // surface is covered by other paths (NewGrokThread dispatch, set_base_view, e2e tests,
             // and the full agent_panel serialization/restore tests).
 
@@ -8065,6 +8217,175 @@ mod tests {
                     .into_iter()
                     .any(|terminal| terminal.id == terminal_id),
                 "active terminal metadata should be restored into the loaded panel"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_set_active_does_not_zoom_before_categorized_surface_ready(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.base_view = BaseView::Uninitialized;
+            panel.overlay_view = None;
+            panel.zoomed = false;
+            panel.set_active(true, window, cx);
+
+            assert!(
+                !panel.zoomed,
+                "grok panel activation must not zoom before the categorized surface overlay exists"
+            );
+            assert!(
+                panel.overlay_view.is_none(),
+                "grok panel activation must not open a partial categorized overlay before the thread is ready"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_categorized_surface_opens_after_thread_ready(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection =
+            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = true;
+            panel.ensure_grok_categorized_surface(window, cx);
+            assert!(!panel.zoomed);
+            assert!(panel.overlay_view.is_none());
+        });
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.ensure_grok_categorized_surface(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel.active_agent_thread(cx).is_some(),
+                "stub grok thread should be active before categorized surface opens"
+            );
+            assert!(
+                matches!(panel.overlay_view, Some(OverlayView::ZedTodosSurface(_))),
+                "categorized surface overlay should open once the grok thread is ready"
+            );
+            assert!(
+                !panel.grok_categorized_surface_pending,
+                "pending flag should clear once the categorized surface opens"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_categorized_surface_opens_after_thread_ready_while_inactive(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection =
+            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = false;
+            panel.grok_categorized_surface_pending = true;
+            panel.ensure_grok_categorized_surface(window, cx);
+            assert!(panel.overlay_view.is_none());
+        });
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel.active_agent_thread(cx).is_some(),
+                "stub grok thread should be active before categorized surface opens"
+            );
+            assert!(
+                matches!(panel.overlay_view, Some(OverlayView::ZedTodosSurface(_))),
+                "categorized surface should open from RootThreadUpdated even when the dock is inactive"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_set_active_false_does_not_reschedule_panel_reveal(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection =
+            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.open_zed_todos_surface(window, cx);
+            panel.grok_panel_revealed = true;
+            panel.grok_panel_reveal_scheduled = false;
+        });
+        cx.run_until_parked();
+
+        for _ in 0..4 {
+            panel.update_in(&mut cx, |panel, window, cx| {
+                panel.set_active(false, window, cx);
+                panel.set_active(true, window, cx);
+            });
+            cx.run_until_parked();
+        }
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.grok_panel_revealed,
+                "one-shot reveal flag should stay set after activation toggles"
+            );
+            assert!(
+                !panel.grok_panel_reveal_scheduled,
+                "inactive set_active must not enqueue another deferred dock reveal"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_zed_todos_surface_clears_initial_state_loading(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection =
+            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        panel.update_in(&mut cx, |panel, _window, _cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.initial_state_loading = true;
+        });
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.open_zed_todos_surface(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(
+                matches!(panel.overlay_view, Some(OverlayView::ZedTodosSurface(_))),
+                "categorized surface should open once the grok thread is ready"
+            );
+            assert!(
+                !panel.initial_state_loading,
+                "opening the categorized surface must clear the startup loading spinner"
+            );
+            assert!(
+                panel.active_agent_thread(cx).is_some(),
+                "stub grok thread should remain active after the surface opens"
             );
         });
     }
@@ -12100,7 +12421,7 @@ mod tests {
         let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
 
         let panel = workspace.update_in(cx, |workspace, window, cx| {
-            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            let panel = cx.new(|cx| AgentPanel::test_new(workspace, window, cx));
             workspace.add_panel(panel.clone(), window, cx);
             panel
         });
@@ -13785,8 +14106,8 @@ mod tests {
     /// background_monitor_tdd (state assertions, render helper presence, expansion
     /// defaults, risk chips) + prior E2E/badge/memory agents (setup_panel +
     /// dispatch + read_with + run_until_parked + VisualTestContext). Exercises
-    /// every requested step with realistic injected GrokFact data via P4-0
-    /// MemoryLayerContract style + direct render_grok_memory_items for DB layer
+    /// every requested step with realistic injected GrokFact data via ACP capture harness
+    /// memory layer contract style + direct render_grok_memory_items for DB layer
     /// facts + RO chips + CopyButtons. Verifies prominent button, overlay open
     /// via action (or palette equivalent), auto-zoom/pre-expand via prepare,
     /// .size_full behavior paths, in-thread activity bar (grok_memory prominent
@@ -13856,7 +14177,7 @@ mod tests {
 
         // Step 5-6 continued: realistic Grok Memory facts from DB layer
         // (via now-fixed grok_facts_for_cwd_with + worktrees correlation) + md
-        // previews + per-fact RO chips + CopyButtons. Use P4-0 MemoryLayerContract
+        // previews + per-fact RO chips + CopyButtons. Use ACP capture harness memory layer contract
         // style injection of GrokFact data directly (hermetic, no real sqlite).
         // Exercise render_grok_memory_items (and by extension the categorized
         // surface path) inside a real GPUI context.
@@ -13968,7 +14289,7 @@ mod tests {
 
         // Explicit exercise of the public categorized collectors on the native Grok path
         // (the exact API any external dock/panel will use for Ship mode / Full Agent Mode).
-        // This assertion ensures the classified surface (approvals + plans + monitors + memory)
+        // This assertion ensures the categorized surface (approvals + plans + monitors + memory)
         // continues to work for native is_grok_build_profile threads exactly as for bridged.
         // Tracked as part of "do the work + write tests so it keeps working".
         panel.read_with(&cx, |panel, cx| {
@@ -13977,7 +14298,7 @@ mod tests {
                 let _approvals = crate::collect_pending_approval_tool_calls(&acp);
                 let _monitors = crate::collect_background_monitor_tool_calls(&acp);
                 // The collectors + risk classification are the foundation of the entire
-                // categorized surface surface in Full Agent Mode. Their continued correct
+                // categorized surface in Full Agent Mode. Their continued correct
                 // behavior for Grok (native) is what keeps Ship mode reliable.
             }
         });
@@ -14016,9 +14337,9 @@ mod tests {
         // macOS/Windows receive the equivalent spacious experience via the same machinery.
         // This test (extended here) + the sibling tests in thread_view.rs background_monitor_tdd now provide the most complete hermetic E2E coverage of the *entire* requested user journey.
 
-        // Exercise skills source tags fidelity ("user" for GrokUser, "project" for GrokProjectLocal) as rendered into classified surface / prompt context.
+        // Exercise skills source tags fidelity ("user" for GrokUser, "project" for GrokProjectLocal) as rendered into categorized surface / prompt context.
         // These tags are produced exactly by render_skill_envelope match arms for the Grok* variants (see agent/src/tools/skill_tool.rs and prior skills fidelity closer).
-        // The render is invoked during native/bridged Grok turns when skills are active; the categorized surface (memory + plan + approvals) and in-thread bar inherit the same classified Grok context.
+        // The render is invoked during native/bridged Grok turns when skills are active; the categorized surface (memory + plan + approvals) and in-thread bar inherit the same Grok context.
         let grok_user_source_tag = "user";
         let grok_project_source_tag = "project";
         assert_eq!(grok_user_source_tag, "user");
@@ -14087,7 +14408,7 @@ mod tests {
             let render_plan_entry_row_function = ZedTodosComponent::render_plan_entry_row;
             let _ = render_plan_entry_row_function;
 
-            // Proposed-plan acceptance flow: construct the classified accept button using
+            // Proposed-plan acceptance flow: construct the categorized accept button using
             // PotentiallyDestructive risk (the classification for proposed plans per
             // approval_risk_for_operation and the plan discipline). The listener represents
             // the dispatch to clear the proposed plan (acceptance signal moving entries
@@ -14130,7 +14451,7 @@ mod tests {
             );
             assert!(
                 true,
-                "proposed-plan acceptance flow (Destructive-classified button + clear dispatch) covers the user accepting a plan whose entries carry TurnId and slug for traceability"
+                "proposed-plan acceptance flow (Destructive-labeled button + clear dispatch) covers the user accepting a plan whose entries carry TurnId and slug for traceability"
             );
             assert!(
                 true,
@@ -14149,7 +14470,7 @@ mod tests {
             );
             // The preceding asserts (TurnId on PlanEntry, task-slug stability, risk classification
             // for proposed plans) plus the action wiring, dock prototype, collectors, and render
-            // helpers provide regression protection for the classified surface (risk chips,
+            // helpers provide regression protection for the categorized surface (risk chips,
             // plan accept, lazy monitors, memory, personas, addressing). The hermetic nature of
             // the test makes some selected_agent checks non-deterministic; the contract is
             // exercised via action dispatch and behavior asserts in this module and related TDD.

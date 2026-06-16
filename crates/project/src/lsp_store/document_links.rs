@@ -91,7 +91,12 @@ impl LspStore {
         {
             let has_different_servers =
                 current_language_servers.is_some_and(|current_language_servers| {
-                    current_language_servers != cached.links.keys().copied().collect()
+                    current_language_servers
+                        != cached
+                            .links
+                            .keys()
+                            .copied()
+                            .collect::<collections::HashSet<_>>()
                 });
             if !has_different_servers {
                 return Task::ready(Some(cached.links.clone()));

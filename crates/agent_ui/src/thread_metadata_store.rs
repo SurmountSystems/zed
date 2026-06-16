@@ -8,15 +8,12 @@ use agent_client_protocol::schema as acp;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
-use db::{
-    sqlez::{
-        bindable::{Bind, Column},
-        domain::Domain,
-        statement::Statement,
-        thread_safe_connection::ThreadSafeConnection,
-    },
-    sqlez_macros::sql,
+use db::sqlez::{
+    bindable::{Bind, Column},
+    statement::Statement,
 };
+#[cfg(test)]
+use db::sqlez_macros::sql;
 use heed3::{
     BoxedError, BytesDecode, BytesEncode, Database, Env, EnvOpenOptions, WithoutTls, types::Bytes,
 };
@@ -122,25 +119,32 @@ const THREAD_ID_MIGRATION_KEY: &str = "thread-metadata-thread-id-backfill";
 ///
 /// This is used to read thread metadata from another release channel's
 /// database without opening a full `ThreadSafeConnection`.
+#[cfg(test)]
+const LEGACY_SIDEBAR_THREAD_DB_NAME: &str = "ThreadMetadataDb";
+
+const LEGACY_SIDEBAR_LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
+    created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
+    main_worktree_paths_order, remote_connection, title_override \
+    FROM sidebar_threads \
+    ORDER BY updated_at DESC";
+
+/// List sidebar thread metadata from a legacy Zed SQLite database (e.g. another release channel).
 pub(crate) fn list_thread_metadata_from_connection(
     connection: &db::sqlez::connection::Connection,
 ) -> anyhow::Result<Vec<ThreadMetadata>> {
-    connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY)?()
+    connection.select::<ThreadMetadata>(LEGACY_SIDEBAR_LIST_QUERY)?()
 }
 
-/// Run the `ThreadMetadataDb` migrations on a raw connection.
-///
-/// This is used in tests to set up the sidebar_threads schema in a
-/// temporary database.
+/// Apply legacy sidebar_threads schema migrations on a raw SQLite connection.
 #[cfg(test)]
 pub(crate) fn run_thread_metadata_migrations(connection: &db::sqlez::connection::Connection) {
     connection
         .migrate(
-            ThreadMetadataDb::NAME,
-            ThreadMetadataDb::MIGRATIONS,
+            LEGACY_SIDEBAR_THREAD_DB_NAME,
+            LEGACY_SIDEBAR_THREAD_MIGRATIONS,
             &mut |_, _, _| false,
         )
-        .expect("thread metadata migrations should succeed");
+        .expect("legacy sidebar thread migrations should succeed");
 }
 
 pub fn init(cx: &mut App) {
@@ -156,7 +160,7 @@ pub fn init(cx: &mut App) {
 /// TODO: Remove this after N weeks of shipping the sidebar
 fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
     let store = ThreadMetadataStore::global(cx);
-    let db = store.read(cx).db.clone();
+    let kv_db = store.read(cx).kv_db.clone();
     let thread_store = ThreadStore::global(cx);
     let thread_store_ready = thread_store.read(cx).reload_task();
 
@@ -168,7 +172,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
         // `test_migration_awaits_thread_store_reload` pins this behavior.
         thread_store_ready.await;
 
-        let existing_list = db.list()?;
+        let existing_list = kv_db.list()?;
         let existing_session_ids: HashSet<Arc<str>> = existing_list
             .into_iter()
             .filter_map(|m| m.session_id.map(|s| s.0))
@@ -237,7 +241,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
         // Manually save each entry to the database and call reload, otherwise
         // we'll end up triggering lots of reloads after each save
         for entry in to_migrate {
-            db.save(entry).await?;
+            kv_db.save(entry)?;
         }
 
         log::info!("Finished migrating thread store entries");
@@ -249,7 +253,7 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
 
 fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::Result<()>>) {
     let store = ThreadMetadataStore::global(cx);
-    let db = store.read(cx).db.clone();
+    let kv_db = store.read(cx).kv_db.clone();
     let workspace_db = WorkspaceDb::global(cx);
     let fs = <dyn Fs>::global(cx);
 
@@ -297,7 +301,7 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
         }
 
         let mut reloaded = false;
-        for metadata in db.list()? {
+        for metadata in kv_db.list()? {
             if metadata.remote_connection.is_some() {
                 continue;
             }
@@ -306,11 +310,10 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
                 .get(metadata.folder_paths())
                 .or_else(|| remote_path_lists.get(metadata.main_worktree_paths()))
             {
-                db.save(ThreadMetadata {
+                kv_db.save(ThreadMetadata {
                     remote_connection: Some(remote_connection.clone()),
                     ..metadata
-                })
-                .await?;
+                })?;
                 reloaded = true;
             }
         }
@@ -320,10 +323,9 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
             .unwrap_or(Task::ready(()).shared());
 
         let _ = cx.update(|cx| {
-            store.read(cx).save_global_json(
-                THREAD_REMOTE_CONNECTION_MIGRATION_KEY.as_bytes(),
-                "1".to_string(),
-            )
+            store
+                .read(cx)
+                .save_global_json(THREAD_REMOTE_CONNECTION_MIGRATION_KEY.as_bytes(), "1")
         });
         reloaded_task.await;
 
@@ -334,7 +336,7 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
 
 fn migrate_thread_ids(cx: &mut App) {
     let store = ThreadMetadataStore::global(cx);
-    let db = store.read(cx).db.clone();
+    let kv_db = store.read(cx).kv_db.clone();
 
     cx.spawn(async move |cx| -> anyhow::Result<()> {
         let already_migrated = cx.update(|cx| {
@@ -348,8 +350,8 @@ fn migrate_thread_ids(cx: &mut App) {
         }
 
         let mut reloaded = false;
-        for metadata in db.list()? {
-            db.save(metadata).await?;
+        for metadata in kv_db.list()? {
+            kv_db.save(metadata)?;
             reloaded = true;
         }
 
@@ -360,7 +362,7 @@ fn migrate_thread_ids(cx: &mut App) {
         let _ = cx.update(|cx| {
             store
                 .read(cx)
-                .save_global_json(THREAD_ID_MIGRATION_KEY.as_bytes(), "1".to_string())
+                .save_global_json(THREAD_ID_MIGRATION_KEY.as_bytes(), "1")
         });
         reloaded_task.await;
 
@@ -443,6 +445,88 @@ impl ThreadMetadata {
         remote_connection: Option<&RemoteConnectionOptions>,
     ) -> bool {
         same_remote_connection_identity(self.remote_connection.as_ref(), remote_connection)
+    }
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug)]
+#[rkyv(derive(Debug))]
+struct ThreadMetadataRecord {
+    thread_id: [u8; 16],
+    session_id: Option<String>,
+    agent_id: String,
+    title: Option<String>,
+    title_override: Option<String>,
+    updated_at_millis: i64,
+    created_at_millis: Option<i64>,
+    interacted_at_millis: Option<i64>,
+    worktree_paths_json: Vec<u8>,
+    remote_connection_json: Option<Vec<u8>>,
+    archived: bool,
+}
+
+impl From<&ThreadMetadata> for ThreadMetadataRecord {
+    fn from(metadata: &ThreadMetadata) -> Self {
+        let folder_strings: Vec<String> = metadata
+            .folder_paths()
+            .paths()
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        Self {
+            thread_id: *metadata.thread_id.0.as_bytes(),
+            session_id: metadata
+                .session_id
+                .as_ref()
+                .map(|session_id| session_id.0.as_ref().to_string()),
+            agent_id: metadata.agent_id.0.to_string(),
+            title: metadata.title.as_ref().map(|title| title.to_string()),
+            title_override: metadata
+                .title_override
+                .as_ref()
+                .map(|title| title.to_string()),
+            updated_at_millis: metadata.updated_at.timestamp_millis(),
+            created_at_millis: metadata.created_at.map(|at| at.timestamp_millis()),
+            interacted_at_millis: metadata.interacted_at.map(|at| at.timestamp_millis()),
+            worktree_paths_json: serde_json::to_vec(&folder_strings).unwrap_or_default(),
+            remote_connection_json: metadata
+                .remote_connection
+                .as_ref()
+                .and_then(|options| serde_json::to_vec(options).ok()),
+            archived: metadata.archived,
+        }
+    }
+}
+
+impl From<ThreadMetadataRecord> for ThreadMetadata {
+    fn from(record: ThreadMetadataRecord) -> Self {
+        let folder_strings: Vec<String> =
+            serde_json::from_slice(&record.worktree_paths_json).unwrap_or_default();
+        let folder_paths: Vec<PathBuf> = folder_strings.into_iter().map(PathBuf::from).collect();
+        let worktree_paths = WorktreePaths::from_folder_paths(&PathList::new(&folder_paths));
+        let remote_connection = record
+            .remote_connection_json
+            .as_deref()
+            .and_then(|json| serde_json::from_slice(json).ok());
+        Self {
+            thread_id: ThreadId(uuid::Uuid::from_bytes(record.thread_id)),
+            session_id: record
+                .session_id
+                .map(|session_id| acp::SessionId::new(Arc::from(session_id.as_str()))),
+            agent_id: AgentId(SharedString::from(record.agent_id.as_str())),
+            title: record.title.map(SharedString::from),
+            title_override: record.title_override.map(SharedString::from),
+            updated_at: DateTime::from_timestamp_millis(record.updated_at_millis)
+                .unwrap_or_else(Utc::now),
+            created_at: record
+                .created_at_millis
+                .and_then(DateTime::from_timestamp_millis),
+            interacted_at: record
+                .interacted_at_millis
+                .and_then(DateTime::from_timestamp_millis),
+            worktree_paths,
+            remote_connection,
+            archived: record.archived,
+        }
     }
 }
 
@@ -581,89 +665,68 @@ pub struct ArchivedGitWorktree {
     pub original_commit_hash: String,
 }
 
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug)]
+#[rkyv(derive(Debug))]
+struct ArchivedGitWorktreeRecord {
+    id: i64,
+    worktree_path: String,
+    main_repo_path: String,
+    branch_name: Option<String>,
+    staged_commit_hash: String,
+    unstaged_commit_hash: String,
+    original_commit_hash: String,
+}
+
+impl From<&ArchivedGitWorktree> for ArchivedGitWorktreeRecord {
+    fn from(worktree: &ArchivedGitWorktree) -> Self {
+        Self {
+            id: worktree.id,
+            worktree_path: worktree.worktree_path.to_string_lossy().into_owned(),
+            main_repo_path: worktree.main_repo_path.to_string_lossy().into_owned(),
+            branch_name: worktree.branch_name.clone(),
+            staged_commit_hash: worktree.staged_commit_hash.clone(),
+            unstaged_commit_hash: worktree.unstaged_commit_hash.clone(),
+            original_commit_hash: worktree.original_commit_hash.clone(),
+        }
+    }
+}
+
+impl From<ArchivedGitWorktreeRecord> for ArchivedGitWorktree {
+    fn from(record: ArchivedGitWorktreeRecord) -> Self {
+        Self {
+            id: record.id,
+            worktree_path: PathBuf::from(record.worktree_path),
+            main_repo_path: PathBuf::from(record.main_repo_path),
+            branch_name: record.branch_name,
+            staged_commit_hash: record.staged_commit_hash,
+            unstaged_commit_hash: record.unstaged_commit_hash,
+            original_commit_hash: record.original_commit_hash,
+        }
+    }
+}
+
 /// The store holds all metadata needed to show threads in the sidebar/the archive.
 ///
 /// Listens to ConversationView events and updates metadata when the root thread changes.
 pub struct ThreadMetadataStore {
-    db: ThreadMetadataDb,
+    kv_db: HeedThreadMetadataDb,
     threads: HashMap<ThreadId, ThreadMetadata>,
     threads_by_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_main_paths: HashMap<PathList, HashSet<ThreadId>>,
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
-    pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
-    _db_operations_task: Task<()>,
-
-    /// Optional key-value backend for per-workspace agent panel state,
-    /// including the ZT-1 classified persistent Todos surface
-    /// (SerializedAgentPanel / SerializedZedTodos). When present, the forwarding
-    /// methods use this path.
-    kv_db: Option<HeedThreadMetadataDb>,
-}
-
-#[derive(Debug, PartialEq)]
-enum DbOperation {
-    Upsert(ThreadMetadata),
-    Delete(ThreadId),
-}
-
-impl DbOperation {
-    fn id(&self) -> ThreadId {
-        match self {
-            DbOperation::Upsert(thread) => thread.thread_id,
-            DbOperation::Delete(thread_id) => *thread_id,
-        }
-    }
-}
-
-/// Override for the test DB name used by `ThreadMetadataStore::init_global`.
-/// When set as a GPUI global, `init_global` uses this name instead of
-/// deriving one from the thread name. This prevents data from leaking
-/// across proptest cases that share a thread name.
-#[cfg(any(test, feature = "test-support"))]
-pub struct TestMetadataDbName(pub String);
-#[cfg(any(test, feature = "test-support"))]
-impl gpui::Global for TestMetadataDbName {}
-
-#[cfg(any(test, feature = "test-support"))]
-impl TestMetadataDbName {
-    pub fn global(cx: &App) -> String {
-        cx.try_global::<Self>()
-            .map(|g| g.0.clone())
-            .unwrap_or_else(|| {
-                let thread = std::thread::current();
-                let test_name = thread.name().unwrap_or("unknown_test");
-                format!("THREAD_METADATA_DB_{}", test_name)
-            })
-    }
 }
 
 impl ThreadMetadataStore {
-    #[cfg(not(any(test, feature = "test-support")))]
     pub fn init_global(cx: &mut App) {
-        if cx.has_global::<Self>() {
+        if cx.has_global::<GlobalThreadMetadataStore>() {
             return;
         }
 
-        let db = ThreadMetadataDb::global(cx);
-        let kv_db = Self::open_kv_db();
-        let thread_store = cx.new(|cx| Self::new(db, kv_db, cx));
-        cx.set_global(GlobalThreadMetadataStore(thread_store));
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn init_global(cx: &mut App) {
-        if cx.has_global::<Self>() {
-            return;
-        }
-        let db_name = TestMetadataDbName::global(cx);
-        let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
-        // In hermetic tests we usually stay on the old path unless a test
-        // explicitly constructs and injects a kv_db instance.
-        let kv_db = Self::open_kv_db();
-        let thread_store = cx.new(|cx| Self::new(ThreadMetadataDb(db), kv_db, cx));
+        let kv_db = HeedThreadMetadataDb::try_open().expect("agent_kv heed3 backend must open");
+        let thread_store = cx.new(|cx| Self::new(kv_db, cx));
         cx.set_global(GlobalThreadMetadataStore(thread_store));
     }
 
@@ -759,11 +822,14 @@ impl ThreadMetadataStore {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
-        let db = self.db.clone();
+        let kv_db = self.kv_db.clone();
         self.reload_task.take();
 
-        let list_task = cx
-            .background_spawn(async move { db.list().context("Failed to fetch sidebar metadata") });
+        let list_task = cx.background_spawn(async move {
+            kv_db
+                .list()
+                .context("Failed to fetch sidebar metadata from heed3")
+        });
 
         let reload_task = cx
             .spawn(async move |this, cx| {
@@ -842,9 +908,7 @@ impl ThreadMetadataStore {
         }
 
         self.cache_thread_metadata(metadata.clone());
-        self.pending_thread_ops_tx
-            .try_send(DbOperation::Upsert(metadata))
-            .log_err();
+        self.kv_db.save(metadata).log_err();
     }
 
     fn cache_thread_metadata(&mut self, metadata: ThreadMetadata) {
@@ -1119,9 +1183,7 @@ impl ThreadMetadataStore {
                     .or_default()
                     .insert(*thread_id);
 
-                self.pending_thread_ops_tx
-                    .try_send(DbOperation::Upsert(thread.clone()))
-                    .log_err();
+                self.kv_db.save(thread.clone()).log_err();
             }
         }
 
@@ -1138,9 +1200,9 @@ impl ThreadMetadataStore {
         original_commit_hash: String,
         cx: &App,
     ) -> Task<anyhow::Result<i64>> {
-        let db = self.db.clone();
+        let kv_db = self.kv_db.clone();
         cx.background_spawn(async move {
-            db.create_archived_worktree(
+            kv_db.create_archived_worktree(
                 worktree_path,
                 main_repo_path,
                 branch_name,
@@ -1148,7 +1210,6 @@ impl ThreadMetadataStore {
                 unstaged_commit_hash,
                 original_commit_hash,
             )
-            .await
         })
     }
 
@@ -1158,10 +1219,9 @@ impl ThreadMetadataStore {
         archived_worktree_id: i64,
         cx: &App,
     ) -> Task<anyhow::Result<()>> {
-        let db = self.db.clone();
+        let kv_db = self.kv_db.clone();
         cx.background_spawn(async move {
-            db.link_thread_to_archived_worktree(thread_id, archived_worktree_id)
-                .await
+            kv_db.link_thread_to_archived_worktree(thread_id, archived_worktree_id)
         })
     }
 
@@ -1170,13 +1230,13 @@ impl ThreadMetadataStore {
         thread_id: ThreadId,
         cx: &App,
     ) -> Task<anyhow::Result<Vec<ArchivedGitWorktree>>> {
-        let db = self.db.clone();
-        cx.background_spawn(async move { db.get_archived_worktrees_for_thread(thread_id).await })
+        let kv_db = self.kv_db.clone();
+        cx.background_spawn(async move { kv_db.get_archived_worktrees_for_thread(thread_id) })
     }
 
     pub fn delete_archived_worktree(&self, id: i64, cx: &App) -> Task<anyhow::Result<()>> {
-        let db = self.db.clone();
-        cx.background_spawn(async move { db.delete_archived_worktree(id).await })
+        let kv_db = self.kv_db.clone();
+        cx.background_spawn(async move { kv_db.delete_archived_worktree(id) })
     }
 
     pub fn unlink_thread_from_all_archived_worktrees(
@@ -1184,11 +1244,10 @@ impl ThreadMetadataStore {
         thread_id: ThreadId,
         cx: &App,
     ) -> Task<anyhow::Result<()>> {
-        let db = self.db.clone();
-        cx.background_spawn(async move {
-            db.unlink_thread_from_all_archived_worktrees(thread_id)
-                .await
-        })
+        let kv_db = self.kv_db.clone();
+        cx.background_spawn(
+            async move { kv_db.unlink_thread_from_all_archived_worktrees(thread_id) },
+        )
     }
 
     pub fn is_archived_worktree_referenced(
@@ -1196,29 +1255,23 @@ impl ThreadMetadataStore {
         archived_worktree_id: i64,
         cx: &App,
     ) -> Task<anyhow::Result<bool>> {
-        let db = self.db.clone();
-        cx.background_spawn(async move {
-            db.is_archived_worktree_referenced(archived_worktree_id)
-                .await
-        })
+        let kv_db = self.kv_db.clone();
+        cx.background_spawn(
+            async move { kv_db.is_archived_worktree_referenced(archived_worktree_id) },
+        )
     }
 
     pub(crate) fn load_panel_state(
         &self,
         key: &[u8],
     ) -> anyhow::Result<Option<SerializedAgentPanel>> {
-        if let Some(kv) = self.kv_db() {
-            return kv.load_panel_state(key).map(|opt| opt.map(Into::into));
-        }
-        Ok(None)
+        self.kv_db
+            .load_panel_state(key)
+            .map(|opt| opt.map(Into::into))
     }
 
     pub fn load_fast_mode_warning_dismissed(&self, key: &str) -> Option<bool> {
-        if let Some(kv) = self.kv_db() {
-            kv.load_bool(key.as_bytes())
-        } else {
-            None
-        }
+        self.kv_db.load_bool(key.as_bytes())
     }
 
     pub fn set_fast_mode_warning_dismissed(
@@ -1226,11 +1279,7 @@ impl ThreadMetadataStore {
         key: &str,
         dismissed: bool,
     ) -> anyhow::Result<()> {
-        if let Some(kv) = self.kv_db() {
-            kv.save_bool(key.as_bytes(), dismissed)
-        } else {
-            Ok(())
-        }
+        self.kv_db.save_bool(key.as_bytes(), dismissed)
     }
 
     pub fn reset_fast_mode_warnings(&self) -> anyhow::Result<()> {
@@ -1238,121 +1287,67 @@ impl ThreadMetadataStore {
     }
 
     pub fn load_agent_kv_bool(&self, key: &str) -> Option<bool> {
-        if let Some(kv) = self.kv_db() {
-            kv.load_bool(key.as_bytes())
-        } else {
-            None
-        }
+        self.kv_db.load_bool(key.as_bytes())
     }
 
     pub fn set_agent_kv_bool(&self, key: &str, val: bool) -> anyhow::Result<()> {
-        if let Some(kv) = self.kv_db() {
-            kv.save_bool(key.as_bytes(), val)
-        } else {
-            Ok(())
-        }
+        self.kv_db.save_bool(key.as_bytes(), val)
     }
 
     pub fn load_agent_kv_string(&self, key: &str) -> Option<String> {
-        if let Some(kv) = self.kv_db() {
-            kv.load_string(key.as_bytes())
-        } else {
-            None
-        }
+        self.kv_db.load_string(key.as_bytes())
     }
 
     pub fn set_agent_kv_string(&self, key: &str, val: &str) -> anyhow::Result<()> {
-        if let Some(kv) = self.kv_db() {
-            kv.save_string(key.as_bytes(), val)
-        } else {
-            Ok(())
-        }
+        self.kv_db.save_string(key.as_bytes(), val)
     }
 
     pub fn delete_agent_kv(&self, key: &str) -> anyhow::Result<()> {
-        if let Some(kv) = self.kv_db() {
-            kv.delete_kv(key.as_bytes())
-        } else {
-            Ok(())
-        }
+        self.kv_db.delete_kv(key.as_bytes())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn save_panel_state(
         &self,
         key: &[u8],
         panel: &ArchivedSerializedAgentPanel,
     ) -> anyhow::Result<()> {
-        if let Some(kv) = self.kv_db() {
-            return kv.save_panel_state(key, panel);
-        }
-        Ok(())
+        self.kv_db.save_panel_state(key, panel)
     }
 
     pub(crate) fn load_global_json(&self, key: &[u8]) -> Option<String> {
-        self.kv_db().and_then(|kv| kv.load_global_json(key))
+        self.kv_db.load_global_json(key)
     }
 
-    pub(crate) fn save_global_json(&self, key: &[u8], json: String) -> anyhow::Result<()> {
-        if let Some(kv) = self.kv_db() {
-            let wrapper = ArchivedSerializedAgentPanel(json.into_bytes());
-            kv.save_global_json(key, &wrapper)
-        } else {
-            Ok(())
-        }
+    pub(crate) fn save_global_json(&self, key: &[u8], json: &str) -> anyhow::Result<()> {
+        let wrapper = ArchivedSerializedAgentPanel::from(json);
+        self.kv_db.save_global_json(key, &wrapper)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn delete_global(&self, key: &[u8]) -> anyhow::Result<()> {
-        if let Some(kv) = self.kv_db() {
-            kv.delete_global(key)
-        } else {
-            Ok(())
-        }
+        self.kv_db.delete_global(key)
     }
 
     pub(crate) fn load_global_last_created_entry_kind_json(&self) -> Option<String> {
         let key = b"global:last_created_entry_kind";
-        self.kv_db().and_then(|kv| kv.load_global_json(key))
+        self.kv_db.load_global_json(key)
     }
 
     pub(crate) fn save_global_last_created_entry_kind_json(
         &self,
-        json: String,
+        json: &str,
     ) -> anyhow::Result<()> {
         let key = b"global:last_created_entry_kind";
-        if let Some(kv) = self.kv_db() {
-            let wrapper = ArchivedSerializedAgentPanel(json.into_bytes());
-            kv.save_global_json(key, &wrapper)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn kv_db(&self) -> Option<&HeedThreadMetadataDb> {
-        self.kv_db.as_ref()
-    }
-
-    /// Best-effort attempt to open the kv backend for agent panel state.
-    /// Returns None if construction fails so callers can handle the case where
-    /// the backend is not yet available.
-    fn open_kv_db() -> Option<HeedThreadMetadataDb> {
-        if cfg!(any(test, feature = "test-support")) {
-            // In tests we require the kv for panel state roundtrips; surface any open error.
-            Some(HeedThreadMetadataDb::try_open().expect("kv backend must open in tests"))
-        } else {
-            // Uses the new fallible try_open. Any failure (permissions, disk, path)
-            // is treated as "kv backend not yet available for this workspace".
-            HeedThreadMetadataDb::try_open().ok()
-        }
+        let wrapper = ArchivedSerializedAgentPanel::from(json);
+        self.kv_db.save_global_json(key, &wrapper)
     }
 
     pub fn get_all_archived_branch_names(
         &self,
         cx: &App,
     ) -> Task<anyhow::Result<HashMap<ThreadId, HashMap<PathBuf, String>>>> {
-        let db = self.db.clone();
-        cx.background_spawn(async move { db.get_all_archived_branch_names() })
+        let kv_db = self.kv_db.clone();
+        cx.background_spawn(async move { kv_db.get_all_archived_branch_names() })
     }
 
     fn update_archived(&mut self, thread_id: ThreadId, archived: bool, cx: &mut Context<Self>) {
@@ -1383,9 +1378,7 @@ impl ThreadMetadataStore {
             }
         }
         self.threads.remove(&thread_id);
-        self.pending_thread_ops_tx
-            .try_send(DbOperation::Delete(thread_id))
-            .log_err();
+        self.kv_db.delete(thread_id).log_err();
         self.delete_agent_kv(&thread_id.to_key_string()).log_err();
         cx.notify();
     }
@@ -1413,15 +1406,7 @@ impl ThreadMetadataStore {
         }
     }
 
-    // The extended signature (kv_db + cx) supports call sites that construct
-    // the store with the kv backend already open (for example agent_panel
-    // early creation and loading UI paths). Simpler call sites use the
-    // thin shim that opens the backend internally.
-    fn new(
-        db: ThreadMetadataDb,
-        kv_db: Option<HeedThreadMetadataDb>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    fn new(kv_db: HeedThreadMetadataDb, cx: &mut Context<Self>) -> Self {
         let weak_store = cx.weak_entity();
 
         cx.observe_new::<crate::ConversationView>(move |_view, _window, cx| {
@@ -1450,32 +1435,7 @@ impl ThreadMetadataStore {
         })
         .detach();
 
-        let (tx, rx) = async_channel::unbounded();
-        let _db_operations_task = cx.background_spawn({
-            let db = db.clone();
-            async move {
-                while let Ok(first_update) = rx.recv().await {
-                    let mut updates = vec![first_update];
-                    while let Ok(update) = rx.try_recv() {
-                        updates.push(update);
-                    }
-                    let updates = Self::dedup_db_operations(updates);
-                    for operation in updates {
-                        match operation {
-                            DbOperation::Upsert(metadata) => {
-                                db.save(metadata).await.log_err();
-                            }
-                            DbOperation::Delete(thread_id) => {
-                                db.delete(thread_id).await.log_err();
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
         let mut this = Self {
-            db,
             kv_db,
             threads: HashMap::default(),
             threads_by_paths: HashMap::default(),
@@ -1483,23 +1443,10 @@ impl ThreadMetadataStore {
             threads_by_session: HashMap::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
-            pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
-            _db_operations_task,
         };
         let _ = this.reload(cx);
         this
-    }
-
-    fn dedup_db_operations(operations: Vec<DbOperation>) -> Vec<DbOperation> {
-        let mut ops = HashMap::default();
-        for operation in operations.into_iter().rev() {
-            if ops.contains_key(&operation.id()) {
-                continue;
-            }
-            ops.insert(operation.id(), operation);
-        }
-        ops.into_values().collect()
     }
 
     fn handle_conversation_event(
@@ -1605,375 +1552,134 @@ pub enum ThreadMetadataStoreEvent {
 
 impl gpui::EventEmitter<ThreadMetadataStoreEvent> for ThreadMetadataStore {}
 
-struct ThreadMetadataDb(ThreadSafeConnection);
+/// Legacy SQLite schema for reading sidebar_threads from other Zed release channels.
+#[cfg(test)]
+const LEGACY_SIDEBAR_THREAD_MIGRATIONS: &[&str] = &[
+    sql!(
+        CREATE TABLE IF NOT EXISTS sidebar_threads(
+            session_id TEXT PRIMARY KEY,
+            agent_id TEXT,
+            title TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            created_at TEXT,
+            folder_paths TEXT,
+            folder_paths_order TEXT
+        ) STRICT;
+    ),
+    sql!(ALTER TABLE sidebar_threads ADD COLUMN archived INTEGER DEFAULT 0),
+    sql!(ALTER TABLE sidebar_threads ADD COLUMN main_worktree_paths TEXT),
+    sql!(ALTER TABLE sidebar_threads ADD COLUMN main_worktree_paths_order TEXT),
+    sql!(
+        CREATE TABLE IF NOT EXISTS archived_git_worktrees(
+            id INTEGER PRIMARY KEY,
+            worktree_path TEXT NOT NULL,
+            main_repo_path TEXT NOT NULL,
+            branch_name TEXT,
+            staged_commit_hash TEXT,
+            unstaged_commit_hash TEXT,
+            original_commit_hash TEXT
+        ) STRICT;
 
-impl Domain for ThreadMetadataDb {
-    const NAME: &str = stringify!(ThreadMetadataDb);
+        CREATE TABLE IF NOT EXISTS thread_archived_worktrees(
+            session_id TEXT NOT NULL,
+            archived_worktree_id INTEGER NOT NULL REFERENCES archived_git_worktrees(id),
+            PRIMARY KEY (session_id, archived_worktree_id)
+        ) STRICT;
+    ),
+    sql!(ALTER TABLE sidebar_threads ADD COLUMN remote_connection TEXT),
+    sql!(ALTER TABLE sidebar_threads ADD COLUMN thread_id BLOB),
+    sql!(
+        UPDATE sidebar_threads SET thread_id = randomblob(16) WHERE thread_id IS NULL;
 
-    const MIGRATIONS: &[&str] = &[
-        sql!(
-            CREATE TABLE IF NOT EXISTS sidebar_threads(
-                session_id TEXT PRIMARY KEY,
-                agent_id TEXT,
-                title TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                created_at TEXT,
-                folder_paths TEXT,
-                folder_paths_order TEXT
-            ) STRICT;
-        ),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN archived INTEGER DEFAULT 0),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN main_worktree_paths TEXT),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN main_worktree_paths_order TEXT),
-        sql!(
-            CREATE TABLE IF NOT EXISTS archived_git_worktrees(
-                id INTEGER PRIMARY KEY,
-                worktree_path TEXT NOT NULL,
-                main_repo_path TEXT NOT NULL,
-                branch_name TEXT,
-                staged_commit_hash TEXT,
-                unstaged_commit_hash TEXT,
-                original_commit_hash TEXT
-            ) STRICT;
+        CREATE TABLE thread_archived_worktrees_v2(
+            thread_id BLOB NOT NULL,
+            archived_worktree_id INTEGER NOT NULL REFERENCES archived_git_worktrees(id),
+            PRIMARY KEY (thread_id, archived_worktree_id)
+        ) STRICT;
 
-            CREATE TABLE IF NOT EXISTS thread_archived_worktrees(
-                session_id TEXT NOT NULL,
-                archived_worktree_id INTEGER NOT NULL REFERENCES archived_git_worktrees(id),
-                PRIMARY KEY (session_id, archived_worktree_id)
-            ) STRICT;
-        ),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN remote_connection TEXT),
-        sql!(ALTER TABLE sidebar_threads ADD COLUMN thread_id BLOB),
-        sql!(
-            UPDATE sidebar_threads SET thread_id = randomblob(16) WHERE thread_id IS NULL;
+        INSERT INTO thread_archived_worktrees_v2(thread_id, archived_worktree_id)
+        SELECT s.thread_id, t.archived_worktree_id
+        FROM thread_archived_worktrees t
+        JOIN sidebar_threads s ON s.session_id = t.session_id;
 
-            CREATE TABLE thread_archived_worktrees_v2(
-                thread_id BLOB NOT NULL,
-                archived_worktree_id INTEGER NOT NULL REFERENCES archived_git_worktrees(id),
-                PRIMARY KEY (thread_id, archived_worktree_id)
-            ) STRICT;
+        DROP TABLE thread_archived_worktrees;
+        ALTER TABLE thread_archived_worktrees_v2 RENAME TO thread_archived_worktrees;
 
-            INSERT INTO thread_archived_worktrees_v2(thread_id, archived_worktree_id)
-            SELECT s.thread_id, t.archived_worktree_id
-            FROM thread_archived_worktrees t
-            JOIN sidebar_threads s ON s.session_id = t.session_id;
+        CREATE TABLE sidebar_threads_v2(
+            thread_id BLOB PRIMARY KEY,
+            session_id TEXT,
+            agent_id TEXT,
+            title TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            created_at TEXT,
+            folder_paths TEXT,
+            folder_paths_order TEXT,
+            archived INTEGER DEFAULT 0,
+            main_worktree_paths TEXT,
+            main_worktree_paths_order TEXT,
+            remote_connection TEXT
+        ) STRICT;
 
-            DROP TABLE thread_archived_worktrees;
-            ALTER TABLE thread_archived_worktrees_v2 RENAME TO thread_archived_worktrees;
+        INSERT INTO sidebar_threads_v2(thread_id, session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection)
+        SELECT thread_id, session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection
+        FROM sidebar_threads;
 
-            CREATE TABLE sidebar_threads_v2(
-                thread_id BLOB PRIMARY KEY,
-                session_id TEXT,
-                agent_id TEXT,
-                title TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                created_at TEXT,
-                folder_paths TEXT,
-                folder_paths_order TEXT,
-                archived INTEGER DEFAULT 0,
-                main_worktree_paths TEXT,
-                main_worktree_paths_order TEXT,
-                remote_connection TEXT
-            ) STRICT;
+        DROP TABLE sidebar_threads;
+        ALTER TABLE sidebar_threads_v2 RENAME TO sidebar_threads;
+    ),
+    sql!(
+        DELETE FROM thread_archived_worktrees
+        WHERE thread_id IN (
+            SELECT thread_id FROM sidebar_threads WHERE session_id IS NULL
+        );
 
-            INSERT INTO sidebar_threads_v2(thread_id, session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection)
-            SELECT thread_id, session_id, agent_id, title, updated_at, created_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection
-            FROM sidebar_threads;
+        DELETE FROM sidebar_threads WHERE session_id IS NULL;
 
-            DROP TABLE sidebar_threads;
-            ALTER TABLE sidebar_threads_v2 RENAME TO sidebar_threads;
-        ),
-        sql!(
-            DELETE FROM thread_archived_worktrees
-            WHERE thread_id IN (
-                SELECT thread_id FROM sidebar_threads WHERE session_id IS NULL
-            );
+        DELETE FROM archived_git_worktrees
+        WHERE id NOT IN (
+            SELECT archived_worktree_id FROM thread_archived_worktrees
+        );
+    ),
+    sql!(
+        ALTER TABLE sidebar_threads ADD COLUMN interacted_at TEXT;
+    ),
+    sql!(
+        ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
+    ),
+    // Index to make ORDER BY updated_at DESC fast for list() / list_ids() used at launch
+    // for the agent thread history sidebar (avoids full table scan + sort on large history).
+    sql!(
+        CREATE INDEX IF NOT EXISTS idx_sidebar_threads_updated_at ON sidebar_threads(updated_at DESC);
+    ),
+];
+const ARCHIVED_WORKTREE_NEXT_ID_KEY: &[u8] = b"archived_worktree_next_id";
 
-            DELETE FROM sidebar_threads WHERE session_id IS NULL;
-
-            DELETE FROM archived_git_worktrees
-            WHERE id NOT IN (
-                SELECT archived_worktree_id FROM thread_archived_worktrees
-            );
-        ),
-        sql!(
-            ALTER TABLE sidebar_threads ADD COLUMN interacted_at TEXT;
-        ),
-        sql!(
-            ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
-        ),
-        // Index to make ORDER BY updated_at DESC fast for list() / list_ids() used at launch
-        // for the agent thread history sidebar (avoids full table scan + sort on large history).
-        sql!(
-            CREATE INDEX IF NOT EXISTS idx_sidebar_threads_updated_at ON sidebar_threads(updated_at DESC);
-        ),
-    ];
+fn archived_worktree_key(id: i64) -> [u8; 8] {
+    id.to_be_bytes()
 }
 
-db::static_connection!(ThreadMetadataDb, []);
-
-impl ThreadMetadataDb {
-    #[allow(dead_code)]
-    pub fn list_ids(&self) -> anyhow::Result<Vec<ThreadId>> {
-        self.select::<ThreadId>(
-            "SELECT thread_id FROM sidebar_threads \
-             ORDER BY updated_at DESC",
-        )?()
-    }
-
-    const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
-        created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override \
-        FROM sidebar_threads \
-        ORDER BY updated_at DESC";
-
-    /// List all sidebar thread metadata, ordered by updated_at descending.
-    ///
-    /// Only returns threads that have a `session_id`.
-    pub fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
-        self.select::<ThreadMetadata>(Self::LIST_QUERY)?()
-    }
-
-    /// Upsert metadata for a thread.
-    ///
-    /// Drafts are persisted with `session_id = None`. They get a real
-    /// session_id on promotion (when the first message is sent) and
-    /// then flow through this same upsert path.
-    pub async fn save(&self, row: ThreadMetadata) -> anyhow::Result<()> {
-        let session_id = row.session_id.as_ref().map(|s| s.0.clone());
-        let agent_id = if row.agent_id.as_ref() == ZED_AGENT_ID.as_ref() {
-            None
-        } else {
-            Some(row.agent_id.to_string())
-        };
-        let title = row
-            .title
-            .as_ref()
-            .map(|t| t.to_string())
-            .unwrap_or_default();
-        let updated_at = row.updated_at.to_rfc3339();
-        let created_at = row.created_at.map(|dt| dt.to_rfc3339());
-        let interacted_at = row.interacted_at.map(|dt| dt.to_rfc3339());
-        let serialized = row.folder_paths().serialize();
-        let (folder_paths, folder_paths_order) = if row.folder_paths().is_empty() {
-            (None, None)
-        } else {
-            (Some(serialized.paths), Some(serialized.order))
-        };
-        let main_serialized = row.main_worktree_paths().serialize();
-        let (main_worktree_paths, main_worktree_paths_order) =
-            if row.main_worktree_paths().is_empty() {
-                (None, None)
-            } else {
-                (Some(main_serialized.paths), Some(main_serialized.order))
-            };
-        let remote_connection = row
-            .remote_connection
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .context("serialize thread metadata remote connection")?;
-        let title_override = row.title_override.as_ref().map(|t| t.to_string());
-        let thread_id = row.thread_id;
-        let archived = row.archived;
-
-        self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
-                       ON CONFLICT(thread_id) DO UPDATE SET \
-                           session_id = excluded.session_id, \
-                           agent_id = excluded.agent_id, \
-                           title = excluded.title, \
-                           updated_at = excluded.updated_at, \
-                           created_at = excluded.created_at, \
-                           interacted_at = excluded.interacted_at, \
-                           folder_paths = excluded.folder_paths, \
-                           folder_paths_order = excluded.folder_paths_order, \
-                           archived = excluded.archived, \
-                           main_worktree_paths = excluded.main_worktree_paths, \
-                           main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                           remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
-            let mut stmt = Statement::prepare(conn, sql)?;
-            let mut i = stmt.bind(&thread_id, 1)?;
-            i = stmt.bind(&session_id, i)?;
-            i = stmt.bind(&agent_id, i)?;
-            i = stmt.bind(&title, i)?;
-            i = stmt.bind(&updated_at, i)?;
-            i = stmt.bind(&created_at, i)?;
-            i = stmt.bind(&interacted_at, i)?;
-            i = stmt.bind(&folder_paths, i)?;
-            i = stmt.bind(&folder_paths_order, i)?;
-            i = stmt.bind(&archived, i)?;
-            i = stmt.bind(&main_worktree_paths, i)?;
-            i = stmt.bind(&main_worktree_paths_order, i)?;
-            i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
-            stmt.exec()
-        })
-        .await
-    }
-
-    /// Delete metadata for a single thread.
-    pub async fn delete(&self, thread_id: ThreadId) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt =
-                Statement::prepare(conn, "DELETE FROM sidebar_threads WHERE thread_id = ?")?;
-            stmt.bind(&thread_id, 1)?;
-            stmt.exec()
-        })
-        .await
-    }
-
-    pub async fn create_archived_worktree(
-        &self,
-        worktree_path: String,
-        main_repo_path: String,
-        branch_name: Option<String>,
-        staged_commit_hash: String,
-        unstaged_commit_hash: String,
-        original_commit_hash: String,
-    ) -> anyhow::Result<i64> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "INSERT INTO archived_git_worktrees(worktree_path, main_repo_path, branch_name, staged_commit_hash, unstaged_commit_hash, original_commit_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                 RETURNING id",
-            )?;
-            let mut i = stmt.bind(&worktree_path, 1)?;
-            i = stmt.bind(&main_repo_path, i)?;
-            i = stmt.bind(&branch_name, i)?;
-            i = stmt.bind(&staged_commit_hash, i)?;
-            i = stmt.bind(&unstaged_commit_hash, i)?;
-            stmt.bind(&original_commit_hash, i)?;
-            stmt.maybe_row::<i64>()?.context("expected RETURNING id")
-        })
-        .await
-    }
-
-    pub async fn link_thread_to_archived_worktree(
-        &self,
-        thread_id: ThreadId,
-        archived_worktree_id: i64,
-    ) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "INSERT INTO thread_archived_worktrees(thread_id, archived_worktree_id) \
-                 VALUES (?1, ?2)",
-            )?;
-            let i = stmt.bind(&thread_id, 1)?;
-            stmt.bind(&archived_worktree_id, i)?;
-            stmt.exec()
-        })
-        .await
-    }
-
-    pub async fn get_archived_worktrees_for_thread(
-        &self,
-        thread_id: ThreadId,
-    ) -> anyhow::Result<Vec<ArchivedGitWorktree>> {
-        self.select_bound::<ThreadId, ArchivedGitWorktree>(
-            "SELECT a.id, a.worktree_path, a.main_repo_path, a.branch_name, a.staged_commit_hash, a.unstaged_commit_hash, a.original_commit_hash \
-             FROM archived_git_worktrees a \
-             JOIN thread_archived_worktrees t ON a.id = t.archived_worktree_id \
-             WHERE t.thread_id = ?1",
-        )?(thread_id)
-    }
-
-    pub async fn delete_archived_worktree(&self, id: i64) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "DELETE FROM thread_archived_worktrees WHERE archived_worktree_id = ?",
-            )?;
-            stmt.bind(&id, 1)?;
-            stmt.exec()?;
-
-            let mut stmt =
-                Statement::prepare(conn, "DELETE FROM archived_git_worktrees WHERE id = ?")?;
-            stmt.bind(&id, 1)?;
-            stmt.exec()
-        })
-        .await
-    }
-
-    pub async fn unlink_thread_from_all_archived_worktrees(
-        &self,
-        thread_id: ThreadId,
-    ) -> anyhow::Result<()> {
-        self.write(move |conn| {
-            let mut stmt = Statement::prepare(
-                conn,
-                "DELETE FROM thread_archived_worktrees WHERE thread_id = ?",
-            )?;
-            stmt.bind(&thread_id, 1)?;
-            stmt.exec()
-        })
-        .await
-    }
-
-    pub async fn is_archived_worktree_referenced(
-        &self,
-        archived_worktree_id: i64,
-    ) -> anyhow::Result<bool> {
-        self.select_row_bound::<i64, i64>(
-            "SELECT COUNT(*) FROM thread_archived_worktrees WHERE archived_worktree_id = ?1",
-        )?(archived_worktree_id)
-        .map(|count| count.unwrap_or(0) > 0)
-    }
-
-    pub fn get_all_archived_branch_names(
-        &self,
-    ) -> anyhow::Result<HashMap<ThreadId, HashMap<PathBuf, String>>> {
-        let rows = self.select::<(ThreadId, String, String)>(
-            "SELECT t.thread_id, a.worktree_path, a.branch_name \
-             FROM thread_archived_worktrees t \
-             JOIN archived_git_worktrees a ON a.id = t.archived_worktree_id \
-             WHERE a.branch_name IS NOT NULL \
-             ORDER BY a.id ASC",
-        )?()?;
-
-        let mut result: HashMap<ThreadId, HashMap<PathBuf, String>> = HashMap::default();
-        for (thread_id, worktree_path, branch_name) in rows {
-            result
-                .entry(thread_id)
-                .or_default()
-                .insert(PathBuf::from(worktree_path), branch_name);
-        }
-        Ok(result)
-    }
+fn thread_archived_link_key(thread_id: &ThreadId, archived_worktree_id: i64) -> Vec<u8> {
+    let mut key = thread_id.0.as_bytes().to_vec();
+    key.extend_from_slice(&archived_worktree_id.to_be_bytes());
+    key
 }
 
 // --- heed3-backed implementation (zero-copy deserialization focus) ---
 //
-// The types below implement the same logical contract as ThreadMetadataDb
-// (list, save, delete, archived worktree helpers) but backed by heed3 + LMDB.
-// The public ThreadMetadataStore continues to own the in-memory cache and
-// DbOperation channel; only the persistence layer is swapped.
-//
-// Encoding strategy (per the design note at the top of the file):
-// - Keys: thread_id (uuid bytes) or session_id (string bytes) for primary lookup.
-// - Values: postcard-encoded (or rkyv archived) ThreadMetadata / ArchivedGitWorktree
-//   blobs. Hot read paths use a custom BytesDecode<'a> that returns borrowed
-//   views where practical (or the archived form for rkyv).
-// - Separate named databases inside the single Env: "threads", "archived_worktrees",
-//   "thread_to_archived_worktree" (mirrors the old table separation).
-//
-// The old SQLite path remains for one release transition to perform the
-// automatic bulk migration on first open after the heed3 env is created.
+// heed3 + rkyv persistence for thread metadata, agent panel state, and categorized surface kv.
 
 #[derive(Clone)]
-#[allow(dead_code)]
-struct HeedThreadMetadataDb {
+pub(crate) struct HeedThreadMetadataDb {
     env: Env<WithoutTls>,
-    threads: Database<Bytes, RkyvCodec<ThreadMetadata>>,
-    archived_worktrees: Database<Bytes, RkyvCodec<ArchivedGitWorktree>>,
+    threads: Database<Bytes, RkyvCodec<ThreadMetadataRecord>>,
+    archived_worktrees: Database<Bytes, RkyvCodec<ArchivedGitWorktreeRecord>>,
     thread_to_archived: Database<Bytes, Bytes>,
     agent_panels: Database<Bytes, RkyvCodec<ArchivedSerializedAgentPanel>>,
     agent_kv: Database<Bytes, Bytes>,
+    terminal_threads: Database<Bytes, RkyvCodec<TerminalThreadKvRecord>>,
 }
+
+static PROD_AGENT_KV: std::sync::OnceLock<HeedThreadMetadataDb> = std::sync::OnceLock::new();
 
 thread_local! {
     static TEST_AGENT_KV: std::cell::RefCell<Option<HeedThreadMetadataDb>> = const { std::cell::RefCell::new(None) };
@@ -1982,7 +1688,7 @@ thread_local! {
 #[allow(dead_code)]
 impl HeedThreadMetadataDb {
     /// Best-effort constructor for the kv backend used by the agent panel
-    /// and the classified persistent agent surface (approvals, plans, monitors).
+    /// and the categorized persistent agent surface (approvals, plans, monitors).
     /// Returns an error instead of panicking so callers can handle the case where
     /// the backend is not yet available (e.g. very early startup).
     pub fn try_open() -> anyhow::Result<Self> {
@@ -1990,9 +1696,11 @@ impl HeedThreadMetadataDb {
             if let Some(cached) = TEST_AGENT_KV.with(|c| c.borrow().clone()) {
                 return Ok(cached);
             }
+        } else if let Some(cached) = PROD_AGENT_KV.get() {
+            return Ok(cached.clone());
         }
         // Real on-disk path using the canonical Zed convention (data_dir / agent_kv).
-        // This is the kv backend for agent metadata, including the classified
+        // This is the kv backend for agent metadata, including the categorized
         // persistent surface and thread metadata.
         let path = if cfg!(any(test, feature = "test-support")) {
             let p = std::env::temp_dir().join(format!(
@@ -2017,14 +1725,16 @@ impl HeedThreadMetadataDb {
         };
 
         let mut wtxn = env.write_txn()?;
-        let threads: Database<Bytes, RkyvCodec<ThreadMetadata>> =
+        let threads: Database<Bytes, RkyvCodec<ThreadMetadataRecord>> =
             env.create_database(&mut wtxn, Some("threads"))?;
-        let archived_worktrees: Database<Bytes, RkyvCodec<ArchivedGitWorktree>> =
+        let archived_worktrees: Database<Bytes, RkyvCodec<ArchivedGitWorktreeRecord>> =
             env.create_database(&mut wtxn, Some("archived_worktrees"))?;
         let thread_to_archived = env.create_database(&mut wtxn, Some("thread_to_archived"))?;
         let agent_panels: Database<Bytes, RkyvCodec<ArchivedSerializedAgentPanel>> =
             env.create_database(&mut wtxn, Some("agent_panels"))?;
         let agent_kv: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some("agent_kv"))?;
+        let terminal_threads: Database<Bytes, RkyvCodec<TerminalThreadKvRecord>> =
+            env.create_database(&mut wtxn, Some("terminal_threads"))?;
         wtxn.commit()?;
 
         let this = Self {
@@ -2034,11 +1744,50 @@ impl HeedThreadMetadataDb {
             thread_to_archived,
             agent_panels,
             agent_kv,
+            terminal_threads,
         };
+        Self::rekey_legacy_panel_keys(&this.env, this.agent_panels).log_err();
         if cfg!(any(test, feature = "test-support")) {
             TEST_AGENT_KV.with(|c| *c.borrow_mut() = Some(this.clone()));
+        } else {
+            let _ = PROD_AGENT_KV.set(this.clone());
         }
         Ok(this)
+    }
+
+    fn rekey_legacy_panel_keys(
+        env: &Env<WithoutTls>,
+        agent_panels: Database<Bytes, RkyvCodec<ArchivedSerializedAgentPanel>>,
+    ) -> anyhow::Result<()> {
+        let rtxn = env.read_txn()?;
+        let mut rows = Vec::new();
+        for result in agent_panels.iter(&rtxn)? {
+            let (key, value) = result?;
+            if key.len() == 8 {
+                continue;
+            }
+            let Some(workspace_id) = std::str::from_utf8(key)
+                .ok()
+                .and_then(|text| text.parse::<i64>().ok())
+            else {
+                continue;
+            };
+            let archived: ArchivedSerializedAgentPanel = value.into();
+            rows.push((workspace_id.to_le_bytes(), key.to_vec(), archived));
+        }
+        drop(rtxn);
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut wtxn = env.write_txn()?;
+        for (new_key, legacy_key, archived) in rows {
+            agent_panels.put(&mut wtxn, &new_key, &archived)?;
+            agent_panels.delete(&mut wtxn, &legacy_key)?;
+        }
+        wtxn.commit()?;
+        Ok(())
     }
 
     pub fn global(_cx: &mut App) -> Self {
@@ -2047,24 +1796,23 @@ impl HeedThreadMetadataDb {
 
     pub fn list(&self) -> anyhow::Result<Vec<ThreadMetadata>> {
         let rtxn = self.env.read_txn()?;
-        let mut out = Vec::new();
+        let mut out: Vec<ThreadMetadata> = Vec::new();
         for result in self.threads.iter(&rtxn)? {
             let (_key, archived) = result?;
-            // Materialize owned value from the zero-copy archived form.
-            // With AsOwned on the complex fields this is the point where we pay
-            // reconstruction cost only for the data we actually load into the cache.
-            let owned: ThreadMetadata = rkyv::deserialize::<_, rkyv::rancor::Error>(archived)
-                .map_err(|e| anyhow::anyhow!("rkyv deserialize failed: {:?}", e))?;
-            out.push(owned);
+            let record: ThreadMetadataRecord =
+                rkyv::deserialize::<_, rkyv::rancor::Error>(archived)
+                    .map_err(|e| anyhow::anyhow!("rkyv deserialize failed: {:?}", e))?;
+            out.push(ThreadMetadata::from(record));
         }
         Ok(out)
     }
 
     pub fn save(&self, row: ThreadMetadata) -> anyhow::Result<()> {
+        let record = ThreadMetadataRecord::from(&row);
         let mut wtxn = self.env.write_txn()?;
         // Use the thread_id bytes as the key for stable lookup.
         let key = row.thread_id.0.as_bytes();
-        self.threads.put(&mut wtxn, key, &row)?;
+        self.threads.put(&mut wtxn, key, &record)?;
         wtxn.commit()?;
         Ok(())
     }
@@ -2077,19 +1825,192 @@ impl HeedThreadMetadataDb {
         Ok(())
     }
 
-    /// One-time migration helper. Called when the old SQLite `sidebar_threads`
-    /// table still contains data. After this runs we mark completion and never
-    /// touch the old tables again.
-    pub fn migrate_from_sqlite(&self, old: &ThreadMetadataDb) -> anyhow::Result<()> {
-        let rows = old.list()?;
-        if rows.is_empty() {
-            return Ok(());
-        }
-        for row in rows {
-            self.save(row)?;
-        }
-        // TODO(HEED): write a completion marker so we don't re-migrate.
+    fn load_i64(&self, key: &[u8]) -> Option<i64> {
+        let rtxn = self.env.read_txn().ok()?;
+        let bytes = self.agent_kv.get(&rtxn, key).ok().flatten()?;
+        (bytes.len() == 8)
+            .then(|| bytes.try_into().ok())
+            .flatten()
+            .map(i64::from_be_bytes)
+    }
+
+    fn save_i64(&self, key: &[u8], val: i64) -> anyhow::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.agent_kv.put(&mut wtxn, key, &val.to_be_bytes())?;
+        wtxn.commit()?;
         Ok(())
+    }
+
+    fn ensure_archived_worktree_counter(&self, next_id: i64) -> anyhow::Result<()> {
+        let current = self.load_i64(ARCHIVED_WORKTREE_NEXT_ID_KEY).unwrap_or(1);
+        if next_id > current {
+            self.save_i64(ARCHIVED_WORKTREE_NEXT_ID_KEY, next_id)?;
+        }
+        Ok(())
+    }
+
+    fn next_archived_worktree_id(&self) -> anyhow::Result<i64> {
+        let next = self.load_i64(ARCHIVED_WORKTREE_NEXT_ID_KEY).unwrap_or(1);
+        self.save_i64(ARCHIVED_WORKTREE_NEXT_ID_KEY, next + 1)?;
+        Ok(next)
+    }
+
+    fn put_archived_worktree(&self, worktree: ArchivedGitWorktree) -> anyhow::Result<()> {
+        let record = ArchivedGitWorktreeRecord::from(&worktree);
+        let mut wtxn = self.env.write_txn()?;
+        self.archived_worktrees
+            .put(&mut wtxn, &archived_worktree_key(worktree.id), &record)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn create_archived_worktree(
+        &self,
+        worktree_path: String,
+        main_repo_path: String,
+        branch_name: Option<String>,
+        staged_commit_hash: String,
+        unstaged_commit_hash: String,
+        original_commit_hash: String,
+    ) -> anyhow::Result<i64> {
+        let id = self.next_archived_worktree_id()?;
+        self.put_archived_worktree(ArchivedGitWorktree {
+            id,
+            worktree_path: PathBuf::from(worktree_path),
+            main_repo_path: PathBuf::from(main_repo_path),
+            branch_name,
+            staged_commit_hash,
+            unstaged_commit_hash,
+            original_commit_hash,
+        })?;
+        Ok(id)
+    }
+
+    pub fn link_thread_to_archived_worktree(
+        &self,
+        thread_id: ThreadId,
+        archived_worktree_id: i64,
+    ) -> anyhow::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        let key = thread_archived_link_key(&thread_id, archived_worktree_id);
+        self.thread_to_archived
+            .put(&mut wtxn, &key, &archived_worktree_id.to_be_bytes())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn get_archived_worktrees_for_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<Vec<ArchivedGitWorktree>> {
+        let rtxn = self.env.read_txn()?;
+        let prefix = thread_id.0.as_bytes();
+        let mut out: Vec<ArchivedGitWorktree> = Vec::new();
+        for result in self.thread_to_archived.iter(&rtxn)? {
+            let (key, _) = result?;
+            if !key.starts_with(prefix) || key.len() != prefix.len() + 8 {
+                continue;
+            }
+            let archived_id = i64::from_be_bytes(key[prefix.len()..].try_into()?);
+            if let Some(archived) = self
+                .archived_worktrees
+                .get(&rtxn, &archived_worktree_key(archived_id))?
+            {
+                let record: ArchivedGitWorktreeRecord = rkyv::deserialize::<_, RkyvError>(archived)
+                    .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+                out.push(ArchivedGitWorktree::from(record));
+            }
+        }
+        out.sort_by_key(|worktree| worktree.id);
+        Ok(out)
+    }
+
+    pub fn delete_archived_worktree(&self, id: i64) -> anyhow::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        let keys: Vec<Vec<u8>> = self
+            .thread_to_archived
+            .iter(&wtxn)?
+            .filter_map(|result| {
+                let (key, _) = result.ok()?;
+                (key.len() >= 8 && i64::from_be_bytes(key[key.len() - 8..].try_into().ok()?) == id)
+                    .then(|| key.to_vec())
+            })
+            .collect();
+        for key in keys {
+            self.thread_to_archived.delete(&mut wtxn, &key)?;
+        }
+        self.archived_worktrees
+            .delete(&mut wtxn, &archived_worktree_key(id))?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn unlink_thread_from_all_archived_worktrees(
+        &self,
+        thread_id: ThreadId,
+    ) -> anyhow::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        let prefix = thread_id.0.as_bytes();
+        let keys: Vec<Vec<u8>> = self
+            .thread_to_archived
+            .iter(&wtxn)?
+            .filter_map(|result| {
+                let (key, _) = result.ok()?;
+                (key.starts_with(prefix) && key.len() == prefix.len() + 8).then(|| key.to_vec())
+            })
+            .collect();
+        for key in keys {
+            self.thread_to_archived.delete(&mut wtxn, &key)?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub fn is_archived_worktree_referenced(
+        &self,
+        archived_worktree_id: i64,
+    ) -> anyhow::Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        for result in self.thread_to_archived.iter(&rtxn)? {
+            let (key, _) = result?;
+            if key.len() >= 8
+                && i64::from_be_bytes(key[key.len() - 8..].try_into()?) == archived_worktree_id
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn get_all_archived_branch_names(
+        &self,
+    ) -> anyhow::Result<HashMap<ThreadId, HashMap<PathBuf, String>>> {
+        let rtxn = self.env.read_txn()?;
+        let mut result: HashMap<ThreadId, HashMap<PathBuf, String>> = HashMap::default();
+        for link in self.thread_to_archived.iter(&rtxn)? {
+            let (key, _) = link?;
+            if key.len() != 16 + 8 {
+                continue;
+            }
+            let thread_id = ThreadId(uuid::Uuid::from_bytes(key[..16].try_into()?));
+            let archived_id = i64::from_be_bytes(key[16..].try_into()?);
+            let Some(archived) = self
+                .archived_worktrees
+                .get(&rtxn, &archived_worktree_key(archived_id))?
+            else {
+                continue;
+            };
+            let record: ArchivedGitWorktreeRecord = rkyv::deserialize::<_, RkyvError>(archived)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let owned: ArchivedGitWorktree = record.into();
+            if let Some(branch_name) = owned.branch_name {
+                result
+                    .entry(thread_id)
+                    .or_default()
+                    .insert(owned.worktree_path, branch_name);
+            }
+        }
+        Ok(result)
     }
 
     pub(crate) fn save_panel_state(
@@ -2125,7 +2046,7 @@ impl HeedThreadMetadataDb {
             .get(&rtxn, key)
             .ok()
             .flatten()
-            .and_then(|a| String::from_utf8(a.0.as_slice().to_vec()).ok())
+            .and_then(|a| std::str::from_utf8(a.0.as_slice()).ok().map(str::to_string))
     }
 
     fn save_global_json(
@@ -2181,7 +2102,8 @@ impl HeedThreadMetadataDb {
     }
 
     pub(crate) fn save_string(&self, key: &[u8], val: &str) -> anyhow::Result<()> {
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&val.to_string())?;
+        let owned = val.to_owned();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&owned)?;
         let mut wtxn = self.env.write_txn()?;
         self.agent_kv.put(&mut wtxn, key, bytes.as_slice())?;
         wtxn.commit()?;
@@ -2194,6 +2116,55 @@ impl HeedThreadMetadataDb {
         wtxn.commit()?;
         Ok(())
     }
+
+    pub(crate) fn list_terminal_threads(&self) -> anyhow::Result<Vec<TerminalThreadKvRecord>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for result in self.terminal_threads.iter(&rtxn)? {
+            let (_key, archived) = result?;
+            let owned: TerminalThreadKvRecord =
+                rkyv::deserialize::<_, rkyv::rancor::Error>(archived).map_err(|e| {
+                    anyhow::anyhow!("rkyv deserialize terminal thread failed: {e:?}")
+                })?;
+            out.push(owned);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn save_terminal_thread(&self, row: &TerminalThreadKvRecord) -> anyhow::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        let key = row.terminal_id.as_bytes().to_vec();
+        self.terminal_threads.put(&mut wtxn, &key, row)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_terminal_thread(&self, terminal_id: uuid::Uuid) -> anyhow::Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.terminal_threads
+            .delete(&mut wtxn, terminal_id.as_bytes().as_ref())?;
+        wtxn.commit()?;
+        Ok(())
+    }
+}
+
+/// heed3 + rkyv record for terminal thread sidebar metadata.
+#[derive(Debug, Clone, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(derive(Debug))]
+pub(crate) struct TerminalThreadKvRecord {
+    #[rkyv(with = ArchivedUuid)]
+    pub terminal_id: uuid::Uuid,
+    #[rkyv(with = ArchivedSharedString)]
+    pub title: SharedString,
+    #[rkyv(with = ArchivedSharedString)]
+    pub custom_title: Option<SharedString>,
+    #[rkyv(with = ArchivedDateTimeUtc)]
+    pub created_at: DateTime<Utc>,
+    #[rkyv(with = ArchivedWorktreePaths)]
+    pub worktree_paths: WorktreePaths,
+    #[rkyv(with = ArchivedRemoteConnectionOptions)]
+    pub remote_connection: Option<RemoteConnectionOptions>,
+    pub working_directory: Option<String>,
 }
 
 impl Column for ThreadMetadata {
@@ -2346,9 +2317,9 @@ mod tests {
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
-            // Keep our Grok native artifacts (G-17 memory / artifacts bridging + native
+            // Keep our Grok native artifacts (Grok memory artifacts / artifacts bridging + native
             // prompt injection) + integrate upstream sandboxed terminal field (additive,
-            // no conflict with surmount charter or ZT-1 classified surface work).
+            // no conflict with surmount charter or categorized todos surface work).
             native_grok_artifacts: None,
             sandboxed_terminal_temp_dir: None,
         }
@@ -2460,16 +2431,10 @@ mod tests {
         );
         metadata.title_override = Some("User Title".into());
 
-        let thread = std::thread::current();
-        let test_name = thread.name().unwrap_or("unknown_test");
-        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
-        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
-            &db_name,
-        )));
+        let kv_db = HeedThreadMetadataDb::try_open().expect("test kv backend must open");
+        kv_db.save(metadata).expect("save should succeed");
 
-        db.save(metadata).await.unwrap();
-
-        let rows = db.list().unwrap();
+        let rows = kv_db.list().expect("list should succeed");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title.as_deref(), Some("Agent Generated Title"));
         assert_eq!(rows[0].title_override.as_deref(), Some("User Title"));
@@ -2515,34 +2480,29 @@ mod tests {
         let now = Utc::now();
         let older = now - chrono::Duration::seconds(1);
 
-        let thread = std::thread::current();
-        let test_name = thread.name().unwrap_or("unknown_test");
-        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
-        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
-            &db_name,
-        )));
-
-        db.save(make_metadata(
-            "session-1",
-            "First Thread",
-            now,
-            first_paths.clone(),
-        ))
-        .await
-        .unwrap();
-        db.save(make_metadata(
-            "session-2",
-            "Second Thread",
-            older,
-            second_paths.clone(),
-        ))
-        .await
-        .unwrap();
+        init_test(cx);
 
         cx.update(|cx| {
-            let settings_store = settings::SettingsStore::test(cx);
-            cx.set_global(settings_store);
-            ThreadMetadataStore::init_global(cx);
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(
+                    make_metadata("session-1", "First Thread", now, first_paths.clone()),
+                    cx,
+                );
+                store.save(
+                    make_metadata("session-2", "Second Thread", older, second_paths.clone()),
+                    cx,
+                );
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                let _ = store.reload(cx);
+            });
         });
 
         cx.run_until_parked();
@@ -3511,57 +3471,6 @@ mod tests {
         assert_eq!(list[0].display_title(), "Regular Thread");
     }
 
-    #[test]
-    fn test_dedup_db_operations_keeps_latest_operation_for_session() {
-        let now = Utc::now();
-
-        let meta = make_metadata("session-1", "First Thread", now, PathList::default());
-        let thread_id = meta.thread_id;
-        let operations = vec![DbOperation::Upsert(meta), DbOperation::Delete(thread_id)];
-
-        let deduped = ThreadMetadataStore::dedup_db_operations(operations);
-
-        assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0], DbOperation::Delete(thread_id));
-    }
-
-    #[test]
-    fn test_dedup_db_operations_keeps_latest_insert_for_same_session() {
-        let now = Utc::now();
-        let later = now + chrono::Duration::seconds(1);
-
-        let old_metadata = make_metadata("session-1", "Old Title", now, PathList::default());
-        let shared_thread_id = old_metadata.thread_id;
-        let new_metadata = ThreadMetadata {
-            thread_id: shared_thread_id,
-            ..make_metadata("session-1", "New Title", later, PathList::default())
-        };
-
-        let deduped = ThreadMetadataStore::dedup_db_operations(vec![
-            DbOperation::Upsert(old_metadata),
-            DbOperation::Upsert(new_metadata.clone()),
-        ]);
-
-        assert_eq!(deduped.len(), 1);
-        assert_eq!(deduped[0], DbOperation::Upsert(new_metadata));
-    }
-
-    #[test]
-    fn test_dedup_db_operations_preserves_distinct_sessions() {
-        let now = Utc::now();
-
-        let metadata1 = make_metadata("session-1", "First Thread", now, PathList::default());
-        let metadata2 = make_metadata("session-2", "Second Thread", now, PathList::default());
-        let deduped = ThreadMetadataStore::dedup_db_operations(vec![
-            DbOperation::Upsert(metadata1.clone()),
-            DbOperation::Upsert(metadata2.clone()),
-        ]);
-
-        assert_eq!(deduped.len(), 2);
-        assert!(deduped.contains(&DbOperation::Upsert(metadata1)));
-        assert!(deduped.contains(&DbOperation::Upsert(metadata2)));
-    }
-
     #[gpui::test]
     async fn test_archive_and_unarchive_thread(cx: &mut TestAppContext) {
         init_test(cx);
@@ -4369,9 +4278,13 @@ mod tests {
             Connection::open_memory(Some("test_thread_id_pk_migration_backfills_nulls"));
 
         // Run migrations 0-6 (the old schema, before the thread_id PK migration).
-        let old_migrations: &[&str] = &ThreadMetadataDb::MIGRATIONS[..7];
+        let old_migrations: &[&str] = &LEGACY_SIDEBAR_THREAD_MIGRATIONS[..7];
         connection
-            .migrate(ThreadMetadataDb::NAME, old_migrations, &mut |_, _, _| false)
+            .migrate(
+                LEGACY_SIDEBAR_THREAD_DB_NAME,
+                old_migrations,
+                &mut |_, _, _| false,
+            )
             .expect("old migrations should succeed");
 
         // Insert rows: one with a thread_id, two without.
@@ -5024,9 +4937,36 @@ impl
     }
 }
 
+fn utf8_string_from_archived_bytes(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn arc_str_from_archived_bytes(bytes: &[u8]) -> Arc<str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Arc::from(text),
+        Err(_) => Arc::from(String::from_utf8_lossy(bytes).into_owned()),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ArchivedPathBuf(Vec<u8>);
 unsafe impl rkyv::Portable for ArchivedPathBuf {}
+unsafe impl<C> rkyv::bytecheck::CheckBytes<C> for ArchivedPathBuf
+where
+    C: ?Sized + rkyv::rancor::Fallible + rkyv::validation::ArchiveContext,
+    C::Error: rkyv::rancor::Source + rkyv::rancor::Trace,
+{
+    unsafe fn check_bytes(value: *const Self, context: &mut C) -> Result<(), C::Error> {
+        unsafe {
+            rkyv::vec::ArchivedVec::<u8>::check_bytes(
+                &(*value).0 as *const _ as *const rkyv::vec::ArchivedVec<u8>,
+                context,
+            )
+        }
+    }
+}
 
 impl From<std::path::PathBuf> for ArchivedPathBuf {
     fn from(p: std::path::PathBuf) -> Self {
@@ -5036,7 +4976,7 @@ impl From<std::path::PathBuf> for ArchivedPathBuf {
 
 impl From<ArchivedPathBuf> for std::path::PathBuf {
     fn from(a: ArchivedPathBuf) -> Self {
-        std::path::PathBuf::from(String::from_utf8_lossy(&a.0).to_string())
+        std::path::PathBuf::from(utf8_string_from_archived_bytes(&a.0))
     }
 }
 
@@ -5074,6 +5014,45 @@ impl
     }
 }
 
+impl<'b>
+    rkyv::with::SerializeWith<
+        std::path::PathBuf,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedPathBuf
+{
+    fn serialize_with(
+        field: &std::path::PathBuf,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
+        let canonical_bytes: Vec<u8> = field.to_string_lossy().as_bytes().to_vec();
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'b>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
+        Ok(())
+    }
+}
+
 impl
     rkyv::with::DeserializeWith<
         ArchivedPathBuf,
@@ -5085,9 +5064,9 @@ impl
         field: &ArchivedPathBuf,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<std::path::PathBuf, rkyv::rancor::Error> {
-        Ok(std::path::PathBuf::from(
-            String::from_utf8_lossy(&field.0).to_string(),
-        ))
+        Ok(std::path::PathBuf::from(utf8_string_from_archived_bytes(
+            &field.0,
+        )))
     }
 }
 
@@ -5327,7 +5306,7 @@ impl From<ui::SharedString> for ArchivedSharedString {
 
 impl From<ArchivedSharedString> for ui::SharedString {
     fn from(value: ArchivedSharedString) -> Self {
-        ui::SharedString::from(String::from_utf8_lossy(&value.0).to_string())
+        ui::SharedString::from(utf8_string_from_archived_bytes(&value.0))
     }
 }
 
@@ -5365,6 +5344,45 @@ impl
     }
 }
 
+impl<'b>
+    rkyv::with::SerializeWith<
+        ui::SharedString,
+        rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'b>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    > for ArchivedSharedString
+{
+    fn serialize_with<'s>(
+        field: &ui::SharedString,
+        serializer: &mut rkyv::rancor::Strategy<
+            rkyv::ser::Serializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'s>,
+                rkyv::ser::sharing::Share,
+            >,
+            rkyv::rancor::Error,
+        >,
+    ) -> Result<Self::Resolver, rkyv::rancor::Error> {
+        let canonical_bytes: Vec<u8> = field.as_bytes().to_vec();
+        let _ = <Vec<u8> as rkyv::Serialize<
+            rkyv::rancor::Strategy<
+                rkyv::ser::Serializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'s>,
+                    rkyv::ser::sharing::Share,
+                >,
+                rkyv::rancor::Error,
+            >,
+        >>::serialize(&canonical_bytes, serializer)?;
+        Ok(())
+    }
+}
+
 impl
     rkyv::with::DeserializeWith<
         ArchivedSharedString,
@@ -5376,9 +5394,9 @@ impl
         field: &ArchivedSharedString,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<ui::SharedString, rkyv::rancor::Error> {
-        Ok(ui::SharedString::from(
-            String::from_utf8_lossy(&field.0).to_string(),
-        ))
+        Ok(ui::SharedString::from(utf8_string_from_archived_bytes(
+            &field.0,
+        )))
     }
 }
 
@@ -5470,7 +5488,7 @@ impl
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<Option<ui::SharedString>, rkyv::rancor::Error> {
         Ok(Some(ui::SharedString::from(
-            String::from_utf8_lossy(&field.0).to_string(),
+            utf8_string_from_archived_bytes(&field.0),
         )))
     }
 }
@@ -5501,9 +5519,9 @@ impl From<project::AgentId> for ArchivedAgentId {
 }
 impl From<ArchivedAgentId> for project::AgentId {
     fn from(value: ArchivedAgentId) -> Self {
-        let bytes = value.0;
-        let text = std::str::from_utf8(&bytes).unwrap_or("");
-        project::AgentId(text.to_owned().into())
+        project::AgentId(SharedString::from(utf8_string_from_archived_bytes(
+            &value.0,
+        )))
     }
 }
 
@@ -5533,9 +5551,7 @@ impl From<agent_client_protocol::schema::SessionId> for ArchivedSessionId {
 }
 impl From<ArchivedSessionId> for agent_client_protocol::schema::SessionId {
     fn from(value: ArchivedSessionId) -> Self {
-        let bytes = value.0;
-        let text = std::str::from_utf8(&bytes).unwrap_or("");
-        agent_client_protocol::schema::SessionId::new(Arc::<str>::from(text))
+        agent_client_protocol::schema::SessionId::new(arc_str_from_archived_bytes(&value.0))
     }
 }
 
@@ -5624,7 +5640,7 @@ impl
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<agent_client_protocol::schema::SessionId, rkyv::rancor::Error> {
         Ok(agent_client_protocol::schema::SessionId::new(
-            std::str::from_utf8(&field.0).unwrap_or_default(),
+            arc_str_from_archived_bytes(&field.0),
         ))
     }
 }
@@ -5719,7 +5735,7 @@ impl
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<Option<agent_client_protocol::schema::SessionId>, rkyv::rancor::Error> {
         Ok(Some(agent_client_protocol::schema::SessionId::new(
-            std::str::from_utf8(&field.0).unwrap_or_default(),
+            arc_str_from_archived_bytes(&field.0),
         )))
     }
 }
@@ -5887,9 +5903,9 @@ impl
         field: &ArchivedAgentId,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<project::AgentId, rkyv::rancor::Error> {
-        Ok(project::AgentId(
-            std::str::from_utf8(&field.0).unwrap_or_default().into(),
-        ))
+        Ok(project::AgentId(SharedString::from(
+            utf8_string_from_archived_bytes(&field.0),
+        )))
     }
 }
 
@@ -5980,9 +5996,9 @@ impl
         field: &ArchivedAgentId,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<Option<project::AgentId>, rkyv::rancor::Error> {
-        Ok(Some(project::AgentId(
-            std::str::from_utf8(&field.0).unwrap_or_default().into(),
-        )))
+        Ok(Some(project::AgentId(SharedString::from(
+            utf8_string_from_archived_bytes(&field.0),
+        ))))
     }
 }
 
@@ -6277,7 +6293,7 @@ impl
     }
 }
 
-// rkyv form for the classified persistent agent surface state
+// rkyv form for the categorized persistent agent surface state
 // (approvals, plans, background monitors, memory). This struct
 // and its adapters let the agent panel and related UI use the
 // kv backend for that data.
@@ -6488,6 +6504,23 @@ where
             let len = (*value).0.len();
             <[u8] as CheckBytes<C>>::check_bytes(std::ptr::slice_from_raw_parts(data, len), context)
         }
+    }
+}
+
+impl From<&str> for ArchivedSerializedAgentPanel {
+    fn from(value: &str) -> Self {
+        Self(value.as_bytes().to_vec())
+    }
+}
+
+impl From<&ArchivedArchivedSerializedAgentPanel> for ArchivedSerializedAgentPanel {
+    fn from(value: &ArchivedArchivedSerializedAgentPanel) -> Self {
+        Self(value.0.as_slice().to_vec())
+    }
+}
+impl From<ArchivedArchivedSerializedAgentPanel> for ArchivedSerializedAgentPanel {
+    fn from(value: ArchivedArchivedSerializedAgentPanel) -> Self {
+        (&value).into()
     }
 }
 

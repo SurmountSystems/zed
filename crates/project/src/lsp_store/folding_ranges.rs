@@ -59,7 +59,12 @@ impl LspStore {
                 if !version_queried_for.changed_since(&lsp_data.buffer_version) {
                     let has_different_servers =
                         current_language_servers.is_some_and(|current_language_servers| {
-                            current_language_servers != cached.ranges.keys().copied().collect()
+                            current_language_servers
+                                != cached
+                                    .ranges
+                                    .keys()
+                                    .copied()
+                                    .collect::<collections::HashSet<_>>()
                         });
                     if !has_different_servers {
                         let snapshot = buffer.read(cx).snapshot();

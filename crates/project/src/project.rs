@@ -48,10 +48,12 @@ pub use agent_registry_store::{AgentRegistryStore, RegistryAgent};
 pub use agent_server_store::{
     AgentId, AgentServerStore, AgentServersUpdated, ExternalAgentSource, GrokFact,
     GrokMemoryArtifacts, GrokTuiRawArtifacts, GrokTuiSessionStore, GrokWorktreeEntry,
-    GrokWorktreesDb, grok_co_equal_indicator_for_id, grok_facts_for_cwd, grok_facts_for_cwd_with,
-    grok_memory_artifacts_for_cwd, grok_memory_artifacts_for_cwd_with,
+    GrokWorktreesDb, grok_build_default_agent_available, grok_co_equal_indicator_for_id,
+    grok_facts_for_cwd, grok_facts_for_cwd_with, grok_memory_artifacts_for_cwd,
+    grok_memory_artifacts_for_cwd_with, grok_memory_artifacts_from_palace_store,
     grok_worktree_entries_for_cwd_with, grok_worktrees_correlating_session_id,
     grok_worktrees_correlating_session_id_with, grok_worktrees_db, has_discovered_grok_binary,
+    import_grok_filesystem_into_palace_if_needed,
 };
 pub use git_store::{
     ConflictRegion, ConflictSet, ConflictSetSnapshot, ConflictSetUpdate,

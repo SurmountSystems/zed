@@ -366,11 +366,11 @@ pub struct NewExternalAgentThread {
 
 /// Convenience action for directly creating a Grok Build (ACP) thread.
 /// Surfaces "agent: new grok thread" in the command palette making the grok agent
-/// a first-class discoverable peer (G-19 co-equal command surface). Delegates to
+/// a first-class discoverable peer (co-equal Grok command surface). Delegates to
 /// NewExternalAgentThread with "grok" id (supports optional resume_session_id for
-/// G-16 roundtrip). After selecting Grok Build mode, use "agent: open zed todos surface"
-/// (or the Full Agent Mode / full screen affordance) to access the complete classified
-/// ZT-1 visual interface matching the user's expectation of the full rich experience.
+/// session resume scaffold roundtrip). After selecting Grok Build mode, use "agent: open zed todos surface"
+/// (or the Full Agent Mode / full screen affordance) to access the complete categorized
+/// categorized todos UI interface matching the user's expectation of the full rich experience.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = agent)]
 #[serde(deny_unknown_fields)]
@@ -483,6 +483,15 @@ impl Agent {
                 Rc::new(agent::NativeAgentServer::new(fs, thread_store))
             }
             Self::Custom { id: name } => {
+                #[cfg(any(test, feature = "test-support"))]
+                if name.as_ref() == "grok" {
+                    return Rc::new(
+                        crate::test_support::StubAgentServer::new(
+                            crate::test_support::stub_agent_connection(),
+                        )
+                        .with_agent_id(name.clone()),
+                    );
+                }
                 Rc::new(agent_servers::CustomAgentServer::new(name.clone()))
             }
             #[cfg(any(test, feature = "test-support"))]
@@ -1231,7 +1240,7 @@ mod tests {
 
         assert!(serde_json::from_str::<NewExternalAgentThread>(r#"{}"#).is_err());
 
-        // G-19: also cover the direct NewGrokThread action (for command palette discoverability of grok peer)
+        // co-equal Grok command surface: also cover the direct NewGrokThread action (for command palette discoverability of grok peer)
         let grok_action = serde_json::from_str::<NewGrokThread>(
             r#"{"resume_session_id":"019e3dd6-b6f6-7481-bb30-0f71c763aaf3"}"#,
         )

@@ -797,7 +797,7 @@ pub fn global_grok_bundled_skills_dir() -> PathBuf {
 /// patterns `(.agents|.grok)/skills` or `.grok/bundled/skills` appear
 /// consecutively anywhere. Case-insensitive.
 ///
-/// Extended for G-15 so that read fast-paths, edit gating, and
+/// Extended for multi-root bundled skills so that read fast-paths, edit gating, and
 /// sensitive classification also protect files inside grok's shipped
 /// skills (whose resources are referenced by relative paths from their
 /// SKILL.md). The any-depth scan prevents bypasses via .. or symlinks
@@ -2061,7 +2061,7 @@ description: A skill with no body content
         )));
     }
 
-    // G-15/G-10 Grok bridging TDD preserved (is_ classifier + global/project
+    // multi-root bundled skills Grok bridging TDD preserved (is_ classifier + global/project
     // symmetry for .grok/skills + bundled). Upstream test changes taken by
     // keeping the full Grok coverage we added.
     #[test]
@@ -2108,7 +2108,7 @@ description: A skill with no body content
 
     #[test]
     fn is_agents_skills_path_grok_bundled_positive() {
-        // G-15: .grok/bundled/skills paths must be recognized for gating
+        // multi-root bundled skills: .grok/bundled/skills paths must be recognized for gating
         // and fast-path so resources referenced by bundled SKILL.md bodies
         // (e.g. ../shared/personas/*.md) are readable by model via skill tool.
         assert!(is_agents_skills_path(Path::new(

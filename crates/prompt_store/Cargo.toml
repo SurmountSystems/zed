@@ -24,7 +24,6 @@ fuzzy.workspace = true
 futures.workspace = true
 gpui.workspace = true
 handlebars.workspace = true
-heed.workspace = true
 heed3.workspace = true
 rkyv.workspace = true
 language.workspace = true

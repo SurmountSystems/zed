@@ -56,6 +56,11 @@ where
         }
     }
 
+    pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
+        self.agent_id = agent_id;
+        self
+    }
+
     pub fn with_connection_agent_id(mut self) -> Self {
         self.agent_id = self.connection.agent_id();
         self

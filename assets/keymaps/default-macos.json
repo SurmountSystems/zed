@@ -665,7 +665,7 @@
     "context": "Workspace",
     "use_key_equivalents": true,
     "bindings": {
-      // Grok Build (xAI) macOS equivalent of Linux ctrl-alt-x (see AGENTS.md G-08 and Mac porting section) and ctrl-alt-shift-t full surface (this discoverability closer).
+      // Grok Build (xAI) macOS equivalent of Linux ctrl-alt-x (see AGENTS.md NewGrok macOS keybinding and Mac porting section) and ctrl-alt-shift-t full surface (this discoverability closer).
       "cmd-alt-x": ["agent::NewGrokThread", {}],
       // macOS equivalent of Linux ctrl-alt-shift-t for dedicated Full Agent Mode / "agent: open full grok surface" discoverability (pairs with prominent toolbar button + palette + "Full Grok Surface" menu; safe as cmd-alt-shift-n pattern exists nearby).
       "cmd-alt-shift-t": ["agent::OpenFullGrokSurface", {}],

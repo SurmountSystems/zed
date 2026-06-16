@@ -8,7 +8,7 @@ members = [
     "crates/agent",
     "crates/agent_servers",
     "crates/agent_settings",
-    "crates/vibe_palace",
+    "crates/memory_palace",
     "crates/agent_skills",
     "crates/agent_ui",
     "crates/ai_onboarding",
@@ -390,6 +390,7 @@ livekit_client = { path = "crates/livekit_client" }
 lmstudio = { path = "crates/lmstudio" }
 lsp = { path = "crates/lsp" }
 markdown = { path = "crates/markdown" }
+memory_palace = { path = "crates/memory_palace" }
 markdown_preview = { path = "crates/markdown_preview" }
 mermaid_render = { path = "crates/mermaid_render" }
 svg_preview = { path = "crates/svg_preview" }
@@ -603,7 +604,6 @@ heapless = "0.9.2"
 handlebars = "4.3"
 heck = "0.5"
 hdrhistogram = "7"
-heed = { version = "0.21.0", features = ["read-txn-no-tls"] }
 heed3 = "0.22.1"
 rkyv = { version = "0.8.16", features = ["unaligned"] }
 hex = "0.4.3"

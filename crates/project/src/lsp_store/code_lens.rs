@@ -123,7 +123,12 @@ impl LspStore {
             if let Some(cached_lens) = &lsp_data.code_lens {
                 if !version_queried_for.changed_since(&lsp_data.buffer_version) {
                     let has_different_servers = existing_servers.is_some_and(|existing_servers| {
-                        existing_servers != cached_lens.lens.keys().copied().collect()
+                        existing_servers
+                            != cached_lens
+                                .lens
+                                .keys()
+                                .copied()
+                                .collect::<collections::HashSet<_>>()
                     });
                     if !has_different_servers {
                         return Task::ready(Ok(Some(flatten_cache(&cached_lens.lens)))).shared();

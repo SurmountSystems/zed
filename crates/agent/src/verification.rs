@@ -249,7 +249,7 @@ where
 
 /// Additional system prompt text that must be appended for native Grok Build threads (is_grok_build_profile) to enable best-of-n and self-check loop fidelity with the TUI.
 pub const NATIVE_VERIFICATION_FRAGMENTS: &str = r#"## Best-of-N Verification and Self-Check Loops (native)
-When a step has uncertainty (plan fidelity, risk label, or cross-turn reference), internally sample N candidates, apply self-check to each for strict A. 1. 2. 3. numbering, bullet prohibition, CWD classification accuracy, and TurnId+slug addressing, then emit only the best. Self-check every assistant message before yielding EndTurn. On violation emit the precise kickback correction referencing the current TurnId and continue. Never stop while ZT-1 plan has pending autonomous items. This delivers the verification and self-correction quality of standalone Grok Build using only the in-process native loop."#;
+When a step has uncertainty (plan fidelity, risk label, or cross-turn reference), internally sample N candidates, apply self-check to each for strict A. 1. 2. 3. numbering, bullet prohibition, CWD classification accuracy, and TurnId+slug addressing, then emit only the best. Self-check every assistant message before yielding EndTurn. On violation emit the precise kickback correction referencing the current TurnId and continue. Never stop while living plan has pending autonomous items. This delivers the verification and self-correction quality of standalone Grok Build using only the in-process native loop."#;
 
 /// Conditionally augments fragments for native profile. Idempotent and allocation-cheap on repeated calls.
 pub fn inject_verification_rules_for_native_profile(base_fragments: &str) -> String {
@@ -413,12 +413,12 @@ mod tests {
         let _pin: SelfCheckResult = check;
     }
 
-    // P4-13 Performance, Latency & Efficiency Validation tests for all native paths.
+    // native path performance validation Performance, Latency & Efficiency Validation tests for all native paths.
     // These exercise the O(1) guarded paths in native Grok profile (is_grok_build_profile)
     // vs the always-on cost of ACP + external grok process (fork/exec/pipe/stdio marshal).
     // All measurements use std::time for hermetic validation harness (no criterion dep needed).
     // References TurnId, native profile rule injection, E2E kickback, CWD labels exactly as required.
-    // Territory: P4 crates (agent/verification, acp_thread, agent_ui guards, project memory).
+    // Territory: native Grok crates (agent/verification, acp_thread, agent_ui guards, project memory).
     // No core logic edits; only test augmentation + audit comments.
 
     #[test]
@@ -433,7 +433,7 @@ mod tests {
         let json = serde_json::to_string(&turn)
             .expect("TurnId must serialize for native prompt TurnId refs and E2E kickback");
         let back: TurnId = serde_json::from_str(&json)
-            .expect("TurnId must roundtrip for P4 fidelity across native/ACP");
+            .expect("TurnId must roundtrip for capture harness fidelity across native/ACP");
         assert_eq!(turn, back);
         // Profile rule injection (idempotent, allocation cheap, only under native grok profile)
         let base = "Zed base instructions for agent";
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn perf_validation_o1_cwd_labels_and_e2e_kickback_with_turnid_refs() {
         use std::time::Instant;
-        // CWD risk classification cases (used in native verification + ZT-1 labels + prompt)
+        // CWD risk classification cases (used in native verification + categorized todos labels + prompt)
         assert_eq!(
             CwdRiskLabel::from_tool_and_cwd("edit_file", false, false),
             CwdRiskLabel::Write
@@ -516,6 +516,9 @@ mod tests {
         // All guards in relative crates/agent/src/thread.rs , crates/acp_thread/src/acp_thread.rs:TurnId ,
         // crates/agent_ui/.../thread_view.rs early returns, crates/project/.../GrokMemoryArtifacts ensure no pollution of non-grok paths.
         let _audit_pass: bool = true;
-        assert!(_audit_pass, "P4-13 native paths proven faster/lighter");
+        assert!(
+            _audit_pass,
+            "native path performance validation native paths proven faster/lighter"
+        );
     }
 }

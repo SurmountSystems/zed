@@ -35,6 +35,7 @@ static LEVEL_ENABLED_MAX_STATIC: AtomicU8 = AtomicU8::new(LEVEL_ENABLED_MAX_DEFA
 pub static LEVEL_ENABLED_MAX_CONFIG: AtomicU8 = AtomicU8::new(LEVEL_ENABLED_MAX_DEFAULT as u8);
 
 const DEFAULT_FILTERS: &[(&str, log::LevelFilter)] = &[
+    ("agent_ui", log::LevelFilter::Warn),
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     ("zbus", log::LevelFilter::Warn),
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]

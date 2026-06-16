@@ -8059,18 +8059,18 @@ async fn test_enter_plan_mode_tool_emits_proposed_plan_state(cx: &mut TestAppCon
         !plan_update.entries.is_empty(),
         "enter_plan_mode must produce plan entries for proposed state"
     );
-    // P4 fidelity: enter_plan_mode with GrokPlanItem (all Pending) produces a plan
-    // that AcpThread::is_proposed() will classify as Proposed for ZT-1 surface.
-    // This matches the observed P4-0 harness shape and native Grok TUI behavior.
+    // capture harness fidelity: enter_plan_mode with GrokPlanItem (all Pending) produces a plan
+    // that AcpThread::is_proposed() will classify as Proposed for categorized todos surface.
+    // This matches the observed ACP capture harness shape and native Grok TUI behavior.
     assert!(
         plan_update
             .entries
             .iter()
             .all(|e| e.status == acp::PlanEntryStatus::Pending),
-        "enter_plan_mode plan must be all-Pending to trigger proposed state in ZT-1"
+        "enter_plan_mode plan must be all-Pending to trigger proposed state in the categorized todos surface"
     );
     // The AcpThread Plan::is_proposed() heuristic (phase=None + completed==0 + no in_progress)
-    // will return true for this shape, enabling ZT-1 proposed plan UX for native Grok threads.
+    // will return true for this shape, enabling categorized todos surface proposed plan UX for native Grok threads.
     let result_string = run_task.await.expect("enter plan mode run succeeds");
     assert_eq!(result_string, "Plan mode entered");
 }
@@ -8224,17 +8224,17 @@ async fn test_is_grok_build_profile_detection_via_model_name_and_provider(cx: &m
 
 #[test]
 fn test_grok_build_fragments_contain_p4_monitor_guidance() {
-    // TDD for Native-P4-Monitor-Fidelity (prompt side).
+    // TDD for native monitor fidelity (prompt side).
     // Explicit unit test asserting that the fragments contain the monitor + retrieval
     // guidance so native xAI grok models are instructed to use the correct long-running
-    // command pattern (matching P4-0 harness observations and real Grok TUI behavior).
+    // command pattern (matching ACP capture harness observations and real Grok TUI behavior).
     assert!(
         GROK_BUILD_SYSTEM_FRAGMENTS
             .contains("use the 'monitor' tool instead of a normal terminal execution")
     );
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("get_command_or_subagent_output"));
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("task_id"));
-    // Additional P4-0 fidelity coverage for plan discipline and persona on spawn.
+    // Additional ACP capture harness fidelity coverage for plan discipline and persona on spawn.
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("todo_write (for plan entries"));
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("enter_plan_mode"));
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("Supported personas for subagent delegation"));
@@ -8281,12 +8281,12 @@ fn test_grok_build_fragments_contain_p4_monitor_guidance() {
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("BOTH (a) performs a write or side-effect on disk/filesystem AND (b) the effect can escape the current working directory"));
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("labeled 'Plan Change'"));
 
-    // Strengthened Autonomous Work Discipline section with ZT-1 references (for the three behavioral rules)
+    // Strengthened Autonomous Work Discipline section with categorized todos surface references (for the three behavioral rules)
     assert!(
         GROK_BUILD_SYSTEM_FRAGMENTS
             .contains("Autonomous Work Discipline (mandatory for Grok Build co-equal experience)")
     );
-    assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("ZT-1 classified persistent surface"));
+    assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("categorized persistent todos surface"));
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("dual-condition CWD rule"));
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("Current Turn ID"));
     assert!(GROK_BUILD_SYSTEM_FRAGMENTS.contains("recent prior-turn summary"));
@@ -8295,10 +8295,10 @@ fn test_grok_build_fragments_contain_p4_monitor_guidance() {
 
 #[test]
 fn test_native_grok_get_command_or_subagent_output_reports_exit_and_pending() {
-    // TDD for Native-P4-Monitor-Fidelity runtime side.
+    // TDD for native monitor fidelity runtime side.
     // Asserts that the native implementation can surface exit status and pending
     // output chunks (from AcpThread pending maps) for finished or long-running
-    // monitors. This matches P4-0 harness expectations for task retrieval.
+    // monitors. This matches ACP capture harness expectations for task retrieval.
     // The public accessors terminal_exit_status and pending_terminal_output
     // (added for native monitor fidelity) are the contract used by
     // get_command_or_subagent_output in the native path (agent.rs ~2796).
@@ -8306,11 +8306,11 @@ fn test_native_grok_get_command_or_subagent_output_reports_exit_and_pending() {
     // nearby monitor_tool test and the runtime keep_alive pattern in MonitorTool.
     // Streaming reuses the shared AcpThread TerminalProviderEvent + pending map
     // (no native-specific gap; high fidelity via reuse).
-    // This marker test ensures the P4 fidelity surface remains present and the
+    // This marker test ensures the capture harness fidelity surface remains present and the
     // accessor API did not regress.
     assert!(
         true,
-        "P4 monitor fidelity accessors (exit + pending) + streaming reuse confirmed for native get_command_or_subagent_output"
+        "native monitor fidelity accessors (exit + pending) + streaming reuse confirmed for native get_command_or_subagent_output"
     );
 }
 
@@ -8338,7 +8338,7 @@ async fn test_todo_write_monitor_enter_plan_mode_tools_registration_fidelity(
         }],
     };
     let todo_serial = serde_json::to_value(&todo_input)
-        .expect("TodoWriteInput serializes matching P4-0 shape with content status");
+        .expect("TodoWriteInput serializes matching ACP capture harness shape with content status");
     assert!(todo_serial.is_object());
     let enter_input = crate::tools::EnterPlanModeInput {
         plan: vec![],
@@ -8495,10 +8495,10 @@ async fn test_native_grok_profile_triggers_system_notification_on_exact_completi
 }
 
 // -----------------------------------------------------------------------------
-// Large dedicated hermetic TDD surface for native Grok Build (P4 / 1.3).
+// Large dedicated hermetic TDD surface for native Grok Build.
 // These tests are unconditional, fast, injectable where needed, and always run
 // in plain `cargo test -p agent --lib`. Goal: dramatically stronger regression
-// signal for TurnId/task addressing, CWD classification, ZT-1 surface,
+// signal for TurnId/task addressing, CWD classification, categorized todos surface,
 // behavioral rules, native profile, plan proposed, and tool shims.
 // -----------------------------------------------------------------------------
 
@@ -8580,9 +8580,9 @@ mod native_grok_surface_tdd {
     #[test]
     fn approval_risk_display_label_respects_cwd_rule_for_native_tools() {
         let _write = ApprovalRisk::PotentiallyDestructive; // in-project write (used for documentation of the test intent)
-        // The display_label helper (with tool name) is the source of truth used in ZT-1 rows
+        // The display_label helper (with tool name) is the source of truth used in the categorized todos surface rows
         // We exercise the same classification paths the render code uses.
-        // Use display_label (the ZT-1 surface API) which applies the user's exact CWD + name-based classification.
+        // Use display_label (the categorized todos surface API) which applies the user's exact CWD + name-based classification.
         assert_eq!(
             acp_thread::approval_risk_for_tool_call(Some(&"edit_file".into()), acp::ToolKind::Edit)
                 .display_label(Some(&"edit_file".into())),
@@ -8633,7 +8633,7 @@ mod native_grok_surface_tdd {
         assert!(f.contains("T-<n>"));
     }
 
-    // Plan helpers that power ZT-1 and autonomous discipline enforcement (status/phase logic only;
+    // Plan helpers that power categorized todos surface and autonomous discipline enforcement (status/phase logic only;
     // full GPUI Markdown content construction for wrapped PlanEntry happens via from_acp in real paths).
     #[test]
     fn plan_is_proposed_detects_all_pending_fresh_plan() {
@@ -8730,7 +8730,7 @@ mod native_grok_surface_tdd {
         }
     }
 
-    // Many more tiny high-signal assertions for the exact paths added in the 1.3 / P4 wave
+    // Many more tiny high-signal assertions for the exact paths added in the native Grok wave
     #[test]
     fn turn_id_task_slug_combination_used_in_kickback_messages() {
         let t = TurnId::new(17);
@@ -8909,7 +8909,7 @@ mod native_grok_surface_tdd {
         let names = ["todo_write", "monitor", "enter_plan_mode", "spawn_agent"];
         for n in names {
             // The registration happens in add_default_tools; the contract test already covers it,
-            // but we keep an explicit lock here for the exact P4 shims.
+            // but we keep an explicit lock here for the native Grok shims.
             assert!(!n.is_empty());
         }
     }

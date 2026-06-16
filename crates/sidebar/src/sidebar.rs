@@ -1344,6 +1344,7 @@ impl Sidebar {
         let mut current_terminal_ids: HashSet<TerminalId> = HashSet::new();
         let mut project_header_indices: Vec<usize> = Vec::new();
         let mut seen_thread_ids: HashSet<agent_ui::ThreadId> = HashSet::new();
+        let mut seen_session_ids: HashSet<acp::SessionId> = HashSet::new();
         let mut seen_terminal_ids: HashSet<TerminalId> = HashSet::new();
 
         let has_open_projects = workspaces
@@ -1562,6 +1563,21 @@ impl Sidebar {
                         })
                     };
 
+                let mut push_thread_row = |row: ThreadMetadata, workspace: ThreadEntryWorkspace| {
+                    if let Some(session_id) = row.session_id.as_ref() {
+                        if !seen_session_ids.insert(session_id.clone()) {
+                            return;
+                        }
+                    }
+                    if !seen_thread_ids.insert(row.thread_id) {
+                        if let Some(session_id) = row.session_id.as_ref() {
+                            seen_session_ids.remove(session_id);
+                        }
+                        return;
+                    }
+                    threads.push(make_thread_entry(row, workspace));
+                };
+
                 // Main code path: one query per group via main_worktree_paths.
                 // The main_worktree_paths column is set on all new threads and
                 // points to the group's canonical paths regardless of which
@@ -1571,11 +1587,8 @@ impl Sidebar {
                     .entries_for_main_worktree_path(group_key.path_list(), group_host.as_ref())
                     .cloned()
                 {
-                    if !seen_thread_ids.insert(row.thread_id) {
-                        continue;
-                    }
                     let workspace = resolve_workspace(row.folder_paths());
-                    threads.push(make_thread_entry(row, workspace));
+                    push_thread_row(row, workspace);
                 }
 
                 // Legacy threads did not have `main_worktree_paths` populated, so they
@@ -1587,11 +1600,8 @@ impl Sidebar {
                     .entries_for_path(group_key.path_list(), group_host.as_ref())
                     .cloned()
                 {
-                    if !seen_thread_ids.insert(row.thread_id) {
-                        continue;
-                    }
                     let workspace = resolve_workspace(row.folder_paths());
-                    threads.push(make_thread_entry(row, workspace));
+                    push_thread_row(row, workspace);
                 }
 
                 // Also surface any thread whose `folder_paths` equals
@@ -1615,13 +1625,7 @@ impl Sidebar {
                         .entries_for_path(&ws_paths, group_host.as_ref())
                         .cloned()
                     {
-                        if !seen_thread_ids.insert(row.thread_id) {
-                            continue;
-                        }
-                        threads.push(make_thread_entry(
-                            row,
-                            ThreadEntryWorkspace::Open(ws.clone()),
-                        ));
+                        push_thread_row(row, ThreadEntryWorkspace::Open(ws.clone()));
                     }
                 }
 
@@ -1632,16 +1636,13 @@ impl Sidebar {
                         .entries_for_path(worktree_path_list, group_host.as_ref())
                         .cloned()
                     {
-                        if !seen_thread_ids.insert(row.thread_id) {
-                            continue;
-                        }
-                        threads.push(make_thread_entry(
+                        push_thread_row(
                             row,
                             ThreadEntryWorkspace::Closed {
                                 folder_paths: worktree_path_list.clone(),
                                 project_group_key: group_key.clone(),
                             },
-                        ));
+                        );
                     }
                 }
 

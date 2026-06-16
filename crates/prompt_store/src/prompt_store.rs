@@ -9,11 +9,10 @@ use futures::future::Shared;
 use fuzzy::StringMatchCandidate;
 
 use gpui::{App, AppContext, Context, Entity, Global, ReadGlobal, SharedString, Task};
-use heed::{
-    Database, RoTxn,
-    types::{SerdeBincode, SerdeJson, Str},
+use heed3::{
+    Database, Env, EnvOpenOptions, RoTxn, WithoutTls,
+    types::{Bytes, SerdeBincode, SerdeJson, Str},
 };
-use heed3::types::Bytes;
 
 #[derive(Default)]
 pub struct RkyvCodec<T>(std::marker::PhantomData<T>);
@@ -179,6 +178,17 @@ impl From<&ArchivedArchivedPromptMetadata> for ArchivedPromptMetadata {
 }
 impl From<ArchivedArchivedPromptMetadata> for ArchivedPromptMetadata {
     fn from(a: ArchivedArchivedPromptMetadata) -> Self {
+        (&a).into()
+    }
+}
+
+impl From<&ArchivedArchivedPromptBody> for ArchivedPromptBody {
+    fn from(a: &ArchivedArchivedPromptBody) -> Self {
+        Self(a.0.as_slice().to_vec())
+    }
+}
+impl From<ArchivedArchivedPromptBody> for ArchivedPromptBody {
+    fn from(a: ArchivedArchivedPromptBody) -> Self {
         (&a).into()
     }
 }
@@ -445,6 +455,37 @@ impl From<PromptId> for ArchivedPromptId {
     }
 }
 
+fn is_binary_rkyv_prompt_key(key: &[u8]) -> bool {
+    matches!(key.first(), Some(0) | Some(1)) && key.len() >= 2
+}
+
+fn prompt_id_from_rkyv_key(key: &[u8]) -> PromptId {
+    if is_binary_rkyv_prompt_key(key) {
+        return ArchivedPromptId(key.to_vec()).into();
+    }
+    if let Ok(text) = std::str::from_utf8(key) {
+        if let Ok(uuid) = uuid::Uuid::parse_str(text) {
+            return PromptId::User {
+                uuid: UserPromptId(uuid),
+            };
+        }
+        if text == BuiltInPrompt::CommitMessage.to_string() {
+            return PromptId::BuiltIn(BuiltInPrompt::CommitMessage);
+        }
+    }
+    PromptId::BuiltIn(BuiltInPrompt::CommitMessage)
+}
+
+fn rkyv_key_bytes(id: &PromptId) -> Vec<u8> {
+    ArchivedPromptId::from(*id).0
+}
+
+fn utf8_string_from_bytes(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .unwrap_or_else(|_| String::from_utf8_lossy(bytes).into_owned())
+}
+
 impl From<ArchivedPromptId> for PromptId {
     fn from(value: ArchivedPromptId) -> Self {
         let d = &value.0;
@@ -589,9 +630,8 @@ impl std::fmt::Display for PromptId {
 }
 
 pub struct PromptStore {
-    env: heed::Env,
+    env: Env<WithoutTls>,
     metadata_cache: RwLock<MetadataCache>,
-    bodies: Database<SerdeJson<PromptId>, Str>,
     rkyv_metadata: Database<Bytes, RkyvCodec<ArchivedPromptMetadata>>,
     rkyv_bodies: Database<Bytes, RkyvCodec<ArchivedPromptBody>>,
 }
@@ -673,26 +713,8 @@ impl LendingMetadataView {
 }
 
 impl MetadataCache {
-    fn from_db(
-        db: Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
-        txn: &RoTxn,
-    ) -> Result<Self> {
+    fn with_builtins_only() -> Self {
         let mut cache = MetadataCache::default();
-        for result in db.iter(txn)? {
-            // Fail-open: skip records that can't be decoded (e.g. from a different branch)
-            // rather than failing the entire prompt store initialization.
-            let Ok((prompt_id, metadata)) = result else {
-                log::warn!(
-                    "Skipping unreadable prompt record in database: {:?}",
-                    result.err()
-                );
-                continue;
-            };
-            cache.metadata.push(metadata.clone());
-            cache.metadata_by_id.insert(prompt_id, metadata);
-        }
-
-        // Insert all the built-in prompts that were not customized by the user
         for builtin in BuiltInPrompt::iter() {
             let builtin_id = PromptId::BuiltIn(builtin);
             if !cache.metadata_by_id.contains_key(&builtin_id) {
@@ -702,45 +724,7 @@ impl MetadataCache {
             }
         }
         cache.sort();
-        Ok(cache)
-    }
-
-    /// Dual population helper — merge data from the zero-copy view-backed metadata database
-    /// into this cache. Prefers entries from the view-backed database when present (or when newer).
-    /// Fail-open on individual records to keep the transition safe.
-    fn merge_from_view_db(
-        &mut self,
-        db: Database<Bytes, RkyvCodec<ArchivedPromptMetadata>>,
-        txn: &RoTxn,
-    ) -> Result<()> {
-        // Stream directly from the DB (or zero-copy view) iterator.
-        // No intermediate owned Vec allocation for the full set during refresh/merge.
-        // "Newer wins" logic applied on the fly as items are yielded.
-        for result in db.iter(txn)? {
-            let Ok((key_bytes, archived_meta)) = result else {
-                log::warn!("Skipping unreadable prompt record during cache merge");
-                continue;
-            };
-            // Convert using the adapter path established for the view-backed population.
-            // Direct tuple construction for the ID newtype + the existing From impls.
-            let archived_pid = ArchivedPromptId(key_bytes.to_vec());
-            let prompt_id: PromptId = archived_pid.into();
-            let single: ArchivedPromptMetadata = archived_meta.into();
-            let meta: PromptMetadata = single.into();
-            if let Some(existing) = self.metadata_by_id.get(&prompt_id) {
-                if meta.saved_at > existing.saved_at {
-                    self.metadata_by_id.insert(prompt_id, meta.clone());
-                    if let Some(existing) = self.metadata.iter_mut().find(|m| m.id == prompt_id) {
-                        *existing = meta;
-                    }
-                }
-            } else {
-                self.metadata_by_id.insert(prompt_id, meta.clone());
-                self.metadata.push(meta);
-            }
-        }
-        self.sort();
-        Ok(())
+        cache
     }
 
     /// Primary population path from the view-backed metadata database.
@@ -757,8 +741,7 @@ impl MetadataCache {
         // the helper expects.
         let items = db.iter(txn)?.filter_map(|res| {
             res.ok().map(|(key_bytes, archived)| {
-                let archived_pid = ArchivedPromptId(key_bytes.to_vec());
-                let prompt_id: PromptId = archived_pid.into();
+                let prompt_id = prompt_id_from_rkyv_key(key_bytes);
                 let single: ArchivedPromptMetadata = archived.into();
                 let meta: PromptMetadata = single.into();
                 (prompt_id, meta)
@@ -909,7 +892,7 @@ impl PromptStore {
         let lending_iter = self.iter_borrowed_metadata_lending()?;
         let items = lending_iter.filter_map(|res| {
             res.ok().map(|(prompt_id, archived)| {
-                let meta: ArchivedPromptMetadata = archived.into();
+                let meta: ArchivedPromptMetadata = archived;
                 Ok((prompt_id, meta))
             })
         });
@@ -938,7 +921,7 @@ impl PromptStore {
     /// Public API of PromptStore remains owned values.
     fn get_borrowed_metadata(&self, id: &PromptId) -> Result<Option<ArchivedPromptMetadata>> {
         self.with_borrowed_metadata(|txn, db| {
-            let key_bytes: Vec<u8> = id.to_string().into_bytes();
+            let key_bytes = rkyv_key_bytes(id);
             let archived = match db.get(txn, &key_bytes)? {
                 Some(b) => b,
                 None => return Ok(None),
@@ -966,8 +949,7 @@ impl PromptStore {
                 .iter(txn)?
                 .filter_map(|res| {
                     res.ok().map(|(key_bytes, value_bytes)| {
-                        let archived_pid = ArchivedPromptId(key_bytes.to_vec());
-                        let prompt_id: PromptId = archived_pid.into();
+                        let prompt_id = prompt_id_from_rkyv_key(key_bytes);
                         let meta: ArchivedPromptMetadata = value_bytes.into();
                         Ok((prompt_id, meta))
                     })
@@ -1005,8 +987,7 @@ impl PromptStore {
                     res.ok().map(|(key_bytes, archived)| {
                         // Use the proven ArchivedPromptId roundtrip for the key
                         // and the single-level conversion for the value.
-                        let archived_pid = ArchivedPromptId(key_bytes.to_vec());
-                        let prompt_id: PromptId = archived_pid.into();
+                        let prompt_id = prompt_id_from_rkyv_key(key_bytes);
                         // archived here from the raw iter may still be the double
                         // form in this experiment path; the From hygiene for the
                         // double case is supplied by the adapters added earlier
@@ -1184,9 +1165,11 @@ impl PromptStore {
             std::fs::create_dir_all(&db_path)?;
 
             let db_env = unsafe {
-                heed::EnvOpenOptions::new()
+                EnvOpenOptions::new()
                     .map_size(1024 * 1024 * 1024) // 1GB
-                    .max_dbs(4) // Metadata and bodies (possibly v1 of both as well)
+                    .max_dbs(8) // v1 metadata+bodies, v2 serde, rkyv_metadata+bodies
+                    .clone()
+                    .read_txn_without_tls()
                     .open(db_path)?
             };
 
@@ -1207,18 +1190,12 @@ impl PromptStore {
             // PS-03 / PS-04: Pass the new view-backed databases so V1->V2 seeding can also write into the
             // zero-copy path. The upgrade_dbs implementation remains best-effort and non-destructive.
             Self::upgrade_dbs(&db_env, metadata, bodies, rkyv_metadata, rkyv_bodies).log_err();
+            Self::seed_rkyv_from_serde_v2(&db_env, metadata, bodies, rkyv_metadata, rkyv_bodies)
+                .log_err();
+            Self::rekey_legacy_rkyv_tables(&db_env, rkyv_metadata, rkyv_bodies).log_err();
 
             let txn = db_env.read_txn()?;
 
-            // Prefer the zero-copy view path as the primary population source for the
-            // metadata cache once any data has been seeded (post V1->V2 upgrade). This makes
-            // the view-backed database the source of truth for hot cache-backed queries
-            // (all_prompt_metadata, search, etc.). Fall back to the old Serde path only for
-            // pure V1 legacy or first-run cases before any seeding has occurred.
-            //
-            // Long-term: after construction, prefer `metadata_cache_from_view()` and
-            // `refresh_metadata_cache_from_view()` (and the raw-lending variant) for all
-            // subsequent population and refresh work.
             let metadata_cache = if rkyv_metadata.iter(&txn)?.next().is_some() {
                 // Use the modern borrowed view adapters for the initial
                 // population when the view-backed database has data. This makes the
@@ -1235,8 +1212,7 @@ impl PromptStore {
                         let (key_bytes, archived) = result.ok()?;
                         // Direct ArchivedPromptId tuple construction + From<ArchivedPromptId> for PromptId.
                         // Same proven sibling pattern as the 824/571/607/1050/816 fixes.
-                        let archived_pid = ArchivedPromptId(key_bytes.to_vec());
-                        let prompt_id: PromptId = archived_pid.into();
+                        let prompt_id = prompt_id_from_rkyv_key(key_bytes);
                         // Use reference directly (From<&double>); previous .clone() on &double was no-op.
                         let single: ArchivedPromptMetadata = archived.into();
                         let meta: ArchivedPromptMetadata = single;
@@ -1244,11 +1220,7 @@ impl PromptStore {
                     },
                 ))?
             } else {
-                let mut cache = MetadataCache::from_db(metadata, &txn)?;
-                // The merge still uses the legacy helper during transition;
-                // long-term this path shrinks as the view-backed database becomes the only source.
-                let _ = cache.merge_from_view_db(rkyv_metadata, &txn);
-                cache
+                MetadataCache::with_builtins_only()
             };
 
             txn.commit()?;
@@ -1256,8 +1228,6 @@ impl PromptStore {
             let store = PromptStore {
                 env: db_env,
                 metadata_cache: RwLock::new(metadata_cache),
-                bodies,
-                // PS-03: New view-backed databases initialized (empty on first creation).
                 rkyv_metadata,
                 rkyv_bodies,
             };
@@ -1271,11 +1241,11 @@ impl PromptStore {
     }
 
     fn upgrade_dbs(
-        env: &heed::Env,
-        metadata_db: heed::Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
-        bodies_db: heed::Database<SerdeJson<PromptId>, Str>,
-        rkyv_metadata_db: heed::Database<Bytes, RkyvCodec<ArchivedPromptMetadata>>,
-        rkyv_bodies_db: heed::Database<Bytes, RkyvCodec<ArchivedPromptBody>>,
+        env: &Env<WithoutTls>,
+        metadata_db: Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
+        bodies_db: Database<SerdeJson<PromptId>, Str>,
+        rkyv_metadata_db: Database<Bytes, RkyvCodec<ArchivedPromptMetadata>>,
+        rkyv_bodies_db: Database<Bytes, RkyvCodec<ArchivedPromptBody>>,
     ) -> Result<()> {
         let mut txn = env.write_txn()?;
         let Some(bodies_v1_db) = env
@@ -1288,7 +1258,7 @@ impl PromptStore {
         };
         let mut bodies_v1 = bodies_v1_db
             .iter(&txn)?
-            .collect::<heed::Result<HashMap<_, _>>>()?;
+            .collect::<heed3::Result<HashMap<_, _>>>()?;
 
         let Some(metadata_v1_db) = env
             .open_database::<SerdeBincode<PromptIdV1>, SerdeBincode<PromptMetadataV1>>(
@@ -1300,7 +1270,7 @@ impl PromptStore {
         };
         let metadata_v1 = metadata_v1_db
             .iter(&txn)?
-            .collect::<heed::Result<HashMap<_, _>>>()?;
+            .collect::<heed3::Result<HashMap<_, _>>>()?;
 
         for (prompt_id_v1, metadata_v1) in metadata_v1 {
             let prompt_id_v2 = UserPromptId(prompt_id_v1.0).into();
@@ -1323,9 +1293,9 @@ impl PromptStore {
                 metadata_db.put(&mut txn, &old_key, &meta_v2)?;
                 bodies_db.put(&mut txn, &old_key, &body_v1)?;
 
-                let key_bytes: Vec<u8> = prompt_id_v2.to_string().into_bytes();
+                let key_bytes = rkyv_key_bytes(&prompt_id_v2);
                 let _ = rkyv_metadata_db.put(&mut txn, &key_bytes, &meta_v2.clone().into());
-                let rkyv_body: ArchivedPromptBody = body_v1.clone().into();
+                let rkyv_body = ArchivedPromptBody::from(body_v1.as_str());
                 let _ = rkyv_bodies_db.put(&mut txn, &key_bytes, &rkyv_body);
 
                 // Best-effort cleanup of the old V1 entries (not the new view-backed DBs).
@@ -1353,25 +1323,94 @@ impl PromptStore {
         Ok(())
     }
 
+    fn seed_rkyv_from_serde_v2(
+        env: &Env<WithoutTls>,
+        metadata_db: Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
+        bodies_db: Database<SerdeJson<PromptId>, Str>,
+        rkyv_metadata_db: Database<Bytes, RkyvCodec<ArchivedPromptMetadata>>,
+        rkyv_bodies_db: Database<Bytes, RkyvCodec<ArchivedPromptBody>>,
+    ) -> Result<()> {
+        let mut txn = env.write_txn()?;
+        let serde_rows: Vec<(PromptId, PromptMetadata)> =
+            metadata_db.iter(&txn)?.collect::<heed3::Result<Vec<_>>>()?;
+        for (id, metadata) in serde_rows {
+            let key_bytes = rkyv_key_bytes(&id);
+            if rkyv_metadata_db.get(&txn, &key_bytes)?.is_none() {
+                rkyv_metadata_db.put(&mut txn, &key_bytes, &metadata.clone().into())?;
+            }
+            if let Some(body) = bodies_db.get(&txn, &id)? {
+                if rkyv_bodies_db.get(&txn, &key_bytes)?.is_none() {
+                    let rkyv_body = ArchivedPromptBody::from(body);
+                    rkyv_bodies_db.put(&mut txn, &key_bytes, &rkyv_body)?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn rekey_legacy_rkyv_tables(
+        env: &Env<WithoutTls>,
+        rkyv_metadata_db: Database<Bytes, RkyvCodec<ArchivedPromptMetadata>>,
+        rkyv_bodies_db: Database<Bytes, RkyvCodec<ArchivedPromptBody>>,
+    ) -> Result<()> {
+        let rtxn = env.read_txn()?;
+        let mut metadata_rows = Vec::new();
+        for result in rkyv_metadata_db.iter(&rtxn)? {
+            let (key, value) = result?;
+            if is_binary_rkyv_prompt_key(key) {
+                continue;
+            }
+            let archived: ArchivedPromptMetadata = value.into();
+            metadata_rows.push((key.to_vec(), archived));
+        }
+        let mut body_rows = Vec::new();
+        for result in rkyv_bodies_db.iter(&rtxn)? {
+            let (key, value) = result?;
+            if is_binary_rkyv_prompt_key(key) {
+                continue;
+            }
+            let archived: ArchivedPromptBody = value.into();
+            body_rows.push((key.to_vec(), archived));
+        }
+        drop(rtxn);
+
+        if metadata_rows.is_empty() && body_rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut wtxn = env.write_txn()?;
+        for (legacy_key, archived) in metadata_rows {
+            let prompt_id = prompt_id_from_rkyv_key(&legacy_key);
+            let new_key = rkyv_key_bytes(&prompt_id);
+            if new_key != legacy_key {
+                rkyv_metadata_db.put(&mut wtxn, &new_key, &archived)?;
+                rkyv_metadata_db.delete(&mut wtxn, &legacy_key)?;
+            }
+        }
+        for (legacy_key, archived) in body_rows {
+            let prompt_id = prompt_id_from_rkyv_key(&legacy_key);
+            let new_key = rkyv_key_bytes(&prompt_id);
+            if new_key != legacy_key {
+                rkyv_bodies_db.put(&mut wtxn, &new_key, &archived)?;
+                rkyv_bodies_db.delete(&mut wtxn, &legacy_key)?;
+            }
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
     pub fn load(&self, id: PromptId, cx: &App) -> Task<Result<String>> {
         let env = self.env.clone();
-        let old_bodies = self.bodies;
-        let new_bodies = self.rkyv_bodies;
-        // Dual-read: prefer the zero-copy rkyv view-backed bodies table; fall back to
-        // the original Serde table only if the record is absent from the new store.
+        let rkyv_bodies = self.rkyv_bodies;
         cx.background_spawn(async move {
             let txn = env.read_txn()?;
 
-            let key_bytes: Vec<u8> = id.to_string().into_bytes();
-            if let Some(archived_body) = new_bodies.get(&txn, &key_bytes)? {
-                let mut prompt: String = String::from_utf8_lossy(&archived_body.0).to_string();
-                LineEnding::normalize(&mut prompt);
-                return Ok(prompt);
-            }
-
-            // Fall back to old path
-            let mut prompt: String = match old_bodies.get(&txn, &id)? {
-                Some(body) => body.into(),
+            let key_bytes = rkyv_key_bytes(&id);
+            let mut prompt: String = match rkyv_bodies.get(&txn, &key_bytes)? {
+                Some(archived_body) => {
+                    utf8_string_from_bytes(ArchivedPromptBody::from(archived_body).as_ref())
+                }
                 None => {
                     if let Some(built_in) = id.as_built_in() {
                         built_in.default_content().into()
@@ -1422,28 +1461,15 @@ impl PromptStore {
         self.metadata_cache.write().remove(id);
 
         let db_connection = self.env.clone();
-        let bodies = self.bodies;
         let rkyv_bodies_db = self.rkyv_bodies;
         let rkyv_metadata_db = self.rkyv_metadata;
 
         let task = cx.background_spawn(async move {
             let mut txn = db_connection.write_txn()?;
 
-            // For the old heed 0.21 Bytes-keyed tables, use the V1-era / original key encoding
-            // those tables have always expected (as corrected in the 1136 upgrade site).
-            // The Archived* form (or the bytes it serializes to) is for the new rkyv_*_db tables.
-            // Old heed 0.21 / V1-era tables expect the original PromptId key form in this path
-            // (not the Archived/V1 bytes used for the new rkyv tables).
-            let old_key = id;
-            bodies.delete(&mut txn, &old_key)?;
-
-            // PS-03: Best-effort dual-delete from the new zero-copy view-backed body DB during transition.
-            let key_bytes: Vec<u8> = id.to_string().into_bytes();
-            let _ = rkyv_bodies_db.delete(&mut txn, &key_bytes);
-
-            // PS-03: Best-effort dual-delete from the new zero-copy view-backed metadata DB
-            // (symmetric to the body dual-delete above). Use the serialized key_bytes.
-            let _ = rkyv_metadata_db.delete(&mut txn, &key_bytes);
+            let key_bytes = rkyv_key_bytes(&id);
+            rkyv_bodies_db.delete(&mut txn, &key_bytes)?;
+            rkyv_metadata_db.delete(&mut txn, &key_bytes)?;
 
             if let PromptId::User { uuid } = id {
                 let prompt_id_v1 = PromptIdV1::from(uuid);
@@ -1592,34 +1618,19 @@ impl PromptStore {
         self.metadata_cache.write().insert(metadata.clone());
 
         let db_connection = self.env.clone();
-        let bodies = self.bodies;
         let rkyv_bodies_db = self.rkyv_bodies;
         let rkyv_metadata_db = self.rkyv_metadata;
 
         let task = cx.background_spawn(async move {
             let mut txn = db_connection.write_txn()?;
 
-            // For the old heed 0.21 Bytes-keyed tables, use the V1-era / original key encoding
-            // (same correction as 1136/1258). The Archived* form is only for the new rkyv tables.
-            // Old heed 0.21 tables (metadata_db / bodies) expect &PromptId in this save path.
-            // New rkyv_* tables expect the serialized key_bytes (V1/Archived encoding).
-            // This is the exact recurring correction applied throughout the wave (e.g. 1292/1164 sites).
+            let key_bytes = rkyv_key_bytes(&id);
             if is_default_content {
-                bodies.delete(&mut txn, &id)?;
-                // PS-03: Also clean the new view-backed body during transition (best-effort)
-                let key_bytes: Vec<u8> = id.to_string().into_bytes();
-                let _ = rkyv_bodies_db.delete(&mut txn, &key_bytes);
+                rkyv_bodies_db.delete(&mut txn, &key_bytes)?;
             } else {
-                bodies.put(&mut txn, &id, &body)?;
-
-                // PS-03: Dual-write the body to the new zero-copy view-backed database as well.
-                // During transition we keep both in sync.
-                let key_bytes: Vec<u8> = id.to_string().into_bytes();
-                let rkyv_body: ArchivedPromptBody = body.clone().into();
-                let _ = rkyv_bodies_db.put(&mut txn, &key_bytes, &rkyv_body);
-
-                // PS-03: Best-effort dual-write of metadata to the new zero-copy view-backed DB.
-                let _ = rkyv_metadata_db.put(&mut txn, &key_bytes, &metadata.clone().into());
+                let rkyv_body = ArchivedPromptBody::from(body.as_str());
+                rkyv_bodies_db.put(&mut txn, &key_bytes, &rkyv_body)?;
+                rkyv_metadata_db.put(&mut txn, &key_bytes, &metadata.clone().into())?;
             }
 
             txn.commit()?;
@@ -1673,13 +1684,8 @@ impl PromptStore {
         let task = cx.background_spawn(async move {
             let mut txn = db_connection.write_txn()?;
 
-            // PS-03: Best-effort dual-write of metadata to the new zero-copy view-backed DB.
-            // Use the V1-era / to_string().into_bytes() encoding for the key (the same bytes
-            // the rkyv_metadata table was seeded with during upgrade_dbs). This is the exact
-            // sibling pattern that cleared every "Vec<u8>: From<ArchivedPromptId>" (E0277)
-            // site in this wave and in ThreadMetadataStore Phase 1.
-            let key_bytes: Vec<u8> = id.to_string().into_bytes();
-            let _ = rkyv_metadata_db.put(&mut txn, &key_bytes, &prompt_metadata.clone().into());
+            let key_bytes = rkyv_key_bytes(&id);
+            rkyv_metadata_db.put(&mut txn, &key_bytes, &prompt_metadata.clone().into())?;
 
             txn.commit()?;
 
@@ -2029,9 +2035,15 @@ impl From<String> for ArchivedPromptBody {
         Self(s.into_bytes())
     }
 }
+
+impl From<&str> for ArchivedPromptBody {
+    fn from(s: &str) -> Self {
+        Self(s.as_bytes().to_vec())
+    }
+}
 impl From<ArchivedPromptBody> for String {
     fn from(b: ArchivedPromptBody) -> Self {
-        String::from_utf8_lossy(&b.0).into_owned()
+        utf8_string_from_bytes(&b.0)
     }
 }
 
@@ -2120,7 +2132,7 @@ impl
         field: &ArchivedPromptBody,
         _d: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     ) -> Result<String, rkyv::rancor::Error> {
-        Ok(String::from_utf8_lossy(&field.0).into_owned())
+        Ok(utf8_string_from_bytes(&field.0))
     }
 }
 

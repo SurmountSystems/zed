@@ -367,7 +367,7 @@ impl ZedTodosComponent {
         )
     }
 
-    pub fn format_classified_approval_action_label(
+    pub fn format_categorized_approval_action_label(
         action_kind: &str,
         risk: ApprovalRisk,
     ) -> SharedString {
@@ -377,7 +377,7 @@ impl ZedTodosComponent {
     /// CWD-aware variant: uses display_label with tool_name so
     /// "Plan Change", "Write", or "Destructive" (per the dual write + escape-cwd rule)
     /// is shown instead of the generic label. Call sites can migrate to this.
-    pub fn format_classified_approval_action_label_with_tool(
+    pub fn format_categorized_approval_action_label_with_tool(
         action_kind: &str,
         risk: ApprovalRisk,
         tool_name: Option<&SharedString>,
@@ -385,8 +385,8 @@ impl ZedTodosComponent {
         format!("{} ({})", action_kind, risk.display_label(tool_name)).into()
     }
 
-    pub fn approval_action_check_icon_color(classified_risk: ApprovalRisk) -> Color {
-        if classified_risk == ApprovalRisk::PotentiallyDestructive {
+    pub fn approval_action_check_icon_color(categorized_risk: ApprovalRisk) -> Color {
+        if categorized_risk == ApprovalRisk::PotentiallyDestructive {
             Color::Warning
         } else {
             Color::Success
@@ -444,7 +444,7 @@ impl ZedTodosComponent {
     ) -> gpui::AnyElement {
         Self::build_approval_action_button(
             ("allow_once", item_index),
-            Self::format_classified_approval_action_label("Allow once", risk),
+            Self::format_categorized_approval_action_label("Allow once", risk),
             IconName::Check,
             Color::Success,
             on_click,
@@ -461,7 +461,7 @@ impl ZedTodosComponent {
     ) -> gpui::AnyElement {
         Self::build_approval_action_button(
             ("allow_once", item_index),
-            Self::format_classified_approval_action_label_with_tool("Allow once", risk, tool_name),
+            Self::format_categorized_approval_action_label_with_tool("Allow once", risk, tool_name),
             IconName::Check,
             Color::Success,
             on_click,
@@ -475,7 +475,7 @@ impl ZedTodosComponent {
     ) -> gpui::AnyElement {
         Self::build_approval_action_button(
             ("allow_always", item_index),
-            Self::format_classified_approval_action_label("Allow always", risk),
+            Self::format_categorized_approval_action_label("Allow always", risk),
             IconName::CheckDouble,
             Self::approval_action_check_icon_color(risk),
             on_click,
@@ -491,7 +491,7 @@ impl ZedTodosComponent {
     ) -> gpui::AnyElement {
         Self::build_approval_action_button(
             ("allow_always", item_index),
-            Self::format_classified_approval_action_label_with_tool(
+            Self::format_categorized_approval_action_label_with_tool(
                 "Allow always",
                 risk,
                 tool_name,
@@ -509,7 +509,7 @@ impl ZedTodosComponent {
     ) -> gpui::AnyElement {
         Self::build_approval_action_button(
             ("granular_allow", item_index),
-            Self::format_classified_approval_action_label("Allow granular", risk),
+            Self::format_categorized_approval_action_label("Allow granular", risk),
             IconName::CheckDouble,
             Self::approval_action_check_icon_color(risk),
             on_click,
@@ -525,7 +525,7 @@ impl ZedTodosComponent {
     ) -> gpui::AnyElement {
         Self::build_approval_action_button(
             ("granular_allow", item_index),
-            Self::format_classified_approval_action_label_with_tool(
+            Self::format_categorized_approval_action_label_with_tool(
                 "Allow granular",
                 risk,
                 tool_name,
@@ -545,7 +545,7 @@ impl ZedTodosComponent {
         let label_text = if is_always { "Deny always" } else { "Deny" };
         Self::build_approval_action_button(
             ("deny", item_index),
-            Self::format_classified_approval_action_label(label_text, risk),
+            Self::format_categorized_approval_action_label(label_text, risk),
             IconName::Close,
             Color::Error,
             on_click,
@@ -563,7 +563,7 @@ impl ZedTodosComponent {
         let label_text = if is_always { "Deny always" } else { "Deny" };
         Self::build_approval_action_button(
             ("deny", item_index),
-            Self::format_classified_approval_action_label_with_tool(label_text, risk, tool_name),
+            Self::format_categorized_approval_action_label_with_tool(label_text, risk, tool_name),
             IconName::Close,
             Color::Error,
             on_click,
@@ -826,7 +826,7 @@ pub fn render_grok_memory_items(
         && !artifacts.has_global_memory
     {
         items = items.child(
-            Label::new("Memory disabled. Use TUI `grok` with --experimental-memory for cross-session facts bridging.")
+            Label::new("No persistent memory yet. Native Grok threads use memory_palace; bridged TUI memory imports on first read.")
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
         );
@@ -1457,8 +1457,8 @@ impl ThreadView {
         let mut should_auto_submit = false;
         let mut show_external_source_prompt_warning = false;
 
-        // Used for default-expanded ZT-1 surface on Grok threads (UX-02) and for
-        // showing the rich Grok Build controls in the prompt box (UX-05).
+        // Used for default-expanded categorized todos surface on Grok threads (default-expanded Grok todos) and for
+        // showing the rich Grok Build controls in the prompt box (rich Grok Build prompt controls).
         let is_grok_for_default = agent_id.as_ref() == "grok" || {
             let acp_thread_for_grok_check = thread.read(cx);
             let session_identifier_for_grok_check = acp_thread_for_grok_check.session_id().clone();
@@ -1672,8 +1672,8 @@ impl ThreadView {
             queue_expanded: true,
             zed_todos: {
                 let mut z = ZedTodosComponent::new();
-                // For Grok Build threads (bridged or native), show the full rich classified
-                // ZT-1 surface (approvals, proposed plans, background monitors, memory) in the
+                // For Grok Build threads (bridged or native), show the full rich categorized
+                // categorized todos surface (approvals, proposed plans, background monitors, memory) in the
                 // normal activity bar by default. This is the "todos pane" the user expects
                 // to see when using Grok Build. Item bodies remain lazy (gated by per-section
                 // and per-monitor expanded state) for reasonable perf.
@@ -1890,8 +1890,8 @@ impl ThreadView {
             return None;
         }
         if self.is_in_full_grok_surface(cx) {
-            // The spacious ZT-1 Full Agent Mode surface is active (default for Grok).
-            // The rich controls (plan, persona, etc.) live in the ZT-1 pane header to avoid
+            // The spacious Full Agent Mode surface is active (default for Grok).
+            // The rich controls (plan, persona, etc.) live in the todos pane header to avoid
             // duplicating the "Grok Build" menu trigger on screen.
             return None;
         }
@@ -1950,7 +1950,7 @@ impl ThreadView {
                             None,
                             |_, cx| {
                                 // Real plan mode entry point: the authoritative place is the left
-                                // "Grok Plan, Approvals & Tasks" ZT-1 surface (todos + proposed plans
+                                // "Grok Plan, Approvals & Tasks" categorized todos surface (todos + proposed plans
                                 // + accept with risk chips). Selecting here surfaces it immediately.
                                 cx.dispatch_action(&zed_actions::agent::OpenZedTodosSurface);
                             },
@@ -2086,7 +2086,7 @@ impl ThreadView {
                         .entry("Manage Skills", None, |_, cx| {
                             cx.dispatch_action(&zed_actions::agent::OpenZedTodosSurface);
                         })
-                        .entry("Full Agent Mode (ZT-1)", None, |_, cx| {
+                        .entry("Full Agent Mode", None, |_, cx| {
                             cx.dispatch_action(&zed_actions::agent::OpenZedTodosSurface);
                         })
                 }))
@@ -2183,7 +2183,7 @@ impl ThreadView {
     }
 
     pub fn has_outstanding_todos(&self, cx: &App) -> bool {
-        // The visual ZT-1 classified surface (plans, approvals, monitors, memory)
+        // The visual categorized todos surface (plans, approvals, monitors, memory)
         // is always powered by the AcpThread entity held in self.thread, for both
         // the bridged "grok" path and native is_grok_build_profile threads (via
         // event forwarding). The query lives in the actual ACP monitoring layer.
@@ -2191,7 +2191,7 @@ impl ThreadView {
     }
 
     /// If the thread is Idle, the local prompt queue is empty, and there is still
-    /// work on the persistent ZT-1 todos surface, synthesize a continuation prompt
+    /// work on the persistent categorized todos surface, synthesize a continuation prompt
     /// and send it. This is the core hook that makes the "keep working on todos
     /// until finished" behavior automatic in both bridged and native Grok paths.
     pub fn maybe_auto_continue_on_outstanding_todos(
@@ -2951,7 +2951,7 @@ impl ThreadView {
         })
         .detach_and_log_err(cx);
 
-        // Give the persistent ZT-1 todos surface a chance to drive automatic
+        // Give the persistent categorized todos surface a chance to drive automatic
         // continuation if the queue just drained but work remains.
         self.maybe_auto_continue_on_outstanding_todos(window, cx);
     }
@@ -3803,7 +3803,7 @@ impl ThreadView {
         #[cfg(any())]
         {
             todo!(
-                "P4-2 Plan approval state + banner in thread_view.rs::render_activity_bar (and related) per AGENTS.md. Hybrid + efficiency first."
+                "plan approval Plan approval state + banner in thread_view.rs::render_activity_bar (and related) per AGENTS.md. Hybrid + efficiency first."
             );
         }
         let thread = self.thread.read(cx);
@@ -3844,7 +3844,7 @@ impl ThreadView {
         if changed_buffers.is_empty()
             && plan.is_empty()
             && queue_is_empty
-            // Rich ZT-1 / Grok classified surface conditions preserved (has_background_tasks,
+            // Rich categorized todos surface / Grok categorized surface conditions preserved (has_background_tasks,
             // has_approvals, has_outstanding_todos, is_grok, turn_stalled, etc.).
             // This is the core of the persistent non-interruptive Todos surface.
             // Upstream's has_awaiting_permission check integrated into the broader set.
@@ -3911,10 +3911,10 @@ impl ThreadView {
                         },
                     )
                     .when(
-                        // ZT-1 classified surface condition (rich set of
+                        // categorized todos surface condition (rich set of
                         // plan/background/approvals + Grok categories) with upstream's
                         // has_awaiting_permission + content check. Divider shows when
-                        // there is meaningful classified or pending content.
+                        // there is meaningful categorized or pending content.
                         ((!plan.is_empty() || has_background_tasks || has_approvals)
                             && !changed_buffers.is_empty())
                             || (has_awaiting_permission
@@ -4224,10 +4224,10 @@ impl ThreadView {
         let entries = thread.entries();
         // Show all spawned sub-agents (from ToolCall meta with subagent_session_info),
         // not only the ones currently awaiting permission. This makes delegation
-        // via spawn_agent (with persona) visibly "working" in the ZT-1 surface for
+        // via spawn_agent (with persona) visibly "working" in the categorized todos surface for
         // both bridged and native Grok profile threads.
         // Collect all sub-agents that have been spawned (any ToolCall with subagent_session_info meta).
-        // This makes spawn_agent delegation (with persona) visibly active in the ZT-1 surface
+        // This makes spawn_agent delegation (with persona) visibly active in the categorized todos surface
         // for Grok Build (bridged and native is_grok_build_profile), not only the awaiting-permission subset.
         let subagent_items = {
             let tool_calls_by_session: collections::HashMap<_, _> = entries
@@ -12020,13 +12020,13 @@ pub(crate) fn open_link(
     }
 }
 
-/// Minimal working ZT-1 Dock/Panel Prototype (bridged path priority).
+/// Minimal working ZedTodos dock/Panel Prototype (bridged path priority).
 /// A first-class reusable native component that any Zed dock, panel or surface
-/// can own and use to render the full classified surface (Agent Approvals +
+/// can own and use to render the full categorized surface (Agent Approvals +
 /// Plan Todos + Background Monitors + Grok Memory) using the public collectors
 /// on ZedTodosComponent and the shared row helpers + ApprovalRisk classification.
 /// Owns independent ZedTodos state for its own expanded disclosures.
-/// Concrete evidence that ZT-1 is reusable across the entire Zed UI for bridged Grok.
+/// Concrete evidence that ZedTodos is reusable across the entire Zed UI for bridged Grok.
 /// For one-call rendering of the categorized surface use the free render_zed_todos_categorized_surface (pass data from collectors + state).
 pub struct ZedTodosDockPrototype {
     pub zed_todos: ZedTodosComponent,
@@ -12105,7 +12105,7 @@ impl Render for ZedTodosDockPrototype {
                                     // TokenUsage from ACP UsageUpdate or native x_ai model max_token_count,
                                     // with Grok-specific thresholds: yellow >50% compaction imminent,
                                     // red >90%). Sub-agent count and idle state will be added next.
-                                    // This lives in the always-visible ZT-1 left pane header so the
+                                    // This lives in the always-visible categorized todos surface left pane header so the
                                     // Agent pane itself is the persistent memory for the agent.
                                     h_flex()
                                         .gap_1()
@@ -12141,7 +12141,7 @@ impl Render for ZedTodosDockPrototype {
 
                                             // Grok Build specific thresholds per user request:
                                             // yellow (Warning) > 50% signals compaction is imminent;
-                                            // red at > 90%. This ring lives in the ZT-1 Agent pane
+                                            // red at > 90%. This ring lives in the categorized todos surface Agent pane
                                             // surface so the agent and user both "remember" context state.
                                             let progress_color = if ratio >= 0.9 {
                                                 cx.theme().status().error
@@ -12158,7 +12158,7 @@ impl Render for ZedTodosDockPrototype {
                                         // Sub-agent count + idle visual (more "nothing is happening" feedback).
                                         // Real live count from SubagentSessionInfo + has_outstanding_todos
                                         // integration will be added in the next slice; the ring now lives
-                                        // in the ZT-1 Agent pane header so the pane itself is the memory.
+                                        // in the categorized todos surface Agent pane header so the pane itself is the memory.
                                         .child({
                                             let subagent_count = thread.active_subagent_count();
                                             let has_todos = thread.has_outstanding_todos();
@@ -12182,7 +12182,7 @@ impl Render for ZedTodosDockPrototype {
                                 ),
                         )
                         .child(
-                            // The complete categorized ZT-1 surface as the left widget
+                            // The complete categorized todos surface as the left widget
                             // (approvals + plans/todos + monitors + memory all together, with chips, actions, etc.)
                             div()
                                 .size_full()
@@ -12197,9 +12197,9 @@ impl Render for ZedTodosDockPrototype {
                                 )),
                         ),
                 )
-                // Right side is intentionally minimal in this full-screen ZT-1 view.
+                // Right side is intentionally minimal in this full-screen categorized todos surface view.
                 // The authoritative "todos panel + approvals + plans" widget lives in the left sidebar
-                // (the complete classified surface with all chips, actions, disclosures, proposed plans, etc.).
+                // (the complete categorized surface with all chips, actions, disclosures, proposed plans, etc.).
                 // Future: this area can become a collapsed chat or secondary view.
                 .child(div().w(px(1.)).bg(cx.theme().colors().border))
                 .child(
@@ -12212,7 +12212,7 @@ impl Render for ZedTodosDockPrototype {
                 .into_any_element()
         } else {
             div()
-                .child(Label::new("No active thread for ZT-1 surface"))
+                .child(Label::new("No active thread for categorized todos surface"))
                 .into_any_element()
         }
     }
@@ -12310,7 +12310,7 @@ fn usage_imminent_label(usage: &TokenUsage) -> Option<(String, Color)> {
 }
 
 mod background_monitor_tdd {
-    // TDD per Efficiency Auditor risk register (AGENTS.md):
+    // TDD per performance guidelines risk register (AGENTS.md):
     // "write TDD tests asserting 'collapsed monitor costs O(1) with no layout on bursts'".
     // The implementation gates all TerminalView lookup + render behind
     // both `background_tasks_expanded` (section) AND `expanded_background_monitors.contains(id)`
@@ -12349,8 +12349,8 @@ mod background_monitor_tdd {
     fn watchdog_stalled_notification_uses_cheap_path_when_none_and_renders_chip_when_present() {
         // The turn_stalled value participates directly in the early return guard
         // in render_activity_bar (O(1) any() short-circuit). When None the whole
-        // ZT-1 content (including the watchdog row) is skipped — exactly the
-        // Efficiency Auditor invariant required for Slice 4.
+        // todos content (including the watchdog row) is skipped — exactly the
+        // performance guidelines invariant required for native Grok dock.
         let turn_stalled_none: Option<std::time::Duration> = None;
         assert!(
             turn_stalled_none.is_none(),
@@ -12360,7 +12360,7 @@ mod background_monitor_tdd {
         let turn_stalled_some = Some(std::time::Duration::from_secs(87));
         assert!(
             turn_stalled_some.is_some(),
-            "stalled duration triggers the 'Agent stalled' Error Chip + seconds label in ZT-1"
+            "stalled duration triggers the 'Agent stalled' Error Chip + seconds label in the categorized todos surface"
         );
     }
 
@@ -12385,7 +12385,7 @@ mod background_monitor_tdd {
             acp::ToolKind::Think,
         );
         assert_eq!(enter_plan_risk_via_tool.label(), "Destructive");
-        // The *user-facing* label (used in chips/buttons in the ZT-1 surface) is deliberately
+        // The *user-facing* label (used in chips/buttons in the categorized todos surface) is deliberately
         // "Plan Change" for these two Grok planning tools, per the rule that "Destructive"
         // must mean both "performs a filesystem write" *and* "can affect something outside
         // the current working directory". These tools only mutate the agent's internal plan
@@ -12402,21 +12402,21 @@ mod background_monitor_tdd {
     fn approval_action_labels_use_cwd_classification_write_vs_destructive() {
         let write_risk = ApprovalRisk::PotentiallyDestructive;
         let in_project_write_label =
-            ZedTodosComponent::format_classified_approval_action_label_with_tool(
+            ZedTodosComponent::format_categorized_approval_action_label_with_tool(
                 "Allow once",
                 write_risk,
                 Some(&SharedString::from("edit_file")),
             );
         assert_eq!(in_project_write_label, "Allow once (Write)");
         let escape_destructive_label =
-            ZedTodosComponent::format_classified_approval_action_label_with_tool(
+            ZedTodosComponent::format_categorized_approval_action_label_with_tool(
                 "Allow always",
                 write_risk,
                 Some(&SharedString::from("terminal")),
             );
         assert_eq!(escape_destructive_label, "Allow always (Destructive)");
         let plan_change_label =
-            ZedTodosComponent::format_classified_approval_action_label_with_tool(
+            ZedTodosComponent::format_categorized_approval_action_label_with_tool(
                 "Deny",
                 write_risk,
                 Some(&SharedString::from("todo_write")),
@@ -12630,7 +12630,7 @@ mod background_monitor_tdd {
             .toggle_background_tasks_expanded();
         assert!(mock_dock_consumer.zed_todos.state.background_tasks_expanded);
         mock_dock_consumer.zed_todos.toggle_grok_memory_expanded();
-        // Ensure the rich Grok default (memory prominent) is exercised for the ZT-1 component API test.
+        // Ensure the rich Grok default (memory prominent) is exercised for the ZedTodos component API test.
         // The toggle + explicit set guarantees the assert in all hermetic contexts.
         mock_dock_consumer.zed_todos.state.grok_memory_expanded = true;
         assert!(mock_dock_consumer.zed_todos.state.grok_memory_expanded);
@@ -12661,7 +12661,7 @@ mod background_monitor_tdd {
         let _ = render_approval_row;
         let _ = ZedTodosComponent::pending_approval_counts;
         let _ = ZedTodosComponent::pending_approval_options_for_tool_call;
-        let _ = ZedTodosComponent::format_classified_approval_action_label;
+        let _ = ZedTodosComponent::format_categorized_approval_action_label;
         let _ = ZedTodosComponent::approval_action_check_icon_color;
         let _ = ZedTodosDockPrototype::new;
         let _ = render_grok_memory_items;
@@ -12709,7 +12709,7 @@ mod background_monitor_tdd {
             |_click, _window, _cx| {},
         );
         let _ = plan_accept_button;
-        // The with_tool variants are part of the public CWD-aware API for the classified surface.
+        // The with_tool variants are part of the public CWD-aware API for the categorized surface.
         // The builders are exercised by the calls above; bare references removed to avoid
         // complex type annotation requirements in the test.
         let _ = plan_accept_button;
@@ -12766,7 +12766,7 @@ mod background_monitor_tdd {
     }
 
     #[test]
-    fn subagent_persona_attribution_behavior_for_native_and_bridged_in_classified_zt1_surface_and_subagent_views_exercises_current_gaps()
+    fn subagent_persona_attribution_behavior_for_native_and_bridged_in_categorized_todos_surface_and_subagent_views_exercises_current_gaps()
      {
         let persona_general = acp_thread::AgentPersona::General;
         let persona_implementer = acp_thread::AgentPersona::Implementer;
@@ -12821,7 +12821,7 @@ mod background_monitor_tdd {
     }
 
     #[test]
-    fn native_grok_launch_path_to_full_agent_mode_overlay_e2e_exercises_grok_native_selection_xai_model_open_zed_todos_surface_pre_expanded_auto_zoom_and_rich_classified_surface()
+    fn native_grok_launch_path_to_full_agent_mode_overlay_e2e_exercises_grok_native_selection_xai_model_open_zed_todos_surface_pre_expanded_auto_zoom_and_rich_categorized_surface()
      {
         let grok_native_action = ::serde_json::from_str::<crate::NewGrokThread>(r#"{}"#)
             .expect("create/select Grok (Native) thread via action");
@@ -12895,7 +12895,7 @@ mod background_monitor_tdd {
         let _ = open_via_palette_or_keybind_or_toolbar;
         // Toolbar button visibility exercised by is_grok_thread checks in AgentPanel (selected_agent == Custom{"grok"} || thread.is_grok_build_profile); context-aware Enter/Exit labels via is_full_screen + zed_todos overlay
 
-        // Step 4: Assert rich classified ZT-1 surface (RO/Destructive chips, proposed plans + accept, lazy monitors, memory) with auto-zoom + pre-expanded behavior from prepare_for_full_agent_mode + toggle_zoom
+        // Step 4: Assert rich categorized todos surface (RO/Destructive chips, proposed plans + accept, lazy monitors, memory) with auto-zoom + pre-expanded behavior from prepare_for_full_agent_mode + toggle_zoom
         let mut overlay_state = ZedTodos::default();
         // prepare_for_full_agent_mode() does exactly this expansion for the 14" GNOME high-DPI auto-zoom flow
         overlay_state.approvals_expanded = true;
@@ -12927,12 +12927,12 @@ mod background_monitor_tdd {
             overlay_state
                 .expanded_background_monitors
                 .contains(&lazy_monitor),
-            "lazy per-monitor expansion in rich ZT-1 surface"
+            "lazy per-monitor expansion in rich categorized todos surface"
         );
         let memory_renderer: fn(&GrokMemoryArtifacts, &mut Window, &App) -> gpui::AnyElement =
             render_grok_memory_items;
         let _ = memory_renderer;
-        let _rich_classified_surface = render_zed_todos_categorized_surface;
+        let _rich_categorized_surface = render_zed_todos_categorized_surface;
         let dock_prototype_for_thread: fn(
             Entity<acp_thread::AcpThread>,
             &mut App,
@@ -12993,12 +12993,12 @@ mod background_monitor_tdd {
         // Native parent + subagent cards/titlebars do get correct persona via render_persona_badge (verified in core flows + prior badge TDD)
         assert!(
             true,
-            "full E2E user flow (native grok launch + discoverability + open full agent + rich pre-expanded ZT-1 + attribution with gaps) tied together hermetically"
+            "full E2E user flow (native grok launch + discoverability + open full agent + rich pre-expanded categorized todos + attribution with gaps) tied together hermetically"
         );
     }
 
     #[test]
-    fn dual_path_grok_experience_normal_threadview_activity_bar_with_grok_memory_prominent_by_default_and_other_zt1_sections_preserved_o1_plus_dedicated_full_agent_mode_overlay_pre_expanded_auto_zoomed_labeled_rich_classified_via_discoverability_for_grok_native_and_bridged_with_persona_subagent_attribution()
+    fn dual_path_grok_experience_normal_threadview_activity_bar_with_grok_memory_prominent_by_default_and_other_zt1_sections_preserved_o1_plus_dedicated_full_agent_mode_overlay_pre_expanded_auto_zoomed_labeled_rich_categorized_via_discoverability_for_grok_native_and_bridged_with_persona_subagent_attribution()
      {
         let grok_native = ::serde_json::from_str::<crate::NewGrokThread>(r#"{}"#)
             .expect("Grok (Native) launch path");
@@ -13019,7 +13019,7 @@ mod background_monitor_tdd {
             zed_actions::agent::OpenZedTodosSurface;
         let _ = dispatch_from_prominent_toolbar_button;
         let button_visible_even_on_empty_thread = true;
-        let prominent_full_agent_mode_button_label = "Full Agent Mode – spacious classified ZT-1 (RO/Destructive chips, proposed plans + accept, lazy monitors, Grok Memory)";
+        let prominent_full_agent_mode_button_label = "Full Agent Mode – spacious categorized todos surface (RO/Destructive chips, proposed plans + accept, lazy monitors, Grok Memory)";
         let _ = (
             button_visible_even_on_empty_thread,
             prominent_full_agent_mode_button_label,
@@ -13125,7 +13125,7 @@ mod background_monitor_tdd {
     }
 
     #[test]
-    fn native_grok_full_agent_mode_memory_artifacts_via_grok_worktrees_db_correlation_and_proposed_plan_with_todo_write_entries_parity_e2e_exercises_rich_classified_zt1_surface_with_ro_chips_copybuttons_destructive_risk_accept_button_and_persona_attribution_in_overlay_and_activity_bar()
+    fn native_grok_full_agent_mode_memory_artifacts_via_grok_worktrees_db_correlation_and_proposed_plan_with_todo_write_entries_parity_e2e_exercises_rich_categorized_todos_surface_with_ro_chips_copybuttons_destructive_risk_accept_button_and_persona_attribution_in_overlay_and_activity_bar()
      {
         let native_grok_thread_action = ::serde_json::from_str::<crate::NewGrokThread>(r#"{}"#).expect("Grok (Native) launch via xAI profile for full agent mode memory proposed plan parity");
         let _ = native_grok_thread_action;
@@ -13433,9 +13433,9 @@ mod background_monitor_tdd {
         // 1. Select Grok (bridged "grok" or "Grok (Native)" via NewGrokThread / NewExternalAgentThread).
         // 2. Prominent "Full Agent Mode" toolbar button visible immediately (is_grok_thread || is_grok_build_profile guards).
         // 3. Discoverability paths (Linux button emphasis + ctrl-alt-shift-t; macOS/Windows palette "agent: open full grok surface" + button + menu + their reference keybinds) all dispatch the same OpenFullGrokSurface action.
-        // 4. Produces identical rich classified ZT-1 (RO/Destructive via render_risk_chip, proposed plans + build_plan_accept_button, lazy monitors via expanded set, Grok Memory with facts + RO chips + CopyButtons via render_grok_memory_items) with prepare_for_full_agent_mode pre-expansion (all sections) + auto-zoom/.size_full() path (Linux GNOME high-DPI polish) or equivalent spacious on other platforms.
+        // 4. Produces identical rich categorized todos surface (RO/Destructive via render_risk_chip, proposed plans + build_plan_accept_button, lazy monitors via expanded set, Grok Memory with facts + RO chips + CopyButtons via render_grok_memory_items) with prepare_for_full_agent_mode pre-expansion (all sections) + auto-zoom/.size_full() path (Linux GNOME high-DPI polish) or equivalent spacious on other platforms.
         // 5. In-thread activity bar (ZedTodos default) has Grok Memory prominent (expanded) with facts; other sections collapsed for O(1).
-        // 6. Persona/subagent attribution: all 8 AgentPersona variants + the two documented gaps (bridged sub ThreadView titlebar=None; ZT-1 rows lack per-item badges, only cards/titlebars use render_persona_badge).
+        // 6. Persona/subagent attribution: all 8 AgentPersona variants + the two documented gaps (bridged sub ThreadView titlebar=None; todo rows lack per-item badges, only cards/titlebars use render_persona_badge).
         // 7. Stretch: TUI artifacts writers (already exercised in sibling test above) produce events.jsonl / prompt_context / worktree correlation.
         // This + the extended GPUI E2E in agent_panel.rs (setup_panel + dispatch + VisualTestContext) + dual-path memory/skills/persona tests give the most complete coverage possible without prod changes.
 
@@ -13512,7 +13512,7 @@ mod background_monitor_tdd {
 
         assert!(
             true,
-            "final cross-platform discoverability E2E (all platforms, all entry points, full rich ZT-1 + memory + skills tags + personas + gaps + artifacts) covered hermetically in existing background_monitor_tdd module"
+            "final cross-platform discoverability E2E (all platforms, all entry points, full rich categorized todos + memory + skills tags + personas + gaps + artifacts) covered hermetically in existing background_monitor_tdd module"
         );
     }
 
@@ -13672,7 +13672,7 @@ mod background_monitor_tdd {
      {
         // Regression TDD for the exact UX complaints:
         // - No stray CopyButton (session ID pill) in normal Grok ThreadView header.
-        // - Rich classified ZT-1 "todos pane" (approvals + proposed plans + monitors + memory with RO/Destructive Chips + actions) is the default visible surface for Grok.
+        // - Rich categorized todos surface "todos pane" (approvals + proposed plans + monitors + memory with RO/Destructive Chips + actions) is the default visible surface for Grok.
         // - No "RO Memory active (RO) — facts injected..." useless label.
         // - Auto-open of the spacious Full Agent Mode overlay on NewGrokThread creation and on thread switch for Grok agents.
         //
@@ -13693,7 +13693,7 @@ mod background_monitor_tdd {
                 .expect("bridged grok via NewExternalAgentThread");
         let _ = bridged_grok_action;
 
-        // 2. Rich ZT-1 surface (todos pane) is pre-expanded for Grok by default (covers "todos pane doesn't show").
+        // 2. Rich categorized todos surface (todos pane) is pre-expanded for Grok by default (covers "todos pane doesn't show").
         let mut rich_grok_state = ZedTodos::default();
         // The auto-open + prepare_for_full_agent_mode + ThreadView Grok default paths set exactly these.
         rich_grok_state.approvals_expanded = true;
@@ -13705,7 +13705,7 @@ mod background_monitor_tdd {
                 && rich_grok_state.plan_expanded
                 && rich_grok_state.background_tasks_expanded
                 && rich_grok_state.grok_memory_expanded,
-            "Grok threads receive the full classified ZT-1 todos surface (RO/Destructive + proposed plans + monitors + memory) by default on create and switch"
+            "Grok threads receive the full categorized todos surface (RO/Destructive + proposed plans + monitors + memory) by default on create and switch"
         );
 
         // 3. Public collectors and render helpers for the rich surface are present and usable (prevents accidental removal of the todos pane).

@@ -249,7 +249,7 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
 
 /// Extracts a stable identifier for a plan/todo entry from ACP meta when the
 /// upstream agent (e.g. the Grok binary) supplies one. This enables the
-/// T-<n>-task-<id> cross-turn referencing feature in the ZT-1 surface.
+/// T-<n>-task-<id> cross-turn referencing feature in the categorized todos surface.
 pub fn plan_entry_id_from_meta(meta: &Option<acp::Meta>) -> Option<String> {
     meta.as_ref()
         .and_then(|m| m.get("id"))
@@ -533,9 +533,9 @@ impl ToolCall {
     /// Returns true if this ToolCall represents a background/monitor-style long-running task
     /// (e.g. Grok's `monitor` tool or background terminal execution).
     ///
-    /// This is used by the UI (G-04) to surface such tasks efficiently in the activity bar
+    /// This is used by the UI (background task activity bar) to surface such tasks efficiently in the activity bar
     /// with low overhead (collapsed by default, live updates only when expanded).
-    /// See AGENTS.md for the full G-04 design and TDD requirements.
+    /// See AGENTS.md for the full background task activity bar design and TDD requirements.
     pub fn is_monitor(&self) -> bool {
         self.tool_name
             .as_ref()
@@ -1782,7 +1782,7 @@ impl AcpThread {
 
     /// Returns the current turn ID for this thread. Used to give Grok Build
     /// threads a stable way to refer to specific turns and tasks (e.g. "T-17-task-xxx") when
-    /// tracking tasks across multiple turns in the ZT-1 surface and behavioral
+    /// tracking tasks across multiple turns in the categorized todos surface and behavioral
     /// rule enforcement.
     pub fn current_turn_id(&self) -> TurnId {
         self.turn_id
@@ -1790,7 +1790,7 @@ impl AcpThread {
 
     /// Returns the number of tool calls currently awaiting user approval.
     /// Exposed so that post-EndTurn diagnostic continuation messages and
-    /// ZT-1 surfaces can report accurate pending approval counts using only
+    /// categorized todos surfaces can report accurate pending approval counts using only
     /// data already held by AcpThread.
     pub fn pending_approval_count(&self) -> usize {
         self.entries
@@ -1828,7 +1828,7 @@ impl AcpThread {
     /// After a clean EndTurn (the point at which the "thinking" / stop button
     /// resets in the UI), automatically query the *live* in-process LSP
     /// diagnostic state via Project::diagnostic_summary (the real data rust-analyzer
-    /// has already pushed into this process) plus the current ZT-1 pending work
+    /// has already pushed into this process) plus the current pending todos
     /// (approvals, plan, monitors). If any remain, synthesize and append a user
     /// content block containing the fresh counts + current turn ID.
     ///
@@ -1858,7 +1858,7 @@ impl AcpThread {
         }
 
         let text = format!(
-            "\n\n## System Continuation (after EndTurn on {})\nThe previous assistant response returned StopReason::EndTurn, but the live state inside this Zed process shows work remains.\n\n## Current Zed Editor Diagnostics (live from rust-analyzer / LSP)\nProject currently has {} errors and {} warnings reported by Zed's language servers.\n\n## Pending ZT-1 Work\n- Plan entries with work remaining: {}\n- Tool calls awaiting approval: {}\n- Active background monitors: {}\n\nPer the three behavioral rules (never stop while tasks remain, mandatory exact completion notification when truly done, and correct CWD-based RO vs Destructive labeling), you must continue autonomously. Reference tasks using the T-<n>-task-<id> syntax (e.g. {}-task-refactor-parser) for stable cross-turn task naming when using todo_write and plan tools.",
+            "\n\n## System Continuation (after EndTurn on {})\nThe previous assistant response returned StopReason::EndTurn, but the live state inside this Zed process shows work remains.\n\n## Current Zed Editor Diagnostics (live from rust-analyzer / LSP)\nProject currently has {} errors and {} warnings reported by Zed's language servers.\n\n## Pending Todos Work\n- Plan entries with work remaining: {}\n- Tool calls awaiting approval: {}\n- Active background monitors: {}\n\nPer the three behavioral rules (never stop while tasks remain, mandatory exact completion notification when truly done, and correct CWD-based RO vs Destructive labeling), you must continue autonomously. Reference tasks using the T-<n>-task-<id> syntax (e.g. {}-task-refactor-parser) for stable cross-turn task naming when using todo_write and plan tools.",
             turn_id,
             diag.error_count,
             diag.warning_count,
@@ -1873,7 +1873,7 @@ impl AcpThread {
         cx.notify();
     }
 
-    /// Validates Grok thread output against the strict formatting contract (Task 0).
+    /// Validates Grok thread output against the strict alpha-numbered list formatting contract.
     /// Rejects bullet/dash lists, numbered lists without alphabetical section headers (A., B.),
     /// smart quotes, and em/en dashes. This ensures items are stably referenceable (A1, B3, ...)
     /// in conjunction with T-<n>-task-<id> naming for plan/todo items. Used by ACP to automatically request revisions.
@@ -2069,7 +2069,7 @@ impl AcpThread {
 
     /// Returns the number of distinct active sub-agents (based on SubagentSessionInfo
     /// attached to tool calls). Used for the Grok Build context ring + "nothing
-    /// happening" visuals in the ZT-1 surface.
+    /// happening" visuals in the categorized todos surface.
     pub fn active_subagent_count(&self) -> usize {
         let mut seen = std::collections::HashSet::new();
         for entry in &self.entries {
@@ -2325,17 +2325,9 @@ impl AcpThread {
     ) {
         let path_style = self.project.read(cx).path_style(cx);
 
-        // Task 0 (output formatting enforcement): for Grok threads, validate every
-        // assistant ContentBlock as soon as it arrives. Violations will trigger
-        // automatic revision requests back through the ACP.
         if self.is_grok() {
             if let acp::ContentBlock::Text(tc) = &chunk {
                 if let Err(violations) = Self::validate_grok_output_formatting(&tc.text) {
-                    // Real ACP kickback for Task 0: immediately inject a user correction message
-                    // so the next model turn for this Grok thread is forced to revise using only
-                    // the required A. 1. 2. / B. 3. alphabetical+numbered format. This is the
-                    // mechanism that actually makes the formatting contract enforceable instead
-                    // of a passive log warning.
                     let correction = format!(
                         "Your previous response violated the required output formatting rules: {:?}. \
                         Please revise your entire last answer. Use ONLY properly enumerated numbered lists \
@@ -2344,8 +2336,6 @@ impl AcpThread {
                         Pair this with T-<n>-task-<id> naming for all plan/todo entries.",
                         violations
                     );
-                    // Push as a follow-up user block so the model sees the revision request on the next turn.
-                    // This is the concrete ACP change that closes the "detection only, no kickback" gap.
                     let text_block = acp::ContentBlock::Text(acp::TextContent::new(correction));
                     self.push_user_content_block(None, text_block, cx);
                 }
@@ -2364,7 +2354,7 @@ impl AcpThread {
                     );
 
                     if stop_violation {
-                        correction.push_str("A. You attempted to stop while the living plan (tracked via todo_write and visible in the ZT-1 classified surface) still has pending items.\n");
+                        correction.push_str("A. You attempted to stop while the living plan (tracked via todo_write and visible in the categorized todos surface) still has pending items.\n");
                         correction.push_str(
                             "   1. Stopping when there are still tasks is not acceptable.\n",
                         );
@@ -2374,10 +2364,10 @@ impl AcpThread {
                     if notification_violation {
                         correction.push_str("B. You concluded the turn without the required explicit completion notification.\n");
                         correction.push_str("   1. When all work is genuinely finished you MUST state: 'All current independent work is complete. No further autonomous actions are possible without additional direction.'\n");
-                        correction.push_str("   2. This notification must be present so the ZT-1 surface can record the correct state.\n\n");
+                        correction.push_str("   2. This notification must be present so the categorized todos surface can record the correct state.\n\n");
                     }
 
-                    correction.push_str("   When naming or referencing tasks (in todo_write, plan entries, ZT-1), always use the T-<n>-task-<id> syntax (e.g. T-17-task-refactor-parser) for stable cross-turn traceability.\n\n");
+                    correction.push_str("   When naming or referencing tasks (in todo_write, plan entries, categorized todos), always use the T-<n>-task-<id> syntax (e.g. T-17-task-refactor-parser) for stable cross-turn traceability.\n\n");
                     correction.push_str("Please revise your last response to comply with all three rules (never stop while tasks remain, always emit the exact completion notification when done, and apply the CWD-based RO/Destructive classification using proper T-<n>-task-<id> references).");
 
                     let text_block = acp::ContentBlock::Text(acp::TextContent::new(correction));
@@ -3851,7 +3841,7 @@ impl AcpThread {
     }
 
     /// Returns the exit status for a terminal if it has completed.
-    /// Used by native monitor/get_command_or_subagent_output for P4 fidelity.
+    /// Used by native monitor/get_command_or_subagent_output for capture harness fidelity.
     pub fn terminal_exit_status(
         &self,
         terminal_id: &acp::TerminalId,
@@ -6863,7 +6853,7 @@ mod tests {
         );
     }
 
-    // TDD for G-04: describes the desired collapsed-by-default low-overhead
+    // TDD for background task activity bar: describes the desired collapsed-by-default low-overhead
     // monitor identification (before heavy UI impl in ThreadView).
     // Monitors (e.g. Grok `monitor` tool) must be detected via is_monitor()
     // so activity bar can gate expensive rendering behind disclosure expand.
@@ -7304,7 +7294,7 @@ mod tests {
         });
     }
 
-    // P4-13 sub-agent perf re-audit additions: TurnId and shared path validation for native vs ACP.
+    // native path performance validation sub-agent perf re-audit additions: TurnId and shared path validation for native vs ACP.
     // TurnId is the canonical cross-turn reference (T-<n>) used in native profile prompt injection
     // and E2E kickback. These tests + timing harness prove O(1) for the common substrate.
     // All native paths (agent::Thread under is_grok_build_profile) and ACP paths share this without
@@ -7319,9 +7309,9 @@ mod tests {
             let _u: u32 = u32::from(tid);
             let _d = format!("{}", tid); // "T-{}"
             let ser = serde_json::to_string(&tid)
-                .expect("TurnId serde for native P4 TurnId refs in prompt and kickback");
-            let de: TurnId =
-                serde_json::from_str(&ser).expect("roundtrip for E2E regression and ZT-1");
+                .expect("TurnId serde for native Grok TurnId refs in prompt and kickback");
+            let de: TurnId = serde_json::from_str(&ser)
+                .expect("roundtrip for E2E regression and the categorized todos surface");
             assert_eq!(tid, de);
             assert_eq!(u32::from(de), i);
         }
@@ -7337,7 +7327,7 @@ mod tests {
     #[test]
     fn perf_validation_acp_thread_turnid_in_grok_kickback_paths() {
         // Exercises the paths used by both bridged ACP grok and native is_grok_build_profile for validation kickback.
-        // Confirms no hidden allocs or non-O(1) in the TurnId carrying types for P4-13 re-audit.
+        // Confirms no hidden allocs or non-O(1) in the TurnId carrying types for native path performance validation re-audit.
         let tid = TurnId::new(42);
         assert_eq!(format!("{}", tid), "T-42");
         // The autonomous discipline + formatting validators reference turns; cost is independent of external process.

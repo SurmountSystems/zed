@@ -405,21 +405,18 @@ impl AcpTools {
             .unwrap_or(0);
         let safe_agent = agent_id.0.replace(['/', '\\', ' '], "_");
         let capture_name = format!("{}-{}", safe_agent, timestamp);
-        let base_dir: PathBuf = PathBuf::from("captures").join("p4-0");
+        let base_dir: PathBuf = PathBuf::from("captures").join("acp-capture");
         let capture_dir = base_dir.join(&capture_name);
         if let Err(err) = fs::create_dir_all(&capture_dir) {
-            log::error!(
-                "P4-0 capture: failed to create dir {:?}: {err}",
-                capture_dir
-            );
+            log::error!("ACP capture: failed to create dir {:?}: {err}", capture_dir);
             return;
         }
 
-        // Write full messages using existing serializer (JSON array for easy consumption by P4-1+)
+        // Write full messages using existing serializer (JSON array for easy consumption by native implementation baseline)
         if let Some(serialized) = self.serialize_observed_messages() {
             let messages_path = capture_dir.join("messages.json");
             if let Err(err) = fs::write(&messages_path, serialized) {
-                log::error!("P4-0 capture: failed writing messages: {err}");
+                log::error!("ACP capture: failed writing messages: {err}");
             }
         }
 
@@ -432,7 +429,7 @@ impl AcpTools {
         {
             Ok(f) => f,
             Err(err) => {
-                log::error!("P4-0 capture: failed opening jsonl: {err}");
+                log::error!("ACP capture: failed opening jsonl: {err}");
                 return;
             }
         };
@@ -466,7 +463,7 @@ impl AcpTools {
 
         // Summary
         let summary = format!(
-            "P4-0 Grok ACP Capture\nAgent: {}\nCaptured at: {}\nMessages: {}\nDir: {:?}\n\nSee messages.json and artifacts for tool schemas, system fragments, monitor patterns, plan decisions, persona usage.\nUse for P4-1+ native implementation to ensure fidelity.\n",
+            "ACP capture harness Grok ACP Capture\nAgent: {}\nCaptured at: {}\nMessages: {}\nDir: {:?}\n\nSee messages.json and artifacts for tool schemas, system fragments, monitor patterns, plan decisions, persona usage.\nUse for native implementation baseline native implementation to ensure fidelity.\n",
             agent_id.0,
             timestamp,
             watched.messages.len(),
@@ -475,7 +472,7 @@ impl AcpTools {
         let _ = fs::write(capture_dir.join("CAPTURE_SUMMARY.txt"), summary);
 
         log::info!(
-            "P4-0 capture complete for {}: {} messages written to {:?}",
+            "ACP capture complete for {}: {} messages written to {:?}",
             agent_id.0,
             watched.messages.len(),
             capture_dir
@@ -577,7 +574,7 @@ impl AcpTools {
             }
         }
 
-        // Persist observed tool schemas / samples (core for P4 fidelity)
+        // Persist observed tool schemas / samples (core for capture harness fidelity)
         let tools_path = capture_dir.join("observed-tool-calls.json");
         let tools_json = serde_json::json!({
             "agent": agent_id.0,
@@ -1011,7 +1008,7 @@ impl Render for AcpTools {
                             .child(
                                 IconButton::new("capture_p4_0", IconName::Download)
                                     .icon_size(IconSize::Small)
-                                    .tooltip(Tooltip::text("Capture P4-0 Grok ACP Session (writes structured artifacts under captures/p4-0 for native implementation baseline)"))
+                                    .tooltip(Tooltip::text("Capture ACP capture harness Grok ACP Session (writes structured artifacts under captures/acp-capture for native implementation baseline)"))
                                     .disabled(!has_messages)
                                     .on_click(cx.listener(|this, _, _window, cx| {
                                         this.capture_selected_connection(cx);

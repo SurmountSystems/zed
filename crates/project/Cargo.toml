@@ -66,6 +66,7 @@ language.workspace = true
 log.workspace = true
 lsp.workspace = true
 markdown.workspace = true
+memory_palace.workspace = true
 node_runtime.workspace = true
 parking_lot.workspace = true
 paths.workspace = true

@@ -257,11 +257,11 @@ impl AgentServerStore {
     }
 
     /// Returns a short "Co-Equal" status indicator for the grok agent (and None for others).
-    /// O(1) after the existing has_discovered_grok_binary cache (G-01/G-07). Used by G-19
+    /// O(1) after the existing has_discovered_grok_binary cache (grok binary discovery cache/cheap status query API). Used by co-equal Grok command surface
     /// to surface a clear peer status in the agent selector button and external agents menu.
-    /// Leverages ACP bridging (G-10 skills used natively by binary, G-16 resume scaffold)
+    /// Leverages ACP bridging (skills used natively by binary skills used natively by binary, session resume scaffold resume scaffold)
     /// so the Zed grok path feels co-equal to standalone TUI today. See AGENTS.md Efficiency
-    /// Auditor register and G-19 entry for rationale; no hot-path cost, no fs on repeated calls.
+    /// Auditor register and co-equal Grok command surface entry for rationale; no hot-path cost, no fs on repeated calls.
     pub fn grok_co_equal_indicator(&self, id: &AgentId) -> Option<SharedString> {
         grok_co_equal_indicator_for_id(id)
     }
@@ -1416,12 +1416,18 @@ pub fn has_discovered_grok_binary() -> bool {
     DISCOVERED_GROK_CONCRETE.get().copied().unwrap_or(false)
 }
 
+/// Whether Grok Build can be the default selected agent (zero-config synthesized command).
+/// Uses the same cached `default_command_for_grok` probe as agent selector registration.
+pub fn grok_build_default_agent_available() -> bool {
+    default_command_for_grok().is_some()
+}
+
 /// Returns a short status for use in agent selector / toolbar when the id is "grok".
-/// "Co-Equal" when the binary was discovered (making ACP path peer to TUI for G-19).
+/// "Co-Equal" when the binary was discovered (making ACP path peer to TUI for co-equal Grok command surface).
 /// Mirrors has_discovered_grok_binary exactly for the same O(1) cache contract (see
-/// AGENTS.md Efficiency Auditor: "cheap UI queries", no repeated syscalls). Non-grok
+/// AGENTS.md performance guidelines: "cheap UI queries", no repeated syscalls). Non-grok
 /// always returns None. Why separate: allows UI to ask "is this the grok entry co-equal?"
-/// without knowing the has_ details; used in G-19 pill rendering.
+/// without knowing the has_ details; used in co-equal Grok command surface pill rendering.
 pub fn grok_co_equal_indicator_for_id(id: &AgentId) -> Option<SharedString> {
     if id.as_ref() == "grok" && has_discovered_grok_binary() {
         Some("Co-Equal".into())
@@ -1505,29 +1511,16 @@ fn discover_grok_command_with(
 
     #[cfg(target_os = "windows")]
     {
-        todo!(
-            "Grok Build Windows support: implement robust default command resolution \
-             for the grok.exe binary (see the detailed porting plan and test requirements \
-             in AGENTS.md under 'Grok Build Integration (Linux-first)')."
-        );
+        // Windows grok default discovery is not implemented yet; return None so callers
+        // treat Grok Build as unavailable rather than panicking on the hot path.
+        return None;
     }
 
-    // P4-0 Capture Harness complete (instrumented via ACP debug + AcpTools capture action).
-    // P4-1: native grok profile ('grok-native' or feature-gated) behind flag here in
-    // discover + default_command_for_grok + external_agents map (RO discovery + preference).
-    // When enabled (post P3), synthesize a native entry that uses in-process Grok loop
-    // instead of (or alongside) the binary ACP path. Hybrid recommended for fidelity.
-    // RO classification: file/path checks + OnceLock cache (modeled on existing grok discovery).
-    // Destructive: none in discovery (actual edits/cmds stay in Thread + auth flows).
-    // References: AGENTS.md (P4-1 "grok-native profile/branch, discovery preference"),
-    // GROK_SEAMLESS_FRICTION_MAP.md (co-equal rule + P3 bridging G-15/G-16 first to avoid silos;
-    // native inherits bridged skills/sessions), Efficiency Auditor (O(1) cache, no perf hit on
-    // ACP grok users, TDD for discover_grok_* variants).
-    // Real todo kept for the native branch.
+    // Native grok-native profile discovery hooks belong here alongside default_command_for_grok.
     #[cfg(any())]
     {
         todo!(
-            "P4-1 native Grok scaffolding: extend discovery + default_command_for_grok (or add discover_grok_native) for 'grok-native' profile in agent_server_store.rs. Per AGENTS.md P4-1, Friction Map, Efficiency Auditor. TDD + cache discipline."
+            "Add grok-native profile discovery in agent_server_store (extend default_command_for_grok or discover_grok_native)."
         );
     }
 
@@ -1569,9 +1562,9 @@ fn default_command_for_grok() -> Option<AgentServerCommand> {
 ///
 /// The heavy work (full updates.jsonl / terminal logs for plans, subagents with
 /// personas, monitors) is deliberately deferred behind explicit user import/open
-/// and behind todo! guards. See AGENTS.md G-16, Efficiency Auditor register
+/// and behind todo! guards. See AGENTS.md session resume scaffold, performance guidelines register
 /// (O(1) list invariant, no jsonl work on hot paths, bg_spawn for any parse),
-/// and the approved G-16 plan.
+/// and the approved session resume scaffold plan.
 pub fn discover_grok_tui_sessions(cwd: &Path) -> Vec<GrokTuiSession> {
     let home = std::env::var("HOME").ok();
     discover_grok_tui_sessions_with(
@@ -1588,7 +1581,7 @@ pub fn discover_grok_tui_sessions(cwd: &Path) -> Vec<GrokTuiSession> {
     )
 }
 
-/// Lightweight RO memory artifacts for a cwd (G-17 bridging).
+/// Lightweight RO memory artifacts for a cwd (Grok memory artifacts bridging).
 /// Workspace memory may live at cwd/MEMORY.md (legacy/direct) or under
 /// ~/.grok/memory/<slug>/MEMORY.md (per official TUI guide). Global at
 /// ~/.grok/memory/MEMORY.md. Content previews are cheap trimmed RO loads
@@ -1695,9 +1688,9 @@ fn grok_worktrees_db_candidates(home: Option<&str>) -> Vec<PathBuf> {
 /// Legacy bridging-only probe (TUI-era).
 ///
 /// This function uses the external `sqlite3` CLI to read `~/.grok/worktrees.db`
-/// for session/worktree correlation during the bridging/co-equal phase (G-17).
+/// for session/worktree correlation during the bridging/co-equal phase (Grok memory artifacts).
 ///
-/// **Native-First Rule (2026-05-20):** This is explicitly NOT part of the full native
+/// **Native-First Rule:** This is explicitly NOT part of the full native
 /// Grok Build implementation. Native Grok must use Zed's own persistence (DbThread,
 /// thread store, native scheduler). Callers under `is_grok_build_profile` that are
 /// purely native should treat a missing/empty result as the normal case and must
@@ -1875,14 +1868,131 @@ pub fn grok_facts_for_cwd(worktree_path: &Path) -> Vec<GrokFact> {
     )
 }
 
-/// RO helper for G-17 memory bridging (modeled on discover_grok_*).
+/// RO helper for Grok memory artifacts bridging (modeled on discover_grok_*).
 /// Returns lightweight read-only artifacts for surfacing Grok's persistent memory
 /// (learned facts in MEMORY.md files) for the given cwd. Strictly RO: existence
 /// checks and optional content reads only; never mutates. Binary/TUI owns writes.
-/// See AGENTS.md G-17 log, GROK_SEAMLESS_FRICTION_MAP.md, CLAUDE.md for design,
-/// classification (RO reads vs PD clear/write), and co-equal P3 requirement.
+/// See AGENTS.md Grok memory artifacts log, friction map doc, CLAUDE.md for design,
+/// classification (RO reads vs PD clear/write), and co-equal ACP bridging requirement.
 /// Used by future acp_thread grok_memory + activity bar render + native prompt paths.
 pub fn grok_memory_artifacts_for_cwd(cwd: &Path) -> GrokMemoryArtifacts {
+    if let Ok(mut store) = memory_palace::MemoryPalaceStore::open_for_cwd(cwd) {
+        if !store.has_any_records().unwrap_or(true) {
+            import_grok_filesystem_into_palace_if_needed(cwd, &mut store).log_err();
+        }
+        if store.has_any_records().unwrap_or(false) {
+            if let Ok(artifacts) = grok_memory_artifacts_from_palace_store(cwd, &store) {
+                return artifacts;
+            }
+        }
+    }
+    grok_memory_artifacts_from_filesystem_bridge(cwd)
+}
+
+/// One-shot ingest from Grok Build filesystem memory into memory_palace.
+pub fn import_grok_filesystem_into_palace_if_needed(
+    cwd: &Path,
+    store: &mut memory_palace::MemoryPalaceStore,
+) -> anyhow::Result<usize> {
+    if store
+        .global
+        .grok_filesystem_import_completed()
+        .unwrap_or(false)
+    {
+        return Ok(0);
+    }
+    let bridge = grok_memory_artifacts_from_filesystem_bridge(cwd);
+    let mut imported = 0usize;
+    if let Some(full) = bridge.workspace_memory_full.as_ref() {
+        store
+            .project
+            .record_observation(full.to_string())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        imported += 1;
+    }
+    if let Some(full) = bridge.global_memory_full.as_ref() {
+        store
+            .global
+            .record_observation(full.to_string())
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        imported += 1;
+    }
+    for fact in bridge.facts_from_db {
+        if let Some(content) = fact.content {
+            store
+                .project
+                .record_observation(content.to_string())
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            imported += 1;
+        }
+    }
+    if imported > 0 {
+        store
+            .global
+            .mark_grok_filesystem_import_completed()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
+    Ok(imported)
+}
+
+/// RO load from native memory_palace when populated; maps records into the
+/// existing GrokMemoryArtifacts shape so UI and prompt paths stay unified.
+pub fn grok_memory_artifacts_from_palace_store(
+    cwd: &Path,
+    store: &memory_palace::MemoryPalaceStore,
+) -> anyhow::Result<GrokMemoryArtifacts> {
+    let mut artifacts = GrokMemoryArtifacts::default();
+
+    if !store.project.is_empty()? {
+        let full = store.project.get_all_context_for_prompt(64)?;
+        if !full.is_empty() {
+            artifacts.has_workspace_memory = true;
+            artifacts.workspace_memory_path = Some(memory_palace::project_palace_path(cwd));
+            let preview: String = full.chars().take(256).collect();
+            artifacts.workspace_memory_preview = Some(SharedString::from(preview));
+            artifacts.workspace_memory_full = Some(SharedString::from(full));
+        }
+    }
+
+    if !store.global.is_empty()? {
+        let full = store.global.get_all_context_for_prompt(64)?;
+        if !full.is_empty() {
+            artifacts.has_global_memory = true;
+            artifacts.global_memory_path = Some(memory_palace::global_palace_path());
+            artifacts.global_memory_full = Some(SharedString::from(full));
+        }
+    }
+
+    let mut facts = Vec::new();
+    for record in store
+        .project
+        .retrieve_by_kind(memory_palace::MemoryKind::Observation, 32)?
+    {
+        facts.push(GrokFact {
+            id: Some(record.id.to_string()),
+            content: Some(SharedString::from(record.content)),
+            category: Some("observation".to_string()),
+            session_id: None,
+            metadata: Some("memory_palace:project".to_string()),
+        });
+    }
+    for record in store
+        .global
+        .retrieve_by_kind(memory_palace::MemoryKind::Observation, 32)?
+    {
+        facts.push(GrokFact {
+            id: Some(record.id.to_string()),
+            content: Some(SharedString::from(record.content)),
+            category: Some("observation".to_string()),
+            session_id: None,
+            metadata: Some("memory_palace:global".to_string()),
+        });
+    }
+    artifacts.facts_from_db = facts;
+    Ok(artifacts)
+}
+
+fn grok_memory_artifacts_from_filesystem_bridge(cwd: &Path) -> GrokMemoryArtifacts {
     let home = std::env::var("HOME").ok();
     let mut artifacts = grok_memory_artifacts_for_cwd_with(
         home.as_deref(),
@@ -1896,7 +2006,7 @@ pub fn grok_memory_artifacts_for_cwd(cwd: &Path) -> GrokMemoryArtifacts {
     artifacts
 }
 
-/// Injectable RO implementation for G-17 testability (exact pattern from
+/// Injectable RO implementation for Grok memory artifacts testability (exact pattern from
 /// discover_grok_tui_sessions_with for hermetic TDD without real FS or binary).
 /// All call sites classify ops: file_exists/read are RO; db_file_exists + query
 /// are also RO (discovery only). Integrated light worktrees correlation here to
@@ -2062,7 +2172,7 @@ fn collect_sessions_from_dir(
                 });
                 // Full TUI session replay/import for native Zed Grok threads (plans,
                 // subagents/personas, monitors, turns) now provided by
-                // GrokTuiSessionStore::load_raw_artifacts (P4-14). See migration
+                // GrokTuiSessionStore::load_raw_artifacts (TUI session import). See migration
                 // tooling below; used for full fidelity state load into Thread
                 // (TurnId etc) without relying on binary ACP resume.
             }
@@ -2127,7 +2237,7 @@ pub struct GrokTuiSession {
 }
 
 /// Raw TUI session artifacts loaded for migration/import into native Zed Grok
-/// (P4-14). Provides the jsonl + json data that encodes full session state
+/// (TUI session import). Provides the jsonl + json data that encodes full session state
 /// (including turn history for TurnId reconstruction, plans, subagent personas,
 /// monitors, memory) so native Thread can achieve full fidelity restore without
 /// external binary. Populated by load_raw_artifacts; consumed by agent crate
@@ -2140,7 +2250,7 @@ pub struct GrokTuiRawArtifacts {
     pub resources_state: Option<String>,
 }
 
-/// Scaffold for a GrokTuiSessionStore / adapter (G-16/G-17 follow-on).
+/// Scaffold for a GrokTuiSessionStore / adapter (session resume scaffold/Grok memory artifacts follow-on).
 /// When a native Thread (is_grok_build_profile true, x_ai + grok model) saves
 /// state, this can write TUI-compatible artifacts (prompt_context.json minimal,
 /// later updates.jsonl for plan/subagent/monitor history, resources_state.json)
@@ -2152,7 +2262,7 @@ pub struct GrokTuiRawArtifacts {
 /// all TDD hermetic. Real usage would be called from Thread persist paths only
 /// under the grok profile (see thread.rs compute_grok_build_profile).
 /// This is the design start + minimal writer; full serialization of AcpThread
-/// state (plans, monitors, personas) is future TDD work behind the G-16 todo.
+/// state (plans, monitors, personas) is future TDD work behind the session resume scaffold todo.
 pub struct GrokTuiSessionStore;
 
 impl GrokTuiSessionStore {
@@ -2256,13 +2366,13 @@ impl GrokTuiSessionStore {
 
     /// Loads the complete raw artifacts from a Grok TUI session directory
     /// (~/.grok/sessions/<encoded-cwd>/<session-id>/*) for migration/import
-    /// into native Zed Grok threads with full fidelity (P4-14). Returns
+    /// into native Zed Grok threads with full fidelity (TUI session import). Returns
     /// prompt_context, events.jsonl lines, updates.jsonl lines, resources_state
     /// which encode the full history: plans, todo entries, subagents with
     /// personas, background monitors, turn state, memory, permissions etc.
     /// Native Thread can replay these to set turn_id (via TurnId serde), messages,
     /// plan etc preserving exact TUI state. Uses injectable read_to_string for
-    /// hermetic TDD (modeled on discover_grok_tui_sessions_with / G-11).
+    /// hermetic TDD (modeled on discover_grok_tui_sessions_with / hermetic injectable patterns).
     /// Errors only on invalid id; missing files yield partial artifacts.
     /// Callers (agent grok_persistence + thread import) gate on is_grok_build_profile.
     pub fn load_raw_artifacts(
@@ -2924,6 +3034,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn test_grok_build_default_agent_available_on_unix() {
+        assert!(grok_build_default_agent_available());
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn test_grok_build_default_agent_unavailable_on_windows() {
+        assert!(!grok_build_default_agent_available());
+    }
+
+    #[test]
     fn test_default_command_for_grok_linux_fallback() {
         // On Linux (and macOS) the function should always return a usable command.
         // The primary happy path (exact ~/.grok/bin/grok) is exercised manually
@@ -2946,7 +3068,7 @@ mod tests {
 
     #[test]
     fn test_has_discovered_grok_binary_is_cheap_and_accurate() {
-        // This test expresses the desired public API for cheap status queries (G-07 / G-01).
+        // This test expresses the desired public API for cheap status queries (cheap status query API / grok binary discovery cache).
         // After the first discovery, has_discovered_grok_binary() must be O(1)
         // and never cause filesystem work or allocations on the hot path.
         // This is critical for UI latency when deciding whether to show Grok options.
@@ -2967,10 +3089,10 @@ mod tests {
 
     #[test]
     fn test_grok_co_equal_indicator_matches_discovery_and_is_cheap() {
-        // TDD test for G-19: expresses that grok_co_equal_indicator_for_id (and store wrapper)
+        // TDD test for co-equal Grok command surface: expresses that grok_co_equal_indicator_for_id (and store wrapper)
         // provides the selector visibility signal ("Co-Equal") exactly when the cheap discovery
         // cache says the binary is present. Must be O(1) idempotent, no fs, per
-        // AGENTS.md Efficiency Auditor + CLAUDE "use full words". Mirrors has_discovered test.
+        // AGENTS.md performance guidelines + CLAUDE "use full words". Mirrors has_discovered test.
         let _ = default_command_for_grok(); // ensure cache populated (triggers discovery once)
         let before = has_discovered_grok_binary();
         let ind_for_grok = grok_co_equal_indicator_for_id(&AgentId::from("grok"));
@@ -2990,7 +3112,7 @@ mod tests {
 
     #[test]
     fn test_grok_discovery_caching_returns_same_value() {
-        // This test strengthens the caching contract (G-02).
+        // This test strengthens the caching contract (discovery caching).
         // After the first resolution, subsequent calls must return identical results
         // without re-performing HOME lookup or filesystem exists checks.
         // This is both a correctness and efficiency requirement.
@@ -3005,7 +3127,7 @@ mod tests {
 
     #[test]
     fn test_has_discovered_grok_binary_is_false_until_default_command_is_called() {
-        // TDD for the precise semantics of the cheap query API (G-07 / G-01) and not-found caching.
+        // TDD for the precise semantics of the cheap query API (cheap status query API / grok binary discovery cache) and not-found caching.
         // `has_discovered_grok_binary` uses `.get()` (non-initializing). It reports false
         // until default_command_for_grok has run (the not-found case is cached as false).
         // This transition (initialization) is critical for UI decisions.
@@ -3110,7 +3232,7 @@ mod tests {
         assert!(grok_command_is_concrete(&command));
     }
 
-    /// Exists solely so the real `todo!` macro (with full G-16 reason) is
+    /// Exists solely so the real `todo!` macro (with full session resume scaffold reason) is
     /// present in the source as required by AGENTS.md. Called only from
     /// future TDD that exercises the replay path; never on hot list paths.
     #[cfg(test)]
@@ -3118,11 +3240,11 @@ mod tests {
     fn __grok_tui_replay_todo_placeholder_for_discipline() {
         // The message is the binding contract text from the approved plan.
         todo!(
-            "Grok Build (G-16): full updates.jsonl + terminal log replay into AcpThread plan/monitors/subagents for offline historical import; gated behind explicit action + bg_spawn; see Efficiency Auditor risk register for parse cost + O(1) list invariant; TDD required before removal; Linux ~/.grok first, Windows %USERPROFILE% todo separate per G-09 rules"
+            "Grok Build (session resume scaffold): full updates.jsonl + terminal log replay into AcpThread plan/monitors/subagents for offline historical import; gated behind explicit action + bg_spawn; see performance guidelines risk register for parse cost + O(1) list invariant; TDD required before removal; Linux ~/.grok first, Windows %USERPROFILE% todo separate per Windows porting rules"
         );
     }
 
-    // TDD for G-16 session resume/roundtrip (per approved plan + Friction Map).
+    // TDD for session resume/roundtrip (per approved plan + friction map).
     // These tests express the desired cheap, injectable discovery API. They must
     // pass with the scaffold. Full jsonl parsing, AgentSessionInfo conversion, and
     // historical monitor/plan replay are behind real todo!() with reasons.
@@ -3186,7 +3308,7 @@ mod tests {
 
     #[test]
     fn test_grok_memory_artifacts_for_cwd_with_injects_and_detects() {
-        // G-17 TDD: hermetic RO test using injected closures (no real FS, no PD).
+        // Grok memory artifacts TDD: hermetic RO test using injected closures (no real FS, no PD).
         // Expresses desired behavior for memory bridging probe: detects presence + cheap preview.
         let cwd = Path::new("/home/test/project");
         let artifacts = grok_memory_artifacts_for_cwd_with(
@@ -3476,5 +3598,59 @@ mod tests {
         );
         assert_eq!(facts.len(), 1);
         assert!(facts[0].content.as_ref().unwrap().contains("full words"));
+    }
+
+    #[test]
+    fn test_import_grok_filesystem_into_palace_if_needed_is_idempotent() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let cwd = root.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::write(cwd.join("MEMORY.md"), "Imported workspace fact").expect("memory.md");
+        let mut store = memory_palace::MemoryPalaceStore {
+            global: memory_palace::MemoryPalace::open(&root.path().join("global_palace"))
+                .expect("global"),
+            project: memory_palace::MemoryPalace::open(&root.path().join("project_palace"))
+                .expect("project"),
+        };
+        let first = import_grok_filesystem_into_palace_if_needed(&cwd, &mut store).expect("import");
+        assert!(first >= 1, "expected at least workspace MEMORY.md import");
+        let second =
+            import_grok_filesystem_into_palace_if_needed(&cwd, &mut store).expect("reimport");
+        assert_eq!(second, 0, "import marker must block duplicate ingest");
+    }
+
+    #[test]
+    fn test_grok_memory_artifacts_from_palace_store_maps_records() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let cwd = root.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let mut project_palace =
+            memory_palace::MemoryPalace::open(&root.path().join("project_palace"))
+                .expect("project palace");
+        project_palace
+            .record_observation("native palace fact".into())
+            .expect("store");
+        let store = memory_palace::MemoryPalaceStore {
+            global: memory_palace::MemoryPalace::open(&root.path().join("empty_global"))
+                .expect("global"),
+            project: project_palace,
+        };
+        let artifacts = grok_memory_artifacts_from_palace_store(&cwd, &store).expect("from palace");
+        assert!(artifacts.has_workspace_memory);
+        assert!(
+            artifacts
+                .workspace_memory_full
+                .as_ref()
+                .expect("full")
+                .contains("native palace fact")
+        );
+        assert_eq!(artifacts.facts_from_db.len(), 1);
+        assert!(
+            artifacts.facts_from_db[0]
+                .content
+                .as_ref()
+                .expect("content")
+                .contains("native palace fact")
+        );
     }
 }
