@@ -1422,6 +1422,12 @@ pub fn grok_build_default_agent_available() -> bool {
     default_command_for_grok().is_some()
 }
 
+/// Surmount grok-first cold start skips upstream Zed cloud sign-in and background
+/// language-model provider authentication when the default Grok binary resolves.
+pub fn surmount_skips_upstream_auth_on_cold_start() -> bool {
+    grok_build_default_agent_available() && !cfg!(test)
+}
+
 /// Returns a short status for use in agent selector / toolbar when the id is "grok".
 /// "Co-Equal" when the binary was discovered (making ACP path peer to TUI for co-equal Grok command surface).
 /// Mirrors has_discovered_grok_binary exactly for the same O(1) cache contract (see
@@ -3031,6 +3037,13 @@ mod tests {
                 "agent-b tx should have been transferred"
             );
         });
+    }
+
+    #[test]
+    fn surmount_auth_skip_is_disabled_under_cfg_test() {
+        // Production cold start skips GitHub + ChatGPT auth when grok resolves, but the
+        // helper returns false under cfg(test) so GPUI tests keep exercising auth paths.
+        assert!(!surmount_skips_upstream_auth_on_cold_start());
     }
 
     #[test]

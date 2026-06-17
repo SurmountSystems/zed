@@ -872,7 +872,14 @@ fn main() {
 
         cx.spawn({
             let client = app_state.client.clone();
-            async move |cx| authenticate(client, cx).await
+            async move |cx| {
+                // Surmount grok-first cold start: skip Zed cloud GitHub sign-in.
+                // See SURMOUNT.md § Linux grok-first cold start.
+                if project::surmount_skips_upstream_auth_on_cold_start() {
+                    return Ok(());
+                }
+                authenticate(client, cx).await
+            }
         })
         .detach_and_log_err(cx);
 

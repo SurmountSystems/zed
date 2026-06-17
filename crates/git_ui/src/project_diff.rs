@@ -51,6 +51,7 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 use zed_actions::agent::ReviewBranchDiff;
+use zed_actions::surmount::StartMergeReview;
 use ztracing::instrument;
 
 actions!(
@@ -1843,6 +1844,13 @@ impl Render for BranchDiffToolbar {
         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
 
         let show_review_button = !is_multibuffer_empty && is_ai_enabled;
+        let is_surmount_workspace = repository.as_ref().is_some_and(|repo| {
+            repo.read(cx)
+                .snapshot()
+                .work_directory_abs_path
+                .join("SURMOUNT.md")
+                .is_file()
+        });
 
         h_group_xl()
             .my_neg_1()
@@ -1920,6 +1928,34 @@ impl Render for BranchDiffToolbar {
                         })
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.dispatch_action(&ReviewDiff, window, cx);
+                        })),
+                )
+            })
+            .when(is_surmount_workspace, |this| {
+                let focus_handle = focus_handle.clone();
+                this.child(Divider::vertical()).child(
+                    Button::new("surmount-merge-review", "Surmount Merge Review")
+                        .start_icon(
+                            Icon::new(IconName::GitMergeConflict)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .key_binding(KeyBinding::for_action_in(
+                            &StartMergeReview,
+                            &focus_handle,
+                            cx,
+                        ))
+                        .tooltip(move |_, cx| {
+                            Tooltip::with_meta_in(
+                                "Surmount Merge Review",
+                                Some(&StartMergeReview),
+                                "Open the categorized merge review queue for upstream sync.",
+                                &focus_handle,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.dispatch_action(&StartMergeReview, window, cx);
                         })),
                 )
             })

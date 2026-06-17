@@ -11686,24 +11686,32 @@ impl ThreadView {
     }
 }
 
+pub fn conversation_area_flex_grow(has_messages: bool, embedded_in_zed_todos_dock: bool) -> bool {
+    if has_messages {
+        return true;
+    }
+    let _ = embedded_in_zed_todos_dock;
+    false
+}
+
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let has_messages = self.list_state.item_count() > 0;
         let list_state = self.list_state.clone();
+        let conversation_flex_grow =
+            conversation_area_flex_grow(has_messages, self.embedded_in_zed_todos_dock);
 
         let conversation = v_flex()
             .when(self.resumed_without_history, |this| {
                 this.child(Self::render_resume_notice(cx))
             })
             .map(|this| {
-                if has_messages {
+                if conversation_flex_grow {
                     this.flex_1()
                         .size_full()
                         .child(self.render_entries(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
                         .into_any()
-                } else if self.embedded_in_zed_todos_dock {
-                    this.flex_1().min_h_0().into_any()
                 } else {
                     this.into_any()
                 }
@@ -11908,7 +11916,9 @@ impl Render for ThreadView {
                 }
             }))
             .size_full()
-            .when(self.embedded_in_zed_todos_dock, |this| this.flex_1().min_h_0())
+            .when(self.embedded_in_zed_todos_dock, |this| {
+                this.flex_1().min_h_0()
+            })
             .children(self.render_subagent_titlebar(cx))
             .child(conversation)
             .children(self.render_multi_root_callout(cx))
@@ -12250,10 +12260,9 @@ impl Render for ZedTodosDockPrototype {
                         .size_full()
                         .min_h_0()
                         .overflow_hidden()
+                        .bg(cx.theme().colors().panel_background)
                         .when_some(
-                            self.thread_view
-                                .as_ref()
-                                .and_then(|view| view.upgrade()),
+                            self.thread_view.as_ref().and_then(|view| view.upgrade()),
                             |this, thread_view| {
                                 this.child(
                                     div()
@@ -12386,6 +12395,16 @@ mod background_monitor_tdd {
             expanded_set.is_empty(),
             "default collapsed state ensures O(1) cost (no heavy content) during output bursts"
         );
+    }
+
+    #[test]
+    fn embedded_empty_conversation_does_not_claim_flex_grow() {
+        assert!(
+            !super::conversation_area_flex_grow(false, true),
+            "empty embedded thread must let message editor fill the dock right pane"
+        );
+        assert!(super::conversation_area_flex_grow(true, true));
+        assert!(!super::conversation_area_flex_grow(false, false));
     }
 
     #[test]

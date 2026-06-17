@@ -1,18 +1,22 @@
 //! Native Grok Contract Tests (TDD Foundation)
 //!
-//! This module provides production-grade test scaffolding and the first set of
-//! meaningful contract tests for the critical Native Grok implementation areas:
+//! Locks observable behavior for the [Native Grok Build completion charter](SURMOUNT.md#native-grok-build-completion-charter)
+//! (see also `PLAN.md`). Pillars covered here:
+//!
+//! 1. **Full native GPUI** — tool registration matches ACP capture harness (`contract_tool_calling_*`)
+//! 2. **Non-bridged first-class** — subagent spawn validation, persona fragments (`contract_subagent_*`)
+//! 3. **IDE diagnostics** — enforced via `GROK_BUILD_SYSTEM_FRAGMENTS` tests in `mod.rs`, not this file
+//! 4. **Completion notifications** — UI dispatch tested in `mod.rs` (`test_native_grok_profile_triggers_*`)
+//! 5. **Planning workspace** — plan mode state machine (`contract_plan_mode_*`); ZedTodos is the user-visible plan surface
+//! 6. **heed3 + rkyv** — persistence roundtrips live in `thread_metadata_store` / `memory_palace` tests
+//!
+//! Additional areas in this module:
 //!
 //! - Tool calling (registration, streaming lifecycle, permission decisions)
-//! - Plan mode state machine (enter_plan_mode → proposed Plan → approval → execution)
-//! - Subagent spawning (spawn_agent depth limits, capability_mode, session reuse)
 //! - Memory layer (GrokMemoryArtifacts RO bridging via injectable predicates)
 //! - SQLite session compatibility (GrokTuiSession discovery + is_valid_grok_tui_session_id)
 //!
-//! These tests are written to guide and lock the observable behavior required for
-//! co-equal bridging with the standalone Grok TUI (ACP roundtrip, ACP capture harness fidelity).
-//! They follow the existing patterns: injectable closures for hermetic FS/SQLite,
-//! GPUI TestAppContext for entity tests, and explicit error propagation.
+//! Patterns: injectable closures for hermetic FS/SQLite, GPUI `TestAppContext`, explicit error propagation.
 
 use super::*;
 use acp_thread::TurnId;
@@ -269,6 +273,8 @@ fn contract_tool_calling_all_grok_native_tools_are_registered() {
     ToolCallingContract::assert_tool_registered("monitor");
     ToolCallingContract::assert_tool_registered("todo_write");
     ToolCallingContract::assert_tool_registered("remember");
+    // Charter pillar 2: skills are first-class on the native path (not bridged-only).
+    ToolCallingContract::assert_tool_registered("skill");
 
     // Sanity: the registry is non-empty and does not contain accidental duplicates in the macro.
     let names = ToolCallingContract::registered_tool_names();

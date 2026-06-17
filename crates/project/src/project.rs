@@ -53,7 +53,7 @@ pub use agent_server_store::{
     grok_memory_artifacts_for_cwd_with, grok_memory_artifacts_from_palace_store,
     grok_worktree_entries_for_cwd_with, grok_worktrees_correlating_session_id,
     grok_worktrees_correlating_session_id_with, grok_worktrees_db, has_discovered_grok_binary,
-    import_grok_filesystem_into_palace_if_needed,
+    import_grok_filesystem_into_palace_if_needed, surmount_skips_upstream_auth_on_cold_start,
 };
 pub use git_store::{
     ConflictRegion, ConflictSet, ConflictSetSnapshot, ConflictSetUpdate,

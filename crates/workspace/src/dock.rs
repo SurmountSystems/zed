@@ -87,6 +87,9 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn is_agent_panel(&self) -> bool {
         false
     }
+    fn immersive_startup_in_progress(&self, _window: &Window, _cx: &App) -> bool {
+        false
+    }
     /// Returns metadata describing how to hide this panel's button from the
     /// status bar by writing to user settings. Implementors should return
     /// `None` if the panel button cannot be hidden through settings.
@@ -123,6 +126,7 @@ pub trait PanelHandle: Send + Sync {
     fn activation_priority(&self, cx: &App) -> u32;
     fn enabled(&self, cx: &App) -> bool;
     fn is_agent_panel(&self, cx: &App) -> bool;
+    fn immersive_startup_in_progress(&self, window: &Window, cx: &App) -> bool;
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem>;
     fn move_to_next_position(&self, window: &mut Window, cx: &mut App) {
         let current_position = self.position(window, cx);
@@ -251,6 +255,10 @@ where
 
     fn is_agent_panel(&self, cx: &App) -> bool {
         self.read(cx).is_agent_panel()
+    }
+
+    fn immersive_startup_in_progress(&self, window: &Window, cx: &App) -> bool {
+        self.read(cx).immersive_startup_in_progress(window, cx)
     }
 
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem> {
@@ -753,7 +761,16 @@ impl Dock {
         index
     }
 
+    pub fn any_panel_immersive_startup_in_progress(&self, window: &Window, cx: &App) -> bool {
+        self.panel_entries
+            .iter()
+            .any(|entry| entry.panel.immersive_startup_in_progress(window, cx))
+    }
+
     pub fn restore_state(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.any_panel_immersive_startup_in_progress(window, cx) {
+            return false;
+        }
         if let Some(serialized) = self.serialized_dock.clone() {
             if let Some(active_panel) = serialized.active_panel.filter(|_| serialized.visible)
                 && let Some(idx) = self.panel_index_for_persistent_name(active_panel.as_str(), cx)

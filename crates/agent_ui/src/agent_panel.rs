@@ -469,6 +469,7 @@ pub fn init(cx: &mut App) {
                 })
                 .register_action(|workspace, _: &OpenFullGrokSurface, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                        workspace.open_panel::<AgentPanel>(window, cx);
                         workspace.focus_panel::<AgentPanel>(window, cx);
                         panel.update(cx, |panel, cx| {
                             // For the explicit "full grok surface" request (button, palette entry "agent: open full grok surface",
@@ -485,6 +486,7 @@ pub fn init(cx: &mut App) {
                                 panel.new_external_agent_thread(&external, window, cx);
                             }
                             panel.mark_grok_categorized_surface_pending(cx);
+                            panel.schedule_grok_immersive_startup_bootstrap(window, cx);
                             panel.ensure_grok_categorized_surface(window, cx);
                         });
                     }
@@ -644,12 +646,31 @@ pub fn init(cx: &mut App) {
                     };
                     let diff_uri = mention_uri.to_uri().to_string();
 
-                    let content_blocks = vec![
-                        acp::ContentBlock::Text(acp::TextContent::new(
+                    let prompt = workspace
+                        .project()
+                        .read(cx)
+                        .active_repository(cx)
+                        .map(|repo| {
+                            let root = &repo.read(cx).snapshot().work_directory_abs_path;
+                            if crate::merge_review::is_surmount_workspace(root.as_ref()) {
+                                crate::merge_review::surmount_merge_review_prompt(
+                                    action.base_ref.as_ref(),
+                                    None,
+                                )
+                            } else {
+                                "Please review this branch diff carefully. Point out any issues, \
+                                 potential bugs, or improvement opportunities you find."
+                                    .to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| {
                             "Please review this branch diff carefully. Point out any issues, \
-                             potential bugs, or improvement opportunities you find.\n\n"
-                                .to_string(),
-                        )),
+                             potential bugs, or improvement opportunities you find."
+                                .to_string()
+                        });
+
+                    let content_blocks = vec![
+                        acp::ContentBlock::Text(acp::TextContent::new(prompt)),
                         acp::ContentBlock::Resource(acp::EmbeddedResource::new(
                             acp::EmbeddedResourceResource::TextResourceContents(
                                 acp::TextResourceContents::new(
@@ -685,7 +706,23 @@ pub fn init(cx: &mut App) {
                             return;
                         };
 
-                        let content_blocks = build_conflict_resolution_prompt(&action.conflicts);
+                        let mut content_blocks =
+                            build_conflict_resolution_prompt(&action.conflicts);
+                        if let Some(repo) = workspace.project().read(cx).active_repository(cx) {
+                            let root = &repo.read(cx).snapshot().work_directory_abs_path;
+                            if crate::merge_review::is_surmount_workspace(root.as_ref()) {
+                                content_blocks.insert(
+                                    0,
+                                    acp::ContentBlock::Text(acp::TextContent::new(format!(
+                                        "{}\n\n",
+                                        crate::merge_review::surmount_merge_review_prompt(
+                                            "main",
+                                            None,
+                                        )
+                                    ))),
+                                );
+                            }
+                        }
 
                         workspace.focus_panel::<AgentPanel>(window, cx);
 
@@ -1254,11 +1291,33 @@ pub struct AgentPanel {
     /// Retries while Grok Build startup has not reached active+zoomed+surface.
     grok_immersive_reveal_attempts: u8,
 
+    /// Retries while immersive startup completion is still pending.
+    grok_immersive_completion_attempts: u8,
+
     /// Logs the one-shot immersive startup success line.
     grok_immersive_startup_logged: bool,
 
     /// Prevents stacking multiple immersive-reveal defer callbacks.
     grok_immersive_defer_scheduled: bool,
+
+    /// Prevents stacking deferred workspace-zoom sync while workspace is updating.
+    grok_immersive_zoom_defer_scheduled: bool,
+
+    /// One-shot bootstrap: open the dock, then apply workspace zoom on startup.
+    grok_immersive_startup_bootstrap_scheduled: bool,
+
+    /// Records defer callback order in unit tests (1=open_panel, 2=apply_zoom).
+    #[cfg(test)]
+    grok_immersive_defer_sequence: Vec<u8>,
+
+    /// Prevents duplicate ZoomIn emissions in the same startup burst.
+    grok_immersive_zoom_apply_in_flight: bool,
+
+    /// Tracks whether the workspace fullscreen zoom overlay is active for this panel.
+    grok_workspace_zoom_overlay_synced: bool,
+
+    /// Monotonic start of the current grok immersive cold-start launch (for phase timing).
+    grok_immersive_launch_started_at: Option<std::time::Instant>,
 
     /// When true, the panel is in the early-creation "loading" state (showing
     /// indeterminate SpinnerLabel UI) while the persisted categorized agent surface
@@ -1271,6 +1330,7 @@ pub struct AgentPanel {
 pub(crate) struct GrokImmersiveDiagnostics {
     pub(crate) is_active: bool,
     pub(crate) zoomed: bool,
+    pub(crate) workspace_zoomed: bool,
     pub(crate) has_zed_todos_surface: bool,
     pub(crate) has_thread_view: bool,
     pub(crate) dock_has_thread_view: bool,
@@ -1279,25 +1339,43 @@ pub(crate) struct GrokImmersiveDiagnostics {
     pub(crate) defer_scheduled: bool,
     pub(crate) reveal_scheduled: bool,
     pub(crate) reveal_attempts: u8,
+    pub(crate) completion_attempts: u8,
+    pub(crate) agent_dock_open: bool,
+    pub(crate) visually_ready: bool,
     pub(crate) categorized_pending: bool,
+    pub(crate) startup_in_progress: bool,
+    pub(crate) bootstrap_scheduled: bool,
+    pub(crate) zoom_defer_scheduled: bool,
+    pub(crate) zoom_apply_in_flight: bool,
+    pub(crate) shows_startup_splash: bool,
+    pub(crate) launch_elapsed_ms: Option<u64>,
 }
 
 impl std::fmt::Display for GrokImmersiveDiagnostics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "active={} zoomed={} surface={} thread_view={} dock_thread_view={} ready={} logged={} defer={} reveal_scheduled={} attempts={} pending={}",
+            "active={} zoomed={} workspace_zoomed={} surface={} thread_view={} dock_thread_view={} dock_open={} ready={} visual_ready={} logged={} defer={} reveal_scheduled={} reveal_attempts={} completion_attempts={} pending={} startup_in_progress={} bootstrap_scheduled={} zoom_defer_scheduled={} zoom_apply_in_flight={} shows_startup_splash={}",
             self.is_active,
             self.zoomed,
+            self.workspace_zoomed,
             self.has_zed_todos_surface,
             self.has_thread_view,
             self.dock_has_thread_view,
+            self.agent_dock_open,
             self.immersive_ready,
+            self.visually_ready,
             self.startup_logged,
             self.defer_scheduled,
             self.reveal_scheduled,
             self.reveal_attempts,
+            self.completion_attempts,
             self.categorized_pending,
+            self.startup_in_progress,
+            self.bootstrap_scheduled,
+            self.zoom_defer_scheduled,
+            self.zoom_apply_in_flight,
+            self.shows_startup_splash,
         )
     }
 }
@@ -1765,8 +1843,16 @@ impl AgentPanel {
             grok_categorized_surface_pending: false,
             grok_panel_reveal_scheduled: false,
             grok_immersive_reveal_attempts: 0,
+            grok_immersive_completion_attempts: 0,
             grok_immersive_startup_logged: false,
             grok_immersive_defer_scheduled: false,
+            grok_immersive_zoom_defer_scheduled: false,
+            grok_immersive_startup_bootstrap_scheduled: false,
+            grok_immersive_zoom_apply_in_flight: false,
+            grok_workspace_zoom_overlay_synced: false,
+            grok_immersive_launch_started_at: None,
+            #[cfg(test)]
+            grok_immersive_defer_sequence: Vec::new(),
             zed_todos_persisted_state: None,
             initial_state_loading: false,
         };
@@ -3991,6 +4077,15 @@ impl AgentPanel {
             matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
         );
         if matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))) {
+            // Immersive startup may call open twice (deferred ensure + explicit open).
+            // Idempotent refresh — do not toggle-close while loading or startup in progress.
+            if self.is_grok_build_context(cx)
+                && (self.initial_state_loading || self.grok_immersive_startup_in_progress())
+            {
+                self.initial_state_loading = false;
+                self.sync_zed_todos_thread_view(cx);
+                return;
+            }
             self.clear_overlay(true, window, cx, true);
             self.serialize(cx);
             return;
@@ -4013,9 +4108,8 @@ impl AgentPanel {
                 cx.notify();
             });
         }
-        let zed_todos_dock_prototype = cx.new(|cx| {
-            ZedTodosDockPrototype::new_for_thread(active_acp_thread, thread_view, cx)
-        });
+        let zed_todos_dock_prototype =
+            cx.new(|cx| ZedTodosDockPrototype::new_for_thread(active_acp_thread, thread_view, cx));
         zed_todos_dock_prototype.update(cx, |prototype, _cx| {
             prototype.prepare_for_full_agent_mode();
             // Restore user's preferred expanded sections from persisted state so the view
@@ -4042,18 +4136,29 @@ impl AgentPanel {
             has_thread_view,
             self.grok_immersive_diagnostics(cx)
         );
+        self.initial_state_loading = false;
         if !self.is_grok_build_context(cx) {
-            self.initial_state_loading = false;
             self.grok_categorized_surface_pending = false;
         }
         self.sync_zed_todos_thread_view(cx);
         if self.is_grok_build_context(cx) {
             self.grok_immersive_reveal_attempts = 0;
-            if !self.zoomed {
-                self.toggle_zoom(&ToggleZoom, window, cx);
+            self.grok_immersive_completion_attempts = 0;
+            if !self.grok_workspace_zoom_overlay_synced {
+                self.defer_grok_immersive_zoom(window, cx);
             }
-            self.log_grok_immersive_debug("open_zed_todos_surface: scheduling immersive reveal", cx);
-            self.schedule_grok_immersive_reveal_until_ready(window, cx);
+            self.log_grok_immersive_debug(
+                "open_zed_todos_surface: scheduling immersive reveal",
+                cx,
+            );
+            if self.grok_immersive_startup_in_progress()
+                && !self.grok_startup_immersive_visually_ready(cx)
+            {
+                self.schedule_grok_immersive_reveal_until_ready(window, cx);
+            } else if !self.is_active && !self.grok_panel_reveal_scheduled {
+                self.schedule_reveal_agent_panel_in_workspace(window, cx);
+            }
+            self.schedule_grok_immersive_startup_completion(window, cx);
             self.log_grok_immersive_startup_once(cx);
             if let Some(thread_view) = self.active_thread_view(cx) {
                 thread_view.focus_handle(cx).focus(window, cx);
@@ -4782,6 +4887,30 @@ impl AgentPanel {
         false
     }
 
+    fn conversation_is_grok_build(cv: &ConversationView, cx: &App) -> bool {
+        if matches!(
+            cv.agent_key(),
+            Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native"
+        ) {
+            return true;
+        }
+        if let Some(acp) = cv.root_thread(cx) {
+            let acp_read = acp.read(cx);
+            if let Some(native_conn) = acp_read
+                .connection()
+                .clone()
+                .downcast::<agent::NativeAgentConnection>()
+            {
+                if let Some(native_thread) = native_conn.thread(&acp_read.session_id(), cx) {
+                    if native_thread.read(cx).is_grok_build_profile(cx) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn will_be_grok_build_context(&self, new_view: &BaseView, cx: &mut Context<Self>) -> bool {
         if matches!(&self.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native")
         {
@@ -4815,7 +4944,7 @@ impl AgentPanel {
     /// left categorized experience stick for Grok on first open and thread activation.
     fn should_ensure_grok_categorized_surface(&self, cx: &mut Context<Self>) -> bool {
         if !self.is_grok_build_context(cx)
-            || !(self.is_active || self.grok_categorized_surface_pending)
+            || !self.is_active
             || matches!(self.base_view, BaseView::Terminal { .. })
             || matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
         {
@@ -4823,29 +4952,174 @@ impl AgentPanel {
         }
         match &self.base_view {
             BaseView::Uninitialized => self.has_open_project(cx),
-            BaseView::AgentThread { .. } => self.active_agent_thread(cx).is_some(),
+            BaseView::AgentThread { .. } => {
+                if self.active_view_is_new_draft(cx) {
+                    return self.is_active && self.grok_immersive_startup_in_progress();
+                }
+                self.active_agent_thread(cx).is_some()
+            }
             BaseView::Terminal { .. } => false,
         }
     }
 
-    fn mark_grok_categorized_surface_pending(&mut self, cx: &mut Context<Self>) {
-        if self.is_grok_build_context(cx)
-            && !matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
-        {
-            self.grok_categorized_surface_pending = true;
+    fn mark_grok_categorized_surface_pending(&mut self, _cx: &mut Context<Self>) {
+        if matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))) {
+            return;
         }
+        if self.grok_immersive_launch_started_at.is_none() {
+            self.grok_immersive_launch_started_at = Some(std::time::Instant::now());
+            log::info!("grok immersive launch phase: surface_pending");
+        }
+        self.grok_categorized_surface_pending = true;
+    }
+
+    fn grok_immersive_startup_in_progress(&self) -> bool {
+        self.grok_categorized_surface_pending && !self.grok_immersive_startup_logged
+    }
+
+    fn agent_dock_is_open(&self, cx: &App) -> bool {
+        self.workspace.upgrade().is_some_and(|workspace| {
+            workspace
+                .read(cx)
+                .dock_at_position(agent_panel_dock_position(cx))
+                .read(cx)
+                .is_open()
+        })
+    }
+
+    fn grok_startup_splash_visible(&self, immersive_ready: bool, is_grok: bool, cx: &App) -> bool {
+        if self.grok_immersive_startup_logged
+            || matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
+        {
+            return false;
+        }
+        if self.is_active {
+            return self.grok_immersive_awaiting_categorized_surface(cx);
+        }
+        self.grok_categorized_surface_pending || (is_grok && !immersive_ready)
     }
 
     fn should_show_grok_startup_splash(&self, cx: &mut Context<Self>) -> bool {
-        self.is_grok_build_context(cx)
-            && !self.grok_immersive_startup_logged
-            && !self.grok_startup_immersive_ready()
+        self.grok_startup_splash_visible(
+            self.grok_startup_immersive_ready(cx),
+            self.is_grok_build_context(cx),
+            cx,
+        )
     }
 
-    fn grok_startup_immersive_ready(&self) -> bool {
+    pub fn ensure_grok_immersive_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.defer_grok_immersive_zoom(window, cx);
+    }
+
+    fn schedule_grok_immersive_startup_bootstrap(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.grok_immersive_startup_bootstrap_scheduled || self.grok_immersive_startup_logged {
+            return;
+        }
+        self.grok_immersive_startup_bootstrap_scheduled = true;
+        let workspace = self.workspace.clone();
+        let panel = cx.entity().downgrade();
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_panel::<Self>(window, cx);
+                workspace.focus_panel::<Self>(window, cx);
+            });
+            let Some(panel) = panel.upgrade() else {
+                return;
+            };
+            panel.update(cx, |panel, _cx| {
+                #[cfg(test)]
+                panel.record_grok_immersive_defer_step(Self::GROK_IMMERSIVE_DEFER_OPEN_PANEL);
+                panel.grok_immersive_startup_bootstrap_scheduled = false;
+            });
+            panel.update(cx, |panel, cx| {
+                if !panel.grok_workspace_zoom_overlay_synced {
+                    #[cfg(test)]
+                    panel.record_grok_immersive_defer_step(Self::GROK_IMMERSIVE_DEFER_APPLY_ZOOM);
+                    panel.apply_grok_immersive_workspace_zoom(window, cx);
+                }
+            });
+        });
+    }
+
+    fn defer_grok_immersive_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_grok_build_context(cx) && !self.grok_categorized_surface_pending {
+            self.log_grok_immersive_debug(
+                "ensure_grok_immersive_zoom: skipped (not grok startup)",
+                cx,
+            );
+            return;
+        }
+        if self.zoomed && self.grok_workspace_zoom_overlay_synced {
+            return;
+        }
+        if self.grok_immersive_zoom_defer_scheduled {
+            return;
+        }
+        self.grok_immersive_zoom_defer_scheduled = true;
+        let panel = cx.entity().downgrade();
+        window.defer(cx, move |window, cx| {
+            let Some(panel) = panel.upgrade() else {
+                return;
+            };
+            panel.update(cx, |panel, cx| {
+                panel.grok_immersive_zoom_defer_scheduled = false;
+                panel.apply_grok_immersive_workspace_zoom(window, cx);
+            });
+        });
+    }
+
+    fn apply_grok_immersive_workspace_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.grok_immersive_zoom_apply_in_flight {
+            return;
+        }
+        if self.zoomed && self.grok_workspace_zoom_overlay_synced {
+            return;
+        }
+        self.grok_immersive_zoom_apply_in_flight = true;
+        if !self.focus_handle(cx).contains_focused(window, cx) {
+            cx.focus_self(window);
+        }
+        cx.emit(PanelEvent::ZoomIn);
+        let panel = cx.entity().downgrade();
+        window.defer(cx, move |_window, cx| {
+            let Some(panel) = panel.upgrade() else {
+                return;
+            };
+            panel.update(cx, |panel, _cx| {
+                panel.grok_immersive_zoom_apply_in_flight = false;
+                if panel.zoomed {
+                    panel.grok_workspace_zoom_overlay_synced = true;
+                }
+            });
+        });
+        log::info!(
+            "ensure_grok_immersive_zoom: applied workspace zoom ({})",
+            self.grok_immersive_diagnostics(cx)
+        );
+    }
+
+    fn grok_startup_immersive_ready(&self, _cx: &App) -> bool {
         self.is_active
             && self.zoomed
+            && self.grok_workspace_zoom_overlay_synced
             && matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
+    }
+
+    fn grok_startup_immersive_visually_ready(&self, cx: &App) -> bool {
+        self.grok_startup_immersive_ready(cx) && self.agent_dock_is_open(cx)
+    }
+
+    fn grok_immersive_awaiting_categorized_surface(&self, cx: &App) -> bool {
+        self.grok_immersive_startup_in_progress()
+            && !matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
+            && self.active_agent_thread(cx).is_none()
     }
 
     fn grok_immersive_diagnostics(&self, cx: &App) -> GrokImmersiveDiagnostics {
@@ -4868,12 +5142,31 @@ impl AgentPanel {
             ),
             has_thread_view: self.active_thread_view(cx).is_some(),
             dock_has_thread_view,
-            immersive_ready: self.grok_startup_immersive_ready(),
+            workspace_zoomed: self.grok_workspace_zoom_overlay_synced,
+            immersive_ready: self.grok_startup_immersive_ready(cx),
+            visually_ready: self.grok_startup_immersive_visually_ready(cx),
+            agent_dock_open: self.agent_dock_is_open(cx),
             startup_logged: self.grok_immersive_startup_logged,
             defer_scheduled: self.grok_immersive_defer_scheduled,
             reveal_scheduled: self.grok_panel_reveal_scheduled,
             reveal_attempts: self.grok_immersive_reveal_attempts,
+            completion_attempts: self.grok_immersive_completion_attempts,
             categorized_pending: self.grok_categorized_surface_pending,
+            startup_in_progress: self.grok_immersive_startup_in_progress(),
+            bootstrap_scheduled: self.grok_immersive_startup_bootstrap_scheduled,
+            zoom_defer_scheduled: self.grok_immersive_zoom_defer_scheduled,
+            zoom_apply_in_flight: self.grok_immersive_zoom_apply_in_flight,
+            shows_startup_splash: self.grok_startup_splash_visible(
+                self.grok_startup_immersive_ready(cx),
+                matches!(
+                    &self.selected_agent,
+                    Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native"
+                ),
+                cx,
+            ),
+            launch_elapsed_ms: self.grok_immersive_launch_started_at.map(|started_at| {
+                started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+            }),
         }
     }
 
@@ -4883,10 +5176,13 @@ impl AgentPanel {
 
     fn log_grok_immersive_startup_once(&mut self, cx: &mut Context<Self>) {
         if self.grok_immersive_startup_logged {
-            self.log_grok_immersive_debug("grok immersive startup log skipped (already logged)", cx);
+            self.log_grok_immersive_debug(
+                "grok immersive startup log skipped (already logged)",
+                cx,
+            );
             return;
         }
-        if !self.grok_startup_immersive_ready() {
+        if !self.grok_startup_immersive_visually_ready(cx) {
             self.log_grok_immersive_debug("grok immersive startup log skipped (not ready)", cx);
             return;
         }
@@ -4894,9 +5190,10 @@ impl AgentPanel {
         self.grok_categorized_surface_pending = false;
         self.initial_state_loading = false;
         self.grok_immersive_defer_scheduled = false;
+        let diagnostics = self.grok_immersive_diagnostics(cx);
         log::info!(
-            "grok immersive startup complete: agent panel dock revealed and zoomed ({})",
-            self.grok_immersive_diagnostics(cx)
+            "grok immersive startup complete: agent panel dock revealed and zoomed (elapsed_ms={:?}, {diagnostics})",
+            diagnostics.launch_elapsed_ms,
         );
         cx.notify();
     }
@@ -4937,35 +5234,43 @@ impl AgentPanel {
 
     pub(crate) const GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS: u8 = 48;
 
-    fn schedule_grok_immersive_reveal_until_ready(
+    #[cfg(test)]
+    pub(crate) const GROK_IMMERSIVE_DEFER_OPEN_PANEL: u8 = 1;
+
+    #[cfg(test)]
+    pub(crate) const GROK_IMMERSIVE_DEFER_APPLY_ZOOM: u8 = 2;
+
+    #[cfg(test)]
+    fn record_grok_immersive_defer_step(&mut self, step: u8) {
+        self.grok_immersive_defer_sequence.push(step);
+    }
+
+    fn schedule_grok_immersive_startup_completion(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.grok_startup_immersive_ready() {
+        if self.grok_startup_immersive_visually_ready(cx) {
             self.log_grok_immersive_startup_once(cx);
             return;
         }
-        if self.grok_immersive_startup_logged {
+        if self.grok_immersive_startup_logged || self.grok_immersive_defer_scheduled {
             return;
         }
-        self.log_grok_immersive_debug("schedule_grok_immersive_reveal_until_ready", cx);
-        if self.grok_immersive_reveal_attempts >= Self::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS {
+        if self.grok_immersive_awaiting_categorized_surface(cx) {
+            return;
+        }
+        if self.grok_immersive_completion_attempts >= Self::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS {
             log::warn!(
-                "grok immersive reveal stopped after {} attempts (active={}, zoomed={})",
+                "grok immersive startup completion stopped after {} attempts (active={}, zoomed={}, surface={})",
                 Self::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
                 self.is_active,
-                self.zoomed
+                self.zoomed,
+                matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
             );
             return;
         }
-        if !self.grok_panel_reveal_scheduled {
-            self.grok_immersive_reveal_attempts += 1;
-            self.schedule_reveal_agent_panel_in_workspace(window, cx);
-        }
-        if self.grok_immersive_defer_scheduled {
-            return;
-        }
+        self.grok_immersive_completion_attempts += 1;
         self.grok_immersive_defer_scheduled = true;
         let panel = cx.entity().downgrade();
         window.defer(cx, move |window, cx| {
@@ -4974,13 +5279,52 @@ impl AgentPanel {
             };
             panel.update(cx, |panel, cx| {
                 panel.grok_immersive_defer_scheduled = false;
-                if panel.grok_startup_immersive_ready() {
+                if panel.grok_startup_immersive_visually_ready(cx) {
                     panel.log_grok_immersive_startup_once(cx);
                 } else if !panel.grok_immersive_startup_logged {
-                    panel.schedule_grok_immersive_reveal_until_ready(window, cx);
+                    panel.schedule_grok_immersive_startup_completion(window, cx);
                 }
             });
         });
+    }
+
+    fn schedule_grok_immersive_reveal_until_ready(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.grok_startup_immersive_visually_ready(cx) {
+            self.log_grok_immersive_startup_once(cx);
+            return;
+        }
+        if self.grok_immersive_startup_logged {
+            return;
+        }
+        self.log_grok_immersive_debug("schedule_grok_immersive_reveal_until_ready", cx);
+        let awaiting_surface = self.grok_immersive_awaiting_categorized_surface(cx);
+        if !awaiting_surface
+            && self.grok_immersive_reveal_attempts >= Self::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS
+        {
+            log::warn!(
+                "grok immersive reveal stopped after {} attempts (active={}, zoomed={})",
+                Self::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
+                self.is_active,
+                self.zoomed
+            );
+            return;
+        }
+        let needs_reveal = !self.is_active
+            || !self.agent_dock_is_open(cx)
+            || (!self.zoomed && !self.grok_workspace_zoom_overlay_synced);
+        if needs_reveal && !self.grok_panel_reveal_scheduled {
+            if !awaiting_surface {
+                self.grok_immersive_reveal_attempts += 1;
+            }
+            self.schedule_reveal_agent_panel_in_workspace(window, cx);
+        } else if !self.zoomed && !self.grok_workspace_zoom_overlay_synced {
+            self.defer_grok_immersive_zoom(window, cx);
+        }
+        self.schedule_grok_immersive_startup_completion(window, cx);
     }
 
     fn schedule_reveal_agent_panel_in_workspace(
@@ -4988,10 +5332,10 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.grok_startup_immersive_ready()
-            || self.grok_immersive_startup_logged
-            || self.grok_panel_reveal_scheduled
-        {
+        if self.grok_immersive_startup_logged || self.grok_panel_reveal_scheduled {
+            return;
+        }
+        if self.grok_startup_immersive_visually_ready(cx) {
             return;
         }
         self.grok_panel_reveal_scheduled = true;
@@ -5000,25 +5344,35 @@ impl AgentPanel {
         window.defer(cx, move |window, cx| {
             let revealed = if let Some(workspace) = workspace.upgrade() {
                 workspace.update(cx, |workspace, cx| {
-                    workspace.reveal_panel::<Self>(window, cx);
-                    if let Some(panel) = workspace.panel::<Self>(cx) {
-                        panel.update(cx, |panel, cx| {
-                            if !panel.zoomed {
-                                panel.toggle_zoom(&ToggleZoom, window, cx);
-                            }
-                        });
-                    }
+                    // open_panel avoids reveal_panel's dismiss_zoomed_items_to_reveal,
+                    // which clears workspace zoom and fights immersive startup.
+                    workspace.open_panel::<Self>(window, cx);
                     workspace.focus_panel::<Self>(window, cx);
                 });
                 true
             } else {
                 false
             };
+            if revealed {
+                if let Some(panel) = panel.upgrade() {
+                    #[cfg(test)]
+                    panel.update(cx, |panel, _cx| {
+                        panel.record_grok_immersive_defer_step(Self::GROK_IMMERSIVE_DEFER_OPEN_PANEL);
+                    });
+                    panel.update(cx, |panel, cx| {
+                        if !panel.grok_workspace_zoom_overlay_synced {
+                            #[cfg(test)]
+                            panel.record_grok_immersive_defer_step(Self::GROK_IMMERSIVE_DEFER_APPLY_ZOOM);
+                            panel.apply_grok_immersive_workspace_zoom(window, cx);
+                        }
+                    });
+                }
+            }
             if let Some(panel) = panel.upgrade() {
                 panel.update(cx, |panel, cx| {
                     panel.grok_panel_reveal_scheduled = false;
                     if revealed {
-                        if panel.grok_startup_immersive_ready() {
+                        if panel.grok_startup_immersive_ready(cx) {
                             panel.log_grok_immersive_startup_once(cx);
                         } else {
                             log::debug!(
@@ -5048,6 +5402,10 @@ impl AgentPanel {
         if !is_grok {
             return;
         }
+        if self.grok_immersive_launch_started_at.is_none() {
+            self.grok_immersive_launch_started_at = Some(std::time::Instant::now());
+            log::info!("grok immersive launch phase: ensure_surface");
+        }
         if matches!(self.base_view, BaseView::Terminal { .. }) {
             return;
         }
@@ -5070,8 +5428,8 @@ impl AgentPanel {
         dock.update(cx, |prototype, _cx| {
             prototype.prepare_for_full_agent_mode();
         });
-        if !self.zoomed {
-            self.toggle_zoom(&ToggleZoom, window, cx);
+        if !self.grok_workspace_zoom_overlay_synced {
+            self.defer_grok_immersive_zoom(window, cx);
         }
         self.sync_zed_todos_thread_view(cx);
         self.log_grok_immersive_startup_once(cx);
@@ -5445,11 +5803,6 @@ impl AgentPanel {
                 } else {
                     cx.emit(AgentPanelEvent::EntryChanged);
                 }
-                if this.should_ensure_grok_categorized_surface(cx)
-                    && server_view.read(cx).root_thread(cx).is_some()
-                {
-                    this.ensure_grok_categorized_surface(window, cx);
-                }
                 cx.notify();
             },
         )
@@ -5487,9 +5840,14 @@ impl AgentPanel {
                 if view.read(cx).root_thread(cx).is_none() {
                     return;
                 }
-                if this.is_grok_build_context(cx)
+                if (this.is_active || this.grok_categorized_surface_pending)
+                    && (this.is_grok_build_context(cx)
+                        || Self::conversation_is_grok_build(view.read(cx), cx))
                     && !matches!(this.base_view, BaseView::Terminal { .. })
                 {
+                    if this.active_view_is_new_draft(cx) {
+                        return;
+                    }
                     if matches!(this.overlay_view, Some(OverlayView::ZedTodosSurface(_))) {
                         this.sync_zed_todos_thread_view(cx);
                     } else {
@@ -5499,6 +5857,8 @@ impl AgentPanel {
                             this.grok_categorized_surface_pending
                         );
                         this.grok_categorized_surface_pending = true;
+                        this.grok_immersive_completion_attempts = 0;
+                        this.grok_immersive_reveal_attempts = 0;
                         this.ensure_grok_categorized_surface(window, cx);
                     }
                 }
@@ -5924,6 +6284,18 @@ impl Panel for AgentPanel {
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         log::debug!("AgentPanel set_active called: active={}", active);
+        if !active && self.grok_immersive_startup_in_progress() {
+            let panel = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                let Some(panel) = panel.upgrade() else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| {
+                    panel.schedule_grok_immersive_reveal_until_ready(window, cx);
+                });
+            });
+            return;
+        }
         self.is_active = active;
         if active {
             let was_grok = matches!(&self.selected_agent, Agent::Custom { id } if id.0.as_ref() == "grok" || id.0.as_ref() == "grok-native");
@@ -5931,20 +6303,28 @@ impl Panel for AgentPanel {
                 "AgentPanel set_active: was_grok={} based on selected_agent",
                 was_grok
             );
-            self.mark_grok_categorized_surface_pending(cx);
+            if was_grok && !self.grok_immersive_startup_logged {
+                self.mark_grok_categorized_surface_pending(cx);
+            }
             self.ensure_thread_initialized(window, cx);
             if was_grok {
+                if self.grok_immersive_startup_logged {
+                    self.defer_grok_immersive_zoom(window, cx);
+                }
                 if matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))) {
-                    if !self.grok_startup_immersive_ready() {
-                        self.schedule_grok_immersive_reveal_until_ready(window, cx);
+                    if !self.grok_startup_immersive_ready(cx) {
+                        self.schedule_grok_immersive_startup_completion(window, cx);
                     }
-                } else {
+                } else if self.grok_immersive_startup_in_progress() {
                     self.ensure_grok_categorized_surface(window, cx);
                 }
+            } else if self.grok_categorized_surface_pending && self.grok_immersive_startup_logged {
+                self.defer_grok_immersive_zoom(window, cx);
             }
+            cx.emit(AgentPanelEvent::ActiveViewFocused);
         } else if matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
             && self.is_grok_build_context(cx)
-            && !self.grok_startup_immersive_ready()
+            && !self.grok_startup_immersive_ready(cx)
         {
             self.grok_immersive_reveal_attempts = 0;
             self.schedule_grok_immersive_reveal_until_ready(window, cx);
@@ -5979,6 +6359,10 @@ impl Panel for AgentPanel {
         true
     }
 
+    fn immersive_startup_in_progress(&self, _window: &Window, _cx: &App) -> bool {
+        self.grok_immersive_startup_in_progress()
+    }
+
     fn hide_button_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
         Some(workspace::HideStatusItem::new(|settings| {
             settings.agent.get_or_insert_default().button = Some(false);
@@ -5989,8 +6373,29 @@ impl Panel for AgentPanel {
         self.zoomed
     }
 
-    fn set_zoomed(&mut self, zoomed: bool, _window: &mut Window, cx: &mut Context<Self>) {
+    fn set_zoomed(&mut self, zoomed: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !zoomed && self.grok_immersive_startup_in_progress() {
+            let panel = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                let Some(panel) = panel.upgrade() else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| {
+                    panel.schedule_grok_immersive_reveal_until_ready(window, cx);
+                });
+            });
+            return;
+        }
         self.zoomed = zoomed;
+        if zoomed
+            && (self.grok_categorized_surface_pending
+                || self.is_grok_build_context(cx)
+                || matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))))
+        {
+            self.grok_workspace_zoom_overlay_synced = true;
+        } else if !zoomed {
+            self.grok_workspace_zoom_overlay_synced = false;
+        }
         cx.notify();
     }
 }
@@ -7668,7 +8073,29 @@ impl AgentPanel {
             window,
             cx,
         );
+        let conversation_view = thread.conversation_view.clone();
         self.set_base_view(thread.into(), true, window, cx);
+        if !self.grok_immersive_startup_logged
+            && !self.active_view_is_new_draft(cx)
+            && Self::conversation_is_grok_build(conversation_view.read(cx), cx)
+        {
+            self.mark_grok_categorized_surface_pending(cx);
+            let panel = cx.entity().downgrade();
+            window.defer(cx, move |window, cx| {
+                let Some(panel) = panel.upgrade() else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| {
+                    if !panel.grok_immersive_startup_logged
+                        && !panel.active_view_is_new_draft(cx)
+                        && Self::conversation_is_grok_build(conversation_view.read(cx), cx)
+                        && panel.active_agent_thread(cx).is_some()
+                    {
+                        panel.ensure_grok_categorized_surface(window, cx);
+                    }
+                });
+            });
+        }
     }
 
     /// Opens a restored external thread with an arbitrary AgentServer and
@@ -7720,8 +8147,57 @@ impl AgentPanel {
     }
 
     #[cfg(test)]
-    pub(crate) fn grok_immersive_diagnostics_for_tests(&self, cx: &App) -> GrokImmersiveDiagnostics {
+    pub(crate) fn grok_immersive_diagnostics_for_tests(
+        &self,
+        cx: &App,
+    ) -> GrokImmersiveDiagnostics {
         self.grok_immersive_diagnostics(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schedule_grok_immersive_startup_bootstrap_for_tests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.schedule_grok_immersive_startup_bootstrap(window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_grok_immersive_workspace_zoom_for_tests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_grok_immersive_workspace_zoom(window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn grok_immersive_defer_sequence_for_tests(&self) -> &[u8] {
+        &self.grok_immersive_defer_sequence
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_grok_immersive_defer_sequence_for_tests(&mut self) {
+        self.grok_immersive_defer_sequence.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schedule_reveal_agent_panel_in_workspace_for_tests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.schedule_reveal_agent_panel_in_workspace(window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schedule_grok_immersive_startup_completion_for_tests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.schedule_grok_immersive_startup_completion(window, cx);
     }
 
     /// Creates a draft thread using a stub server and sets it as the active view.
@@ -7895,6 +8371,7 @@ impl AgentPanel {
 mod tests {
     use super::*;
     use crate::NewWorktreeBranchTarget;
+    use crate::conversation_view::conversation_area_flex_grow;
     use crate::conversation_view::tests::{StubAgentServer, init_test};
     use crate::test_support::{
         active_session_id, active_thread_id, open_thread_with_connection,
@@ -7914,6 +8391,135 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Instant;
+
+    /// Regression snapshots for the production startup sequence that reached
+    /// "grok immersive startup complete" on 2026-06-17 (surmount branch).
+    fn assert_grok_startup_awaiting_thread_phase(diagnostics: &GrokImmersiveDiagnostics) {
+        assert!(
+            diagnostics.is_active,
+            "awaiting-thread phase must keep agent panel active (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.agent_dock_open,
+            "awaiting-thread phase must keep agent dock open (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.startup_in_progress,
+            "awaiting-thread phase must remain in startup (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.shows_startup_splash,
+            "awaiting-thread phase must show startup splash (got {diagnostics})"
+        );
+        assert!(
+            !diagnostics.has_zed_todos_surface,
+            "awaiting-thread phase must not have categorized surface yet (got {diagnostics})"
+        );
+        assert!(
+            !diagnostics.immersive_ready,
+            "awaiting-thread phase must not be immersive ready (got {diagnostics})"
+        );
+        assert!(
+            !diagnostics.visually_ready,
+            "awaiting-thread phase must not be visually ready (got {diagnostics})"
+        );
+        assert!(
+            !diagnostics.startup_logged,
+            "awaiting-thread phase must not log startup complete (got {diagnostics})"
+        );
+        assert_eq!(
+            diagnostics.completion_attempts, 0,
+            "awaiting-thread phase must not burn completion attempts (got {diagnostics})"
+        );
+        assert_eq!(
+            diagnostics.reveal_attempts, 0,
+            "awaiting-thread phase must not burn reveal attempts (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.completion_attempts < AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
+            "awaiting-thread phase must stay under completion cap (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.reveal_attempts < AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
+            "awaiting-thread phase must stay under reveal cap (got {diagnostics})"
+        );
+    }
+
+    fn assert_grok_startup_surface_open_phase(diagnostics: &GrokImmersiveDiagnostics) {
+        assert!(
+            diagnostics.is_active,
+            "surface-open phase must keep agent panel active (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.agent_dock_open,
+            "surface-open phase must keep agent dock open (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.zoomed && diagnostics.workspace_zoomed,
+            "surface-open phase must have workspace zoom applied (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.has_zed_todos_surface,
+            "surface-open phase must have categorized surface (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.has_thread_view && diagnostics.dock_has_thread_view,
+            "surface-open phase must attach thread view to dock (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.immersive_ready && diagnostics.visually_ready,
+            "surface-open phase must be immersive and visually ready (got {diagnostics})"
+        );
+        assert!(
+            !diagnostics.shows_startup_splash,
+            "surface-open phase must hide startup splash (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.completion_attempts < AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
+            "surface-open phase must not exhaust completion attempts (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.reveal_attempts < AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
+            "surface-open phase must not exhaust reveal attempts (got {diagnostics})"
+        );
+    }
+
+    fn assert_grok_startup_complete_phase(diagnostics: &GrokImmersiveDiagnostics) {
+        assert_grok_startup_surface_open_phase(diagnostics);
+        // Surmount records monotonic cold-start duration once immersive startup completes.
+        assert!(
+            diagnostics.launch_elapsed_ms.is_some(),
+            "complete phase must record launch elapsed_ms (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.startup_logged,
+            "complete phase must log startup once (got {diagnostics})"
+        );
+        assert!(
+            !diagnostics.categorized_pending,
+            "complete phase must clear categorized pending (got {diagnostics})"
+        );
+        assert!(
+            !diagnostics.startup_in_progress,
+            "complete phase must end startup in progress (got {diagnostics})"
+        );
+        assert!(
+            !diagnostics.defer_scheduled && !diagnostics.reveal_scheduled,
+            "complete phase must drain startup defers (got {diagnostics})"
+        );
+        assert!(
+            !diagnostics.zoom_apply_in_flight,
+            "complete phase must finish zoom apply (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.completion_attempts < AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
+            "complete phase must not exhaust completion attempts (got {diagnostics})"
+        );
+        assert!(
+            diagnostics.reveal_attempts < AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
+            "complete phase must not exhaust reveal attempts (got {diagnostics})"
+        );
+    }
 
     #[test]
     fn test_is_known_terminal_agent_command() {
@@ -8504,8 +9110,7 @@ mod tests {
     #[gpui::test]
     async fn test_grok_categorized_surface_opens_after_thread_ready(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
-        let connection =
-            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.selected_agent = Agent::Custom {
@@ -8547,8 +9152,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (panel, mut cx) = setup_panel(cx).await;
-        let connection =
-            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.selected_agent = Agent::Custom {
@@ -8591,8 +9195,7 @@ mod tests {
     #[gpui::test]
     async fn test_grok_set_active_false_skips_reveal_when_immersive_ready(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
-        let connection =
-            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
 
         open_thread_with_custom_connection(&panel, connection, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -8630,8 +9233,7 @@ mod tests {
     #[gpui::test]
     async fn test_open_zed_todos_surface_clears_initial_state_loading(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
-        let connection =
-            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
 
         panel.update_in(&mut cx, |panel, _window, _cx| {
             panel.selected_agent = Agent::Custom {
@@ -8668,8 +9270,7 @@ mod tests {
     #[gpui::test]
     async fn test_grok_zed_todos_surface_attaches_thread_view_to_dock(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
-        let connection =
-            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
 
         open_thread_with_custom_connection(&panel, connection, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -8701,6 +9302,14 @@ mod tests {
                 thread_view.read(cx).embedded_in_zed_todos_dock,
                 "ThreadView must suppress duplicate activity-bar todos when embedded in the dock split"
             );
+            assert!(
+                !panel.active_thread_has_messages(cx),
+                "fresh grok thread should be empty so the message editor fills the right pane"
+            );
+            assert!(
+                !conversation_area_flex_grow(false, true),
+                "embedded empty thread must not reserve a blank flex conversation area"
+            );
         });
     }
 
@@ -8709,8 +9318,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         let (panel, mut cx) = setup_panel(cx).await;
-        let connection =
-            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
 
         open_thread_with_custom_connection(&panel, connection, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -8744,9 +9352,8 @@ mod tests {
 
     #[gpui::test]
     async fn test_grok_immersive_startup_logged_once_when_ready(cx: &mut TestAppContext) {
-        let (panel, mut cx) = setup_panel(cx).await;
-        let connection =
-            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
 
         open_thread_with_custom_connection(&panel, connection, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -8755,6 +9362,7 @@ mod tests {
             };
             panel.is_active = true;
             panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
             panel.grok_immersive_reveal_attempts = 0;
             panel.grok_immersive_startup_logged = false;
             panel.ensure_grok_categorized_surface(window, cx);
@@ -8786,8 +9394,7 @@ mod tests {
     #[gpui::test]
     async fn test_grok_immersive_defer_does_not_stack(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
-        let connection =
-            StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
 
         open_thread_with_custom_connection(&panel, connection, &mut cx);
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -8797,6 +9404,7 @@ mod tests {
             panel.is_active = false;
             panel.zoomed = false;
             panel.grok_immersive_reveal_attempts = 0;
+            panel.grok_immersive_completion_attempts = 0;
             panel.grok_immersive_startup_logged = false;
             panel.grok_immersive_defer_scheduled = false;
             panel.grok_panel_reveal_scheduled = false;
@@ -8806,11 +9414,18 @@ mod tests {
             }
             assert!(
                 panel.grok_immersive_defer_scheduled,
-                "burst scheduling should leave exactly one immersive defer armed"
+                "burst scheduling should leave exactly one immersive defer armed (completion_attempts={})",
+                panel.grok_immersive_completion_attempts
             );
             assert!(
                 panel.grok_immersive_reveal_attempts <= 1,
-                "burst scheduling should coalesce reveal attempts in one frame"
+                "burst scheduling should coalesce reveal attempts in one frame (got {})",
+                panel.grok_immersive_reveal_attempts
+            );
+            assert!(
+                panel.grok_immersive_completion_attempts <= 1,
+                "burst scheduling should coalesce completion attempts in one frame (got {})",
+                panel.grok_immersive_completion_attempts
             );
         });
         cx.run_until_parked();
@@ -8824,6 +9439,787 @@ mod tests {
             assert!(
                 diagnostics.reveal_attempts <= AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
                 "immersive reveal retries must stop at the configured cap (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_completion_awaits_surface_without_burning_attempts(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.grok_immersive_completion_attempts = 0;
+            panel.grok_immersive_defer_scheduled = false;
+            panel.overlay_view = None;
+            for _ in 0..64 {
+                panel.schedule_grok_immersive_startup_completion_for_tests(window, cx);
+            }
+            assert_eq!(
+                panel.grok_immersive_completion_attempts, 0,
+                "completion must not burn attempts while awaiting categorized surface"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.startup_in_progress,
+                "startup must remain in progress while awaiting surface (got {diagnostics})"
+            );
+            assert_eq!(
+                diagnostics.completion_attempts, 0,
+                "parked completion defer must not consume attempts while awaiting surface (got {diagnostics})"
+            );
+            assert!(
+                !diagnostics.has_zed_todos_surface,
+                "surface must still be absent while awaiting thread (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_exhausted_completion_recovers_when_surface_opens(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = true;
+            panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.grok_immersive_completion_attempts =
+                AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS;
+            panel.grok_immersive_reveal_attempts = AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS;
+            panel.overlay_view = None;
+            panel.open_zed_todos_surface(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.has_zed_todos_surface,
+                "surface open must attach categorized overlay (got {diagnostics})"
+            );
+            assert!(
+                diagnostics.startup_logged,
+                "exhausted completion must recover once surface opens (got {diagnostics})"
+            );
+            assert!(
+                diagnostics.visually_ready,
+                "recovered startup must reach visually ready (got {diagnostics})"
+            );
+            assert!(
+                diagnostics.agent_dock_open,
+                "recovered startup must keep agent dock open (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_open_surface_schedules_reveal_when_active_during_startup(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = true;
+            panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.grok_panel_reveal_scheduled = false;
+            panel.overlay_view = None;
+            panel.open_zed_todos_surface(window, cx);
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.reveal_scheduled || diagnostics.visually_ready,
+                "active startup surface open must schedule reveal until visually ready (got {diagnostics})"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.has_zed_todos_surface,
+                "surface must be open (got {diagnostics})"
+            );
+            assert!(
+                diagnostics.visually_ready,
+                "active startup must finish visually ready after surface open (got {diagnostics})"
+            );
+            assert!(
+                diagnostics.startup_logged,
+                "active startup must log complete after surface open (got {diagnostics})"
+            );
+        });
+    }
+
+    // Surmount regression: last-known-good grok immersive startup sequence from 2026-06-17;
+    // asserts launch_elapsed_ms is recorded once startup completes.
+    #[gpui::test]
+    async fn test_grok_startup_last_known_good_sequence(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, _window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = true;
+            panel.zoomed = false;
+            panel.grok_workspace_zoom_overlay_synced = false;
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.grok_immersive_completion_attempts = 0;
+            panel.grok_immersive_reveal_attempts = 0;
+            panel.overlay_view = None;
+            cx.notify();
+        });
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_grok_startup_awaiting_thread_phase(
+                &panel.grok_immersive_diagnostics_for_tests(cx),
+            );
+        });
+
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.overlay_view = None;
+            panel.is_active = true;
+            panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.grok_immersive_completion_attempts =
+                AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS;
+            panel.grok_immersive_reveal_attempts = AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS;
+            panel.ensure_grok_categorized_surface(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_grok_startup_complete_phase(&panel.grok_immersive_diagnostics_for_tests(cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_startup_complete_preserves_attempt_budget_under_burst(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = true;
+            panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            for _ in 0..64 {
+                panel.schedule_grok_immersive_reveal_until_ready(window, cx);
+            }
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.reveal_attempts < AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
+                "burst reveal scheduling must not hit reveal cap before surface (got {diagnostics})"
+            );
+            assert!(
+                diagnostics.completion_attempts < AgentPanel::GROK_IMMERSIVE_REVEAL_MAX_ATTEMPTS,
+                "burst reveal scheduling must not hit completion cap before surface (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_startup_splash_shown_while_pending_without_surface(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, _window, _cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.overlay_view = None;
+        });
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.shows_startup_splash,
+                "pending grok startup without surface must show splash (got {diagnostics})"
+            );
+            assert!(
+                diagnostics.startup_in_progress,
+                "pending without logged startup must be in progress (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_startup_splash_hidden_when_zed_todos_surface_open(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, _window, _cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+        });
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.has_zed_todos_surface,
+                "test setup must open categorized surface (got {diagnostics})"
+            );
+            assert!(
+                !diagnostics.shows_startup_splash,
+                "splash must hide once categorized surface is open to avoid spinner flicker (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_set_active_deactivate_ignored_during_startup_in_progress(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = true;
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.set_active(false, window, cx);
+        });
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.is_active,
+                "deactivate must be ignored during immersive startup in progress (got {diagnostics})"
+            );
+            assert!(
+                diagnostics.startup_in_progress,
+                "startup must still be in progress (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_set_active_deactivate_honored_after_startup_logged(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = true;
+            panel.grok_immersive_startup_logged = true;
+            panel.grok_categorized_surface_pending = false;
+            panel.set_active(false, window, cx);
+        });
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                !diagnostics.is_active,
+                "deactivate must be honored after immersive startup logged (got {diagnostics})"
+            );
+            assert!(
+                !diagnostics.startup_in_progress,
+                "logged startup must not be in progress (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_immersive_ready_requires_workspace_zoom_overlay_synced(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = true;
+            panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = false;
+            panel.grok_immersive_completion_attempts = 0;
+            panel.overlay_view = None;
+            panel.open_zed_todos_surface(window, cx);
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.has_zed_todos_surface,
+                "surface must be open (got {diagnostics})"
+            );
+            assert!(
+                !diagnostics.workspace_zoomed,
+                "test setup must leave workspace zoom overlay unsynced (got {diagnostics})"
+            );
+            assert!(
+                !diagnostics.immersive_ready,
+                "immersive ready requires workspace zoom overlay sync (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_zoom_apply_in_flight_dedupes_burst_apply(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, _window, _cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            for _ in 0..8 {
+                panel.apply_grok_immersive_workspace_zoom_for_tests(window, cx);
+            }
+            assert!(
+                panel.grok_immersive_zoom_apply_in_flight,
+                "first zoom apply must arm the in-flight guard"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                !diagnostics.zoom_apply_in_flight,
+                "zoom apply in-flight guard must clear after parking (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_zoom_defer_dedupes_burst_ensure(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, _window, _cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_zoom_defer_scheduled = false;
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            for _ in 0..8 {
+                panel.ensure_grok_immersive_zoom(window, cx);
+            }
+            assert!(
+                panel.grok_immersive_zoom_defer_scheduled,
+                "burst ensure_grok_immersive_zoom must leave exactly one defer armed"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                !diagnostics.zoom_defer_scheduled,
+                "zoom defer must drain after parking (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_startup_bootstrap_scheduled_once(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, _window, _cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_bootstrap_scheduled = false;
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            for _ in 0..8 {
+                panel.schedule_grok_immersive_startup_bootstrap_for_tests(window, cx);
+            }
+            assert!(
+                panel.grok_immersive_startup_bootstrap_scheduled,
+                "burst bootstrap scheduling must arm exactly one defer"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                !diagnostics.bootstrap_scheduled,
+                "bootstrap defer must drain after parking (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_startup_bootstrap_opens_panel_before_zoom(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_bootstrap_scheduled = false;
+            panel.grok_workspace_zoom_overlay_synced = false;
+            panel.clear_grok_immersive_defer_sequence_for_tests();
+            panel.schedule_grok_immersive_startup_bootstrap_for_tests(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.grok_immersive_defer_sequence_for_tests(),
+                &[
+                    AgentPanel::GROK_IMMERSIVE_DEFER_OPEN_PANEL,
+                    AgentPanel::GROK_IMMERSIVE_DEFER_APPLY_ZOOM,
+                ],
+                "bootstrap defer must open the dock before applying workspace zoom"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_startup_bootstrap_runs_when_workspace_zoom_synced(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
+            panel.grok_immersive_startup_bootstrap_scheduled = false;
+            panel.schedule_grok_immersive_startup_bootstrap_for_tests(window, cx);
+            assert!(
+                panel.grok_immersive_startup_bootstrap_scheduled,
+                "bootstrap must still open the dock when workspace zoom is already synced"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_set_zoomed_syncs_workspace_overlay_during_startup(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_workspace_zoom_overlay_synced = false;
+            panel.set_zoomed(true, window, cx);
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.workspace_zoomed,
+                "set_zoomed during grok startup must mark workspace zoom overlay synced (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_reveal_defer_opens_panel_before_zoom(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = false;
+            panel.zoomed = false;
+            panel.grok_workspace_zoom_overlay_synced = false;
+            panel.grok_immersive_startup_logged = false;
+            panel.grok_panel_reveal_scheduled = false;
+            panel.clear_grok_immersive_defer_sequence_for_tests();
+            panel.schedule_reveal_agent_panel_in_workspace_for_tests(window, cx);
+            assert!(
+                panel.grok_panel_reveal_scheduled,
+                "inactive grok reveal must arm the dock reveal defer"
+            );
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(
+                panel.grok_immersive_defer_sequence_for_tests(),
+                &[
+                    AgentPanel::GROK_IMMERSIVE_DEFER_OPEN_PANEL,
+                    AgentPanel::GROK_IMMERSIVE_DEFER_APPLY_ZOOM,
+                ],
+                "reveal defer must open the dock before applying workspace zoom"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_dock_restore_skipped_during_startup(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let workspace = panel.read_with(&cx, |panel, _| panel.workspace.clone());
+
+        let agent_dock_position = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.is_active = true;
+            panel.grok_immersive_startup_bootstrap_scheduled = false;
+            panel.schedule_grok_immersive_startup_bootstrap_for_tests(window, cx);
+            agent_panel_dock_position(cx)
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, _window, cx| {
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            cx.notify();
+        });
+
+        workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                let dock = workspace.dock_at_position(agent_dock_position).read(cx);
+                assert!(
+                    dock.is_open(),
+                    "agent dock must be open before serialized restore during grok startup"
+                );
+                assert!(
+                    dock.any_panel_immersive_startup_in_progress(window, cx),
+                    "agent dock must observe grok immersive startup before restore"
+                );
+            })
+            .unwrap();
+
+        let closed_dock = workspace::DockData {
+            visible: false,
+            active_panel: None,
+            zoom: false,
+        };
+        let mut docks = workspace::DockStructure::default();
+        match agent_dock_position {
+            DockPosition::Left => docks.left = closed_dock,
+            DockPosition::Right => docks.right = closed_dock,
+            DockPosition::Bottom => docks.bottom = closed_dock,
+        }
+        workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.set_dock_structure(docks, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        workspace
+            .read_with(&cx, |workspace, cx| {
+                assert!(
+                    workspace
+                        .dock_at_position(agent_dock_position)
+                        .read(cx)
+                        .is_open(),
+                    "agent dock must stay open when restore is skipped during grok startup"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_grok_dock_close_during_startup_reopens_panel(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let workspace = panel.read_with(&cx, |panel, _| panel.workspace.clone());
+
+        let agent_dock_position = panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.is_active = true;
+            panel.grok_immersive_reveal_attempts = 0;
+            panel.grok_panel_reveal_scheduled = false;
+            panel.grok_immersive_startup_bootstrap_scheduled = false;
+            panel.schedule_grok_immersive_startup_bootstrap_for_tests(window, cx);
+            agent_panel_dock_position(cx)
+        });
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, _window, cx| {
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.grok_immersive_reveal_attempts = 0;
+            panel.grok_panel_reveal_scheduled = false;
+            cx.notify();
+        });
+
+        workspace
+            .read_with(&cx, |workspace, cx| {
+                assert!(
+                    workspace
+                        .dock_at_position(agent_dock_position)
+                        .read(cx)
+                        .is_open(),
+                    "agent dock must be open before a close attempt during grok startup"
+                );
+            })
+            .unwrap();
+
+        workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace
+                    .dock_at_position(agent_dock_position)
+                    .update(cx, |dock, cx| {
+                        dock.set_open(false, window, cx);
+                    });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        workspace
+            .read_with(&cx, |workspace, cx| {
+                assert!(
+                    workspace
+                        .dock_at_position(agent_dock_position)
+                        .read(cx)
+                        .is_open(),
+                    "agent dock must reopen after a close attempt during grok immersive startup"
+                );
+            })
+            .unwrap();
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.is_active,
+                "panel must stay active after dock close attempt during startup (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_set_zoomed_false_ignored_during_startup(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
+            panel.set_zoomed(false, window, cx);
+        });
+
+        panel.read_with(&cx, |panel, cx| {
+            let diagnostics = panel.grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                diagnostics.zoomed,
+                "unzoom must be ignored during grok immersive startup (got {diagnostics})"
+            );
+            assert!(
+                diagnostics.workspace_zoomed,
+                "workspace zoom sync must stay set during grok immersive startup (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_set_active_skips_zoom_defer_during_startup(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.grok_categorized_surface_pending = true;
+            panel.grok_immersive_startup_logged = false;
+            panel.grok_immersive_zoom_defer_scheduled = false;
+            panel.set_active(true, window, cx);
+            assert!(
+                !panel.grok_immersive_zoom_defer_scheduled,
+                "set_active during startup must not enqueue zoom defer; bootstrap owns zoom"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_open_zed_todos_surface_schedules_reveal_only_when_inactive(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = false;
+            panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
+            panel.grok_panel_reveal_scheduled = false;
+            panel.grok_immersive_reveal_attempts = 0;
+            panel.overlay_view = None;
+            panel.open_zed_todos_surface(window, cx);
+            assert!(
+                panel.grok_panel_reveal_scheduled,
+                "inactive surface open must schedule dock reveal"
+            );
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.is_active = true;
+            panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
+            panel.grok_categorized_surface_pending = false;
+            panel.grok_immersive_startup_logged = true;
+            panel.grok_panel_reveal_scheduled = false;
+            panel.grok_immersive_reveal_attempts = 0;
+            panel.overlay_view = None;
+            panel.open_zed_todos_surface(window, cx);
+            assert!(
+                !panel.grok_panel_reveal_scheduled,
+                "active surface re-open after startup logged must not schedule another dock reveal"
             );
         });
     }

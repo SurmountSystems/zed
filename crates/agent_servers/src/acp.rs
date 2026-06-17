@@ -48,6 +48,48 @@ const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
 const ACP_RESPONSE_CHANNEL_CANCELLED: &str =
     "response channel cancelled — connection may have dropped";
 
+/// Grok Build's bridged agent emits JSON-RPC responses with `id: "skills-reload"`
+/// that Zed never requested. The ACP SDK warns on every orphan; drop them here.
+fn is_grok_orphan_acp_response_line(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.contains_key("method") {
+        return false;
+    }
+    if !(object.contains_key("result") || object.contains_key("error")) {
+        return false;
+    }
+    matches!(
+        object.get("id"),
+        Some(serde_json::Value::String(id)) if id == "skills-reload"
+    )
+}
+
+/// xAI Grok agent extensions that surmount intentionally ignores on the grok-first path.
+fn is_grok_ignored_acp_notification_line(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let Some(method) = object.get("method").and_then(|method| method.as_str()) else {
+        return false;
+    };
+    matches!(
+        method,
+        "_x.ai/settings/update" | "_x.ai/announcements/update"
+    )
+}
+
+fn should_drop_grok_acp_transport_line(line: &str) -> bool {
+    is_grok_orphan_acp_response_line(line) || is_grok_ignored_acp_notification_line(line)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcpDebugMessageDirection {
     Incoming,
@@ -875,7 +917,15 @@ impl AcpConnection {
         // closures to the !Send foreground thread.
         let (dispatch_tx, dispatch_rx) = mpsc::unbounded::<ForegroundWork>();
 
-        let incoming_lines = futures::io::BufReader::new(stdout).lines();
+        let incoming_lines =
+            futures::io::BufReader::new(stdout)
+                .lines()
+                .filter_map(|result| async move {
+                    match result {
+                        Ok(line) if should_drop_grok_acp_transport_line(&line) => None,
+                        other => Some(other),
+                    }
+                });
         let tapped_incoming = incoming_lines.inspect({
             let debug_log = debug_log.clone();
             move |result| match result {
@@ -2605,6 +2655,33 @@ mod tests {
     use super::*;
     use gpui::UpdateGlobal as _;
     use settings::Settings as _;
+
+    #[test]
+    fn grok_orphan_skills_reload_response_is_dropped_at_transport() {
+        // Surmount: grok agent emits unsolicited skills-reload responses every ~2s.
+        let line = r#"{"jsonrpc":"2.0","id":"skills-reload","result":{}}"#;
+        assert!(is_grok_orphan_acp_response_line(line));
+        assert!(should_drop_grok_acp_transport_line(line));
+    }
+
+    #[test]
+    fn legitimate_acp_response_ids_are_not_dropped_at_transport() {
+        let line = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        assert!(!is_grok_orphan_acp_response_line(line));
+        assert!(!should_drop_grok_acp_transport_line(line));
+    }
+
+    #[test]
+    fn grok_xai_extension_notifications_are_dropped_at_transport() {
+        // Surmount: swallow xAI extension notifications Zed has no handler for yet.
+        for method in ["_x.ai/settings/update", "_x.ai/announcements/update"] {
+            let line = format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{{}}}}"#);
+            assert!(
+                should_drop_grok_acp_transport_line(&line),
+                "expected transport drop for {method}"
+            );
+        }
+    }
 
     #[test]
     fn terminal_auth_task_builds_spawn_from_prebuilt_command() {

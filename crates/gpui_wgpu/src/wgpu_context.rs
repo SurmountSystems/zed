@@ -2,6 +2,8 @@
 use anyhow::Context as _;
 #[cfg(not(target_family = "wasm"))]
 use gpui_util::ResultExt;
+#[cfg(not(target_family = "wasm"))]
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::TextureFormat;
@@ -60,16 +62,18 @@ impl WgpuContext {
             }
         };
 
-        // Select an adapter by actually testing surface configuration with the real device.
-        // This is the only reliable way to determine compatibility on hybrid GPU systems.
+        // Device enumeration and creation are slow on cold start (Mesa shader cache, driver init).
+        // Never use gpui::block_on (pollster on the foreground thread) for that work — it freezes
+        // the UI for tens of seconds during Workspace::open. Surface configuration stays on the
+        // caller thread because the window surface is not portable across threads.
         let (adapter, device, queue, dual_source_blending, color_texture_format) =
-            gpui::block_on(Self::select_adapter_and_device(
+            Self::select_adapter_and_device_off_foreground(
                 &instance,
                 device_id_filter,
                 surface,
                 compositor_gpu.as_ref(),
                 reject_software,
-            ))?;
+            )?;
 
         let device_lost = Arc::new(AtomicBool::new(false));
         device.set_device_lost_callback({
@@ -206,25 +210,89 @@ impl WgpuContext {
         Ok(())
     }
 
-    /// Select an adapter and create a device, testing that the surface can actually be configured.
-    /// This is the only reliable way to determine compatibility on hybrid GPU systems, where
-    /// adapters may report surface compatibility via get_capabilities() but fail when actually
-    /// configuring (e.g., NVIDIA reporting Vulkan Wayland support but failing because the
-    /// Wayland compositor runs on the Intel GPU).
+    /// Runs a GPU-selection future on a dedicated worker thread so the foreground executor
+    /// can keep pumping during slow driver initialization.
     #[cfg(not(target_family = "wasm"))]
-    async fn select_adapter_and_device(
+    fn block_on_gpu_worker<R>(future: impl Future<Output = R> + Send + 'static) -> R
+    where
+        R: Send + 'static,
+    {
+        std::thread::spawn(move || pollster::block_on(future))
+            .join()
+            .expect("GPU worker thread panicked during adapter selection")
+    }
+
+    /// Adapter ranking tiers (lower sorts first):
+    /// 1. ZED_DEVICE_ID match
+    /// 2. Compositor GPU match
+    /// 3. Device type (Discrete > Integrated > Other > Virtual > Cpu)
+    /// 4. Backend (Vulkan/Metal/Dx12 before GL)
+    #[cfg(not(target_family = "wasm"))]
+    fn adapter_sort_key(
+        info: &wgpu::AdapterInfo,
+        device_id_filter: Option<u32>,
+        compositor_gpu: Option<&CompositorGpuHint>,
+    ) -> (u8, u8, u8, u8) {
+        let device_known = info.device != 0;
+
+        let user_override: u8 = match device_id_filter {
+            Some(id) if device_known && info.device == id => 0,
+            _ => 1,
+        };
+
+        let compositor_match: u8 = match compositor_gpu {
+            Some(hint)
+                if device_known
+                    && info.vendor == hint.vendor_id
+                    && info.device == hint.device_id =>
+            {
+                0
+            }
+            _ => 1,
+        };
+
+        let type_priority: u8 = if info.device_type == wgpu::DeviceType::Cpu {
+            4
+        } else {
+            match info.device_type {
+                wgpu::DeviceType::DiscreteGpu => 0,
+                wgpu::DeviceType::IntegratedGpu => 1,
+                wgpu::DeviceType::Other => 2,
+                wgpu::DeviceType::VirtualGpu => 3,
+                wgpu::DeviceType::Cpu => 4,
+            }
+        };
+
+        let backend_priority: u8 = match info.backend {
+            wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12 => 0,
+            _ => 1,
+        };
+
+        (
+            user_override,
+            compositor_match,
+            type_priority,
+            backend_priority,
+        )
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn sort_adapters(
+        adapters: &mut [wgpu::Adapter],
+        device_id_filter: Option<u32>,
+        compositor_gpu: Option<&CompositorGpuHint>,
+    ) {
+        adapters.sort_by_key(|adapter| {
+            Self::adapter_sort_key(&adapter.get_info(), device_id_filter, compositor_gpu)
+        });
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn enumerate_sorted_adapters(
         instance: &wgpu::Instance,
         device_id_filter: Option<u32>,
-        surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<&CompositorGpuHint>,
-        reject_software: bool,
-    ) -> anyhow::Result<(
-        wgpu::Adapter,
-        wgpu::Device,
-        wgpu::Queue,
-        bool,
-        TextureFormat,
-    )> {
+    ) -> anyhow::Result<Vec<wgpu::Adapter>> {
         let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
 
         if adapters.is_empty() {
@@ -235,62 +303,8 @@ impl WgpuContext {
             log::info!("ZED_DEVICE_ID filter: {:#06x}", device_id);
         }
 
-        // Sort adapters into a single priority order. Tiers (from highest to lowest):
-        //
-        // 1. ZED_DEVICE_ID match — explicit user override
-        // 2. Compositor GPU match — the GPU the display server is rendering on
-        // 3. Device type (Discrete > Integrated > Other > Virtual > Cpu).
-        //    "Other" ranks above "Virtual" because OpenGL seems to count as "Other".
-        // 4. Backend — prefer Vulkan/Metal/Dx12 over GL/etc.
-        adapters.sort_by_key(|adapter| {
-            let info = adapter.get_info();
+        Self::sort_adapters(&mut adapters, device_id_filter, compositor_gpu);
 
-            // Backends like OpenGL report device=0 for all adapters, so
-            // device-based matching is only meaningful when non-zero.
-            let device_known = info.device != 0;
-
-            let user_override: u8 = match device_id_filter {
-                Some(id) if device_known && info.device == id => 0,
-                _ => 1,
-            };
-
-            let compositor_match: u8 = match compositor_gpu {
-                Some(hint)
-                    if device_known
-                        && info.vendor == hint.vendor_id
-                        && info.device == hint.device_id =>
-                {
-                    0
-                }
-                _ => 1,
-            };
-
-            let type_priority: u8 = if info.device_type == wgpu::DeviceType::Cpu {
-                4
-            } else {
-                match info.device_type {
-                    wgpu::DeviceType::DiscreteGpu => 0,
-                    wgpu::DeviceType::IntegratedGpu => 1,
-                    wgpu::DeviceType::Other => 2,
-                    wgpu::DeviceType::VirtualGpu => 3,
-                    wgpu::DeviceType::Cpu => 4,
-                }
-            };
-
-            let backend_priority: u8 = match info.backend {
-                wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12 => 0,
-                _ => 1,
-            };
-
-            (
-                user_override,
-                compositor_match,
-                type_priority,
-                backend_priority,
-            )
-        });
-
-        // Log all available adapters (in sorted order)
         log::info!("Found {} GPU adapter(s):", adapters.len());
         for adapter in &adapters {
             let info = adapter.get_info();
@@ -304,7 +318,31 @@ impl WgpuContext {
             );
         }
 
-        // Test each adapter by creating a device and configuring the surface
+        Ok(adapters)
+    }
+
+    /// Select an adapter and device off the foreground thread; validate surface on caller thread.
+    #[cfg(not(target_family = "wasm"))]
+    fn select_adapter_and_device_off_foreground(
+        instance: &wgpu::Instance,
+        device_id_filter: Option<u32>,
+        surface: &wgpu::Surface<'_>,
+        compositor_gpu: Option<&CompositorGpuHint>,
+        reject_software: bool,
+    ) -> anyhow::Result<(
+        wgpu::Adapter,
+        wgpu::Device,
+        wgpu::Queue,
+        bool,
+        TextureFormat,
+    )> {
+        let instance = instance.clone();
+        let compositor_gpu = compositor_gpu.copied();
+        let adapters = Self::block_on_gpu_worker(async move {
+            Self::enumerate_sorted_adapters(&instance, device_id_filter, compositor_gpu.as_ref())
+                .await
+        })?;
+
         for adapter in adapters {
             let info = adapter.get_info();
 
@@ -319,27 +357,35 @@ impl WgpuContext {
 
             log::info!("Testing adapter: {} ({:?})...", info.name, info.backend);
 
-            match Self::try_adapter_with_surface(&adapter, surface).await {
-                Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
+            let adapter_for_device = adapter.clone();
+            let device_bundle = match Self::block_on_gpu_worker(async move {
+                Self::create_device(&adapter_for_device).await
+            }) {
+                Ok(bundle) => bundle,
+                Err(error) => {
+                    log::info!(
+                        "  Adapter {} ({:?}) device creation failed: {error:#}, trying next...",
+                        info.name,
+                        info.backend
+                    );
+                    continue;
+                }
+            };
+
+            match Self::validate_surface_with_device(surface, &adapter, device_bundle) {
+                Ok(bundle) => {
                     log::info!(
                         "Selected GPU (passed configuration test): {} ({:?})",
                         info.name,
                         info.backend
                     );
-                    return Ok((
-                        adapter,
-                        device,
-                        queue,
-                        dual_source_blending,
-                        color_atlas_texture_format,
-                    ));
+                    return Ok((adapter, bundle.0, bundle.1, bundle.2, bundle.3));
                 }
-                Err(e) => {
+                Err(error) => {
                     log::info!(
-                        "  Adapter {} ({:?}) failed: {}, trying next...",
+                        "  Adapter {} ({:?}) failed: {error:#}, trying next...",
                         info.name,
-                        info.backend,
-                        e
+                        info.backend
                     );
                 }
             }
@@ -348,12 +394,17 @@ impl WgpuContext {
         anyhow::bail!("No GPU adapter found that can configure the display surface")
     }
 
-    /// Try to use an adapter with a surface by creating a device and testing configuration.
-    /// Returns the device and queue if successful, allowing them to be reused.
+    /// Validate that an already-created device can configure the window surface.
     #[cfg(not(target_family = "wasm"))]
-    async fn try_adapter_with_surface(
-        adapter: &wgpu::Adapter,
+    fn validate_surface_with_device(
         surface: &wgpu::Surface<'_>,
+        adapter: &wgpu::Adapter,
+        (device, queue, dual_source_blending, color_atlas_texture_format): (
+            wgpu::Device,
+            wgpu::Queue,
+            bool,
+            TextureFormat,
+        ),
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
         let caps = surface.get_capabilities(adapter);
         if caps.formats.is_empty() {
@@ -363,8 +414,6 @@ impl WgpuContext {
             anyhow::bail!("no compatible alpha modes");
         }
 
-        let (device, queue, dual_source_blending, color_atlas_texture_format) =
-            Self::create_device(adapter).await?;
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
         let test_config = wgpu::SurfaceConfiguration {
@@ -380,9 +429,9 @@ impl WgpuContext {
 
         surface.configure(&device, &test_config);
 
-        let error = error_scope.pop().await;
-        if let Some(e) = error {
-            anyhow::bail!("surface configuration failed: {e}");
+        let error = pollster::block_on(error_scope.pop());
+        if let Some(error) = error {
+            anyhow::bail!("surface configuration failed: {error}");
         }
 
         Ok((
@@ -465,7 +514,67 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pci_id;
+    use super::{CompositorGpuHint, WgpuContext, parse_pci_id};
+    use std::fs;
+    use std::path::Path;
+    use wgpu::Backend;
+
+    #[test]
+    fn wgpu_context_does_not_block_foreground_with_gpui_block_on() {
+        let forbidden = concat!("gpui", "::block_on");
+        let source =
+            fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/wgpu_context.rs"))
+                .expect("read wgpu_context.rs");
+        assert!(
+            !source.lines().any(|line| {
+                let trimmed = line.split("//").next().unwrap_or(line).trim();
+                trimmed.contains(forbidden)
+            }),
+            "WgpuContext must not call gpui block_on on the foreground thread; use block_on_gpu_worker"
+        );
+    }
+
+    #[test]
+    fn adapter_sort_key_prefers_compositor_gpu_match() {
+        let compositor = CompositorGpuHint {
+            vendor_id: 0x1002,
+            device_id: 0x1114,
+        };
+        let compositor_match = wgpu::AdapterInfo {
+            name: "Compositor GPU".into(),
+            vendor: 0x1002,
+            device: 0x1114,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            backend: Backend::Vulkan,
+            driver: "".into(),
+            driver_info: "".into(),
+            device_pci_bus_id: "".into(),
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: false,
+        };
+        let other_gpu = wgpu::AdapterInfo {
+            name: "Other GPU".into(),
+            vendor: 0x1002,
+            device: 0x2222,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            backend: Backend::Vulkan,
+            driver: "".into(),
+            driver_info: "".into(),
+            device_pci_bus_id: "".into(),
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: false,
+        };
+
+        let compositor_key =
+            WgpuContext::adapter_sort_key(&compositor_match, None, Some(&compositor));
+        let other_key = WgpuContext::adapter_sort_key(&other_gpu, None, Some(&compositor));
+        assert!(
+            compositor_key < other_key,
+            "compositor-matched adapter must sort before other adapters (compositor={compositor_key:?}, other={other_key:?})"
+        );
+    }
 
     #[test]
     fn test_parse_device_id() {

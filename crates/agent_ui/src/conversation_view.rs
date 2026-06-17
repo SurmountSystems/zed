@@ -114,6 +114,9 @@ pub use thread_view::{
     render_zed_todos_categorized_surface, reset_fast_mode_warnings,
 };
 
+#[cfg(test)]
+pub use thread_view::conversation_area_flex_grow;
+
 pub struct QueuedMessage {
     pub content: Vec<acp::ContentBlock>,
     pub tracked_buffers: Vec<Entity<Buffer>>,

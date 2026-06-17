@@ -853,12 +853,28 @@ async fn initialize_agent_panel(
         })?
         .await?;
 
+    // Prewarm the bridged Grok ACP subprocess before Full Agent Mode so RootThreadUpdated
+    // arrives sooner on cold start (see SURMOUNT.md § Linux grok-first cold start).
+    if project::surmount_skips_upstream_auth_on_cold_start() {
+        workspace_handle.update_in(&mut cx, |workspace, window, cx| {
+            if let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.new_external_agent_thread(
+                        &agent_ui::NewExternalAgentThread::grok(None),
+                        window,
+                        cx,
+                    );
+                });
+            }
+        })?;
+    }
+
     // Ensure the Agent Panel (and therefore the right dock) is visible by default on startup.
     // This is required for the Grok Build / Full Agent Mode experience the user expects.
-    workspace_handle.update_in(&mut cx, |workspace, window, cx| {
-        log::info!("initialize_agent_panel: revealing and opening full grok surface");
-        workspace.reveal_panel::<agent_ui::AgentPanel>(window, cx);
-        workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
+    workspace_handle.update_in(&mut cx, |_workspace, window, cx| {
+        log::info!(
+            "initialize_agent_panel: grok immersive launch phase: opening full grok surface"
+        );
         window.dispatch_action(zed_actions::agent::OpenFullGrokSurface.boxed_clone(), cx);
     })?;
 
@@ -5294,6 +5310,7 @@ mod tests {
                 "skill_creator",
                 "snippets",
                 "stash_picker",
+                "surmount",
                 "svg",
                 "syntax_tree_view",
                 "tab_switcher",

@@ -4,6 +4,18 @@ Living record of technical differences between Zed upstream `main` and the `surm
 
 Only describe differences explicitly visible in supplied diffs. Open questions use `TODO:` markers.
 
+## Merge review workflow
+
+When syncing upstream `main` into `surmount`:
+
+1. Human runs `git fetch` and `git merge origin/main`.
+2. In Zed: open **Branch Diff** against `main`, then **Surmount Merge Review** (toolbar) or palette `surmount: Start Merge Review`.
+3. Use the queue for HITL on ambiguous paths; resolve conflicts via editor or **Resolve with Agent**.
+4. Agent skill: `.agents/skills/surmount-merge-review/SKILL.md`. Category manifest: `surmount-merge-categories.toml`. Triage script: `script/surmount-merge-triage`.
+5. Update this file per category; resolve `TODO:` markers when the queue verdict is `Documented`.
+
+Keep `surmount-merge-categories.toml` in sync when categories here change.
+
 ## Documentation map
 
 | Layer | Location | Audience |
@@ -107,7 +119,60 @@ Fork adds a native-first Grok Build stack on top of upstream Zed's agent panel. 
 | [xAI provider](#xai--llm-provider) | `x_ai` crate, language model provider wiring |
 | [Bridged ACP Grok](#native-agent-core) | Optional `~/.grok/bin/grok` stdio path (legacy compatibility) |
 | [memory_palace / ref](#memory_palace--ref) | Memory-palace reference subtree + native crate; [native memory replacement plan](#native-memory-replacement--scoped-plan) |
+| [Linux grok-first cold start](#linux-grok-first-cold-start) | Auth skip, ACP transport filter, prewarm, launch timing |
 | [Decisions](#decisions--policy) | `PLAN.md`, `.rules` binding constraints |
+
+## Native Grok Build completion charter
+
+**North star:** Replicate all Grok Build TUI features as a complete, non-bridged, first-class native Rust + GPUI implementation inside Zed. The external `~/.grok/bin/grok` stdio path is legacy compatibility only — not the source of truth for new work. Strategic intent also lives in `PLAN.md`; this section is the maintainer-facing status matrix against that intent.
+
+**No half-measures:** Sub-agent tracking with personas, all skills, background monitors, plan discipline, categorized todos surface, memory, and session continuity must reach full parity with captured ACP harness fidelity before the bridged path can be demoted.
+
+### Pillar status
+
+| Pillar | Implementation | Tests | Primary locations | Open work |
+|--------|----------------|-------|-------------------|-----------|
+| **1. Full native GPUI replication** | **Partial** — categorized todos surface, Full Agent Mode, thread UI, native tools registered; `GrokNativeServer` remains a contract skeleton routed via `agent_ui` | `cargo test -p agent native_grok` (charter scope; see below) | `agent_ui/`, `acp_thread/`, `agent_servers/native_agent_server.rs` | Wire `grok-native` as default when binary absent; complete native run loop independent of ACP stdio |
+| **2. Non-bridged first-class (subagents, skills, personas)** | **Partial** — `spawn_agent`, `skill`, persona/capability fragments, `SubagentContext`, weak subagent handles; UI collectors share bridged + native | `contract_subagent_spawn_*`, `contract_tool_calling_*`, persona tests in `mod.rs` / `templates.rs` | `agent/thread.rs`, `agent/tools/spawn_agent_tool.rs`, `agent_skills/` | Full subagent tree UI in categorized surface; native path default over bridged on Linux |
+| **3. IDE diagnostics as primary context** | **Partial** — `build_project_diagnostics_context`, `<diagnostics>` injection, system-fragment prohibition on `cargo check`/`clippy` | `mod.rs` `GROK_BUILD_SYSTEM_FRAGMENTS` assertions; `thread.rs` diagnostics builder | `agent/thread.rs`, `project` LSP summaries | ACP/bridged threads: same diagnostics push on `EndTurn`; cross-language coverage tests beyond Rust |
+| **4. Completion notifications (desktop + in-Zed)** | **Partial** — `dispatch_grok_completion_system_notification` on exact completion phrase; toast + pop-up when unfocused; prompt rule in fragments | `test_native_grok_profile_triggers_system_notification_on_exact_completion_phrase`; fragment assertions in `mod.rs` | `agent_ui/conversation_view.rs` | Linux desktop notification via ashpd when window unfocused; test must assert toast/pop-up fired (currently type-pin only) |
+| **5. Planning workspace (no markdown pollution)** | **Partial** — `todo_write` / `enter_plan_mode` drive ZedTodos plan section; git worktree support on thread create; **not** a hidden TUI planning workspace | Plan proposed heuristic tests; `thread_worktree_archive` worktree plan tests | `acp_thread/`, `agent_ui/thread_view.rs`, `thread_worktree_archive.rs` | Replace opaque Grok planning workspace with ZedTodos + `memory_palace` session captures; no `PLAN.md`-on-disk dependency for native path |
+| **6. heed3 + rkyv MVCC persistence** | **Partial** — `thread_metadata_store` LMDB (`agent_panels`, `agent_kv`), `prompt_store` on heed3; legacy SQLite KVP terminated for agent panel state | `thread_metadata_store` roundtrip tests; `surmount_auth_skip_is_disabled_under_cfg_test` | `thread_metadata_store.rs`, `prompt_store.rs`, `memory_palace/` | TODO: migrate remaining `db::kvp` agent paths; retire thread SQLite artifacts to palace/heed3; eliminate heed2 if any linger |
+| **7. Linux grok-first cold start** | **Done** (2026-06-17) — auth skip, ACP transport filter, prewarm, launch timing | `agent_servers` `dropped_at_transport`; `agent_ui` `launch_elapsed_ms`; `project` auth-skip test | See [Linux grok-first cold start](#linux-grok-first-cold-start) | Re-apply on upstream merges; bridged ACP prewarm until native default ships |
+
+### Verification scopes (keep separate)
+
+Two independent regression surfaces — do not conflate them:
+
+| Scope | Pillars | When to run | Command |
+|-------|---------|-------------|---------|
+| **Charter** | 1–6 (native completion) | Any change to `agent/`, `acp_thread/`, native tools, fragments, contracts, `memory_palace/` | `cargo test -p agent native_grok` |
+| **Cold start** | 7 only | Changes to immersive startup, auth skip, ACP transport filter, `zed.rs` panel init | [Linux grok-first cold start](#linux-grok-first-cold-start) commands |
+
+**Charter command** matches ~69 tests: `native_grok_contracts` (`contract_*`), `native_grok_surface_tdd`, `test_native_grok_*` in `mod.rs`, and production tests whose names include `native_grok` (tool registration, diagnostics injection, persona propagation, etc.). This is the single command to run after charter work — includes the two you already verified:
+
+- `contract_tool_calling_all_grok_native_tools_are_registered`
+- `test_native_grok_build_profile_injects_three_behavioral_rules_and_turn_id`
+
+```bash
+cargo test -p agent native_grok
+```
+
+Equivalent wrapper: `./script/test-surmount-charter`
+
+**Cold-start command** (separate from charter — `agent_ui` immersive startup, not native completion):
+
+```bash
+cargo test -p agent_ui test_grok_ -- --nocapture
+```
+
+When touching cold-start files also run `cargo test -p agent_servers dropped_at_transport` and `cargo test -p project surmount_auth`. Wrapper: `./script/test-surmount-cold-start`.
+
+TODO: Add CI jobs `surmount-charter` and `surmount-cold-start` mirroring the two scopes above.
+
+### Bridged vs native honesty
+
+Code still maintains a substantial bridged ACP surface (`agent_servers/acp.rs`, default Linux `grok` synthesis). PLAN.md states bridged is legacy; SURMOUNT tracks this as **transitional** until pillar 1 ships native default routing. Do not remove bridged paths without native parity tests green.
 
 ## Categories
 
@@ -173,7 +238,7 @@ Entries are added as diffs are reviewed. Each section states observable changes 
 
 **`agent_skills` crate** — Multi-root skill discovery: `.agents/skills/`, `~/.grok/skills/`, `~/.grok/bundled/skills/` with `GrokUser`/`GrokProjectLocal` scope types; precedence `.agents > .grok/user > bundled`.
 
-**`.agents/skills/`** — Project agent skills (`branch-differences-documenter`, `refactor-debug`, `hygiene`, `gpui-test`, etc.).
+**`.agents/skills/`** — Project agent skills (`branch-differences-documenter`, `surmount-merge-review`, `refactor-debug`, `hygiene`, `gpui-test`, etc.).
 
 **`skill_tool.rs`, `agent_skills.rs`** — Agent runtime skill loading and invocation.
 
@@ -198,6 +263,22 @@ Entries are added as diffs are reviewed. Each section states observable changes 
 **`assets/keymaps/`** — `ctrl-alt-x` / `cmd-alt-x` → `NewGrokThread`; `ctrl-alt-shift-t` / `cmd-alt-shift-t` → `OpenFullGrokSurface` (Linux/macOS). Windows: palette/button/menu only.
 
 **`keymap_file.rs`, `keymap_editor/`** — Keymap loading/editor tweaks for new actions.
+
+### Linux grok-first cold start
+
+Surmount on Linux with a discovered `~/.grok/bin/grok` binary cold-starts into maximized Full Agent Mode (ZedTodos left, Grok thread right). These fork-specific choices reduce startup latency and log noise; **re-apply deliberately on upstream merges** — upstream will re-enable auth and add ACP handlers that may overlap.
+
+| Decision | Location | Rationale |
+|----------|----------|-----------|
+| Skip Zed cloud GitHub sign-in | `crates/zed/src/main.rs` (`authenticate` spawn) | Grok-first users do not need collab/GitHub auth at cold start; avoids network work on the critical path |
+| Skip background LM provider auth | `crates/agent/src/agent.rs` (`authenticate_all_language_model_providers`) | ChatGPT Subscription (`openai-subscribed`), Copilot Chat, OpenAI, etc. are not warmed on grok-first launch |
+| Auth gate helper | `project::surmount_skips_upstream_auth_on_cold_start()` | Single predicate: `grok_build_default_agent_available() && !cfg!(test)` |
+| Prewarm Grok ACP subprocess | `crates/zed/src/zed.rs` (`initialize_agent_panel`) | `new_external_agent_thread(grok)` before `OpenFullGrokSurface` so `RootThreadUpdated` arrives sooner |
+| Drop orphan `skills-reload` responses | `crates/agent_servers/src/acp.rs` (stdio transport filter) | Grok agent emits unsolicited JSON-RPC responses with `id: "skills-reload"`; SDK warns every ~2s without filter |
+| Swallow `_x.ai/*` extension notifications | `crates/agent_servers/src/acp.rs` (same filter) | `_x.ai/settings/update`, `_x.ai/announcements/update` have no Zed handlers yet; avoids INFO reject spam |
+| Launch phase timing | `crates/agent_ui/src/agent_panel.rs` | `grok_immersive_launch_started_at` + `launch_elapsed_ms` in diagnostics; INFO logs at `surface_pending` and startup complete |
+
+Tests (cold-start scope only — not charter): `agent_servers` `dropped_at_transport`; `agent_ui` `test_grok_*` (`launch_elapsed_ms`); `project` `surmount_auth_skip_is_disabled_under_cfg_test`. Run via `./script/test-surmount-cold-start`.
 
 ### Decisions & policy
 
@@ -231,6 +312,8 @@ From `.rules` / `AGENTS.md` (binding, already enforced):
 **`PLAN.md`** — Strategic intent document (see Decisions).
 
 ### Testing appendix
+
+Maps to [Native Grok Build completion charter](#native-grok-build-completion-charter) pillars 1–6. Run `cargo test -p agent native_grok` after changes. Cold-start tests (`agent_ui` `test_grok_*`) are a [separate scope](#verification-scopes-keep-separate).
 
 **`agent/src/tests/native_grok_contracts.rs`** — Native Grok contract tests: tool surface parity, TurnId serialization, monitor/plan shapes, performance validation hooks.
 
@@ -376,3 +459,48 @@ Items agents cannot close without maintainer judgment:
 2. **Category entries** — Review all sections above for accuracy against your intent (diff-derived, not verified line-by-line).
 3. **PLAN.md vs code** — PLAN states bridged path is "legacy only"; code still maintains substantial bridged ACP surface. Track explicitly if this is transitional.
 4. **Upstream merge** — Re-run `git diff main...surmount` before each merge attempt; this doc reflects one point-in-time snapshot.
+
+## Vector Store Decision
+
+**GitHub link for LanceDB:**
+
+**https://github.com/lancedb/lancedb**
+
+(The core Lance format is at https://github.com/lancedb/lance — both are actively maintained and written in Rust.)
+
+### Full Summary: Why LanceDB Was Selected
+
+After evaluating your requirements across multiple rounds (embedded Rust vector store, significantly better performance than `sqlite-vec`, strong results on speed/throughput, reliability/durability, parallelism/concurrency, space + time efficiency, local-first operation, and explicit avoidance of heavy LSM-tree/RocksDB-style storage engines), **LanceDB** emerged as the clearest best fit.
+
+Here is the consolidated reasoning:
+
+#### 1. Matches Your Core Technical Priorities Extremely Well
+- **Performance (time)**: Delivers low query latency on large datasets (typically 1–5 ms range on million-scale high-dimensional vectors with proper indexing and tuning, sometimes single-digit ms). Uses optimized **IVF-PQ** ANN indexes with a refine step for excellent speed/recall trade-offs. Heavy use of Rust SIMD for distance computations and other hot paths. Columnar layout + zero-copy Arrow integration gives strong scan and random-access performance.
+- **Space efficiency**: Columnar storage + Product Quantization in indexes provides good compression. Recent Lance format improvements (v2.2) show significant storage savings vs. Parquet equivalents in many workloads while preserving (or improving) access speed. Much more efficient than pure in-memory HNSW stores for anything beyond moderate sizes.
+- **Reliability & correctness**: Entirely Rust-based core. Built-in automatic **versioning** (cheap time-travel and reproducibility — a major advantage for AI/ML pipelines). Durable file-based persistence with manifests/commits. Good crash-recovery characteristics via the storage layer.
+- **Parallelism & concurrency**: Native async Rust SDK. Strong support for concurrent reads. Storage format (fragments + indices) designed for concurrent access. Integrates with DataFusion for parallel query execution where applicable. Benefits from Rust’s fearless concurrency model without data races.
+- **Local-first embedded**: Runs fully in-process with no server. Connects to a simple local directory path (`connect("data/my_vectors")`). Data lives as ordinary files on disk — no heavy embedded database engine required.
+
+#### 2. Avoids the Storage Model You Explicitly Rejected
+- **No LSM-tree / RocksDB dependency**: LanceDB’s storage is the **Lance columnar lakehouse format** itself — a modern file format (with table + versioning layers) that writes directly to the filesystem (or object stores). 
+- It does **not** use RocksDB, LevelDB, Sled, or any classic LSM-style engine with memtables, multi-level SST files, or background compaction machinery.
+- This keeps the embedded footprint lighter and avoids the write amplification / compaction overhead characteristics you wanted to steer clear of, while still providing durability and good random access (often dramatically better than Parquet for the access patterns that matter for vectors and multimodal data).
+
+#### 3. Better Than the Main Alternatives on Your Full Criteria
+- **vs. sqlite-vec**: Far superior ANN indexing (IVF-PQ vs. basic extension functions), columnar efficiency, random access, versioning, and scalability. `sqlite-vec` is fine for tiny on-device cases but falls short on performance and modern vector workloads.
+- **vs. SurrealDB**: Avoids the RocksDB backend (and general-purpose DB overhead). LanceDB is more specialized and efficient for pure vector + multimodal workloads.
+- **vs. PolarisDB**: LanceDB wins on scale, random-access performance, versioning, ecosystem maturity, and production features. PolarisDB is a credible lighter pure-Rust WAL-based option (also non-LSM) and could be worth a quick look if you want something even more minimal, but it has less public large-scale benchmarking and fewer advanced capabilities.
+- **vs. lighter/experimental options** (nano-vectordb-rs, SahomeDB, iqdb, early SatoriDB, etc.): LanceDB offers the best combination of performance, reliability features, and efficiency without feeling under-powered for serious use. The others are either too basic, less mature, or still carry extra storage layers you preferred to avoid.
+
+#### 4. Additional Advantages That Align With Real-World Use
+- Excellent support for the typical vector/AI access patterns: bulk appends + versioning, fast similarity search, metadata filtering, multimodal data (vectors + blobs + structured fields), and schema evolution.
+- Strong Rust ergonomics (async, zero-copy with Arrow) plus good interoperability if you ever need to bridge to other tools.
+- Proven in production AI workloads while remaining fully embeddable and local-first.
+- Future-proof storage (works seamlessly on local disk today and can scale to object storage later with the same format).
+
+#### Minor Caveats (for transparency)
+- Write concurrency has practical limits under very high contention (retries on commit help, but it’s not an OLTP-style engine).
+- Best suited to append-oriented + versioning workflows rather than extremely high-frequency point updates (the latter is where some LSM designs can shine, but that’s not the typical vector store pattern).
+
+**Bottom line**: LanceDB gives you the best combination of raw performance, space/time efficiency, reliability features (especially versioning), concurrency characteristics, and lightweight embedded operation **without** relying on the heavy LSM-style storage engines you wanted to avoid. It is purpose-built for exactly the kind of local-first, high-performance vector workloads you described.
+

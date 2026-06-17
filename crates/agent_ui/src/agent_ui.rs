@@ -19,6 +19,7 @@ mod inline_assistant;
 mod inline_prompt_editor;
 mod language_model_selector;
 mod mention_set;
+pub mod merge_review;
 mod message_editor;
 mod mode_selector;
 mod model_selector;
@@ -364,6 +365,15 @@ pub struct NewExternalAgentThread {
     resume_session_id: Option<String>,
 }
 
+impl NewExternalAgentThread {
+    pub fn grok(resume_session_id: Option<String>) -> Self {
+        Self {
+            agent: AgentId::from("grok"),
+            resume_session_id,
+        }
+    }
+}
+
 /// Convenience action for directly creating a Grok Build (ACP) thread.
 /// Surfaces "agent: new grok thread" in the command palette making the grok agent
 /// a first-class discoverable peer (co-equal Grok command surface). Delegates to
@@ -601,6 +611,7 @@ pub fn init(
     agent_panel::init(cx);
     context_server_configuration::init(language_registry.clone(), fs.clone(), cx);
     thread_metadata_store::init(cx);
+    merge_review::init(cx);
     terminal_thread_metadata_store::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);

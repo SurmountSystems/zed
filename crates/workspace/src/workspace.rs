@@ -2315,6 +2315,13 @@ impl Workspace {
         }
     }
 
+    fn any_panel_immersive_startup_in_progress(&self, window: &Window, cx: &App) -> bool {
+        self.all_docks().iter().any(|dock| {
+            dock.read(cx)
+                .any_panel_immersive_startup_in_progress(window, cx)
+        })
+    }
+
     pub fn agent_panel_position(&self, cx: &App) -> Option<DockPosition> {
         self.all_docks().into_iter().find_map(|dock| {
             let dock = dock.read(cx);
@@ -7136,7 +7143,9 @@ impl Workspace {
 
                     if let Some(active_pane) = active_pane {
                         workspace.set_active_pane(&active_pane, window, cx);
-                        cx.focus_self(window);
+                        if !workspace.any_panel_immersive_startup_in_progress(window, cx) {
+                            cx.focus_self(window);
+                        }
                     } else {
                         workspace.set_active_pane(&workspace.center.first_pane(), window, cx);
                     }

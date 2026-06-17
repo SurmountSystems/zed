@@ -568,6 +568,20 @@ pub mod agent {
     }
 }
 
+pub mod surmount {
+    use gpui::actions;
+
+    actions!(
+        surmount,
+        [
+            /// Populate and open the Surmount merge review queue against upstream main.
+            StartMergeReview,
+            /// Reopen the persisted Surmount merge review queue.
+            OpenMergeReview,
+        ]
+    );
+}
+
 pub mod assistant {
     use gpui::{Action, actions};
     use schemars::JsonSchema;

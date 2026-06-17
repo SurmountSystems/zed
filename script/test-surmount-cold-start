@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Linux grok-first cold start (SURMOUNT.md pillar 7 only).
+# Separate from native completion charter tests.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+cargo test -p agent_ui test_grok_ -- --nocapture "$@"
+cargo test -p agent_servers dropped_at_transport -- --nocapture
+cargo test -p project surmount_auth -- --nocapture

@@ -1,0 +1,162 @@
+version = 1
+
+[[rules]]
+category_id = "datastore"
+surmount_section = "Datastore / persistence"
+disposition = "fork_owned"
+risk = "high"
+paths = [
+  "crates/agent_ui/src/thread_metadata_store.rs",
+  "crates/agent_ui/src/draft_prompt_store.rs",
+  "crates/agent/src/grok_persistence.rs",
+  "crates/agent/src/db.rs",
+  "crates/agent/src/thread_store.rs",
+]
+
+[[rules]]
+category_id = "native_agent_core"
+surmount_section = "Native agent core"
+disposition = "fork_owned"
+risk = "high"
+paths = [
+  "crates/agent/src/thread.rs",
+  "crates/agent/src/agent.rs",
+  "crates/agent/src/native_agent_server.rs",
+  "crates/agent/src/scheduler.rs",
+  "crates/agent/src/verification.rs",
+  "crates/agent/src/templates/**",
+  "crates/acp_thread/**",
+  "crates/agent_servers/**",
+  "crates/acp_tools/**",
+]
+
+[[rules]]
+category_id = "agent_ui"
+surmount_section = "Agent UI & conversation"
+disposition = "fork_owned"
+risk = "high"
+paths = [
+  "crates/agent_ui/**",
+  "docs/src/ai/**",
+]
+
+[[rules]]
+category_id = "agent_tools"
+surmount_section = "Agent tools & permissions"
+disposition = "fork_owned"
+risk = "high"
+paths = [
+  "crates/agent/src/tools.rs",
+  "crates/agent/src/tools/**",
+  "crates/agent/src/tool_permissions_setup.rs",
+  "crates/agent/src/update_plan_tool.rs",
+]
+
+[[rules]]
+category_id = "agent_skills"
+surmount_section = "Agent skills system"
+disposition = "fork_owned"
+risk = "medium"
+paths = [
+  "crates/agent_skills/**",
+  "crates/agent/src/skill_tool.rs",
+  "crates/agent/src/agent_skills.rs",
+  "crates/prompt_store/**",
+  ".agents/skills/**",
+]
+
+[[rules]]
+category_id = "xai"
+surmount_section = "xAI / LLM provider"
+disposition = "fork_owned"
+risk = "medium"
+paths = [
+  "crates/x_ai/**",
+  "crates/language_models/src/provider/x_ai.rs",
+  "crates/agent_ui/src/agent_configuration/**",
+  "crates/settings_content/src/language_model.rs",
+]
+
+[[rules]]
+category_id = "keymaps"
+surmount_section = "Keymaps & agent actions"
+disposition = "fork_owned"
+risk = "low"
+paths = [
+  "crates/zed_actions/**",
+  "assets/keymaps/**",
+  "crates/zed/src/keymap_file.rs",
+  "crates/keymap_editor/**",
+]
+
+[[rules]]
+category_id = "memory_palace"
+surmount_section = "memory_palace & ref"
+disposition = "fork_owned"
+risk = "medium"
+paths = [
+  "crates/memory_palace/**",
+  "ref/**",
+]
+
+[[rules]]
+category_id = "testing"
+surmount_section = "Testing appendix"
+disposition = "fork_owned"
+risk = "low"
+paths = [
+  "crates/agent/src/tests/**",
+  "crates/agent_ui/src/test_support.rs",
+  "crates/collab/tests/integration/agent_sharing_tests.rs",
+  "tools/evals/**",
+]
+
+[[rules]]
+category_id = "decisions"
+surmount_section = "Decisions & policy"
+disposition = "fork_owned"
+risk = "low"
+paths = [
+  "PLAN.md",
+  "SURMOUNT.md",
+  ".rules",
+  "AGENTS.md",
+]
+
+[[rules]]
+category_id = "workspace_build"
+surmount_section = "Workspace & build config"
+disposition = "build_config"
+risk = "medium"
+paths = [
+  "Cargo.toml",
+  "Cargo.lock",
+  "supply-chain/**",
+  ".cargo/**",
+  ".config/**",
+  ".gitmodules",
+]
+
+[[rules]]
+category_id = "misc_upstream"
+surmount_section = "Misc upstream-touching tweaks"
+disposition = "ambiguous"
+risk = "medium"
+paths = [
+  "crates/zed/src/zed.rs",
+  "crates/editor/**",
+  "crates/git_ui/**",
+  "crates/onboarding/**",
+  "crates/ai_onboarding/**",
+  "crates/workspace/**",
+  "crates/sidebar/**",
+  "crates/edit_prediction/**",
+  "crates/edit_prediction_cli/**",
+  "crates/collab/**",
+  "crates/languages/**",
+  "crates/terminal/**",
+  "crates/search/**",
+  "crates/debugger/**",
+  "crates/extensions/**",
+  "crates/gpui_wgpu/**",
+]
