@@ -1372,6 +1372,10 @@ pub struct ThreadView {
     pub show_external_source_prompt_warning: bool,
     pub show_codex_windows_warning: bool,
     pub multi_root_callout_dismissed: bool,
+    /// When true, ThreadView renders as the right pane of the full-agent-mode dock
+    /// split; the categorized surface lives in the left pane so activity-bar todos
+    /// are suppressed to avoid duplicate layout.
+    pub embedded_in_zed_todos_dock: bool,
     pub generating_indicator_in_list: bool,
     pub skill_loading_errors: Vec<SkillLoadingError>,
     /// Errors the user has explicitly dismissed. Each entry is matched against
@@ -1720,6 +1724,7 @@ impl ThreadView {
             show_external_source_prompt_warning,
             show_codex_windows_warning,
             multi_root_callout_dismissed: false,
+            embedded_in_zed_todos_dock: false,
             generating_indicator_in_list: false,
             skill_loading_errors: Vec::new(),
             dismissed_skill_loading_errors: HashSet::default(),
@@ -3795,11 +3800,18 @@ impl ThreadView {
             .into_any_element()
     }
 
+    pub fn set_embedded_in_zed_todos_dock(&mut self, embedded: bool) {
+        self.embedded_in_zed_todos_dock = embedded;
+    }
+
     pub fn render_activity_bar(
         &self,
         window: &mut Window,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
+        if self.embedded_in_zed_todos_dock {
+            return None;
+        }
         #[cfg(any())]
         {
             todo!(
@@ -11690,6 +11702,8 @@ impl Render for ThreadView {
                         .child(self.render_entries(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
                         .into_any()
+                } else if self.embedded_in_zed_todos_dock {
+                    this.flex_1().min_h_0().into_any()
                 } else {
                     this.into_any()
                 }
@@ -11894,6 +11908,7 @@ impl Render for ThreadView {
                 }
             }))
             .size_full()
+            .when(self.embedded_in_zed_todos_dock, |this| this.flex_1().min_h_0())
             .children(self.render_subagent_titlebar(cx))
             .child(conversation)
             .children(self.render_multi_root_callout(cx))
@@ -12031,6 +12046,7 @@ pub(crate) fn open_link(
 pub struct ZedTodosDockPrototype {
     pub zed_todos: ZedTodosComponent,
     thread: WeakEntity<acp_thread::AcpThread>,
+    thread_view: Option<WeakEntity<ThreadView>>,
     focus_handle: FocusHandle,
     /// Cache for the context ring: only re-render/notify when the display bucket changes
     /// (prevents thrashing the element tree + potential focus/pane side-effects on every
@@ -12039,17 +12055,30 @@ pub struct ZedTodosDockPrototype {
 }
 
 impl ZedTodosDockPrototype {
-    pub fn new(thread: WeakEntity<acp_thread::AcpThread>, cx: &mut App) -> Self {
+    pub fn new(
+        thread: WeakEntity<acp_thread::AcpThread>,
+        thread_view: Option<WeakEntity<ThreadView>>,
+        cx: &mut App,
+    ) -> Self {
         Self {
             zed_todos: ZedTodosComponent::new(),
             thread,
+            thread_view,
             focus_handle: cx.focus_handle(),
             last_ring_bucket: None,
         }
     }
 
-    pub fn new_for_thread(thread: Entity<acp_thread::AcpThread>, cx: &mut App) -> Self {
-        Self::new(thread.downgrade(), cx)
+    pub fn new_for_thread(
+        thread: Entity<acp_thread::AcpThread>,
+        thread_view: Option<Entity<ThreadView>>,
+        cx: &mut App,
+    ) -> Self {
+        Self::new(
+            thread.downgrade(),
+            thread_view.map(|view| view.downgrade()),
+            cx,
+        )
     }
 
     pub fn prepare_for_full_agent_mode(&mut self) {
@@ -12057,6 +12086,16 @@ impl ZedTodosDockPrototype {
         self.zed_todos.state.plan_expanded = true;
         self.zed_todos.state.background_tasks_expanded = true;
         self.zed_todos.state.grok_memory_expanded = true;
+    }
+
+    pub fn set_thread_view(&mut self, thread_view: WeakEntity<ThreadView>) {
+        self.thread_view = Some(thread_view);
+    }
+
+    pub fn has_attached_thread_view(&self, _cx: &App) -> bool {
+        self.thread_view
+            .as_ref()
+            .is_some_and(|view| view.upgrade().is_some())
     }
 }
 
@@ -12083,11 +12122,15 @@ impl Render for ZedTodosDockPrototype {
             // This is the default primary visual for Grok (bridged and native is_grok_build_profile).
             h_flex()
                 .size_full()
+                .min_h_0()
                 .gap_0()
                 .child(
                     // Left pane: the full categorized surface
                     v_flex()
                         .w(px(380.))
+                        .flex_shrink_0()
+                        .h_full()
+                        .overflow_hidden()
                         .border_r_1()
                         .border_color(cx.theme().colors().border)
                         .bg(cx.theme().colors().panel_background)
@@ -12184,8 +12227,11 @@ impl Render for ZedTodosDockPrototype {
                         .child(
                             // The complete categorized todos surface as the left widget
                             // (approvals + plans/todos + monitors + memory all together, with chips, actions, etc.)
-                            div()
-                                .size_full()
+                            v_flex()
+                                .id("zed-todos-categorized-scroll")
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_y_scroll()
                                 .child(render_zed_todos_categorized_surface(
                                     &pending_approvals,
                                     plan,
@@ -12197,17 +12243,28 @@ impl Render for ZedTodosDockPrototype {
                                 )),
                         ),
                 )
-                // Right side is intentionally minimal in this full-screen categorized todos surface view.
-                // The authoritative "todos panel + approvals + plans" widget lives in the left sidebar
-                // (the complete categorized surface with all chips, actions, disclosures, proposed plans, etc.).
-                // Future: this area can become a collapsed chat or secondary view.
                 .child(div().w(px(1.)).bg(cx.theme().colors().border))
                 .child(
-                    v_flex().flex_1().p_2().child(
-                        Label::new("Right area available for future chat or secondary tools")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                    v_flex()
+                        .flex_1()
+                        .size_full()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .when_some(
+                            self.thread_view
+                                .as_ref()
+                                .and_then(|view| view.upgrade()),
+                            |this, thread_view| {
+                                this.child(
+                                    div()
+                                        .id("zed-todos-dock-thread-view")
+                                        .flex_1()
+                                        .min_h_0()
+                                        .size_full()
+                                        .child(thread_view),
+                                )
+                            },
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -12715,11 +12772,13 @@ mod background_monitor_tdd {
         let _ = plan_accept_button;
         let dock_prototype_constructor: fn(
             WeakEntity<acp_thread::AcpThread>,
+            Option<WeakEntity<ThreadView>>,
             &mut App,
         ) -> ZedTodosDockPrototype = ZedTodosDockPrototype::new;
         let _ = dock_prototype_constructor;
         let dock_prototype_for_thread_constructor: fn(
             Entity<acp_thread::AcpThread>,
+            Option<Entity<ThreadView>>,
             &mut App,
         ) -> ZedTodosDockPrototype = ZedTodosDockPrototype::new_for_thread;
         let _ = dock_prototype_for_thread_constructor;
@@ -12935,6 +12994,7 @@ mod background_monitor_tdd {
         let _rich_categorized_surface = render_zed_todos_categorized_surface;
         let dock_prototype_for_thread: fn(
             Entity<acp_thread::AcpThread>,
+            Option<Entity<ThreadView>>,
             &mut App,
         ) -> ZedTodosDockPrototype = ZedTodosDockPrototype::new_for_thread;
         let _ = dock_prototype_for_thread;
@@ -13055,10 +13115,14 @@ mod background_monitor_tdd {
                 && overlay_state.grok_memory_expanded
         );
         let _ = render_zed_todos_categorized_surface;
-        let _dock_ctor: fn(WeakEntity<acp_thread::AcpThread>, &mut App) -> ZedTodosDockPrototype =
-            ZedTodosDockPrototype::new;
+        let _dock_ctor: fn(
+            WeakEntity<acp_thread::AcpThread>,
+            Option<WeakEntity<ThreadView>>,
+            &mut App,
+        ) -> ZedTodosDockPrototype = ZedTodosDockPrototype::new;
         let _dock_for_thread_ctor: fn(
             Entity<acp_thread::AcpThread>,
+            Option<Entity<ThreadView>>,
             &mut App,
         ) -> ZedTodosDockPrototype = ZedTodosDockPrototype::new_for_thread;
         let _plan_accept_overlay = ZedTodosComponent::build_plan_accept_button(
@@ -13192,6 +13256,7 @@ mod background_monitor_tdd {
         let _ = render_zed_todos_categorized_surface;
         let dock_prototype_for_native_thread: fn(
             Entity<acp_thread::AcpThread>,
+            Option<Entity<ThreadView>>,
             &mut App,
         ) -> ZedTodosDockPrototype = ZedTodosDockPrototype::new_for_thread;
         let _ = dock_prototype_for_native_thread;
@@ -13723,8 +13788,11 @@ mod background_monitor_tdd {
             &App,
         ) -> gpui::AnyElement = super::render_grok_memory_items;
         let _one_call_surface = render_zed_todos_categorized_surface;
-        let _dock_proto: fn(Entity<acp_thread::AcpThread>, &mut App) -> ZedTodosDockPrototype =
-            ZedTodosDockPrototype::new_for_thread;
+        let _dock_proto: fn(
+            Entity<acp_thread::AcpThread>,
+            Option<Entity<ThreadView>>,
+            &mut App,
+        ) -> ZedTodosDockPrototype = ZedTodosDockPrototype::new_for_thread;
 
         // 4. prepare_for_full_agent_mode (used by auto-open on Grok create/switch) forces the rich expanded state.
         let mut prepared = ZedTodos::default();

@@ -28,7 +28,7 @@ use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
 use fs::Fs;
-use futures::FutureExt as _;
+
 use futures::{StreamExt, channel::mpsc, select_biased};
 use git_ui::commit_view::CommitViewToolbar;
 use git_ui::git_panel::GitPanel;
@@ -759,7 +759,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(debug_panel, workspace_handle, cx),
+            add_panel_when_ready(debug_panel, workspace_handle, cx.clone()),
         );
 
         anyhow::Ok(())
@@ -856,6 +856,8 @@ async fn initialize_agent_panel(
     // Ensure the Agent Panel (and therefore the right dock) is visible by default on startup.
     // This is required for the Grok Build / Full Agent Mode experience the user expects.
     workspace_handle.update_in(&mut cx, |workspace, window, cx| {
+        log::info!("initialize_agent_panel: revealing and opening full grok surface");
+        workspace.reveal_panel::<agent_ui::AgentPanel>(window, cx);
         workspace.focus_panel::<agent_ui::AgentPanel>(window, cx);
         window.dispatch_action(zed_actions::agent::OpenFullGrokSurface.boxed_clone(), cx);
     })?;
