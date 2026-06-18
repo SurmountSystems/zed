@@ -869,13 +869,16 @@ async fn initialize_agent_panel(
         })?;
     }
 
-    // Ensure the Agent Panel (and therefore the right dock) is visible by default on startup.
-    // This is required for the Grok Build / Full Agent Mode experience the user expects.
-    workspace_handle.update_in(&mut cx, |_workspace, window, cx| {
+    // SURMOUNT INVARIANT: Linux grok-first cold start must ALWAYS open fully maximized
+    // agent mode (OpenFullGrokSurface → dock open + workspace zoom + categorized surface)
+    // on every launch. Never editor-first. Never side-panel-only. See agent_ui tests
+    // `test_grok_open_full_surface_must_maximize_before_thread_ready` and
+    // `test_grok_toggle_must_not_close_immersive_maximized_mode`.
+    workspace_handle.update_in(&mut cx, |workspace, window, cx| {
         log::info!(
             "initialize_agent_panel: grok immersive launch phase: opening full grok surface"
         );
-        window.dispatch_action(zed_actions::agent::OpenFullGrokSurface.boxed_clone(), cx);
+        agent_ui::AgentPanel::open_full_grok_immersive_from_workspace(workspace, window, cx);
     })?;
 
     workspace_handle.update_in(&mut cx, |workspace, window, cx| {

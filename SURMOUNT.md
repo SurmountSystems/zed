@@ -273,12 +273,58 @@ Surmount on Linux with a discovered `~/.grok/bin/grok` binary cold-starts into m
 | Skip Zed cloud GitHub sign-in | `crates/zed/src/main.rs` (`authenticate` spawn) | Grok-first users do not need collab/GitHub auth at cold start; avoids network work on the critical path |
 | Skip background LM provider auth | `crates/agent/src/agent.rs` (`authenticate_all_language_model_providers`) | ChatGPT Subscription (`openai-subscribed`), Copilot Chat, OpenAI, etc. are not warmed on grok-first launch |
 | Auth gate helper | `project::surmount_skips_upstream_auth_on_cold_start()` | Single predicate: `grok_build_default_agent_available() && !cfg!(test)` |
-| Prewarm Grok ACP subprocess | `crates/zed/src/zed.rs` (`initialize_agent_panel`) | `new_external_agent_thread(grok)` before `OpenFullGrokSurface` so `RootThreadUpdated` arrives sooner |
+| Prewarm Grok ACP subprocess | `crates/zed/src/zed.rs` (`initialize_agent_panel`) | `new_external_agent_thread(grok)` before immersive open so `RootThreadUpdated` arrives sooner |
+| Synchronous immersive open | `crates/zed/src/zed.rs`, `agent_ui::AgentPanel::open_full_grok_immersive_from_workspace` | Cold start calls this directly (not `dispatch_action`) so dock open + workspace zoom land in the same update cycle |
 | Drop orphan `skills-reload` responses | `crates/agent_servers/src/acp.rs` (stdio transport filter) | Grok agent emits unsolicited JSON-RPC responses with `id: "skills-reload"`; SDK warns every ~2s without filter |
 | Swallow `_x.ai/*` extension notifications | `crates/agent_servers/src/acp.rs` (same filter) | `_x.ai/settings/update`, `_x.ai/announcements/update` have no Zed handlers yet; avoids INFO reject spam |
-| Launch phase timing | `crates/agent_ui/src/agent_panel.rs` | `grok_immersive_launch_started_at` + `launch_elapsed_ms` in diagnostics; INFO logs at `surface_pending` and startup complete |
+| Launch phase timing | `crates/agent_ui/src/agent_panel.rs` | `grok_immersive_launch_started_at` + `launch_elapsed_ms` in diagnostics; INFO logs at `surface_pending`, `zoom_applied_sync`, and startup complete |
 
 Tests (cold-start scope only — not charter): `agent_servers` `dropped_at_transport`; `agent_ui` `test_grok_*` (`launch_elapsed_ms`); `project` `surmount_auth_skip_is_disabled_under_cfg_test`. Run via `./script/test-surmount-cold-start`.
+
+#### Immersive startup pitfalls (maintainer notes)
+
+**Product invariant:** Linux grok-first cold start must always land in fully maximized Full Agent Mode (agent dock open, workspace zoomed, ZedTodos categorized surface) — never editor-first, never side-panel-only. Code comments mark this as `SURMOUNT INVARIANT` in `agent_panel.rs` and `zed.rs`.
+
+**Why sync zoom matters:** Layout maximization is driven by `workspace.zoomed_position`, not `panel.zoomed` alone. Emitting `PanelEvent::ZoomIn` from nested `panel.update` does not reliably set `workspace.zoomed_position` on the same frame — logs can show `zoom_applied_sync` with `zoomed=false workspace_zoomed=false` while internal flags later go green. Fix: `Workspace::zoom_dock_panel` (uses `set_panel_zoomed_no_serialize` to avoid double-lease) called from `sync_grok_immersive_zoom_from_workspace`; log marker is `grok immersive launch phase: zoom_applied_sync` and must show `zoomed=true workspace_zoomed=true`.
+
+**Entry point:** `AgentPanel::open_full_grok_immersive_from_workspace` (workspace context) opens dock, arms startup via `arm_grok_immersive_startup`, then `sync_grok_immersive_zoom_from_workspace` → `Workspace::zoom_dock_panel`. Wired from `OpenFullGrokSurface` action and `initialize_agent_panel` — cold start must call the workspace helper directly, not `window.dispatch_action` alone.
+
+**Double-lease:** Never `workspace.read()` from inside nested `panel.update` during immersive startup while a `workspace.update_in` lease is active. `agent_dock_open_hint` avoids probing the dock in that window — set it in `open_full_grok_immersive_from_workspace` only **after** `workspace.open_panel`. Do **not** call `schedule_grok_immersive_reveal_until_ready` from `arm_grok_immersive_startup` (its diagnostics read the dock). `reassert_grok_immersive_maximized` must not set `agent_dock_open_hint` before the dock is actually reopened. Tests: `test_grok_set_active_with_surface_after_startup_avoids_double_lease`, `test_grok_open_full_immersive_from_workspace_matches_cold_start_path`.
+
+**Awaiting ACP thread:** When `active_agent_thread` is still `None`, `open_zed_todos_surface` returns early. `schedule_grok_awaiting_thread_surface_retry` spaces retries with `background_executor().timer(500ms)` — never chain `window.defer` for this path (GPUI can drain the whole chain in one frame, burning all 48 attempts instantly). Never call `schedule_grok_immersive_startup_completion` synchronously from `ensure_grok_categorized_surface`. `set_active(false)` during startup clears `agent_dock_open_hint`; `reassert_grok_immersive_maximized` must not set the hint before `open_panel` runs. Tests: `test_grok_awaiting_thread_does_not_retry_synchronously_on_arm`, `test_grok_set_active_false_clears_dock_hint_during_startup`, `test_grok_reassert_does_not_set_dock_hint_before_reopen`, `test_grok_dock_close_during_startup_reopens_panel`.
+
+**Pre-first-frame stalls (environmental):** Hang traces may show ~19–106s blocked at `Workspace::new_local` (`workspace.rs:1884` async open: path canonicalization, serialized workspace restore, worktree creation) and GPU adapter selection before `Rendered first frame`. ACP registry CDN timeout (30s) and context-server init (60s) stack on power-saver runs. Sync zoom may still log `zoom_applied_sync` on first frame; categorized surface opens only after `RootThreadUpdated` or timer-spaced `schedule_grok_awaiting_thread_surface_retry` once the thread exists.
+
+**Measured cold start (2026-06-18, same binary):**
+
+| Power mode | Start → first frame | `elapsed_ms` at startup complete | Wall clock |
+|------------|---------------------|----------------------------------|------------|
+| High performance | ~19s | ~8281ms | ~39s |
+| Power saver | ~106s | ~4518ms (after first frame) | ~2m21s |
+
+Grok immersive `elapsed_ms` measures from `surface_pending`; most user-visible delay on power saver is pre-first-frame workspace/GPU work, not categorized-surface attach.
+
+**Awaiting-thread ensure dedup:** While `active_agent_thread` is `None`, `ensure_grok_categorized_surface` must return before `open_zed_todos_surface` (timer + `RootThreadUpdated` only). `defer_ensure_grok_categorized_surface` and serialized panel load skip ensure during `grok_immersive_startup_in_progress`. Tests: `test_grok_ensure_skips_surface_open_while_awaiting_thread`, `test_grok_awaiting_thread_does_not_retry_synchronously_on_arm`, `test_grok_open_full_immersive_from_workspace_matches_cold_start_path`, `test_grok_cold_start_startup_complete_matches_last_known_good`.
+
+**Palette `agent: toggle` spin-close:** `Workspace::toggle_panel_focus` may call `close_panel` when `close_panel_on_toggle` is set and focus leaves the panel. Reasserting after that toggle is too late — the dock is already closed. Fix: when `grok_immersive_must_stay_maximized()` is true, short-circuit toggle/toggle-focus to `open_panel` + `reassert_grok_immersive_maximized` without calling `toggle_panel_focus`. Test: `test_grok_toggle_must_not_close_immersive_maximized_mode`.
+
+**`set_zoomed(false)` during startup:** `AgentPanel::set_zoomed` ignores unzoom requests while `grok_immersive_startup_in_progress` or `grok_immersive_must_stay_maximized` and schedules reveal instead.
+
+**Diagnostics vs visuals:** Internal flags (`zoomed`, `grok_workspace_zoom_overlay_synced`, `startup_logged`) can go green while the user still sees editor-first if zoom was deferred or dock restore ran before immersive skip. Trust `zoom_applied_sync` timestamp in logs (should match `surface_pending`), not flags alone.
+
+**Key symbols:** `open_full_grok_immersive_from_workspace`, `sync_grok_immersive_zoom_from_workspace`, `Workspace::zoom_dock_panel`, `arm_grok_immersive_startup`, `agent_dock_open_hint`, `grok_immersive_must_stay_maximized`, `reassert_grok_immersive_maximized`, `defer_ensure_grok_categorized_surface`.
+
+**Last known good production log (2026-06-18):** All three INFO lines share the same second on cold start; `zoom_applied_sync` must show `zoomed=true workspace_zoomed=true` (not `false`). Surface opens ~2s later; startup complete shows all layout flags green.
+
+```
+grok immersive launch phase: surface_pending
+initialize_agent_panel: grok immersive launch phase: opening full grok surface
+grok immersive launch phase: zoom_applied_sync (active=true zoomed=true workspace_zoomed=true ... dock_open=true ... pending=true startup_in_progress=true ... zoom_defer_scheduled=false zoom_apply_in_flight=false shows_startup_splash=true)
+open_zed_todos_surface: opened categorized surface (...)
+grok immersive startup complete: agent panel dock revealed and zoomed (elapsed_ms=Some(~2254), ... ready=true visual_ready=true logged=true ... pending=false startup_in_progress=false)
+```
+
+**Regression tests:** Phase helpers `assert_grok_sync_zoom_phase`, `assert_grok_startup_awaiting_thread_phase`, `assert_grok_startup_surface_open_phase`, `assert_grok_startup_complete_phase` encode LKG flag shapes. `test_grok_open_full_immersive_from_workspace_matches_cold_start_path` asserts full `assert_grok_sync_zoom_phase` including `Workspace::zoomed_dock_position` with zero parks (production `zed.rs` path). `test_grok_open_full_surface_must_maximize_before_thread_ready` covers palette/button via `window.dispatch_action` (panel-level LKG flags). Also: `test_grok_cold_start_startup_complete_matches_last_known_good`, `test_grok_startup_last_known_good_sequence`, `test_grok_toggle_must_not_close_immersive_maximized_mode`, `test_grok_build_must_default_to_fully_maximized_categorized_surface_on_editor_open`.
 
 ### Decisions & policy
 

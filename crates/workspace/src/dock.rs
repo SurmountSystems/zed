@@ -552,7 +552,7 @@ impl Dock {
         }
     }
 
-    pub fn set_panel_zoomed(
+    pub(crate) fn set_panel_zoomed_no_serialize(
         &mut self,
         panel: &AnyView,
         zoomed: bool,
@@ -568,13 +568,22 @@ impl Dock {
                 entry.panel.set_zoomed(false, window, cx);
             }
         }
+        cx.notify();
+    }
 
+    pub fn set_panel_zoomed(
+        &mut self,
+        panel: &AnyView,
+        zoomed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_panel_zoomed_no_serialize(panel, zoomed, window, cx);
         self.workspace
             .update(cx, |workspace, cx| {
                 workspace.serialize_workspace(window, cx);
             })
             .ok();
-        cx.notify();
     }
 
     pub fn zoom_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {

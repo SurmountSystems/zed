@@ -4296,6 +4296,26 @@ impl Workspace {
         panel.to_any().downcast().ok()
     }
 
+    /// Zoom a dock panel and synchronously update workspace zoom state for layout.
+    pub fn zoom_dock_panel<T: Panel>(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.panel::<T>(cx) else {
+            return;
+        };
+        let position = panel.read(cx).position(window, cx);
+        self.dismiss_zoomed_items_to_reveal(Some(position), window, cx);
+        let dock = self.dock_at_position(position).clone();
+        dock.update(cx, |dock, cx| {
+            dock.set_panel_zoomed_no_serialize(&panel.to_any(), true, window, cx);
+            if !panel.panel_focus_handle(cx).contains_focused(window, cx) {
+                window.focus(&panel.focus_handle(cx), cx);
+            }
+        });
+        self.zoomed = Some(panel.downgrade().into());
+        self.zoomed_position = Some(position);
+        cx.emit(Event::ZoomChanged);
+        self.serialize_workspace(window, cx);
+    }
+
     /// Focus the panel of the given type if it isn't already focused. If it is
     /// already focused, then transfer focus back to the workspace center.
     /// When the `close_panel_on_toggle` setting is enabled, also closes the
@@ -7871,6 +7891,10 @@ impl Workspace {
 
     pub fn zoomed_item(&self) -> Option<&AnyWeakView> {
         self.zoomed.as_ref()
+    }
+
+    pub fn zoomed_dock_position(&self) -> Option<DockPosition> {
+        self.zoomed_position
     }
 
     pub fn activate_next_window(&mut self, cx: &mut Context<Self>) {
