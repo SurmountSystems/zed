@@ -14,28 +14,40 @@ if [[ ! -f SURMOUNT.md ]]; then
 fi
 
 MERGE_BASE="$(git merge-base HEAD "$UPSTREAM_REF")"
-NAME_STATUS="$(git diff --name-status -z "$MERGE_BASE"..HEAD)"
-CONFLICTS="$(git diff --name-only --diff-filter=U -z || true)"
+export MERGE_BASE UPSTREAM_REF
 
-python3 - <<'PY' "$MERGE_BASE" "$UPSTREAM_REF" "$NAME_STATUS" "$CONFLICTS"
-import json, sys
+python3 <<'PY'
+import json
+import os
+import subprocess
 
-merge_base, upstream_ref, name_status, conflicts_raw = sys.argv[1:5]
+merge_base = os.environ["MERGE_BASE"]
+upstream_ref = os.environ["UPSTREAM_REF"]
+
+name_status = subprocess.run(
+    ["git", "diff", "--name-status", "-z", f"{merge_base}..HEAD"],
+    check=True,
+    capture_output=True,
+).stdout.decode("utf-8", errors="surrogateescape")
+
+conflicts_raw = subprocess.run(
+    ["git", "diff", "--name-only", "--diff-filter=U", "-z"],
+    capture_output=True,
+).stdout.decode("utf-8", errors="surrogateescape")
+
 conflicts = {p for p in conflicts_raw.split("\0") if p}
 
 entries = []
-chunk = name_status.split("\0")
+parts = [p for p in name_status.split("\0") if p]
 i = 0
-while i < len(chunk):
-    part = chunk[i]
-    if not part:
+while i < len(parts):
+    status = parts[i]
+    if "\t" in status:
+        status, path = status.split("\t", 1)
         i += 1
-        continue
-    if "\t" in part:
-        status, path = part.split("\t", 1)
     else:
-        status = part
-        path = chunk[i + 1] if i + 1 < len(chunk) else ""
+        i += 1
+        path = parts[i] if i < len(parts) else ""
         i += 1
     if path:
         entries.append({
@@ -43,12 +55,12 @@ while i < len(chunk):
             "status": status,
             "is_conflict": path in conflicts,
         })
-    i += 1
 
 print(json.dumps({
     "merge_base": merge_base,
     "upstream_ref": upstream_ref,
     "changed_files": entries,
+    "changed_file_count": len(entries),
     "manifest": "surmount-merge-categories.toml",
     "skill": ".agents/skills/surmount-merge-review/SKILL.md",
 }, indent=2))

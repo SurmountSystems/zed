@@ -8,6 +8,8 @@ ONE TEST AT A TIME. NO BROAD RUNS. ONLY SCOPED SINGLE-TEST COMMANDS. NO SUB-AGEN
 
 > NEVER MODIFY TESTS: The agent must never change test assertions, expectations, or test logic to make a test pass. If a test appears to be incorrect, the agent must explicitly notify the user and must not edit the test. It should instead move on to other failing tests.
 
+> RED/GREEN TDD FOR DIAGNOSIS: Encode each bug hypothesis as a failing test or assertion first, then fix production code and re-run the same scoped single-test command until green. Applies to regressions in merge-review, triage, and UI workflows — not only post-refactor test clusters.
+
 > PREFER ASSERTIONS OVER DEBUG PRINTS: When you need visibility into values, conditions, or control flow during debugging, **strongly prefer adding proper assertions** (`assert!`, `assert_eq!`, `assert_ne!`, `assert_matches!`, etc.) over `eprintln!`, `println!`, or any other debug printing. Debug prints are a last resort only. If you find yourself wanting to add a debug print to understand why something is happening, first ask whether that observation can be expressed as an assertion instead. This keeps the feedback loop tight, makes failures obvious and actionable, and avoids littering the code with temporary prints. The goal is to turn observations into verifiable checks, not to sprinkle temporary prints.
 
 > NOTE: If the agent gets stuck in a loop, warnings will be issued through interjections. If the warnings are not acknowledged immediately by breaking out of the loop, the conversation will end.

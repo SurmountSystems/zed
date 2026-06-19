@@ -16,6 +16,35 @@ When syncing upstream `main` into `surmount`:
 
 Keep `surmount-merge-categories.toml` in sync when categories here change.
 
+### Merge review tab visibility (Linux grok-first cold start)
+
+**Symptom:** Palette `surmount: Start Merge Review` logs `deploying tab` and `tab opened`, then Zed exits or the tab stays invisible behind the maximized agent dock.
+
+**Root cause (2026-06-19):** An early deploy path called `active_pane().focus_handle().focus()`. That routes through `Workspace::handle_pane_focused` → `dismiss_zoomed_items_to_reveal(None)`, which **closes** the zoomed agent dock (`Dock::set_open(false)`) while `AgentPanel` still holds `OverlayView::ZedTodosSurface` from grok-first cold start. The dock teardown plus overlay state is undefined and has been observed to crash after `tab opened`.
+
+**Fix:** Deferred `MergeReviewView::reveal_tab`: `activate_item`, then `PanelEvent::ZoomOut` on the agent panel when `workspace.zoomed_dock_position()` is set (unzoom only — dock stays open), then `focus_center_pane` (item focus, not pane focus). Initial render caps actionable rows at 25.
+
+**Expected log sequence after fix:**
+
+1. `surmount merge review: start requested`
+2. `surmount merge review: populated N items`
+3. `surmount merge review: deploying tab`
+4. `surmount merge review: tab opened`
+5. `surmount merge review: deferred reveal starting`
+6. `surmount merge review: reveal_tab begin`
+7. `surmount merge review: reveal_tab emitted PanelEvent::ZoomOut` (when agent dock was zoomed)
+8. `surmount merge review: reveal_tab complete`
+9. `surmount merge review: deferred reveal complete`
+10. `surmount merge review: first render`
+
+**Regression tests:**
+
+```bash
+cargo test -p agent_ui merge_review::tests::test_merge_review_deploy_unzooms_without_closing_agent_dock
+cargo test -p agent_ui merge_review::tests::test_merge_review_deploy_completes_first_render
+cargo test -p agent_ui merge_review::tests
+```
+
 ## Documentation map
 
 | Layer | Location | Audience |

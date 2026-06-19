@@ -17,6 +17,20 @@ description: Use when syncing upstream main into the Surmount fork. Guides read-
 
 > ONE CATEGORY AT A TIME. Stop after each category for human confirmation.
 
+> RED/GREEN TDD WHEN DIAGNOSING BUGS: State a hypothesis, add a failing test or assertion that encodes it, fix production code, re-run the same scoped test until green. Prefer `assert!` / `assert_eq!` over debug prints. For this crate: `cargo test -p agent_ui merge_review::tests::<test_name>`. One test at a time; no broad test runs.
+
+## Merge review UI failure checklist
+
+When the human reports crash, hang, or invisible tab after `surmount: Start Merge Review`:
+
+1. **Confirm build includes fixes** — startup log SHA must change after `cargo build --release`; stale binaries reuse old deploy code.
+2. **Read logs in order** — see SURMOUNT.md § Merge review tab visibility. Missing `deferred reveal` or `first render` pinpoints deploy vs render.
+3. **Hypothesis: invisible behind zoomed agent dock** — logs stop after `tab opened`, no crash. Fix path is `reveal_tab` + `ZoomOut`, not pane focus.
+4. **Hypothesis: crash after `tab opened`** — likely `dismiss_zoomed_items_to_reveal` closing agent dock during `ZedTodosSurface` overlay. Do not reintroduce `active_pane().focus_handle().focus()`.
+5. **Hypothesis: empty queue** — `populated 0 items`: wrong active repo (e.g. `ref/vibe-palace` submodule). Confirm `start requested` worktree path ends with `/zed`.
+6. **Hypothesis: triage mismatch** — run `./script/surmount-merge-triage`; `changed_file_count` should match `populated N items`.
+7. **Before asking human to retest** — run `cargo test -p agent_ui merge_review::tests` and ensure GPUI deploy tests are green.
+
 ## When to use
 
 - Before, during, or after `git merge origin/main` on `surmount`
@@ -36,7 +50,7 @@ description: Use when syncing upstream main into the Surmount fork. Guides read-
 
 ## Agent workflow
 
-1. Run `script/surmount-merge-triage` (or equivalent read-only commands) for merge-base + file list.
+1. Run `script/surmount-merge-triage` for merge-base + file list. Expect `changed_file_count` > 0 on `surmount` before merge; zero means wrong repo or a triage/parser bug — investigate before proceeding.
 2. Propose categories from [surmount-merge-categories.toml](surmount-merge-categories.toml). Flag borderline groupings with `TODO:`.
 3. Human confirms category order.
 4. For each category: `git diff <merge-base>..HEAD -- <paths>` — draft SURMOUNT.md entry.
