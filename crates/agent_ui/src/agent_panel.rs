@@ -629,28 +629,47 @@ pub fn init(cx: &mut App) {
                     };
                     let diff_uri = mention_uri.to_uri().to_string();
 
-                    let prompt = workspace
-                        .project()
-                        .read(cx)
-                        .active_repository(cx)
-                        .map(|repo| {
-                            let root = &repo.read(cx).snapshot().work_directory_abs_path;
-                            if crate::merge_review::is_surmount_workspace(root.as_ref()) {
+                    let prompt = {
+                        let merge_session = crate::merge_review::load_session(cx);
+                        let surmount_prompt = workspace
+                            .project()
+                            .read(cx)
+                            .active_repository(cx)
+                            .map(|repo| {
+                                let root = &repo.read(cx).snapshot().work_directory_abs_path;
+                                crate::merge_review::is_surmount_workspace(root.as_ref())
+                            })
+                            .unwrap_or(false);
+                        if surmount_prompt {
+                            if let (Some(session), Some(file_path)) =
+                                (merge_session.as_ref(), action.file_path.as_ref())
+                            {
+                                if let Some(item) =
+                                    crate::merge_review::item_for_path(session, file_path.as_ref())
+                                {
+                                    crate::merge_review::merge_review_file_prompt(
+                                        session,
+                                        item,
+                                        file_path.as_ref(),
+                                    )
+                                } else {
+                                    crate::merge_review::surmount_merge_review_prompt(
+                                        action.base_ref.as_ref(),
+                                        None,
+                                    )
+                                }
+                            } else {
                                 crate::merge_review::surmount_merge_review_prompt(
                                     action.base_ref.as_ref(),
                                     None,
                                 )
-                            } else {
-                                "Please review this branch diff carefully. Point out any issues, \
-                                 potential bugs, or improvement opportunities you find."
-                                    .to_string()
                             }
-                        })
-                        .unwrap_or_else(|| {
+                        } else {
                             "Please review this branch diff carefully. Point out any issues, \
                              potential bugs, or improvement opportunities you find."
                                 .to_string()
-                        });
+                        }
+                    };
 
                     let content_blocks = vec![
                         acp::ContentBlock::Text(acp::TextContent::new(prompt)),
@@ -1271,6 +1290,10 @@ pub struct AgentPanel {
     /// the ACP thread was ready. Cleared once the overlay opens.
     grok_categorized_surface_pending: bool,
 
+    /// Set when the user explicitly exits full agent mode (toolbar back). Suppresses
+    /// auto-ensure until they open the categorized surface again.
+    grok_categorized_surface_user_dismissed: bool,
+
     /// Prevents duplicate deferred dock reveal/focus work per frame burst.
     grok_panel_reveal_scheduled: bool,
 
@@ -1834,6 +1857,7 @@ impl AgentPanel {
             is_active: false,
             agent_dock_open_hint: false,
             grok_categorized_surface_pending: false,
+            grok_categorized_surface_user_dismissed: false,
             grok_panel_reveal_scheduled: false,
             grok_immersive_reveal_attempts: 0,
             grok_immersive_completion_attempts: 0,
@@ -3862,6 +3886,29 @@ impl AgentPanel {
         })
     }
 
+    pub(crate) fn start_merge_review_plan(
+        &mut self,
+        session: &crate::merge_review::MergeReviewSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = crate::merge_review::merge_review_plan_prompt(session);
+        self.external_thread(
+            None,
+            None,
+            None,
+            Some("Surmount merge review".into()),
+            Some(AgentInitialContent::ContentBlock {
+                blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+                auto_submit: true,
+            }),
+            false,
+            AgentThreadSource::GitPanel,
+            window,
+            cx,
+        );
+    }
+
     fn external_thread(
         &mut self,
         agent_choice: Option<crate::Agent>,
@@ -3997,10 +4044,33 @@ impl AgentPanel {
     }
 
     pub fn go_back(&mut self, _: &workspace::GoBack, window: &mut Window, cx: &mut Context<Self>) {
+        let exiting_grok_full_agent_mode = self.is_grok_build_context(cx)
+            && matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)));
+
         if self.overlay_view.is_some() {
             self.clear_overlay(true, window, cx, true);
-            cx.notify();
         }
+
+        if exiting_grok_full_agent_mode {
+            self.grok_categorized_surface_user_dismissed = true;
+            self.grok_categorized_surface_pending = false;
+            self.mark_agent_dock_open_hint(false);
+            if self.zoomed {
+                self.toggle_zoom(&ToggleZoom, window, cx);
+            }
+            let workspace = self.workspace.clone();
+            window.defer(cx, move |window, cx| {
+                let Some(workspace) = workspace.upgrade() else {
+                    return;
+                };
+                workspace.update(cx, |workspace, cx| {
+                    workspace.close_panel::<AgentPanel>(window, cx);
+                    workspace.focus_center_pane(window, cx);
+                });
+            });
+        }
+
+        cx.notify();
     }
 
     pub fn toggle_options_menu(
@@ -4166,6 +4236,7 @@ impl AgentPanel {
         if matches!(self.base_view, BaseView::Terminal { .. }) {
             return;
         }
+        self.grok_categorized_surface_user_dismissed = false;
         log::debug!(
             "open_zed_todos_surface called (current overlay present: {})",
             matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_)))
@@ -5042,6 +5113,9 @@ impl AgentPanel {
     /// forces zoom if needed. This is the mechanism that makes the default primary
     /// left categorized experience stick for Grok on first open and thread activation.
     fn should_ensure_grok_categorized_surface(&self, cx: &mut Context<Self>) -> bool {
+        if self.grok_categorized_surface_user_dismissed {
+            return false;
+        }
         if !self.is_grok_build_context(cx)
             || !self.is_active
             || matches!(self.base_view, BaseView::Terminal { .. })
@@ -5099,6 +5173,9 @@ impl AgentPanel {
     }
 
     fn reassert_grok_immersive_maximized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.grok_categorized_surface_user_dismissed {
+            return;
+        }
         if !self.grok_immersive_must_stay_maximized()
             && !self.is_grok_selected_for_immersive_launch()
         {
@@ -5605,6 +5682,9 @@ impl AgentPanel {
     }
 
     fn ensure_grok_categorized_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.grok_categorized_surface_user_dismissed {
+            return;
+        }
         let is_grok = self.is_grok_build_context(cx);
         log::debug!(
             "ensure_grok_categorized_surface called: is_grok={}, selected_agent={:?}, has_overlay={:?}",
@@ -6610,7 +6690,10 @@ impl Panel for AgentPanel {
     }
 
     fn set_zoomed(&mut self, zoomed: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !zoomed && self.grok_immersive_startup_in_progress() {
+        if !zoomed
+            && self.grok_immersive_startup_in_progress()
+            && !self.grok_categorized_surface_user_dismissed
+        {
             let panel = cx.entity().downgrade();
             window.defer(cx, move |window, cx| {
                 let Some(panel) = panel.upgrade() else {
@@ -10256,6 +10339,69 @@ mod tests {
             assert!(
                 !diagnostics.has_zed_todos_surface,
                 "surface must still be absent while awaiting thread (got {diagnostics})"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_grok_go_back_exits_full_agent_mode_to_ide_view(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        let workspace = panel.read_with(&cx, |panel, _| panel.workspace.clone());
+        let connection = StubAgentConnection::new().with_agent_id(AgentId::from("grok"));
+        open_thread_with_custom_connection(&panel, connection, &mut cx);
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.selected_agent = Agent::Custom {
+                id: AgentId::from("grok"),
+            };
+            panel.is_active = true;
+            panel.zoomed = true;
+            panel.grok_workspace_zoom_overlay_synced = true;
+            panel.ensure_grok_categorized_surface(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                matches!(panel.overlay_view, Some(OverlayView::ZedTodosSurface(_))),
+                "test setup must open categorized surface before go_back"
+            );
+            assert!(panel.zoomed, "test setup must be zoomed before go_back");
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.go_back(&workspace::GoBack, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.overlay_view.is_none(),
+                "go_back must clear categorized surface overlay"
+            );
+            assert!(!panel.zoomed, "go_back must exit maximized agent mode");
+            assert!(
+                !panel.grok_workspace_zoom_overlay_synced,
+                "go_back must clear workspace zoom sync"
+            );
+        });
+        let _ = workspace.read_with(&cx, |workspace, cx| {
+            assert!(
+                !workspace
+                    .dock_at_position(agent_panel_dock_position(cx))
+                    .read(cx)
+                    .is_open(),
+                "go_back must close the agent dock and return to IDE layout"
+            );
+        });
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.ensure_grok_categorized_surface_for_tests(window, cx);
+        });
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.overlay_view.is_none(),
+                "go_back must suppress auto-ensure until user re-opens full agent mode"
             );
         });
     }

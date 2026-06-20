@@ -1072,6 +1072,10 @@ pub enum DiffType {
     HeadToIndex,
     HeadToWorktree,
     MergeBase { base_ref: SharedString },
+    MergeBaseFile {
+        base_ref: SharedString,
+        path: SharedString,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -2136,6 +2140,17 @@ impl GitRepository for RealGitRepository {
                         git.build_command(&["diff", "--merge-base", base_ref.as_ref()])
                             .output()
                             .await?
+                    }
+                    DiffType::MergeBaseFile { base_ref, path } => {
+                        git.build_command(&[
+                            "diff",
+                            "--merge-base",
+                            base_ref.as_ref(),
+                            "--",
+                            path.as_ref(),
+                        ])
+                        .output()
+                        .await?
                     }
                 };
 

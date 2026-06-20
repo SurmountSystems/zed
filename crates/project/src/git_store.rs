@@ -7520,7 +7520,8 @@ impl Repository {
                         DiffType::HeadToWorktree => {
                             (proto::git_diff::DiffType::HeadToWorktree.into(), None)
                         }
-                        DiffType::MergeBase { base_ref } => (
+                        DiffType::MergeBase { base_ref }
+                        | DiffType::MergeBaseFile { base_ref, .. } => (
                             proto::git_diff::DiffType::MergeBase.into(),
                             Some(base_ref.to_string()),
                         ),

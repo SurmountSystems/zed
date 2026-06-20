@@ -448,8 +448,8 @@ impl AgentServerStore {
         // default that points at the official binary the user installed via the
         // xAI script. This is the primary Linux (and macOS) experience.
         //
-        // Windows deliberately hits a todo!() inside default_command_for_grok
-        // until that platform is implemented (see AGENTS.md).
+        // Windows uses the same default_command_for_grok discovery as Unix
+        // (%USERPROFILE%\.grok\bin\grok.exe, LOCALAPPDATA, PATH).
         const GROK_AGENT_ID: &str = "grok";
         if let std::collections::hash_map::Entry::Vacant(e) =
             self.external_agents.entry(AgentId::from(GROK_AGENT_ID))
@@ -1461,77 +1461,102 @@ fn grok_command_is_concrete(command: &AgentServerCommand) -> bool {
 /// (for the zero-config contract). The not-found case for concrete locations is
 /// implicitly cached by the OnceLock in the caller.
 ///
-/// macOS benefits from the same logic. Windows support is deliberately a `todo!()`.
-fn discover_grok_command_with(
-    home: Option<&str>,
-    file_exists: impl Fn(&Path) -> bool,
-) -> Option<AgentServerCommand> {
-    if let Some(home) = home {
-        let home = Path::new(home);
-        let mut candidates: Vec<PathBuf> = vec![
-            home.join(".grok/bin/grok"),
-            home.join(".local/bin/grok"),
-            home.join("bin/grok"),
-        ];
-        // Support common XDG user bin locations in addition to the blessed ~/.grok
+fn grok_executable_filenames() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &["grok.exe", "grok"]
+    } else {
+        &["grok"]
+    }
+}
+
+fn grok_home_candidate_paths(home: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for bin_dir in [".grok/bin", ".local/bin", "bin"] {
+        for name in grok_executable_filenames() {
+            candidates.push(home.join(bin_dir).join(name));
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
         if let Ok(xdg_bin) = std::env::var("XDG_BIN_HOME") {
             if !xdg_bin.is_empty() {
-                candidates.push(Path::new(&xdg_bin).join("grok"));
+                for name in grok_executable_filenames() {
+                    candidates.push(Path::new(&xdg_bin).join(name));
+                }
             }
         }
         if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
             if !xdg_data.is_empty() {
-                candidates.push(Path::new(&xdg_data).join("grok/bin/grok"));
-            }
-        }
-
-        for candidate in candidates {
-            if file_exists(&candidate) {
-                return Some(AgentServerCommand {
-                    path: candidate.to_string_lossy().to_string().into(),
-                    args: vec!["agent".into(), "stdio".into()],
-                    env: None,
-                });
-            }
-        }
-    }
-
-    // Resolve via $PATH using the injected predicate. This yields a full absolute
-    // path in the synthesized AgentServerCommand when possible, making it robust
-    // (e.g. for environments with a leader process wrapper or modified PATH).
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(':') {
-            if dir.is_empty() {
-                continue;
-            }
-            let candidate = Path::new(dir).join("grok");
-            if file_exists(&candidate) {
-                return Some(AgentServerCommand {
-                    path: candidate.to_string_lossy().to_string().into(),
-                    args: vec!["agent".into(), "stdio".into()],
-                    env: None,
-                });
+                for name in grok_executable_filenames() {
+                    candidates.push(Path::new(&xdg_data).join("grok/bin").join(name));
+                }
             }
         }
     }
 
     #[cfg(target_os = "windows")]
-    {
-        // Windows grok default discovery is not implemented yet; return None so callers
-        // treat Grok Build as unavailable rather than panicking on the hot path.
-        return None;
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        if !local_app_data.is_empty() {
+            for name in grok_executable_filenames() {
+                candidates.push(Path::new(&local_app_data).join("grok/bin").join(name));
+            }
+        }
     }
 
-    // Native grok-native profile discovery hooks belong here alongside default_command_for_grok.
-    #[cfg(any())]
-    {
-        todo!(
-            "Add grok-native profile discovery in agent_server_store (extend default_command_for_grok or discover_grok_native)."
-        );
+    candidates
+}
+
+fn path_directories() -> Vec<String> {
+    let separator = if cfg!(target_os = "windows") { ';' } else { ':' };
+    std::env::var("PATH")
+        .ok()
+        .map(|path_var| {
+            path_var
+                .split(separator)
+                .filter(|dir| !dir.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn grok_command_from_path(file_exists: &impl Fn(&Path) -> bool, path: &Path) -> Option<AgentServerCommand> {
+    if file_exists(path) {
+        Some(AgentServerCommand {
+            path: path.to_string_lossy().to_string().into(),
+            args: vec!["agent".into(), "stdio".into()],
+            env: None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Discovers the default Grok Build stdio command on Linux, macOS, and Windows.
+fn discover_grok_command_with(
+    home: Option<&str>,
+    file_exists: impl Fn(&Path) -> bool,
+) -> Option<AgentServerCommand> {
+    if let Some(home) = home {
+        for candidate in grok_home_candidate_paths(Path::new(home)) {
+            if let Some(command) = grok_command_from_path(&file_exists, &candidate) {
+                return Some(command);
+            }
+        }
+    }
+
+    for dir in path_directories() {
+        for name in grok_executable_filenames() {
+            let candidate = Path::new(&dir).join(name);
+            if let Some(command) = grok_command_from_path(&file_exists, &candidate) {
+                return Some(command);
+            }
+        }
     }
 
     log::debug!(
-        "No grok binary found in ~/.grok, XDG, or PATH locations; falling back to bare 'grok' name. \
+        "No grok binary found in user home, XDG/LOCALAPPDATA, or PATH; falling back to bare 'grok' name. \
          This caches the not-found outcome for subsequent cheap queries."
     );
 
@@ -1543,8 +1568,19 @@ fn discover_grok_command_with(
 }
 
 fn discover_grok_command_impl() -> Option<AgentServerCommand> {
-    let home = std::env::var("HOME").ok();
-    discover_grok_command_with(home.as_deref(), |p| p.exists() && p.is_file())
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.is_empty())
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|profile| !profile.is_empty())
+        })
+        .or_else(|| {
+            std::env::home_dir()
+                .map(|home| home.to_string_lossy().into_owned())
+        });
+    discover_grok_command_with(home.as_deref(), |path| path.exists() && path.is_file())
 }
 
 fn default_command_for_grok() -> Option<AgentServerCommand> {
@@ -3054,8 +3090,8 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "windows")]
-    fn test_grok_build_default_agent_unavailable_on_windows() {
-        assert!(!grok_build_default_agent_available());
+    fn test_grok_build_default_agent_available_on_windows() {
+        assert!(grok_build_default_agent_available());
     }
 
     #[test]
@@ -3166,7 +3202,7 @@ mod tests {
         // TDD for candidate ordering on Unix platforms sharing the HOME-based discover logic
         // (cfg(any) per AGENTS.md Mac/Windows porting rules; Linux behavior unchanged).
         // Documents .grok/bin before .local/bin preference and never-None guarantee
-        // (Windows path hits todo!() inside discover_grok_command_with).
+        // Windows shares the same never-None fallback contract.
         let cmd = default_command_for_grok();
         assert!(
             cmd.is_some(),
@@ -3221,6 +3257,15 @@ mod tests {
         let grok_path = Path::new("/home/test/.grok/bin/grok");
         let local_path = Path::new("/home/test/.local/bin/grok");
         let cmd = discover_grok_command_with(Some(home), |p| p == grok_path || p == local_path);
+        let cmd = cmd.unwrap();
+        assert_eq!(cmd.path, grok_path.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn test_discover_grok_command_with_prefers_windows_grok_exe() {
+        let home = r"C:\Users\test";
+        let grok_path = Path::new(r"C:\Users\test\.grok\bin\grok.exe");
+        let cmd = discover_grok_command_with(Some(home), |path| path == grok_path);
         let cmd = cmd.unwrap();
         assert_eq!(cmd.path, grok_path.to_string_lossy().to_string());
     }

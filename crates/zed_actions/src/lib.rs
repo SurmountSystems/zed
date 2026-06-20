@@ -538,6 +538,9 @@ pub mod agent {
         pub diff_text: SharedString,
         /// The base ref that the diff was computed against (e.g. "main").
         pub base_ref: SharedString,
+        /// When set, the diff text is scoped to this repo-relative path.
+        #[serde(default)]
+        pub file_path: Option<SharedString>,
     }
 
     /// A single merge conflict region extracted from a file.
@@ -578,6 +581,8 @@ pub mod surmount {
             StartMergeReview,
             /// Reopen the persisted Surmount merge review queue.
             OpenMergeReview,
+            /// Mark the active Branch Diff file as an open merge-review question.
+            MarkMergeReviewOpenQuestion,
         ]
     );
 }

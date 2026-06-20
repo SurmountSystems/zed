@@ -217,6 +217,24 @@ impl ProjectDiff {
         });
     }
 
+    pub fn open_against_base_ref(
+        workspace: &mut Workspace,
+        project: Entity<Project>,
+        intended_repo: Entity<Repository>,
+        base_ref: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        Self::deploy_branch_diff_with_base_ref(
+            workspace,
+            project,
+            intended_repo,
+            base_ref,
+            window,
+            cx,
+        );
+    }
+
     fn deploy_branch_diff_with_base_ref(
         workspace: &mut Workspace,
         project: Entity<Project>,
@@ -291,14 +309,22 @@ impl ProjectDiff {
             return;
         };
 
-        let diff_receiver = repo.update(cx, |repo, cx| {
-            repo.diff(
-                DiffType::MergeBase {
-                    base_ref: base_ref.clone(),
-                },
-                cx,
-            )
-        });
+        let file_path = self
+            .active_project_path(cx)
+            .map(|project_path| project_path.path.as_ref().to_proto());
+
+        let diff_type = if let Some(path) = file_path.clone() {
+            DiffType::MergeBaseFile {
+                base_ref: base_ref.clone(),
+                path: path.into(),
+            }
+        } else {
+            DiffType::MergeBase {
+                base_ref: base_ref.clone(),
+            }
+        };
+
+        let diff_receiver = repo.update(cx, |repo, cx| repo.diff(diff_type, cx));
 
         let workspace = self.workspace.clone();
 
@@ -314,6 +340,7 @@ impl ProjectDiff {
                                 ReviewBranchDiff {
                                     diff_text: diff_text.into(),
                                     base_ref: base_ref.to_string().into(),
+                                    file_path: file_path.map(Into::into),
                                 }
                                 .boxed_clone(),
                                 cx,
@@ -1051,6 +1078,26 @@ impl ProjectDiff {
             })
             .collect()
     }
+
+    pub fn active_file_repo_path(&self, cx: &App) -> Option<String> {
+        self.active_project_path(cx)
+            .map(|project_path| project_path.path.as_ref().to_proto())
+    }
+
+    fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
+        let editor = self.editor.read(cx).focused_editor().read(cx);
+        let multibuffer = editor.buffer().read(cx);
+        let position = editor.selections.newest_anchor().head();
+        let snapshot = multibuffer.snapshot(cx);
+        let (text_anchor, _) = snapshot.anchor_to_buffer_anchor(position)?;
+        let buffer = multibuffer.buffer(text_anchor.buffer_id)?;
+
+        let file = buffer.read(cx).file()?;
+        Some(ProjectPath {
+            worktree_id: file.worktree_id(cx),
+            path: file.path().clone(),
+        })
+    }
 }
 
 fn sort_prefix(repo: &Repository, repo_path: &RepoPath, status: FileStatus, cx: &App) -> u64 {
@@ -1153,21 +1200,6 @@ impl Item for ProjectDiff {
             .rhs_editor()
             .read(cx)
             .for_each_project_item(cx, f)
-    }
-
-    fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
-        let editor = self.editor.read(cx).focused_editor().read(cx);
-        let multibuffer = editor.buffer().read(cx);
-        let position = editor.selections.newest_anchor().head();
-        let snapshot = multibuffer.snapshot(cx);
-        let (text_anchor, _) = snapshot.anchor_to_buffer_anchor(position)?;
-        let buffer = multibuffer.buffer(text_anchor.buffer_id)?;
-
-        let file = buffer.read(cx).file()?;
-        Some(ProjectPath {
-            worktree_id: file.worktree_id(cx),
-            path: file.path().clone(),
-        })
     }
 
     fn set_nav_history(
@@ -1934,7 +1966,7 @@ impl Render for BranchDiffToolbar {
             .when(is_surmount_workspace, |this| {
                 let focus_handle = focus_handle.clone();
                 this.child(Divider::vertical()).child(
-                    Button::new("surmount-merge-review", "Surmount Merge Review")
+                    Button::new("surmount-merge-review", "Plan merge review")
                         .start_icon(
                             Icon::new(IconName::GitMergeConflict)
                                 .size(IconSize::Small)
@@ -1947,9 +1979,9 @@ impl Render for BranchDiffToolbar {
                         ))
                         .tooltip(move |_, cx| {
                             Tooltip::with_meta_in(
-                                "Surmount Merge Review",
+                                "Plan merge review",
                                 Some(&StartMergeReview),
-                                "Open the categorized merge review queue for upstream sync.",
+                                "Open Branch Diff against upstream and post a merge review plan in the agent thread.",
                                 &focus_handle,
                                 cx,
                             )

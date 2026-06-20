@@ -7,21 +7,23 @@ use collections::HashMap;
 use git::commit::parse_git_diff_name_status;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use gpui::{
-    App, AppContext, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, WeakEntity, Window,
+    Action, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    Render, SharedString, WeakEntity, Window,
 };
 use project::Project;
 use serde::{Deserialize, Serialize};
+use util::ResultExt as _;
 use ui::{Button, ButtonStyle, Color, Icon, IconName, Label, prelude::*};
+use git_ui::project_diff::ProjectDiff;
 use workspace::{
-    Item, Toast, Workspace,
-    dock::PanelEvent,
+    Item, ItemHandle, Toast, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace,
     item::{ItemBufferKind, ItemEvent},
     notifications::{NotificationId, NotifyTaskExt},
 };
 
 use crate::agent_panel::AgentPanel;
-use zed_actions::surmount::{OpenMergeReview, StartMergeReview};
+use project::git_store::branch_diff::DiffBase;
+use zed_actions::surmount::{MarkMergeReviewOpenQuestion, OpenMergeReview, StartMergeReview};
 
 pub const MANIFEST_FILE: &str = "surmount-merge-categories.toml";
 pub const SESSION_STORAGE_KEY: &[u8] = b"surmount_merge_review_session";
@@ -35,13 +37,6 @@ pub fn initial_actionable_visible_count(total: usize, show_all: bool) -> usize {
     } else {
         total.min(MAX_INITIAL_ACTIONABLE_ITEMS)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MergeReviewRevealDiagnostics {
-    pub had_zoomed_dock: bool,
-    pub emitted_zoom_out: bool,
-    pub activated_item: bool,
 }
 
 fn element_id_for_path(prefix: &str, path: &str) -> String {
@@ -111,6 +106,25 @@ pub enum ReviewVerdict {
     Documented,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeReviewState {
+    #[default]
+    NotReviewed,
+    Summarized,
+    OpenQuestion,
+}
+
+impl MergeReviewState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotReviewed => "Not reviewed yet",
+            Self::Summarized => "Summarized",
+            Self::OpenQuestion => "Open question",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeReviewItem {
     pub path: String,
@@ -121,6 +135,10 @@ pub struct MergeReviewItem {
     pub lines_added: u32,
     pub lines_removed: u32,
     pub notes: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub review_state: MergeReviewState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -129,6 +147,10 @@ pub struct MergeReviewSession {
     pub upstream_ref: String,
     pub items: Vec<MergeReviewItem>,
     pub categories_completed: HashSet<String>,
+    #[serde(default)]
+    pub running_notes: String,
+    #[serde(default)]
+    pub patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -198,6 +220,8 @@ impl CategoryManifest {
                     lines_added: 0,
                     lines_removed: 0,
                     notes: None,
+                    summary: None,
+                    review_state: MergeReviewState::default(),
                 };
             }
         }
@@ -210,6 +234,8 @@ impl CategoryManifest {
             lines_added: 0,
             lines_removed: 0,
             notes: None,
+            summary: None,
+            review_state: MergeReviewState::default(),
         }
     }
 }
@@ -260,6 +286,8 @@ pub fn build_session(
         upstream_ref,
         items,
         categories_completed: HashSet::default(),
+        running_notes: String::new(),
+        patterns: Vec::new(),
     }
 }
 
@@ -297,6 +325,81 @@ impl MergeReviewSession {
             }
         }
     }
+}
+
+pub fn item_for_path<'a>(
+    session: &'a MergeReviewSession,
+    path: &str,
+) -> Option<&'a MergeReviewItem> {
+    let normalized = path.replace('\\', "/");
+    session.items.iter().find(|item| item.path == normalized)
+}
+
+pub fn session_memory_for_prompt(session: &MergeReviewSession, section: &str) -> String {
+    let mut parts = Vec::new();
+    if !session.running_notes.is_empty() {
+        parts.push(format!("Running notes:\n{}", session.running_notes));
+    }
+    if !session.patterns.is_empty() {
+        parts.push(format!(
+            "Patterns from earlier files:\n{}",
+            session.patterns.join("\n")
+        ));
+    }
+    let section_summaries = session
+        .items
+        .iter()
+        .filter(|item| item.surmount_section == section)
+        .filter_map(|item| {
+            item.summary
+                .as_ref()
+                .map(|summary| format!("{}: {summary}", item.path))
+        })
+        .collect::<Vec<_>>();
+    if !section_summaries.is_empty() {
+        parts.push(format!(
+            "Earlier summaries in this section:\n{}",
+            section_summaries.join("\n")
+        ));
+    }
+    parts.join("\n\n")
+}
+
+pub fn store_file_summary(
+    session: &mut MergeReviewSession,
+    path: &str,
+    summary: String,
+    open_question: bool,
+) -> Result<()> {
+    let normalized = path.replace('\\', "/");
+    let item = session
+        .items
+        .iter_mut()
+        .find(|item| item.path == normalized)
+        .with_context(|| format!("unknown merge review path: {normalized}"))?;
+    item.summary = Some(summary.clone());
+    item.review_state = if open_question {
+        MergeReviewState::OpenQuestion
+    } else {
+        MergeReviewState::Summarized
+    };
+    if !session.running_notes.is_empty() {
+        session.running_notes.push('\n');
+    }
+    session.running_notes.push_str(&format!("{normalized}: {summary}"));
+    Ok(())
+}
+
+pub fn extract_summary_from_agent_reply(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let trimmed = line.trim();
+        trimmed
+            .strip_prefix("Summary:")
+            .or_else(|| trimmed.strip_prefix("summary:"))
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+            .map(str::to_string)
+    })
 }
 
 pub fn save_session(cx: &mut App, session: &MergeReviewSession) -> Result<()> {
@@ -340,45 +443,6 @@ impl MergeReviewView {
         }
     }
 
-    fn reveal_tab(
-        workspace: &mut Workspace,
-        view: Entity<Self>,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) -> MergeReviewRevealDiagnostics {
-        let had_zoomed_dock = workspace.zoomed_dock_position().is_some();
-        log::info!(
-            "surmount merge review: reveal_tab begin (zoomed_dock={had_zoomed_dock:?})"
-        );
-        workspace.activate_item(&view, true, true, window, cx);
-        let mut emitted_zoom_out = false;
-        if had_zoomed_dock {
-            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                panel.update(cx, |_, cx| cx.emit(PanelEvent::ZoomOut));
-                emitted_zoom_out = true;
-                log::info!("surmount merge review: reveal_tab emitted PanelEvent::ZoomOut");
-            } else {
-                log::warn!("surmount merge review: reveal_tab zoomed dock but no AgentPanel");
-            }
-        }
-        workspace.focus_center_pane(window, cx);
-        let diagnostics = MergeReviewRevealDiagnostics {
-            had_zoomed_dock,
-            emitted_zoom_out,
-            activated_item: true,
-        };
-        log::info!(
-            "surmount merge review: reveal_tab complete (zoomed_dock_after={:?}, diagnostics={diagnostics:?})",
-            workspace.zoomed_dock_position()
-        );
-        diagnostics
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_surface_state(&self) -> (bool, bool) {
-        (self.first_render_logged, self.show_all_actionable)
-    }
-
     fn set_item_verdict(&mut self, path: &str, verdict: ReviewVerdict, cx: &mut Context<Self>) {
         self.session.set_verdict(path, verdict);
         if save_session(cx, &self.session).is_err() {
@@ -387,66 +451,58 @@ impl MergeReviewView {
         cx.notify();
     }
 
-    pub fn deploy(
+    pub fn open_merge_review_workflow(
         workspace: &mut Workspace,
         session: MergeReviewSession,
+        project: Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        log::info!(
-            "surmount merge review: deploying tab ({} items)",
-            session.items.len()
-        );
-        let workspace_handle = cx.entity().downgrade();
-        let existing = workspace.items_of_type::<Self>(cx).next();
+        let item_count = session.items.len();
         let ambiguous_count = session.ambiguous_items().count();
-        let view = if let Some(existing) = existing {
-            existing.update(cx, |view, cx| {
-                view.session = session;
-                view.show_all_actionable = false;
-                cx.notify();
-            });
-            existing
+        let conflict_count = session.conflict_items().count();
+        log::info!(
+            "surmount merge review: opening workflow ({} items, {} shared-upstream guesses, {} conflicts)",
+            item_count,
+            ambiguous_count,
+            conflict_count
+        );
+        if let Err(error) = save_session(cx, &session) {
+            log::error!("surmount merge review: failed to persist session: {error:#}");
+        }
+        let upstream_ref: SharedString = session.upstream_ref.clone().into();
+        if let Some(repository) = project.read(cx).active_repository(cx) {
+            ProjectDiff::open_against_base_ref(
+                workspace,
+                project,
+                repository,
+                upstream_ref,
+                window,
+                cx,
+            );
+            log::info!(
+                "surmount merge review: opened Branch Diff against {}",
+                session.upstream_ref
+            );
         } else {
-            let view = cx.new(|cx| Self::new(session, workspace_handle.clone(), window, cx));
-            workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
-            view
-        };
-        let view_for_reveal = view.clone();
-        window.defer(cx, move |window, cx| {
-            log::info!("surmount merge review: deferred reveal starting");
-            if let Some(workspace) = workspace_handle.upgrade() {
-                workspace.update(cx, |workspace, cx| {
-                    let diagnostics =
-                        Self::reveal_tab(workspace, view_for_reveal, window, cx);
-                    log::info!(
-                        "surmount merge review: deferred reveal complete ({diagnostics:?})"
-                    );
-                });
-            } else {
-                log::error!(
-                    "surmount merge review: workspace dropped before deferred reveal"
-                );
-            }
-        });
+            log::warn!("surmount merge review: no active repository for Branch Diff");
+        }
+        workspace.open_panel::<AgentPanel>(window, cx);
+        if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.start_merge_review_plan(&session, window, cx);
+            });
+            log::info!("surmount merge review: posted plan to agent thread");
+        }
         workspace.show_toast(
             Toast::new(
                 NotificationId::unique::<MergeReviewView>(),
                 format!(
-                    "Surmount merge review opened ({ambiguous_count} items need review)"
+                    "Branch Diff open — merge plan in agent ({ambiguous_count} shared-upstream guesses)"
                 ),
             ),
             cx,
         );
-        log::info!(
-            "surmount merge review: tab opened and center pane focused ({ambiguous_count} ambiguous)"
-        );
-        let session_to_save = view.read(cx).session.clone();
-        cx.defer(move |cx| {
-            if let Err(error) = save_session(cx, &session_to_save) {
-                log::error!("surmount merge review: failed to persist session: {error:#}");
-            }
-        });
     }
 
     fn start_review(
@@ -487,6 +543,7 @@ impl MergeReviewView {
         };
         let workspace_handle = cx.entity().downgrade();
         let workspace_handle_for_task = workspace_handle.clone();
+        let project_for_workflow = project.clone();
         let task = window.spawn(cx, async move |cx| {
             let started = std::time::Instant::now();
             let session = populate_session_from_git(
@@ -513,7 +570,13 @@ impl MergeReviewView {
             }
             if let Some(workspace) = workspace_handle_for_task.upgrade() {
                 workspace.update_in(cx, |workspace, window, cx| {
-                    Self::deploy(workspace, session, window, cx);
+                    Self::open_merge_review_workflow(
+                        workspace,
+                        session,
+                        project_for_workflow,
+                        window,
+                        cx,
+                    );
                 })?;
             } else {
                 log::error!("surmount merge review: workspace dropped before deploy");
@@ -530,7 +593,8 @@ impl MergeReviewView {
         cx: &mut Context<Workspace>,
     ) {
         if let Some(session) = load_session(cx) {
-            Self::deploy(workspace, session, window, cx);
+            let project = workspace.project().clone();
+            Self::open_merge_review_workflow(workspace, session, project, window, cx);
         }
     }
 }
@@ -812,23 +876,258 @@ impl Item for MergeReviewView {
     }
 }
 
+pub fn merge_review_summary_snippet(summary: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    if summary.chars().count() <= MAX_CHARS {
+        summary.to_string()
+    } else {
+        let mut snippet: String = summary.chars().take(MAX_CHARS).collect();
+        snippet.push('…');
+        snippet
+    }
+}
+
+pub struct MergeReviewToolbar {
+    project_diff: Option<WeakEntity<ProjectDiff>>,
+}
+
+impl MergeReviewToolbar {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
+        Self {
+            project_diff: None,
+        }
+    }
+
+    fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(project_diff) = self
+            .project_diff
+            .as_ref()
+            .and_then(|project_diff| project_diff.upgrade())
+        {
+            project_diff.focus_handle(cx).focus(window, cx);
+        }
+        let action = action.boxed_clone();
+        cx.defer(move |cx| {
+            cx.dispatch_action(action.as_ref());
+        });
+    }
+
+    fn mark_open_question(project_diff: &Entity<ProjectDiff>, cx: &mut App) {
+        let Some(path) = project_diff.read(cx).active_file_repo_path(cx) else {
+            return;
+        };
+        let Some(mut session) = load_session(cx) else {
+            return;
+        };
+        let summary = item_for_path(&session, &path)
+            .and_then(|item| item.summary.clone())
+            .unwrap_or_else(|| "Needs a decision.".into());
+        if store_file_summary(&mut session, &path, summary, true)
+            .log_err()
+            .is_none()
+        {
+            return;
+        }
+        if save_session(cx, &session).log_err().is_none() {
+            return;
+        }
+        project_diff.update(cx, |_, cx| cx.notify());
+    }
+}
+
+impl EventEmitter<ToolbarItemEvent> for MergeReviewToolbar {}
+
+impl ToolbarItemView for MergeReviewToolbar {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn ItemHandle>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolbarItemLocation {
+        let show = load_session(cx).is_some()
+            && active_pane_item
+                .and_then(|item| item.act_as::<ProjectDiff>(cx))
+                .is_some_and(|item| {
+                    matches!(item.read(cx).diff_base(cx), DiffBase::Merge { .. })
+                });
+        self.project_diff = if show {
+            active_pane_item
+                .and_then(|item| item.act_as::<ProjectDiff>(cx))
+                .map(|entity| entity.downgrade())
+        } else {
+            None
+        };
+        if show {
+            ToolbarItemLocation::PrimaryRight
+        } else {
+            ToolbarItemLocation::Hidden
+        }
+    }
+
+    fn pane_focus_update(
+        &mut self,
+        _pane_focused: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+}
+
+impl Render for MergeReviewToolbar {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(project_diff) = self
+            .project_diff
+            .as_ref()
+            .and_then(|project_diff| project_diff.upgrade())
+        else {
+            return div();
+        };
+        let Some(session) = load_session(cx) else {
+            return div();
+        };
+        let Some(path) = project_diff.read(cx).active_file_repo_path(cx) else {
+            return div();
+        };
+        let Some(item) = item_for_path(&session, &path) else {
+            return div();
+        };
+        let summary_label = item
+            .summary
+            .as_deref()
+            .map(merge_review_summary_snippet)
+            .unwrap_or_else(|| "Not summarized yet".to_string());
+        h_flex()
+            .gap_2()
+            .items_center()
+            .max_w_96()
+            .child(
+                Label::new(item.surmount_section.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new(item.review_state.label())
+                    .size(LabelSize::Small)
+                    .color(Color::Accent),
+            )
+            .child(
+                Label::new(summary_label)
+                    .size(LabelSize::Small)
+                    .truncate(),
+            )
+            .child(
+                Button::new("merge-review-open-question", "Open question")
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&MarkMergeReviewOpenQuestion, window, cx);
+                    })),
+            )
+    }
+}
+
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(MergeReviewView::start_review);
         workspace.register_action(MergeReviewView::open_review);
+        workspace.register_action(
+            |workspace, _: &MarkMergeReviewOpenQuestion, _window, cx| {
+                let Some(project_diff) = workspace.active_item_as::<ProjectDiff>(cx) else {
+                    return;
+                };
+                MergeReviewToolbar::mark_open_question(&project_diff, cx);
+            },
+        );
     })
     .detach();
 }
 
+pub fn merge_review_plan_prompt(session: &MergeReviewSession) -> String {
+    let section_lines = category_groups(session)
+        .iter()
+        .map(|(_, section, items)| format!("- {section}: {} files", items.len()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let shared_upstream_guess_count = session
+        .items
+        .iter()
+        .filter(|item| item.disposition == ReviewDisposition::Ambiguous)
+        .count();
+    format!(
+        "Merge review session for upstream `{upstream}` into the Surmount fork.\n\
+         merge-base: {merge_base}\n\
+         {total} files changed; {shared_upstream_guess_count} paths start as shared-with-upstream guesses; \
+         {conflicts} merge conflicts.\n\n\
+         SURMOUNT sections in this merge:\n{section_lines}\n\n\
+         Branch Diff against `{upstream}` is open in the editor.\n\n\
+         Your tasks:\n\
+         1. Propose an order to review by SURMOUNT section (conflicts first).\n\
+         2. When I select a file, summarize the actual diff hunks: what changed, fork vs upstream, \
+            how it relates to earlier summaries in this session.\n\
+         3. Use todo_write only for items you cannot resolve with high confidence — those become Plan Todos.\n\
+         4. As summaries accumulate, apply the same reasoning to similar files without asking me again.\n\
+         5. Only cite diff text; do not invent changes. Draft SURMOUNT.md prose per section when asked.",
+        upstream = session.upstream_ref,
+        merge_base = session.merge_base,
+        total = session.items.len(),
+        conflicts = session.conflict_items().count(),
+    )
+}
+
+fn starting_guess_label(disposition: ReviewDisposition) -> &'static str {
+    match disposition {
+        ReviewDisposition::ForkOwned => "ours — likely intentional fork work",
+        ReviewDisposition::Ambiguous => {
+            "shared with upstream — show whether this is harmless drift or a mistake"
+        }
+        ReviewDisposition::BuildConfig => "build / deps — usually routine",
+        ReviewDisposition::Conflict => "merge conflict — summarize both sides",
+        ReviewDisposition::AutoClear => "likely routine — still cite the diff",
+        ReviewDisposition::Confirmed => "already confirmed in this session",
+        ReviewDisposition::Deferred => "deferred — explain why it still matters",
+    }
+}
+
+pub fn merge_review_file_prompt(
+    session: &MergeReviewSession,
+    item: &MergeReviewItem,
+    path: &str,
+) -> String {
+    let memory = session_memory_for_prompt(session, &item.surmount_section);
+    let memory_section = if memory.is_empty() {
+        String::new()
+    } else {
+        format!("{memory}\n\n")
+    };
+    format!(
+        "Summarize this file for merging upstream `{upstream}` into the Surmount fork.\n\
+         File: {path}\n\
+         SURMOUNT section: {section}\n\
+         Starting guess: {guess}\n\n\
+         {memory_section}\
+         Read the diff hunks below. Write 3–6 concise sentences: what changed, fork vs upstream, \
+         overlap with earlier files in this section, suggested outcome.\n\
+         End with a single line: Summary: …\n\
+         Use todo_write only if genuinely stuck — plain one-line questions become Plan Todos.\n\
+         Only cite visible diff text.",
+        upstream = session.upstream_ref,
+        path = path,
+        section = item.surmount_section,
+        guess = starting_guess_label(item.disposition),
+        memory_section = memory_section,
+    )
+}
+
 pub fn surmount_merge_review_prompt(base_ref: &str, category_id: Option<&str>) -> String {
     let category_hint = category_id
-        .map(|id| format!("Category: {id}. "))
+        .map(|id| format!("SURMOUNT section id: {id}. "))
         .unwrap_or_default();
     format!(
-        "{category_hint}Review this diff for merging upstream `{base_ref}` into the Surmount fork. \
-         Use SURMOUNT.md categories. Draft concise documentation for observable changes only. \
-         Mark uncertainty with TODO:. Emit todo_write items only for ambiguous files that need human judgment. \
-         Prefer upstream for unrelated files; preserve fork intent for fork-owned paths."
+        "{category_hint}Summarize this diff for merging upstream `{base_ref}` into the Surmount fork. \
+         Explain what changed, fork vs upstream, and suggested outcome. \
+         Use todo_write for open questions (Plan Todos), not a parallel list. \
+         Prefer upstream for unrelated files; preserve fork intent for fork-owned paths. \
+         Only cite visible diff text."
     )
 }
 
@@ -1031,6 +1330,183 @@ paths = ["Cargo.toml"]
         assert_eq!(initial_actionable_visible_count(99, true), 99);
     }
 
+    #[test]
+    fn test_item_serde_backward_compat() {
+        let json = r#"{
+            "merge_base": "abc123",
+            "upstream_ref": "origin/main",
+            "items": [{
+                "path": "crates/editor/src/editor.rs",
+                "category_id": "misc_upstream",
+                "surmount_section": "Misc upstream-touching tweaks",
+                "disposition": "ambiguous",
+                "verdict": "pending",
+                "lines_added": 0,
+                "lines_removed": 0,
+                "notes": null
+            }],
+            "categories_completed": []
+        }"#;
+        let session: MergeReviewSession = serde_json::from_str(json).unwrap();
+        let item = &session.items[0];
+        assert_eq!(item.summary, None);
+        assert_eq!(item.review_state, MergeReviewState::NotReviewed);
+        assert!(session.running_notes.is_empty());
+        assert!(session.patterns.is_empty());
+    }
+
+    #[test]
+    fn test_session_memory_for_prompt_includes_prior_summaries() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc123".into(),
+            "origin/main".into(),
+            [("crates/editor/src/editor.rs".into(), false)],
+        );
+        session.patterns.push("Upstream renamed this module.".into());
+        store_file_summary(
+            &mut session,
+            "crates/editor/src/editor.rs",
+            "Editor tweak only affects gutter.".into(),
+            false,
+        )
+        .unwrap();
+        let memory = session_memory_for_prompt(&session, "Misc upstream-touching tweaks");
+        assert!(memory.contains("Editor tweak only affects gutter."));
+        assert!(memory.contains("Upstream renamed this module."));
+        assert!(memory.contains("crates/editor/src/editor.rs"));
+    }
+
+    #[test]
+    fn test_store_file_summary_keeps_plain_text() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc123".into(),
+            "origin/main".into(),
+            [("crates/editor/src/editor.rs".into(), false)],
+        );
+        let summary: String = "Upstream changed scroll behavior; fork hook unchanged.".into();
+        store_file_summary(
+            &mut session,
+            "crates/editor/src/editor.rs",
+            summary.clone(),
+            false,
+        )
+        .unwrap();
+        let item = item_for_path(&session, "crates/editor/src/editor.rs").unwrap();
+        assert_eq!(item.summary.as_deref(), Some(summary.as_str()));
+        assert_eq!(item.review_state, MergeReviewState::Summarized);
+        assert!(session.running_notes.contains(&summary));
+    }
+
+    #[test]
+    fn test_store_file_summary_open_question() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc123".into(),
+            "origin/main".into(),
+            [("crates/editor/src/editor.rs".into(), false)],
+        );
+        store_file_summary(
+            &mut session,
+            "crates/editor/src/editor.rs",
+            "Unclear whether to keep fork keymap.".into(),
+            true,
+        )
+        .unwrap();
+        let item = item_for_path(&session, "crates/editor/src/editor.rs").unwrap();
+        assert_eq!(item.review_state, MergeReviewState::OpenQuestion);
+    }
+
+    #[test]
+    fn test_extract_summary_from_agent_reply() {
+        let text = "Upstream added a helper.\nSummary: Keep our fork hook; upstream change is unrelated.\n";
+        assert_eq!(
+            extract_summary_from_agent_reply(text).as_deref(),
+            Some("Keep our fork hook; upstream change is unrelated.")
+        );
+        assert!(extract_summary_from_agent_reply("No summary here.").is_none());
+    }
+
+    #[test]
+    fn test_merge_review_file_prompt_includes_memory() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc123".into(),
+            "origin/main".into(),
+            [("crates/editor/src/editor.rs".into(), false)],
+        );
+        store_file_summary(
+            &mut session,
+            "crates/editor/src/editor.rs",
+            "Prior editor summary.".into(),
+            false,
+        )
+        .unwrap();
+        let item = item_for_path(&session, "crates/editor/src/editor.rs").unwrap();
+        let prompt = merge_review_file_prompt(&session, item, "crates/editor/src/editor.rs");
+        assert!(prompt.contains("Prior editor summary."));
+        assert!(prompt.contains("Running notes:"));
+    }
+
+    #[test]
+    fn test_merge_review_file_prompt_includes_section() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let session = build_session(
+            &manifest,
+            "abc123".into(),
+            "origin/main".into(),
+            [("crates/editor/src/editor.rs".into(), false)],
+        );
+        let item = item_for_path(&session, "crates/editor/src/editor.rs").unwrap();
+        let prompt = merge_review_file_prompt(&session, item, "crates/editor/src/editor.rs");
+        assert!(prompt.contains("Misc upstream-touching tweaks"));
+        assert!(prompt.contains("crates/editor/src/editor.rs"));
+    }
+
+    #[test]
+    fn test_merge_review_file_prompt_asks_for_summary_line() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let session = build_session(
+            &manifest,
+            "abc123".into(),
+            "origin/main".into(),
+            [("crates/editor/src/editor.rs".into(), false)],
+        );
+        let item = item_for_path(&session, "crates/editor/src/editor.rs").unwrap();
+        let prompt = merge_review_file_prompt(&session, item, "crates/editor/src/editor.rs");
+        assert!(prompt.contains("Summary:"));
+        assert!(!prompt.contains("```json"));
+    }
+
+    #[test]
+    fn test_merge_review_summary_snippet_truncates_long_text() {
+        let long = "a".repeat(150);
+        let snippet = merge_review_summary_snippet(&long);
+        assert!(snippet.ends_with('…'));
+        assert!(snippet.chars().count() <= 121);
+    }
+
+    #[test]
+    fn test_review_state_labels_are_plain_language() {
+        assert_eq!(MergeReviewState::NotReviewed.label(), "Not reviewed yet");
+        assert_eq!(MergeReviewState::Summarized.label(), "Summarized");
+        assert_eq!(MergeReviewState::OpenQuestion.label(), "Open question");
+    }
+
+    #[test]
+    fn merge_review_plan_prompt_mentions_branch_diff_and_todos() {
+        let session = test_session_with_ambiguous_items(3);
+        let prompt = merge_review_plan_prompt(&session);
+        assert!(prompt.contains("Branch Diff"), "{prompt}");
+        assert!(prompt.contains("todo_write"), "{prompt}");
+        assert!(prompt.contains("origin/main"), "{prompt}");
+    }
+
     fn test_session_with_ambiguous_items(count: usize) -> MergeReviewSession {
         let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
         let paths = (0..count)
@@ -1060,6 +1536,7 @@ paths = ["Cargo.toml"]
 
         init_test(cx);
         cx.update(|cx| {
+            git_ui::init(cx);
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
             AgentSettings::override_global(
@@ -1110,35 +1587,20 @@ paths = ["Cargo.toml"]
         (workspace, cx)
     }
 
-    /// Regression (2026-06-19): center pane focus dismisses zoom by closing the agent dock;
-    /// merge review must unzoom via ZoomOut and keep the dock open.
     #[gpui::test]
-    async fn test_merge_review_deploy_unzooms_without_closing_agent_dock(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        use agent_settings::AgentSettings;
-        use settings::Settings;
-
+    async fn test_merge_review_opens_branch_diff_not_queue_tab(cx: &mut gpui::TestAppContext) {
         let (workspace, mut cx) = setup_zoomed_agent_workspace(cx).await;
-        let dock_position = workspace.read_with(&cx, |_, cx| {
-            AgentSettings::get_global(cx).dock.into()
-        });
-
-        workspace.read_with(&cx, |workspace, cx| {
-            assert_eq!(
-                workspace.zoomed_dock_position(),
-                Some(dock_position),
-                "precondition: agent dock must start zoomed"
-            );
-            assert!(
-                workspace.dock_at_position(dock_position).read(cx).is_open(),
-                "precondition: agent dock must start open"
-            );
-        });
-
+        let project = workspace.read_with(&cx, |workspace, _| workspace.project().clone());
         let session = test_session_with_ambiguous_items(5);
+
         workspace.update_in(&mut cx, |workspace, window, cx| {
-            MergeReviewView::deploy(workspace, session, window, cx);
+            MergeReviewView::open_merge_review_workflow(
+                workspace,
+                session,
+                project,
+                window,
+                cx,
+            );
         });
 
         for _ in 0..12 {
@@ -1147,50 +1609,14 @@ paths = ["Cargo.toml"]
 
         workspace.read_with(&cx, |workspace, cx| {
             assert!(
-                workspace.items_of_type::<MergeReviewView>(cx).next().is_some(),
-                "merge review tab must exist in workspace"
-            );
-            assert_eq!(
-                workspace.zoomed_dock_position(),
-                None,
-                "merge review reveal must unzoom the dock without leaving it zoomed"
-            );
-            assert!(
-                workspace.dock_at_position(dock_position).read(cx).is_open(),
-                "agent dock must stay open (must not use dismiss_zoomed pane focus)"
+                workspace.items_of_type::<MergeReviewView>(cx).next().is_none(),
+                "prototype Surmount Merge Review tab must not open"
             );
         });
-    }
-
-    #[gpui::test]
-    async fn test_merge_review_deploy_completes_first_render(cx: &mut gpui::TestAppContext) {
-        let (workspace, mut cx) = setup_zoomed_agent_workspace(cx).await;
-        let session = test_session_with_ambiguous_items(30);
-
-        workspace.update_in(&mut cx, |workspace, window, cx| {
-            MergeReviewView::deploy(workspace, session, window, cx);
-        });
-
-        for _ in 0..12 {
-            cx.run_until_parked();
-        }
-
-        let view = workspace
-            .read_with(&cx, |workspace, cx| {
-                workspace.items_of_type::<MergeReviewView>(cx).next()
-            })
-            .expect("merge review tab");
-        view.read_with(&cx, |view, _cx| {
-            let (first_render_logged, show_all_actionable) = view.test_surface_state();
+        cx.update(|_, cx| {
             assert!(
-                first_render_logged,
-                "first render must complete without crashing"
-            );
-            assert!(!show_all_actionable, "deploy must reset show_all_actionable");
-            assert_eq!(
-                initial_actionable_visible_count(pending_action_items(&view.session).len(), false),
-                25,
-                "first render must cap actionable rows"
+                load_session(cx).is_some(),
+                "merge review session must persist after workflow opens"
             );
         });
     }

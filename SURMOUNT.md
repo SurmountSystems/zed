@@ -6,15 +6,20 @@ Only describe differences explicitly visible in supplied diffs. Open questions u
 
 ## Merge review workflow
 
-When syncing upstream `main` into `surmount`:
+**Direction (review in progress):** [docs/surmount/merge-review.md](docs/surmount/merge-review.md) — per-diff summaries and a running explanation in Branch Diff; human only for leftover uncertainty; not the prototype file-list tab.
 
-1. Human runs `git fetch` and `git merge origin/main`.
-2. In Zed: open **Branch Diff** against `main`, then **Surmount Merge Review** (toolbar) or palette `surmount: Start Merge Review`.
-3. Use the queue for HITL on ambiguous paths; resolve conflicts via editor or **Resolve with Agent**.
-4. Agent skill: `.agents/skills/surmount-merge-review/SKILL.md`. Category manifest: `surmount-merge-categories.toml`. Triage script: `script/surmount-merge-triage`.
-5. Update this file per category; resolve `TODO:` markers when the queue verdict is `Documented`.
+Until that ships: triage via `script/surmount-merge-triage`; agent skill `.agents/skills/surmount-merge-review/SKILL.md`; categories in `surmount-merge-categories.toml`. Update this file per category after reviewing real hunks; resolve `TODO:` when human confirms.
 
 Keep `surmount-merge-categories.toml` in sync when categories here change.
+
+## Surmount maintainer docs
+
+Living table of contents for fork-specific design docs (not published to zed.dev). Add new rows here when adding files under `docs/surmount/`.
+
+| Doc | Summary |
+|-----|---------|
+| [docs/surmount/README.md](docs/surmount/README.md) | Index for this folder |
+| [docs/surmount/merge-review.md](docs/surmount/merge-review.md) | Merging upstream main: summarize each diff, cumulative review memory, SURMOUNT.md from that |
 
 ### Merge review tab visibility (Linux grok-first cold start)
 
@@ -50,6 +55,7 @@ cargo test -p agent_ui merge_review::tests
 | Layer | Location | Audience |
 |-------|----------|----------|
 | Technical diff record | This file (`SURMOUNT.md`) | Maintainers, agents, merge work |
+| Surmount feature design | `docs/surmount/` ([TOC](#surmount-maintainer-docs)) | Maintainers before implementation |
 | User-facing AI guides | `docs/src/ai/` | End users (zed.dev) |
 | Doc writing style | `docs/.rules` | Anyone editing user docs |
 | Agent-binding rules | `.rules` / `AGENTS.md` (symlink) | Agents and contributors |
@@ -360,7 +366,7 @@ grok immersive startup complete: agent panel dock revealed and zoomed (elapsed_m
 From `PLAN.md` (new file, explicit statements only):
 
 - **Primary goal:** Full native Rust + GPUI re-implementation of Grok Build; external binary is legacy compatibility only.
-- **Non-negotiable:** Linux-first; native Rust/GPUI; TDD; efficiency/latency first-class; edit existing files.
+- **Non-negotiable:** Linux-first for platform UX porting only; agents are not OS-scoped (see AGENTS.md § No OS–agent coupling); native Rust/GPUI; TDD; efficiency/latency first-class; edit existing files.
 - **Persistence:** heed3 + rkyv LMDB only; SQLite KVP legacy path terminated.
 - **Diagnostics:** Zed LSP diagnostics are primary agent context (not shell cargo builds).
 - **Contradictions:** Track in todos/living docs; escalate for human resolution — agents must not silently resolve.
@@ -368,7 +374,7 @@ From `PLAN.md` (new file, explicit statements only):
 From `.rules` / `AGENTS.md` (binding, already enforced):
 
 - Native-first Grok; bridged stdio path optional.
-- `~/.grok/bin/grok` Linux default synthesized in store.
+- Grok default command synthesized in `agent_server_store` on all platforms when the binary is discovered (not Linux-only).
 - Fork documentation map points to this file.
 - No ephemeral slice identifiers in code or docs.
 

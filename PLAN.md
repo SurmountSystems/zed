@@ -15,7 +15,7 @@ The external grok binary and its ACP interface are now legacy compatibility only
 
 Guiding Constraints (non-negotiable)
 - Full native replacement is the only primary path. Incremental bridging is rejected.
-- Linux-first, then Mac/Windows.
+- Linux-first for *platform UX* porting (cold start, keymaps, notifications), then Mac/Windows — not for agent availability; agents and agent-panel workflows stay cross-platform (see AGENTS.md § No OS–agent coupling).
 - Native Rust + GPUI only. Efficiency and latency are first-class requirements.
 - TDD with production-quality test coverage.
 - All changes follow existing CLAUDE.md discipline (edit existing files, full words, proper error handling, no creative low-level additions).

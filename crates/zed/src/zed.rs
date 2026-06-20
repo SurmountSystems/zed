@@ -1396,6 +1396,8 @@ fn initialize_pane(
             toolbar.add_item(project_diff_toolbar, window, cx);
             let branch_diff_toolbar = cx.new(BranchDiffToolbar::new);
             toolbar.add_item(branch_diff_toolbar, window, cx);
+            let merge_review_toolbar = cx.new(agent_ui::merge_review::MergeReviewToolbar::new);
+            toolbar.add_item(merge_review_toolbar, window, cx);
             let solo_diff_git_toolbar = cx.new(SoloDiffGitToolbar::new);
             toolbar.add_item(solo_diff_git_toolbar, window, cx);
             let commit_view_toolbar = cx.new(|_| CommitViewToolbar::new());
