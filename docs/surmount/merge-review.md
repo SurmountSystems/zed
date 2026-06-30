@@ -47,7 +47,7 @@ As you (or the agent) confirm summaries, they feed a **running explanation** for
 | **Ours** | Likely intentional fork work; summarize and document. |
 | **Shared with upstream** | Might be harmless upstream drift or a subtle mistake — **summary must prove which**. |
 | **Build / deps** | Lockfile, Cargo, CI — usually routine; summarize once per cluster. |
-| **Conflict** | Git could not merge cleanly; summarize both sides, then fix in the editor. |
+| **Conflict** | Git could not merge cleanly; summarize both sides in split diff (fork left, upstream right), then resolve with colored toolbar buttons or the agent `resolve_merge_conflict` tool (`git checkout --ours/--theirs`) — never strip conflict markers manually unless synthesizing both sides. |
 
 The TOML guess is **not** the final verdict. The per-diff summary + running explanation is.
 
@@ -82,11 +82,14 @@ Triage lists changed paths (read-only git). The agent produces a **review plan**
 
 **Branch Diff** against `origin/main` stays the spine: file list, real hunks in the center.
 
+Starting merge review collapses the **left project tree** and **bottom terminal** so Branch Diff and the agent panel get the space (same idea as maximized agent mode, but Branch Diff stays center and the agent dock stays on the right). Collapsed docks are remembered on the session for restore later.
+
 For each file (or when you open it), you see:
 
-1. **The diff** (as today).
-2. **A summary panel** (or thread message): what changed, fork vs upstream, ties to earlier reviews, suggested outcome, confidence.
+1. **The diff** — for conflicts, **split view** (fork left, upstream right).
+2. **A summary panel** (or thread message): what changed, fork vs upstream, ties to earlier reviews, `Outcome:` line, confidence.
 3. **Row hints**: SURMOUNT section, reviewed or not, uncertain or auto-cleared.
+4. **Conflict resolution** (after summary): colored **Keep fork** / **Take upstream** toolbar buttons (`git checkout --ours/--theirs` + `git add`), or agent `resolve_merge_conflict`. Manual marker stripping is only for true synthesis.
 
 You can accept the summary, correct it, or open the agent on the hunk. Corrections **update the running explanation** so the next file in that section is cheaper.
 
@@ -124,7 +127,8 @@ If prose is drafted but a doc gap remains, a `TODO:` in that paragraph is fine �
 | Piece | Role in the new model |
 |-------|------------------------|
 | `surmount-merge-categories.toml` | Starting section + guess; input to summaries |
-| `script/surmount-merge-triage` | File list for planning and batch summarize |
+| `merge_review_triage` (ACP) | File list for planning; replaces `script/surmount-merge-triage` |
+| `merge_review_diff` (ACP) | Per-file merge-base diff hunks |
 | `surmount-merge-review` skill | Agent rules: summarize diff, session memory, `todo_write` for open items only |
 | Per-file session state | Stores summaries, outcomes, links to running explanation |
 | Review Diff prompts | Per-hunk summarize + contextualize, not generic “review this” |
@@ -145,15 +149,63 @@ If prose is drafted but a doc gap remains, a `TODO:` in that paragraph is fine �
 2. Command palette — plan or resume merge review (opens Branch Diff, restores session memory).
 3. Agent skill — same session; agent can summarize the next batch using prior context.
 
+## Branch Diff UI (minimal)
+
+**Step rail** (Branch Diff toolbar while merge review workflow is engaged): always shows `reviewed/N`, **Next file →**, **Review Diff**, conflict buttons when applicable, and **End merge review**. Exactly one button is tinted (primary) for the obvious next action — never a dead toolbar state.
+
+| State | Step rail primary | Agent panel toolbar |
+|-------|-------------------|---------------------|
+| Pick file | **Next file →** (accent) | hidden when workflow engaged |
+| Review ready | **Review Diff** (green) | snippet + `?` only after summarize |
+| Summarizing | **Summarizing…** (accent, disabled) | agent panel shows file prompt |
+| Summarized | **Next file →** | snippet + `?` |
+| Conflict resolve | **Keep fork** or **Take upstream** | snippet + `?` |
+| All complete | **End merge review** (red) | — |
+
+- **Start:** palette **Start Merge Review** or Branch Diff **Merge review** (accent; hidden while a session is already active).
+- **Summary toast:** `Saved path (N/M).` with embedded click action (**Review Diff**, **Next file →**, conflict button, or **End**).
+- **Per file:** **Review Diff** → agent ends with `Summary: …` + `Outcome: …` → session updates; toast offers the next primary action.
+
 ## Build order
 
-**Done:** TOML mapping, triage script, skill shell, per-path session storage, basic Review Diff prompts.
+**Done:** TOML mapping; triage script; session storage; Review Diff + session memory; Start/Resume/End workflow; auto-capture `Summary:` / `Pattern:` / `Outcome:`; `patterns` + `categories_completed` on capture; minimal toolbar + headers above; prototype tab stays closed; Grok immersive suppression during merge review; dock restore on End; conflict split diff + colored **Keep fork** / **Take upstream** toolbar buttons; agent `resolve_merge_conflict` ACP tool (git checkout, not marker stripping).
 
-**Shipped:** **Plan merge review** opens Branch Diff against `origin/main` and posts a plan in the agent thread (prototype file-list tab no longer opens by default).
+**Next:** Manual verify on a real conflicted merge (Review Diff → Outcome → colored buttons or tool).
 
-**Next:** Per-diff summary generation; running explanation in session; show summary + status on Branch Diff rows; remove prototype tab.
+**Then:** Auto-apply high-confidence outcomes; section-level SURMOUNT.md draft; Plan Todo ↔ session sync.
 
-**Then:** Auto-apply high-confidence outcomes; section-level SURMOUNT.md draft from accumulated summaries; human queue = open Plan Todos only.
+## Requirements → tests (red/green)
+
+Run before release:
+
+```bash
+cargo test -p agent_ui merge_review::tests
+CARGO_TERM_QUIET=true cargo nextest run -p agent_ui -p git_ui -p project -p git \
+  --all-features --no-fail-fast --hide-progress-bar --status-level fail \
+  -E 'test(merge_review) | test(branch_diff)'
+```
+
+| Requirement | Test |
+|-------------|------|
+| Start opens Branch Diff, not prototype tab | `test_merge_review_opens_branch_diff_not_queue_tab` |
+| Start collapses left tree + bottom terminal | `test_merge_review_opens_branch_diff_not_queue_tab` |
+| `Summary:` captured into session | `capture_summary_for_path_stores_summary_and_clears_open_question_default` |
+| `Pattern:` + category completion | `capture_summary_records_pattern_and_completes_category` |
+| Pending file: no list header noise | `merge_review_header_label_hides_pending_files` |
+| Summarized: snippet on header | `merge_review_header_label_shows_summary_snippet_when_done` |
+| Stuck chip | `merge_review_header_label_shows_stuck_chip` |
+| Toolbar/status copy stable | `merge_review_user_visible_strings_are_stable` |
+| Conflict summary → resolution buttons | `merge_review_branch_diff_controls_shows_conflict_resolution_buttons` |
+| `Outcome:` capture | `extract_suggested_outcome_from_reply_parses_outcome_line` |
+| `resolve_merge_conflict` tool schema | `resolve_merge_conflict_tool_input_deserializes_side_aliases` (agent crate) |
+| Toolbar progress `{reviewed}/{total}` | `merge_review_progress_label_counts_summarized_items` |
+| Branch Diff button label wired from `agent_ui` | `merge_review_init_wires_branch_diff_button_label_to_git_ui` |
+| Session active after save | `merge_review_session_active_reflects_persisted_session` |
+| Review Diff → `Stopped` → session capture (GPUI) | `test_review_diff_stopped_handler_captures_summary_into_session` |
+| Review Diff suppresses Grok immersive | `test_merge_review_review_branch_diff_suppresses_grok_surface` |
+| Grok reassert blocked during session | `test_merge_review_blocks_grok_reassert_after_workflow` |
+| End restores collapsed docks + clears session | `test_merge_review_end_restores_collapsed_docks` |
+| Triage script ↔ Rust paths | `triage_script_matches_load_session_paths` |
 
 ## Still to decide
 

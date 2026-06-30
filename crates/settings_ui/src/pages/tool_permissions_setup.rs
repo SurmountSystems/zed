@@ -1443,6 +1443,13 @@ mod tests {
             // remember persists observations to memory_palace (native Grok memory)
             // but does not use tool permission rules.
             "remember",
+            // resolve_merge_conflict runs git checkout --ours/--theirs during merge
+            // review; permission is enforced by merge-review workflow context.
+            "resolve_merge_conflict",
+            // merge_review_triage / merge_review_diff are read-only git helpers for
+            // Surmount merge review (replace script/surmount-merge-triage).
+            "merge_review_triage",
+            "merge_review_diff",
         ];
 
         let tool_info_ids: Vec<&str> = TOOLS.iter().map(|t| t.id).collect();

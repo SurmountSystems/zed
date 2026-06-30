@@ -1841,6 +1841,12 @@ impl AcpThread {
         if !self.is_grok() {
             return;
         }
+        if self.merge_review_file_turn_scoped() {
+            log::info!(
+                "acp_thread: skipping live diagnostic continuation for merge review file turn"
+            );
+            return;
+        }
 
         let diag = self.project.read(cx).diagnostic_summary(false, cx);
         let turn_id = self.turn_id;
@@ -2316,6 +2322,64 @@ impl AcpThread {
         self.push_assistant_content_block_with_indent(chunk, is_thought, false, cx)
     }
 
+    /// Keep in sync with `agent_ui::merge_review::merge_review_file_prompt`.
+    const MERGE_REVIEW_FILE_PROMPT_MARKER: &'static str =
+        "Summarize this file for merging upstream";
+    const MERGE_REVIEW_SCOPED_TURN_MARKER: &'static str = "This is a scoped single-file turn";
+    const MERGE_REVIEW_FORMAT_RETRY_MARKER: &'static str =
+        "missing the required Summary: and Outcome: lines";
+    const DISCIPLINE_KICKBACK_MARKER: &'static str = "autonomous work discipline rules";
+    const FORMATTING_KICKBACK_MARKER: &'static str =
+        "violated the required output formatting rules";
+
+    pub(crate) fn user_message_plain_text(message: &UserMessage) -> String {
+        message
+            .chunks
+            .iter()
+            .filter_map(|block| match block {
+                acp::ContentBlock::Text(text_content) => Some(text_content.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn is_injected_grok_correction(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        lower.contains(Self::DISCIPLINE_KICKBACK_MARKER)
+            || lower.contains(Self::FORMATTING_KICKBACK_MARKER)
+            || lower.contains("please revise your last response to comply")
+            || lower.contains("please revise your entire last answer")
+    }
+
+    fn is_merge_review_file_prompt(text: &str) -> bool {
+        text.contains(Self::MERGE_REVIEW_FILE_PROMPT_MARKER)
+            || text.contains(Self::MERGE_REVIEW_SCOPED_TURN_MARKER)
+    }
+
+    /// True while the thread is answering a per-file merge review prompt, including
+    /// follow-up turns after injected Grok discipline kickbacks.
+    fn merge_review_file_turn_scoped(&self) -> bool {
+        for entry in self.entries.iter().rev() {
+            let AgentThreadEntry::UserMessage(message) = entry else {
+                continue;
+            };
+            let text = Self::user_message_plain_text(message);
+            if Self::is_injected_grok_correction(&text)
+                || text.contains(Self::MERGE_REVIEW_FORMAT_RETRY_MARKER)
+            {
+                continue;
+            }
+            return Self::is_merge_review_file_prompt(&text);
+        }
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merge_review_file_turn_scoped_for_tests(&self) -> bool {
+        self.merge_review_file_turn_scoped()
+    }
+
     pub fn push_assistant_content_block_with_indent(
         &mut self,
         chunk: acp::ContentBlock,
@@ -2325,7 +2389,8 @@ impl AcpThread {
     ) {
         let path_style = self.project.read(cx).path_style(cx);
 
-        if self.is_grok() {
+        let merge_review_scoped = self.merge_review_file_turn_scoped();
+        if self.is_grok() && !merge_review_scoped {
             if let acp::ContentBlock::Text(tc) = &chunk {
                 if let Err(violations) = Self::validate_grok_output_formatting(&tc.text) {
                     let correction = format!(
@@ -2370,10 +2435,15 @@ impl AcpThread {
                     correction.push_str("   When naming or referencing tasks (in todo_write, plan entries, categorized todos), always use the T-<n>-task-<id> syntax (e.g. T-17-task-refactor-parser) for stable cross-turn traceability.\n\n");
                     correction.push_str("Please revise your last response to comply with all three rules (never stop while tasks remain, always emit the exact completion notification when done, and apply the CWD-based RO/Destructive classification using proper T-<n>-task-<id> references).");
 
+                    log::info!(
+                        "acp_thread: injecting Grok discipline kickback (stop={stop_violation}, notification={notification_violation})"
+                    );
                     let text_block = acp::ContentBlock::Text(acp::TextContent::new(correction));
                     self.push_user_content_block(None, text_block, cx);
                 }
             }
+        } else if self.is_grok() && merge_review_scoped {
+            log::info!("acp_thread: skipping Grok output discipline for merge review file turn");
         }
 
         // For text chunks going to an existing Markdown block, buffer for smooth
@@ -7197,6 +7267,218 @@ mod tests {
             // When plan is empty, the stop-violation helper should return false even on bad phrasing
             plan.entries[0].status = acp::PlanEntryStatus::Completed;
             assert!(!plan.would_violate_autonomous_discipline("I have no more work."));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_merge_review_file_prompt_skips_autonomous_discipline_kickback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        thread.update(cx, |thread, cx| {
+            thread.plan.entries.clear();
+            let merge_review_prompt = "Summarize this file for merging upstream `origin/main` into the Surmount fork.\nFile: lib.rs\n";
+            thread.push_user_content_block(
+                None,
+                acp::ContentBlock::Text(acp::TextContent::new(merge_review_prompt)),
+                cx,
+            );
+            let summary_without_notification =
+                "Upstream tweaked the skill wording.\nSummary: Keep our fork additions.\n";
+            thread.push_assistant_content_block_with_indent(
+                acp::ContentBlock::Text(acp::TextContent::new(summary_without_notification)),
+                false,
+                false,
+                cx,
+            );
+        });
+        thread.read_with(cx, |thread, app| {
+            let correction_found = thread.entries.iter().any(|entry| {
+                if let AgentThreadEntry::UserMessage(user_message) = entry {
+                    user_message
+                        .content
+                        .to_markdown(app)
+                        .contains("Autonomous Work Discipline rules")
+                } else {
+                    false
+                }
+            });
+            assert!(
+                !correction_found,
+                "merge review file summaries must not trigger autonomous discipline kickback"
+            );
+            assert!(
+                thread.merge_review_file_turn_scoped_for_tests(),
+                "merge review file prompt must keep the turn scoped"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_merge_review_file_turn_stays_scoped_after_injected_kickback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(
+                None,
+                acp::ContentBlock::Text(acp::TextContent::new(
+                    "Summarize this file for merging upstream `origin/main` into the Surmount fork.\nFile: lib.rs\n",
+                )),
+                cx,
+            );
+            thread.push_assistant_content_block_with_indent(
+                acp::ContentBlock::Text(acp::TextContent::new("Summary: keep ours.\n")),
+                false,
+                false,
+                cx,
+            );
+            thread.push_user_content_block(
+                None,
+                acp::ContentBlock::Text(acp::TextContent::new(
+                    "Your previous response violated the Autonomous Work Discipline rules:\n\nB. You concluded the turn...",
+                )),
+                cx,
+            );
+            assert!(
+                thread.merge_review_file_turn_scoped_for_tests(),
+                "injected kickback must not end merge review scoping"
+            );
+            thread.push_assistant_content_block_with_indent(
+                acp::ContentBlock::Text(acp::TextContent::new(
+                    "Summary: upstream doc tweak only.\n",
+                )),
+                false,
+                false,
+                cx,
+            );
+        });
+        thread.read_with(cx, |thread, app| {
+            let kickback_count = thread
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, AgentThreadEntry::UserMessage(message)
+                        if AcpThread::user_message_plain_text(message)
+                            .contains("Autonomous Work Discipline rules"))
+                })
+                .count();
+            assert_eq!(
+                kickback_count, 1,
+                "simulated kickback must not multiply during merge review revisions"
+            );
+            assert!(
+                !thread.entries.iter().any(|entry| {
+                    matches!(entry, AgentThreadEntry::UserMessage(message) if {
+                        let text = AcpThread::user_message_plain_text(message);
+                        text.contains("Autonomous Work Discipline rules")
+                            && text.contains("Please revise your last response")
+                    })
+                }),
+                "second assistant revision must not inject another kickback (got {kickback_count})"
+            );
+            let _ = app;
+        });
+    }
+
+    #[gpui::test]
+    async fn test_merge_review_file_turn_stays_scoped_after_capitalized_discipline_kickback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(
+                None,
+                acp::ContentBlock::Text(acp::TextContent::new(
+                    "Summarize this file for merging upstream `origin/main` into the Surmount fork.\n\
+                     File: lib.rs\n\
+                     This is a scoped single-file turn — do not use todo_write or plan entries.\n",
+                )),
+                cx,
+            );
+            thread.push_assistant_content_block_with_indent(
+                acp::ContentBlock::Text(acp::TextContent::new("Summary: keep ours.\n")),
+                false,
+                false,
+                cx,
+            );
+            thread.push_user_content_block(
+                None,
+                acp::ContentBlock::Text(acp::TextContent::new(
+                    "Your response violated the Autonomous Work Discipline Rules:\n\n\
+                     B. You concluded the turn without the required explicit completion notification.\n\
+                     Please revise your last response to comply with all three rules.",
+                )),
+                cx,
+            );
+            assert!(
+                thread.merge_review_file_turn_scoped_for_tests(),
+                "capitalized discipline kickback must not end merge review scoping"
+            );
+            thread.push_assistant_content_block_with_indent(
+                acp::ContentBlock::Text(acp::TextContent::new(
+                    "Summary: upstream doc tweak only.\n",
+                )),
+                false,
+                false,
+                cx,
+            );
+        });
+        thread.read_with(cx, |thread, app| {
+            let kickback_count = thread
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, AgentThreadEntry::UserMessage(message)
+                        if AcpThread::user_message_plain_text(message)
+                            .to_ascii_lowercase()
+                            .contains("autonomous work discipline rules"))
+                })
+                .count();
+            assert_eq!(
+                kickback_count, 1,
+                "capitalized kickback must not multiply during merge review revisions"
+            );
+            let _ = app;
         });
     }
 

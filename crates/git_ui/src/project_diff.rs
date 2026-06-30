@@ -22,7 +22,7 @@ use git::{
     status::FileStatus,
 };
 use gpui::{
-    Action, AnyElement, App, AppContext as _, AsyncWindowContext, Entity, EventEmitter,
+    Action, AnyElement, App, AppContext as _, AsyncApp, AsyncWindowContext, Entity, EventEmitter,
     FocusHandle, Focusable, Render, Subscription, Task, WeakEntity, actions,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
@@ -36,22 +36,22 @@ use project::{
 };
 use settings::{Settings, SettingsStore};
 use std::any::{Any, TypeId};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use theme::ActiveTheme;
 use ui::{
-    CommonAnimationExt as _, DiffStat, Divider, KeyBinding, PopoverMenu, Tooltip, prelude::*,
-    vertical_divider,
+    ButtonStyle, CommonAnimationExt as _, DiffStat, Divider, KeyBinding, PopoverMenu, TintColor,
+    Tooltip, prelude::*, vertical_divider,
 };
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
-    CloseActiveItem, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
-    ToolbarItemView, Workspace,
+    CloseActiveItem, ItemNavHistory, SerializableItem, Toast, ToolbarItemEvent,
+    ToolbarItemLocation, ToolbarItemView, Workspace,
     item::{Item, ItemEvent, ItemHandle, SaveOptions, TabContentParams},
-    notifications::NotifyTaskExt,
+    notifications::{NotificationId, NotifyTaskExt},
     searchable::SearchableItemHandle,
 };
 use zed_actions::agent::ReviewBranchDiff;
-use zed_actions::surmount::StartMergeReview;
+use zed_actions::surmount::{EndMergeReview, StartMergeReview};
 use ztracing::instrument;
 
 actions!(
@@ -82,6 +82,7 @@ pub struct ProjectDiff {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    review_diff_in_flight: bool,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -302,16 +303,37 @@ impl ProjectDiff {
     fn review_diff(&mut self, _: &ReviewDiff, window: &mut Window, cx: &mut Context<Self>) {
         let diff_base = self.diff_base(cx).clone();
         let DiffBase::Merge { base_ref } = diff_base else {
+            log::warn!("project_diff: Review Diff ignored (not a merge base diff)");
             return;
         };
 
         let Some(repo) = self.branch_diff.read(cx).repo().cloned() else {
+            log::warn!("project_diff: Review Diff ignored (no repository)");
             return;
         };
 
         let file_path = self
             .active_project_path(cx)
             .map(|project_path| project_path.path.as_ref().to_proto());
+
+        log::info!("project_diff: Review Diff requested (base={base_ref}, file={file_path:?})");
+
+        self.review_diff_in_flight = true;
+        cx.notify();
+        if let Some(workspace) = self.workspace.upgrade() {
+            let file_label = file_path.clone().unwrap_or_else(|| "branch diff".into());
+            workspace.update(cx, |workspace, cx| {
+                struct ReviewDiffToast;
+                workspace.show_toast(
+                    Toast::new(
+                        NotificationId::unique::<ReviewDiffToast>(),
+                        format!("Review Diff: loading {file_label}…"),
+                    )
+                    .autohide(),
+                    cx,
+                );
+            });
+        }
 
         let diff_type = if let Some(path) = file_path.clone() {
             DiffType::MergeBaseFile {
@@ -327,27 +349,84 @@ impl ProjectDiff {
         let diff_receiver = repo.update(cx, |repo, cx| repo.diff(diff_type, cx));
 
         let workspace = self.workspace.clone();
+        let project_diff = cx.entity().downgrade();
 
         window
             .spawn(cx, {
                 let workspace = workspace.clone();
                 async move |cx| {
-                    let diff_text = diff_receiver.await??;
+                    struct ReviewDiffToast;
+                    let clear_in_flight = |cx: &mut AsyncApp| {
+                        if let Some(project_diff) = project_diff.upgrade() {
+                            project_diff.update(cx, |project_diff, cx| {
+                                project_diff.review_diff_in_flight = false;
+                                cx.notify();
+                            });
+                        }
+                    };
+
+                    let diff_text = match diff_receiver.await {
+                        Ok(Ok(diff_text)) => diff_text,
+                        Ok(Err(error)) => {
+                            clear_in_flight(cx);
+                            if let Some(workspace) = workspace.upgrade() {
+                                workspace.update(cx, |workspace, cx| {
+                                    workspace.show_toast(
+                                        Toast::new(
+                                            NotificationId::unique::<ReviewDiffToast>(),
+                                            format!("Review Diff failed: {error:#}"),
+                                        ),
+                                        cx,
+                                    );
+                                });
+                            }
+                            return Err(error);
+                        }
+                        Err(error) => {
+                            clear_in_flight(cx);
+                            return Err(error.into());
+                        }
+                    };
+
+                    log::info!(
+                        "project_diff: Review Diff diff ready (file={file_path:?}, bytes={})",
+                        diff_text.len()
+                    );
 
                     if let Some(workspace) = workspace.upgrade() {
-                        workspace.update_in(cx, |_workspace, window, cx| {
+                        workspace.update_in(cx, |workspace, window, cx| {
+                            log::info!(
+                                "project_diff: Review Diff dispatching ReviewBranchDiff action (file={file_path:?})"
+                            );
                             window.dispatch_action(
                                 ReviewBranchDiff {
                                     diff_text: diff_text.into(),
                                     base_ref: base_ref.to_string().into(),
-                                    file_path: file_path.map(Into::into),
+                                    file_path: file_path.clone().map(Into::into),
                                 }
                                 .boxed_clone(),
+                                cx,
+                            );
+                            let file_label = file_path
+                                .clone()
+                                .unwrap_or_else(|| "branch diff".into());
+                            workspace.show_toast(
+                                Toast::new(
+                                    NotificationId::unique::<ReviewDiffToast>(),
+                                    format!(
+                                        "Review Diff sent to agent ({file_label}) — check the right panel."
+                                    ),
+                                )
+                                .autohide(),
                                 cx,
                             );
                         })?;
                     }
 
+                    clear_in_flight(cx);
+                    log::info!(
+                        "project_diff: Review Diff finished (file={file_path:?}, in_flight=false)"
+                    );
                     anyhow::Ok(())
                 }
             })
@@ -640,6 +719,7 @@ impl ProjectDiff {
             buffer_diff_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            review_diff_in_flight: false,
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -665,7 +745,13 @@ impl ProjectDiff {
         let sort_prefix = sort_prefix(repo, &entry.repo_path, entry.status, cx);
         let path_key = PathKey::with_sort_prefix(sort_prefix, entry.repo_path.as_ref().clone());
 
-        self.move_to_path(path_key, window, cx)
+        self.move_to_path(path_key, window, cx);
+        if self.pending_scroll.is_some() {
+            self._task = window.spawn(cx, {
+                let this = cx.weak_entity();
+                async move |cx| Self::refresh(this, RefreshReason::StatusesChanged, cx).await
+            });
+        }
     }
 
     pub fn move_to_project_path(
@@ -691,6 +777,35 @@ impl ProjectDiff {
         let sort_prefix = sort_prefix(&git_repo.read(cx), &repo_path, status, cx);
         let path_key = PathKey::with_sort_prefix(sort_prefix, repo_path.as_ref().clone());
         self.move_to_path(path_key, window, cx)
+    }
+
+    pub fn move_to_repo_relative_path(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Ok(repo_path) = RepoPath::new(path) else {
+            return false;
+        };
+        let Some(git_repo) = self.branch_diff.read(cx).repo() else {
+            return false;
+        };
+        let repo = git_repo.read(cx);
+        let status = repo
+            .status_for_path(&repo_path)
+            .map(|entry| entry.status)
+            .unwrap_or(FileStatus::Untracked);
+        let sort_prefix = sort_prefix(repo, &repo_path, status, cx);
+        let path_key = PathKey::with_sort_prefix(sort_prefix, repo_path.as_ref().clone());
+        self.move_to_path(path_key, window, cx);
+        if self.pending_scroll.is_some() {
+            self._task = window.spawn(cx, {
+                let this = cx.weak_entity();
+                async move |cx| Self::refresh(this, RefreshReason::StatusesChanged, cx).await
+            });
+        }
+        true
     }
 
     fn move_to_beginning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -729,6 +844,27 @@ impl ProjectDiff {
     /// Returns the total count of review comments across all hunks/files.
     pub fn total_review_comment_count(&self) -> usize {
         self.review_comment_count
+    }
+
+    pub fn review_diff_in_flight(&self) -> bool {
+        self.review_diff_in_flight
+    }
+
+    pub fn project(&self) -> &Entity<Project> {
+        &self.project
+    }
+
+    pub fn ensure_split_diff_for_merge_review(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use editor::{DiffViewStyle, ToggleSplitDiff};
+        self.editor.update(cx, |editor, cx| {
+            if editor.diff_view_style() == DiffViewStyle::Unified {
+                editor.toggle_split(&ToggleSplitDiff, window, cx);
+            }
+        });
     }
 
     /// Returns a reference to the splittable editor.
@@ -1042,16 +1178,21 @@ impl ProjectDiff {
                 })?;
             }
         }
-        this.update(cx, |this, cx| {
-            if !buffers_to_fold.is_empty() {
-                this.editor.update(cx, |editor, cx| {
-                    editor
-                        .rhs_editor()
-                        .update(cx, |editor, cx| editor.fold_buffers(buffers_to_fold, cx));
-                });
-            }
-            this.pending_scroll.take();
-            cx.notify();
+        cx.update(|window, cx| {
+            this.update(cx, |this, cx| {
+                if !buffers_to_fold.is_empty() {
+                    this.editor.update(cx, |editor, cx| {
+                        editor
+                            .rhs_editor()
+                            .update(cx, |editor, cx| editor.fold_buffers(buffers_to_fold, cx));
+                    });
+                }
+                if let Some(path_key) = this.pending_scroll.take() {
+                    this.move_to_path(path_key, window, cx);
+                }
+                cx.notify();
+            })
+            .ok();
         })?;
 
         Ok(())
@@ -1085,18 +1226,11 @@ impl ProjectDiff {
     }
 
     fn active_project_path(&self, cx: &App) -> Option<ProjectPath> {
-        let editor = self.editor.read(cx).focused_editor().read(cx);
-        let multibuffer = editor.buffer().read(cx);
-        let position = editor.selections.newest_anchor().head();
-        let snapshot = multibuffer.snapshot(cx);
-        let (text_anchor, _) = snapshot.anchor_to_buffer_anchor(position)?;
-        let buffer = multibuffer.buffer(text_anchor.buffer_id)?;
-
-        let file = buffer.read(cx).file()?;
-        Some(ProjectPath {
-            worktree_id: file.worktree_id(cx),
-            path: file.path().clone(),
-        })
+        self.editor()
+            .read(cx)
+            .rhs_editor()
+            .read(cx)
+            .active_project_path(cx)
     }
 }
 
@@ -1803,18 +1937,27 @@ fn render_send_review_to_agent_button(review_count: usize, focus_handle: &FocusH
 
 pub struct BranchDiffToolbar {
     project_diff: Option<WeakEntity<ProjectDiff>>,
+    _project_diff_subscription: Option<Subscription>,
 }
 
 impl BranchDiffToolbar {
     pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self { project_diff: None }
+        Self {
+            project_diff: None,
+            _project_diff_subscription: None,
+        }
     }
 
     fn project_diff(&self, _: &App) -> Option<Entity<ProjectDiff>> {
         self.project_diff.as_ref()?.upgrade()
     }
 
-    fn dispatch_action(&self, action: &dyn Action, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn dispatch_action(
+        &self,
+        action: &dyn Action,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(project_diff) = self.project_diff(cx) {
             project_diff.focus_handle(cx).focus(window, cx);
         }
@@ -1834,11 +1977,16 @@ impl ToolbarItemView for BranchDiffToolbar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
-        self.project_diff = active_pane_item
+        self._project_diff_subscription = None;
+        let project_diff = active_pane_item
             .and_then(|item| item.act_as::<ProjectDiff>(cx))
-            .filter(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Merge { .. }))
-            .map(|entity| entity.downgrade());
-        if self.project_diff.is_some() {
+            .filter(|item| matches!(item.read(cx).diff_base(cx), DiffBase::Merge { .. }));
+        self.project_diff = project_diff.as_ref().map(|entity| entity.downgrade());
+        if let Some(project_diff) = project_diff {
+            self._project_diff_subscription =
+                Some(cx.observe(&project_diff, |_this, _project_diff, cx| {
+                    cx.notify();
+                }));
             ToolbarItemLocation::PrimaryRight
         } else {
             ToolbarItemLocation::Hidden
@@ -1855,7 +2003,7 @@ impl ToolbarItemView for BranchDiffToolbar {
 }
 
 impl Render for BranchDiffToolbar {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(project_diff) = self.project_diff(cx) else {
             return div();
         };
@@ -1873,9 +2021,37 @@ impl Render for BranchDiffToolbar {
         let project_diff_for_picker = project_diff.downgrade();
 
         let is_multibuffer_empty = project_diff.read(cx).multibuffer.read(cx).is_empty();
+        let file_selected = !is_multibuffer_empty;
+        let review_diff_in_flight = project_diff.read(cx).review_diff_in_flight();
         let is_ai_enabled = AgentSettings::get_global(cx).enabled(cx);
+        let selected_path = project_diff.read(cx).active_file_repo_path(cx);
+        let mut merge_controls =
+            merge_review_branch_diff_controls(file_selected, selected_path.as_deref(), cx);
+        if let Some(workspace) = workspace.upgrade() {
+            workspace.read_with(cx, |workspace, cx| {
+                merge_review_finalize_branch_diff_controls(
+                    &mut merge_controls,
+                    review_diff_in_flight,
+                    workspace,
+                    cx,
+                );
+            });
+        }
+        let merge_review_workflow = merge_controls.workflow_active;
 
-        let show_review_button = !is_multibuffer_empty && is_ai_enabled;
+        let show_review_button = is_ai_enabled && (merge_review_workflow || file_selected);
+        let merge_review_rail = merge_review_workflow.then(|| {
+            render_merge_review_step_rail(
+                self,
+                &merge_controls,
+                review_diff_in_flight,
+                file_selected,
+                is_ai_enabled,
+                &focus_handle,
+                window,
+                cx,
+            )
+        });
         let is_surmount_workspace = repository.as_ref().is_some_and(|repo| {
             repo.read(cx)
                 .snapshot()
@@ -1939,21 +2115,25 @@ impl Render for BranchDiffToolbar {
                     deletions as usize,
                 ))
             })
-            .when(show_review_button, |this| {
+            .when_some(merge_review_rail, |this, rail| {
+                this.child(Divider::vertical()).child(rail)
+            })
+            .when(show_review_button && !merge_review_workflow, |this| {
                 let focus_handle = focus_handle.clone();
                 this.child(Divider::vertical()).child(
                     Button::new("review-diff", "Review Diff")
                         .start_icon(
                             Icon::new(IconName::ZedAssistant)
                                 .size(IconSize::Small)
-                                .color(Color::Muted),
+                                .color(Color::Success),
                         )
+                        .style(ButtonStyle::Tinted(TintColor::Success))
                         .key_binding(KeyBinding::for_action_in(&ReviewDiff, &focus_handle, cx))
                         .tooltip(move |_, cx| {
                             Tooltip::with_meta_in(
                                 "Review Diff",
                                 Some(&ReviewDiff),
-                                "Send this diff for your last agent to review.",
+                                "Send this file's diff to the agent for review.",
                                 &focus_handle,
                                 cx,
                             )
@@ -1963,15 +2143,16 @@ impl Render for BranchDiffToolbar {
                         })),
                 )
             })
-            .when(is_surmount_workspace, |this| {
-                let focus_handle = focus_handle.clone();
-                this.child(Divider::vertical()).child(
-                    Button::new("surmount-merge-review", "Plan merge review")
-                        .start_icon(
-                            Icon::new(IconName::GitMergeConflict)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
+            .when(
+                is_surmount_workspace && !merge_review_session_active(cx),
+                |this| {
+                    let focus_handle = focus_handle.clone();
+                    this.child(Divider::vertical()).child(
+                        Button::new(
+                            "surmount-merge-review",
+                            merge_review_branch_diff_button_label(),
                         )
+                        .style(ButtonStyle::Tinted(TintColor::Accent))
                         .key_binding(KeyBinding::for_action_in(
                             &StartMergeReview,
                             &focus_handle,
@@ -1979,9 +2160,9 @@ impl Render for BranchDiffToolbar {
                         ))
                         .tooltip(move |_, cx| {
                             Tooltip::with_meta_in(
-                                "Plan merge review",
+                                "Start merge review",
                                 Some(&StartMergeReview),
-                                "Open Branch Diff against upstream and post a merge review plan in the agent thread.",
+                                "Opens Branch Diff and posts a plan in the agent thread.",
                                 &focus_handle,
                                 cx,
                             )
@@ -1989,8 +2170,39 @@ impl Render for BranchDiffToolbar {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.dispatch_action(&StartMergeReview, window, cx);
                         })),
-                )
-            })
+                    )
+                },
+            )
+            .when(
+                is_surmount_workspace && merge_review_session_active(cx) && !merge_review_workflow,
+                |this| {
+                    let focus_handle = focus_handle.clone();
+                    this.child(Divider::vertical()).child(
+                        Button::new(
+                            "surmount-merge-review-end",
+                            merge_review_end_branch_diff_button_label(),
+                        )
+                        .style(ButtonStyle::Tinted(TintColor::Error))
+                        .key_binding(KeyBinding::for_action_in(
+                            &EndMergeReview,
+                            &focus_handle,
+                            cx,
+                        ))
+                        .tooltip(move |_, cx| {
+                            Tooltip::with_meta_in(
+                                "End merge review",
+                                Some(&EndMergeReview),
+                                "Clears the session and restores collapsed docks.",
+                                &focus_handle,
+                                cx,
+                            )
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.dispatch_action(&EndMergeReview, window, cx);
+                        })),
+                    )
+                },
+            )
             .when(review_count > 0, |this| {
                 this.child(vertical_divider()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(
@@ -2003,6 +2215,171 @@ impl Render for BranchDiffToolbar {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeReviewConflictOutcomeHint {
+    KeepFork,
+    TakeUpstream,
+    Synthesize,
+    NeedsHuman,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeReviewBranchDiffControls {
+    pub workflow_active: bool,
+    pub progress_label: SharedString,
+    pub step_label: SharedString,
+    pub review_diff_ready: bool,
+    pub current_file_done: bool,
+    pub is_conflict_file: bool,
+    pub show_conflict_resolution: bool,
+    pub suggested_outcome: Option<MergeReviewConflictOutcomeHint>,
+    /// True after Review Diff was sent until the agent summary is captured.
+    pub awaiting_agent_summary: bool,
+}
+
+type MergeReviewStepRailRendererFn = fn(
+    &BranchDiffToolbar,
+    &MergeReviewBranchDiffControls,
+    bool,
+    bool,
+    bool,
+    &FocusHandle,
+    &mut Window,
+    &mut Context<BranchDiffToolbar>,
+) -> AnyElement;
+
+type MergeReviewHeaderLabelFn = fn(&str, &App) -> Option<SharedString>;
+type MergeReviewSessionActiveFn = fn(&App) -> bool;
+type MergeReviewBranchDiffControlsFn =
+    fn(bool, Option<&str>, &App) -> MergeReviewBranchDiffControls;
+type MergeReviewBranchDiffButtonLabelFn = fn() -> &'static str;
+type MergeReviewEndBranchDiffButtonLabelFn = fn() -> &'static str;
+type MergeReviewFinalizeControlsFn = fn(&mut MergeReviewBranchDiffControls, bool, &Workspace, &App);
+
+static MERGE_REVIEW_HEADER_LABEL: OnceLock<MergeReviewHeaderLabelFn> = OnceLock::new();
+static MERGE_REVIEW_SESSION_ACTIVE: OnceLock<MergeReviewSessionActiveFn> = OnceLock::new();
+static MERGE_REVIEW_BRANCH_DIFF_CONTROLS: OnceLock<MergeReviewBranchDiffControlsFn> =
+    OnceLock::new();
+static MERGE_REVIEW_BRANCH_DIFF_BUTTON_LABEL: OnceLock<MergeReviewBranchDiffButtonLabelFn> =
+    OnceLock::new();
+static MERGE_REVIEW_END_BRANCH_DIFF_BUTTON_LABEL: OnceLock<MergeReviewEndBranchDiffButtonLabelFn> =
+    OnceLock::new();
+static MERGE_REVIEW_STEP_RAIL_RENDERER: OnceLock<MergeReviewStepRailRendererFn> = OnceLock::new();
+static MERGE_REVIEW_FINALIZE_CONTROLS: OnceLock<MergeReviewFinalizeControlsFn> = OnceLock::new();
+
+pub fn set_merge_review_header_label(renderer: MergeReviewHeaderLabelFn) {
+    let _ = MERGE_REVIEW_HEADER_LABEL.set(renderer);
+}
+
+pub fn set_merge_review_session_active(check: MergeReviewSessionActiveFn) {
+    let _ = MERGE_REVIEW_SESSION_ACTIVE.set(check);
+}
+
+pub fn set_merge_review_branch_diff_controls(renderer: MergeReviewBranchDiffControlsFn) {
+    let _ = MERGE_REVIEW_BRANCH_DIFF_CONTROLS.set(renderer);
+}
+
+pub fn set_merge_review_branch_diff_button_label(label: MergeReviewBranchDiffButtonLabelFn) {
+    let _ = MERGE_REVIEW_BRANCH_DIFF_BUTTON_LABEL.set(label);
+}
+
+pub fn set_merge_review_end_branch_diff_button_label(label: MergeReviewEndBranchDiffButtonLabelFn) {
+    let _ = MERGE_REVIEW_END_BRANCH_DIFF_BUTTON_LABEL.set(label);
+}
+
+pub fn set_merge_review_step_rail_renderer(renderer: MergeReviewStepRailRendererFn) {
+    let _ = MERGE_REVIEW_STEP_RAIL_RENDERER.set(renderer);
+}
+
+pub fn set_merge_review_finalize_controls(finalize: MergeReviewFinalizeControlsFn) {
+    let _ = MERGE_REVIEW_FINALIZE_CONTROLS.set(finalize);
+}
+
+fn render_merge_review_step_rail(
+    toolbar: &BranchDiffToolbar,
+    controls: &MergeReviewBranchDiffControls,
+    review_diff_in_flight: bool,
+    file_selected: bool,
+    is_ai_enabled: bool,
+    focus_handle: &FocusHandle,
+    window: &mut Window,
+    cx: &mut Context<BranchDiffToolbar>,
+) -> AnyElement {
+    MERGE_REVIEW_STEP_RAIL_RENDERER
+        .get()
+        .map(|render| {
+            render(
+                toolbar,
+                controls,
+                review_diff_in_flight,
+                file_selected,
+                is_ai_enabled,
+                focus_handle,
+                window,
+                cx,
+            )
+        })
+        .unwrap_or_else(|| div().into_any())
+}
+
+pub fn merge_review_branch_diff_button_label() -> &'static str {
+    MERGE_REVIEW_BRANCH_DIFF_BUTTON_LABEL
+        .get()
+        .map(|label| label())
+        .unwrap_or("Merge review")
+}
+
+pub fn merge_review_end_branch_diff_button_label() -> &'static str {
+    MERGE_REVIEW_END_BRANCH_DIFF_BUTTON_LABEL
+        .get()
+        .map(|label| label())
+        .unwrap_or("End merge review")
+}
+
+fn merge_review_header_label(path: &str, cx: &App) -> Option<SharedString> {
+    MERGE_REVIEW_HEADER_LABEL
+        .get()
+        .and_then(|render| render(path, cx))
+}
+
+fn merge_review_session_active(cx: &App) -> bool {
+    MERGE_REVIEW_SESSION_ACTIVE
+        .get()
+        .is_some_and(|check| check(cx))
+}
+
+fn merge_review_finalize_branch_diff_controls(
+    controls: &mut MergeReviewBranchDiffControls,
+    review_diff_in_flight: bool,
+    workspace: &Workspace,
+    cx: &App,
+) {
+    if let Some(finalize) = MERGE_REVIEW_FINALIZE_CONTROLS.get() {
+        finalize(controls, review_diff_in_flight, workspace, cx);
+    }
+}
+
+fn merge_review_branch_diff_controls(
+    file_selected: bool,
+    selected_path: Option<&str>,
+    cx: &App,
+) -> MergeReviewBranchDiffControls {
+    MERGE_REVIEW_BRANCH_DIFF_CONTROLS
+        .get()
+        .map(|controls| controls(file_selected, selected_path, cx))
+        .unwrap_or(MergeReviewBranchDiffControls {
+            workflow_active: false,
+            progress_label: SharedString::default(),
+            step_label: SharedString::default(),
+            review_diff_ready: file_selected,
+            current_file_done: false,
+            is_conflict_file: false,
+            show_conflict_resolution: false,
+            suggested_outcome: None,
+            awaiting_agent_summary: false,
+        })
+}
+
 struct BranchDiffAddon {
     branch_diff: Entity<branch_diff::BranchDiff>,
 }
@@ -2010,6 +2387,23 @@ struct BranchDiffAddon {
 impl Addon for BranchDiffAddon {
     fn to_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn render_buffer_header_controls(
+        &self,
+        _: &multi_buffer::ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let path = buffer.file()?.path().as_ref().to_proto();
+        let label = merge_review_header_label(&path, cx)?;
+        Some(
+            Label::new(label)
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+        )
     }
 
     fn override_status_for_buffer_id(

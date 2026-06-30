@@ -8299,15 +8299,15 @@ mod tests {
             path!("/project"),
             json!({
                 ".git": {},
-                "tracked": "tracked\n",
-                "untracked": "\n",
+                "tracked": "tracked content\n",
+                "untracked": "new untracked content\n",
             }),
         )
         .await;
 
         fs.set_head_and_index_for_repo(
             path!("/project/.git").as_ref(),
-            &[("tracked", "old tracked\n".into())],
+            &[("tracked", "old tracked content\n".into())],
         );
 
         let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
@@ -8317,7 +8317,29 @@ mod tests {
             .read_with(cx, |mw, _| mw.workspace().clone())
             .unwrap();
         let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.read(|cx| {
+            project
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .as_local()
+                .unwrap()
+                .scan_complete()
+        })
+        .await;
+
+        cx.executor().run_until_parked();
+
         let panel = workspace.update_in(cx, GitPanel::new);
+
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
+            std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
 
         // Enable the `sort_by_path` setting and wait for entries to be updated,
         // as there should no longer be separators between Tracked and Untracked
@@ -8330,25 +8352,63 @@ mod tests {
             });
         });
 
-        cx.update_window_entity(&panel, |panel, _, _| {
+        let handle = cx.update_window_entity(&panel, |panel, _, _| {
             std::mem::replace(&mut panel.update_visible_entries_task, Task::ready(()))
-        })
-        .await;
+        });
+        cx.executor().advance_clock(2 * UPDATE_DEBOUNCE);
+        handle.await;
+
+        let untracked_idx = panel.read_with(cx, |panel, _| {
+            panel
+                .entries
+                .iter()
+                .enumerate()
+                .find_map(|(index, entry)| {
+                    entry.status_entry().and_then(|status| {
+                        (status.repo_path.as_ref().as_ref() == "untracked").then_some(index)
+                    })
+                })
+                .expect("untracked entry should exist")
+        });
 
         // Confirm that `Open Diff` still works for the untracked file, updating
         // the Project Diff's active path.
         panel.update_in(cx, |panel, window, cx| {
-            panel.selected_entry = Some(1);
+            panel.selected_entry = Some(untracked_idx);
             panel.open_diff(&menu::Confirm, window, cx);
         });
         cx.run_until_parked();
 
-        workspace.update_in(cx, |workspace, _window, cx| {
-            let active_path = workspace
+        workspace.update_in(cx, |workspace, window, cx| {
+            let project_diff = workspace
                 .item_of_type::<ProjectDiff>(cx)
-                .expect("ProjectDiff should exist")
+                .expect("ProjectDiff should exist");
+            let excerpt_paths = project_diff.read(cx).excerpt_paths(cx);
+            assert!(
+                excerpt_paths
+                    .iter()
+                    .any(|path| path.as_ref() == "untracked"),
+                "open_diff should load untracked into project diff, got {excerpt_paths:?}"
+            );
+            assert!(
+                project_diff.update(cx, |project_diff, cx| {
+                    project_diff.move_to_repo_relative_path("untracked", window, cx)
+                }),
+                "untracked should be navigable in project diff"
+            );
+            let active_path = project_diff
                 .read(cx)
                 .active_project_path(cx)
+                .or_else(|| {
+                    project_diff.read_with(cx, |project_diff, cx| {
+                        project_diff
+                            .editor()
+                            .read(cx)
+                            .rhs_editor()
+                            .read(cx)
+                            .active_project_path(cx)
+                    })
+                })
                 .expect("active_project_path should exist");
 
             assert_eq!(active_path.path, rel_path("untracked").into_arc());

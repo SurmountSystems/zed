@@ -40,12 +40,22 @@ pub struct XAiLanguageModelProvider {
 
 pub struct State {
     api_key_state: ApiKeyState,
+    session_token: Option<String>,
+    refresh_token: Option<String>,
     credentials_provider: Arc<dyn CredentialsProvider>,
 }
 
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.api_key_state.has_key()
+        self.api_key_state.has_key() || self.session_token.is_some()
+    }
+
+    fn active_credential(&self, cx: &App) -> Option<String> {
+        if let Some(token) = &self.session_token {
+            return Some(token.clone());
+        }
+        let api_url = XAiLanguageModelProvider::api_url(cx);
+        self.api_key_state.key(&api_url).map(|k| k.to_string())
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -60,7 +70,21 @@ impl State {
         )
     }
 
+    fn set_session_tokens(
+        &mut self,
+        session_token: Option<String>,
+        refresh_token: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_token = session_token;
+        self.refresh_token = refresh_token;
+        cx.notify();
+    }
+
     fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+        if self.session_token.is_some() {
+            return Task::ready(Ok(()));
+        }
         let credentials_provider = self.credentials_provider.clone();
         let api_url = XAiLanguageModelProvider::api_url(cx);
         self.api_key_state.load_if_needed(
@@ -93,6 +117,8 @@ impl XAiLanguageModelProvider {
             .detach();
             State {
                 api_key_state: ApiKeyState::new(Self::api_url(cx), (*API_KEY_ENV_VAR).clone()),
+                session_token: None,
+                refresh_token: None,
                 credentials_provider,
             }
         });
@@ -231,21 +257,21 @@ impl XAiLanguageModel {
     > {
         let http_client = self.http_client.clone();
 
-        let (api_key, api_url) = self.state.read_with(cx, |state, cx| {
+        let (credential, api_url) = self.state.read_with(cx, |state, cx| {
             let api_url = XAiLanguageModelProvider::api_url(cx);
-            (state.api_key_state.key(&api_url), api_url)
+            (state.active_credential(cx), api_url)
         });
 
         let future = self.request_limiter.stream(async move {
             let provider = PROVIDER_NAME;
-            let Some(api_key) = api_key else {
+            let Some(credential) = credential else {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             };
             let request = open_ai::stream_completion(
                 http_client.as_ref(),
                 provider.0.as_str(),
                 &api_url,
-                &api_key,
+                &credential,
                 request,
             );
             let response = request.await?;

@@ -1071,7 +1071,9 @@ pub trait GitRepository: Send + Sync {
 pub enum DiffType {
     HeadToIndex,
     HeadToWorktree,
-    MergeBase { base_ref: SharedString },
+    MergeBase {
+        base_ref: SharedString,
+    },
     MergeBaseFile {
         base_ref: SharedString,
         path: SharedString,

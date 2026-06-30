@@ -8,7 +8,7 @@ Only describe differences explicitly visible in supplied diffs. Open questions u
 
 **Direction (review in progress):** [docs/surmount/merge-review.md](docs/surmount/merge-review.md) — per-diff summaries and a running explanation in Branch Diff; human only for leftover uncertainty; not the prototype file-list tab.
 
-Until that ships: triage via `script/surmount-merge-triage`; agent skill `.agents/skills/surmount-merge-review/SKILL.md`; categories in `surmount-merge-categories.toml`. Update this file per category after reviewing real hunks; resolve `TODO:` when human confirms.
+Triage via `merge_review_triage` ACP tool (matches in-app populate; `script/surmount-merge-triage` is legacy for humans/CI); agent skill `.agents/skills/surmount-merge-review/SKILL.md`; categories in `surmount-merge-categories.toml`. Per-file summaries land in the merge review session from Review Diff replies; update this file per section after human confirms drafted prose.
 
 Keep `surmount-merge-categories.toml` in sync when categories here change.
 
@@ -21,33 +21,26 @@ Living table of contents for fork-specific design docs (not published to zed.dev
 | [docs/surmount/README.md](docs/surmount/README.md) | Index for this folder |
 | [docs/surmount/merge-review.md](docs/surmount/merge-review.md) | Merging upstream main: summarize each diff, cumulative review memory, SURMOUNT.md from that |
 
-### Merge review tab visibility (Linux grok-first cold start)
+### Merge review visibility (Linux grok-first cold start)
 
-**Symptom:** Palette `surmount: Start Merge Review` logs `deploying tab` and `tab opened`, then Zed exits or the tab stays invisible behind the maximized agent dock.
+**Symptom:** Palette **Start Merge Review** appears to do nothing, or Branch Diff is hidden behind the maximized agent dock.
 
-**Root cause (2026-06-19):** An early deploy path called `active_pane().focus_handle().focus()`. That routes through `Workspace::handle_pane_focused` → `dismiss_zoomed_items_to_reveal(None)`, which **closes** the zoomed agent dock (`Dock::set_open(false)`) while `AgentPanel` still holds `OverlayView::ZedTodosSurface` from grok-first cold start. The dock teardown plus overlay state is undefined and has been observed to crash after `tab opened`.
+**Expected behavior:** `open_merge_review_workflow` opens Branch Diff against `origin/main`, zooms out the agent dock (`PanelEvent::ZoomOut`), focuses the center pane, and posts the plan in the agent thread. The prototype **Surmount Merge Review** file-list tab does not open.
 
-**Fix:** Deferred `MergeReviewView::reveal_tab`: `activate_item`, then `PanelEvent::ZoomOut` on the agent panel when `workspace.zoomed_dock_position()` is set (unzoom only — dock stays open), then `focus_center_pane` (item focus, not pane focus). Initial render caps actionable rows at 25.
-
-**Expected log sequence after fix:**
+**Expected log sequence:**
 
 1. `surmount merge review: start requested`
 2. `surmount merge review: populated N items`
-3. `surmount merge review: deploying tab`
-4. `surmount merge review: tab opened`
-5. `surmount merge review: deferred reveal starting`
-6. `surmount merge review: reveal_tab begin`
-7. `surmount merge review: reveal_tab emitted PanelEvent::ZoomOut` (when agent dock was zoomed)
-8. `surmount merge review: reveal_tab complete`
-9. `surmount merge review: deferred reveal complete`
-10. `surmount merge review: first render`
+3. `surmount merge review: opened Branch Diff against origin/main`
+4. `surmount merge review: posted plan to agent thread`
 
-**Regression tests:**
+**Regression tests:** See requirements matrix in [docs/surmount/merge-review.md](docs/surmount/merge-review.md#requirements--tests-redgreen). Quick slice:
 
 ```bash
-cargo test -p agent_ui merge_review::tests::test_merge_review_deploy_unzooms_without_closing_agent_dock
-cargo test -p agent_ui merge_review::tests::test_merge_review_deploy_completes_first_render
 cargo test -p agent_ui merge_review::tests
+CARGO_TERM_QUIET=true cargo nextest run -p agent_ui -p git_ui -p project -p git \
+  --all-features --no-fail-fast --hide-progress-bar --status-level fail \
+  -E 'test(merge_review) | test(branch_diff)'
 ```
 
 ## Documentation map

@@ -1586,6 +1586,105 @@ impl ConversationView {
                     return;
                 }
 
+                let reply_text =
+                    thread
+                        .read(cx)
+                        .entries()
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            acp_thread::AgentThreadEntry::AssistantMessage(message) => {
+                                Some(message.to_markdown(cx))
+                            }
+                            _ => None,
+                        });
+                let end_turn = matches!(stop_reason, acp::StopReason::EndTurn);
+                match crate::merge_review::handle_merge_review_reply_on_stop(
+                    reply_text.as_deref(),
+                    end_turn,
+                    cx,
+                ) {
+                    Some(crate::merge_review::MergeReviewCaptureOnStop::Captured(
+                        captured_path,
+                    )) => {
+                        log::info!(
+                            "surmount merge review: captured Summary from agent reply (file={captured_path})"
+                        );
+                        if let Some(workspace) = self.workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                let advanced =
+                                    crate::merge_review::advance_merge_review_to_next_file(
+                                        workspace, window, cx,
+                                    );
+                                crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
+                                workspace.show_toast(
+                                    crate::merge_review::merge_review_summary_capture_toast(
+                                        &captured_path,
+                                        advanced,
+                                        cx,
+                                    ),
+                                    cx,
+                                );
+                            });
+                        }
+                    }
+                    Some(crate::merge_review::MergeReviewCaptureOnStop::FormatRetryRequested {
+                        path,
+                        prompt,
+                    }) => {
+                        log::info!(
+                            "surmount merge review: requesting Summary/Outcome format retry for {path}"
+                        );
+                        if let Some(active) = self.thread_view(&session_id) {
+                            active.update(cx, |view, cx| {
+                                view.message_editor.update(cx, |editor, cx| {
+                                    editor.set_message(
+                                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                            prompt,
+                                        ))],
+                                        window,
+                                        cx,
+                                    );
+                                });
+                                view.send(window, cx);
+                            });
+                        }
+                        if let Some(workspace) = self.workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
+                                workspace.show_toast(
+                                    crate::merge_review::merge_review_toast(format!(
+                                        "Formatting {path} — agent will add Summary: and Outcome: lines."
+                                    )),
+                                    cx,
+                                );
+                            });
+                        }
+                    }
+                    Some(crate::merge_review::MergeReviewCaptureOnStop::Abandoned(path)) => {
+                        use git_ui::project_diff::ReviewDiff;
+
+                        if let Some(workspace) = self.workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
+                                workspace.show_toast(
+                                    crate::merge_review::merge_review_toast(format!(
+                                        "Could not capture {path} — click Review Diff to retry."
+                                    ))
+                                    .on_click(
+                                        "Review Diff",
+                                        move |_, cx| {
+                                            cx.dispatch_action(ReviewDiff.boxed_clone().as_ref());
+                                        },
+                                    ),
+                                    cx,
+                                );
+                            });
+                        }
+                    }
+                    None => {}
+                }
+
                 let should_send_queued = if let Some(active) = self.root_thread_view() {
                     active.update(cx, |active, cx| {
                         if active.skip_queue_processing_count > 0 {
@@ -1626,10 +1725,16 @@ impl ConversationView {
                         cx,
                     );
                     if let Some(view) = self.thread_view(&session_id) {
-                        if view.read(cx).is_grok_build_profile(cx) {
+                        if view.read(cx).is_grok_build_profile(cx)
+                            && !crate::merge_review::merge_review_workflow_engaged(cx)
+                        {
                             let completion_phrase = "All current independent work is complete. No further autonomous actions are possible without additional direction.";
                             let plan = thread.read(cx).plan();
                             if !plan.requires_explicit_completion_notification(completion_phrase) {
+                                log::info!(
+                                    "conversation_view: dispatching Grok completion notification (plan_pending={})",
+                                    plan.has_pending_work()
+                                );
                                 self.dispatch_grok_completion_system_notification(window, cx);
                             }
                         }

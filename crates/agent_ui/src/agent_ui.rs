@@ -20,6 +20,7 @@ mod inline_prompt_editor;
 mod language_model_selector;
 mod mention_set;
 pub mod merge_review;
+mod merge_review_step_rail;
 mod message_editor;
 mod mode_selector;
 mod model_selector;

@@ -331,6 +331,24 @@ impl BranchDiff {
         self.repo.as_ref()
     }
 
+    fn project_path_is_loadable_file(
+        project: &Project,
+        project_path: &crate::ProjectPath,
+        cx: &App,
+    ) -> bool {
+        let Some(worktree) = project.worktree_for_id(project_path.worktree_id, cx) else {
+            return false;
+        };
+        let worktree = worktree.read(cx);
+        match worktree.entry_for_path(project_path.path.as_ref()) {
+            Some(entry) => entry.is_file(),
+            None => {
+                let abs_path = worktree.abs_path().join(project_path.path.as_ref());
+                !abs_path.is_dir()
+            }
+        }
+    }
+
     #[instrument(skip_all)]
     pub fn load_buffers(&mut self, cx: &mut Context<Self>) -> Vec<DiffBuffer> {
         let mut output = Vec::default();
@@ -341,7 +359,7 @@ impl BranchDiff {
             return output;
         }
 
-        self.project.update(cx, |_project, cx| {
+        self.project.update(cx, |project, cx| {
             let mut seen = HashSet::default();
 
             for item in repo.read(cx).cached_status() {
@@ -364,6 +382,9 @@ impl BranchDiff {
                 else {
                     continue;
                 };
+                if !Self::project_path_is_loadable_file(project, &project_path, cx) {
+                    continue;
+                }
                 let task = Self::load_buffer(branch_diff, project_path, repo.clone(), cx);
 
                 output.push(DiffBuffer {
@@ -384,6 +405,9 @@ impl BranchDiff {
                 let Some(project_path) = repo.read(cx).repo_path_to_project_path(&path, cx) else {
                     continue;
                 };
+                if !Self::project_path_is_loadable_file(project, &project_path, cx) {
+                    continue;
+                }
                 let task =
                     Self::load_buffer(Some(branch_diff.clone()), project_path, repo.clone(), cx);
 

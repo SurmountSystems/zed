@@ -13,19 +13,23 @@ if [[ ! -f SURMOUNT.md ]]; then
   exit 1
 fi
 
+WORKTREE_ROOT="$(git rev-parse --show-toplevel)"
+export WORKTREE_ROOT UPSTREAM_REF
+
 MERGE_BASE="$(git merge-base HEAD "$UPSTREAM_REF")"
-export MERGE_BASE UPSTREAM_REF
+export MERGE_BASE
 
 python3 <<'PY'
 import json
 import os
 import subprocess
 
-merge_base = os.environ["MERGE_BASE"]
+worktree_root = os.environ["WORKTREE_ROOT"]
 upstream_ref = os.environ["UPSTREAM_REF"]
+merge_base = os.environ["MERGE_BASE"]
 
 name_status = subprocess.run(
-    ["git", "diff", "--name-status", "-z", f"{merge_base}..HEAD"],
+    ["git", "diff", "--merge-base", upstream_ref, "--name-status", "-z"],
     check=True,
     capture_output=True,
 ).stdout.decode("utf-8", errors="surrogateescape")
@@ -42,19 +46,24 @@ parts = [p for p in name_status.split("\0") if p]
 i = 0
 while i < len(parts):
     status = parts[i]
-    if "\t" in status:
-        status, path = status.split("\t", 1)
-        i += 1
-    else:
+    if status in {"M", "A", "D"}:
         i += 1
         path = parts[i] if i < len(parts) else ""
         i += 1
-    if path:
-        entries.append({
-            "path": path.replace("\\", "/"),
-            "status": status,
-            "is_conflict": path in conflicts,
-        })
+    else:
+        i += 1
+        continue
+    if not path:
+        continue
+    normalized = path.replace("\\", "/")
+    full_path = os.path.join(worktree_root, normalized)
+    if os.path.isdir(full_path):
+        continue
+    entries.append({
+        "path": normalized,
+        "status": status,
+        "is_conflict": normalized in conflicts,
+    })
 
 print(json.dumps({
     "merge_base": merge_base,

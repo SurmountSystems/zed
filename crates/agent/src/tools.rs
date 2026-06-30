@@ -17,9 +17,19 @@ mod go_to_definition_tool;
 mod grep_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
+mod merge_review_triage_tool;
 mod move_path_tool;
 mod read_file_tool;
 mod rename_tool;
+pub use merge_review_triage_tool::{
+    MergeReviewDiffTool, MergeReviewDiffToolInput, MergeReviewTriageTool,
+    MergeReviewTriageToolInput,
+};
+mod resolve_merge_conflict_tool;
+pub use resolve_merge_conflict_tool::{
+    ResolveMergeConflictSide, ResolveMergeConflictTool, ResolveMergeConflictToolInput,
+    resolve_merge_conflict_with_git,
+};
 mod skill_tool;
 mod spawn_agent_tool;
 mod symbol_locator;
@@ -574,12 +584,15 @@ tools! {
     GrepTool,
     ListAgentsAndModelsTool,
     ListDirectoryTool,
+    MergeReviewDiffTool,
+    MergeReviewTriageTool,
     MonitorTool,
     RememberTool,
     GetCommandOrSubagentOutputTool,
     MovePathTool,
     ReadFileTool,
     RenameTool,
+    ResolveMergeConflictTool,
     SkillTool,
     SpawnAgentTool,
     TerminalTool,

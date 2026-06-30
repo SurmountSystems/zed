@@ -1508,7 +1508,11 @@ fn grok_home_candidate_paths(home: &Path) -> Vec<PathBuf> {
 }
 
 fn path_directories() -> Vec<String> {
-    let separator = if cfg!(target_os = "windows") { ';' } else { ':' };
+    let separator = if cfg!(target_os = "windows") {
+        ';'
+    } else {
+        ':'
+    };
     std::env::var("PATH")
         .ok()
         .map(|path_var| {
@@ -1521,7 +1525,10 @@ fn path_directories() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn grok_command_from_path(file_exists: &impl Fn(&Path) -> bool, path: &Path) -> Option<AgentServerCommand> {
+fn grok_command_from_path(
+    file_exists: &impl Fn(&Path) -> bool,
+    path: &Path,
+) -> Option<AgentServerCommand> {
     if file_exists(path) {
         Some(AgentServerCommand {
             path: path.to_string_lossy().to_string().into(),
@@ -1576,10 +1583,7 @@ fn discover_grok_command_impl() -> Option<AgentServerCommand> {
                 .ok()
                 .filter(|profile| !profile.is_empty())
         })
-        .or_else(|| {
-            std::env::home_dir()
-                .map(|home| home.to_string_lossy().into_owned())
-        });
+        .or_else(|| std::env::home_dir().map(|home| home.to_string_lossy().into_owned()));
     discover_grok_command_with(home.as_deref(), |path| path.exists() && path.is_file())
 }
 

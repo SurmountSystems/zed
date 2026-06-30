@@ -621,55 +621,41 @@ pub fn init(cx: &mut App) {
                 })
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
                     let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                        log::warn!("ReviewBranchDiff: no agent panel");
                         return;
                     };
+
+                    let merge_review_active =
+                        crate::merge_review::merge_review_workflow_engaged(cx);
+                    let file_path = action.file_path.as_deref();
 
                     let mention_uri = MentionUri::GitDiff {
                         base_ref: action.base_ref.to_string(),
                     };
                     let diff_uri = mention_uri.to_uri().to_string();
 
-                    let prompt = {
-                        let merge_session = crate::merge_review::load_session(cx);
-                        let surmount_prompt = workspace
-                            .project()
-                            .read(cx)
-                            .active_repository(cx)
-                            .map(|repo| {
-                                let root = &repo.read(cx).snapshot().work_directory_abs_path;
-                                crate::merge_review::is_surmount_workspace(root.as_ref())
-                            })
-                            .unwrap_or(false);
-                        if surmount_prompt {
-                            if let (Some(session), Some(file_path)) =
-                                (merge_session.as_ref(), action.file_path.as_ref())
-                            {
-                                if let Some(item) =
-                                    crate::merge_review::item_for_path(session, file_path.as_ref())
-                                {
-                                    crate::merge_review::merge_review_file_prompt(
-                                        session,
-                                        item,
-                                        file_path.as_ref(),
-                                    )
-                                } else {
-                                    crate::merge_review::surmount_merge_review_prompt(
-                                        action.base_ref.as_ref(),
-                                        None,
-                                    )
-                                }
-                            } else {
-                                crate::merge_review::surmount_merge_review_prompt(
-                                    action.base_ref.as_ref(),
-                                    None,
-                                )
-                            }
-                        } else {
-                            "Please review this branch diff carefully. Point out any issues, \
-                             potential bugs, or improvement opportunities you find."
-                                .to_string()
+                    let project = workspace.project().clone();
+                    let prompt = crate::merge_review::branch_diff_review_prompt(
+                        &project,
+                        cx,
+                        action.base_ref.as_ref(),
+                        file_path,
+                    )
+                    .unwrap_or_else(|| {
+                        "Please review this branch diff carefully. Point out any issues, \
+                         potential bugs, or improvement opportunities you find."
+                            .to_string()
+                    });
+
+                    if let Some(file_path) = file_path {
+                        if let Err(error) =
+                            crate::merge_review::set_pending_summary_capture(cx, file_path)
+                        {
+                            log::error!(
+                                "surmount merge review: Review Diff pending capture failed for {file_path}: {error:#}"
+                            );
                         }
-                    };
+                    }
 
                     let content_blocks = vec![
                         acp::ContentBlock::Text(acp::TextContent::new(prompt)),
@@ -683,24 +669,60 @@ pub fn init(cx: &mut App) {
                         )),
                     ];
 
-                    workspace.focus_panel::<AgentPanel>(window, cx);
+                    let active_thread_ready = merge_review_active
+                        && panel.read(cx).active_thread_view(cx).is_some();
+
+                    log::info!(
+                        "surmount merge review: Review Diff dispatch (merge_review_active={merge_review_active}, file={file_path:?}, diff_bytes={}, active_thread_ready={active_thread_ready})",
+                        action.diff_text.len(),
+                    );
+
+                    if merge_review_active {
+                        workspace.open_panel::<AgentPanel>(window, cx);
+                    } else {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
 
                     panel.update(cx, |panel, cx| {
-                        panel.external_thread(
-                            None,
-                            None,
-                            None,
-                            None,
-                            Some(AgentInitialContent::ContentBlock {
-                                blocks: content_blocks,
-                                auto_submit: true,
-                            }),
-                            true,
-                            AgentThreadSource::GitPanel,
-                            window,
-                            cx,
-                        );
+                        if merge_review_active {
+                            panel.prepare_for_merge_review(window, cx);
+                        }
+                        if active_thread_ready {
+                            let file_path = file_path.map(str::to_string);
+                            cx.defer_in(window, move |panel, window, cx| {
+                                panel.submit_merge_review_branch_diff(
+                                    content_blocks,
+                                    file_path.as_deref(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        } else {
+                            log::info!(
+                                "surmount merge review: Review Diff opening external thread (file={file_path:?})"
+                            );
+                            panel.external_thread(
+                                None,
+                                None,
+                                None,
+                                file_path.map(|path| {
+                                    SharedString::from(format!("Merge review · {path}"))
+                                }),
+                                Some(AgentInitialContent::ContentBlock {
+                                    blocks: content_blocks,
+                                    auto_submit: true,
+                                }),
+                                true,
+                                AgentThreadSource::GitPanel,
+                                window,
+                                cx,
+                            );
+                        }
                     });
+
+                    if merge_review_active {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
                 })
                 .register_action(
                     |workspace, action: &ResolveConflictsWithAgent, window, cx| {
@@ -867,6 +889,12 @@ pub fn init(cx: &mut App) {
             if !matches!(event, workspace::Event::ActiveItemChanged) {
                 return;
             }
+            if crate::merge_review::merge_review_workflow_engaged(cx)
+                && workspace.zoomed_dock_position().is_some()
+            {
+                crate::merge_review::restore_merge_review_workspace_layout(workspace, window, cx);
+                return;
+            }
             let has_editor = workspace
                 .active_pane()
                 .read(cx)
@@ -929,9 +957,10 @@ fn build_conflict_resolution_prompt(conflicts: &[ConflictContent]) -> Vec<acp::C
             indoc::formatdoc!(
                 "\nThe conflict is between branch `{ours}` (ours) and `{theirs}` (theirs).
 
-                Analyze both versions carefully and resolve the conflict by editing \
-                the file directly. Choose the resolution that best preserves the intent \
-                of both changes, or combine them if appropriate.
+                Analyze both versions carefully. Prefer `resolve_merge_conflict` with \
+                `side: ours` or `side: theirs` (git checkout --ours/--theirs + git add) \
+                — never strip conflict markers manually unless both sides must be synthesized. \
+                Use edit_file only for true merge/synthesis.
 
                 ",
                 ours = conflict.ours_branch_name,
@@ -974,12 +1003,10 @@ fn build_conflicted_files_resolution_prompt(
     }
 
     let instruction = indoc::indoc!(
-        "The following files have unresolved merge conflicts. Please open each \
-         file, find the conflict markers (`<<<<<<<` / `=======` / `>>>>>>>`), \
-         and resolve every conflict by editing the files directly.
-
-         Choose resolutions that best preserve the intent of both changes, \
-         or combine them if appropriate.
+        "The following files have unresolved merge conflicts. For each file, prefer \
+         `resolve_merge_conflict` with `side: ours` or `side: theirs` (git checkout \
+         --ours/--theirs, then git add). Do not strip conflict markers manually unless \
+         both sides must be synthesized into a new hunk (then use edit_file).
 
          Files with conflicts:
          ",
@@ -1271,7 +1298,7 @@ pub struct AgentPanel {
     pending_serialization: Option<Task<Result<()>>>,
     new_user_onboarding: Entity<AgentPanelOnboarding>,
     new_user_onboarding_upsell_dismissed: AtomicBool,
-    selected_agent: Agent,
+    pub(crate) selected_agent: Agent,
     _thread_view_subscription: Option<Subscription>,
     _active_thread_focus_subscription: Option<Subscription>,
     _base_view_observation: Option<Subscription>,
@@ -2041,7 +2068,7 @@ impl AgentPanel {
         if !panel.read(cx).enabled(cx) {
             return;
         }
-        if panel.read(cx).grok_immersive_must_stay_maximized() {
+        if panel.read(cx).grok_immersive_must_stay_maximized(cx) {
             workspace.open_panel::<Self>(window, cx);
             workspace.focus_panel::<Self>(window, cx);
             panel.update(cx, |panel, cx| {
@@ -2063,7 +2090,7 @@ impl AgentPanel {
             if grok_launch {
                 Self::sync_grok_immersive_zoom_from_workspace(workspace, window, cx);
             }
-        } else if panel.read(cx).grok_immersive_must_stay_maximized() {
+        } else if panel.read(cx).grok_immersive_must_stay_maximized(cx) {
             panel.update(cx, |panel, cx| {
                 panel.reassert_grok_immersive_maximized(window, cx);
             });
@@ -2097,7 +2124,7 @@ impl AgentPanel {
         if !panel.read(cx).enabled(cx) {
             return;
         }
-        if panel.read(cx).grok_immersive_must_stay_maximized() {
+        if panel.read(cx).grok_immersive_must_stay_maximized(cx) {
             workspace.open_panel::<Self>(window, cx);
             workspace.focus_panel::<Self>(window, cx);
             panel.update(cx, |panel, cx| {
@@ -3886,12 +3913,68 @@ impl AgentPanel {
         })
     }
 
+    pub(crate) fn suppress_grok_immersive_for_merge_review(&mut self, _cx: &mut Context<Self>) {
+        log::info!("surmount merge review: suppressing grok immersive reassert");
+        self.grok_categorized_surface_pending = false;
+        self.grok_panel_reveal_scheduled = false;
+        self.grok_immersive_defer_scheduled = false;
+        self.grok_immersive_zoom_defer_scheduled = false;
+        self.grok_immersive_zoom_apply_in_flight = false;
+        self.grok_immersive_startup_bootstrap_scheduled = false;
+    }
+
+    pub(crate) fn prepare_for_merge_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.suppress_grok_immersive_for_merge_review(cx);
+        if let Some(thread_view) = self.active_thread_view(cx) {
+            thread_view.update(cx, |thread_view, cx| {
+                thread_view.zed_todos.state.grok_memory_expanded = false;
+                cx.notify();
+            });
+        }
+        if matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))) {
+            self.clear_overlay(false, window, cx, true);
+        }
+    }
+
+    pub(crate) fn submit_merge_review_branch_diff(
+        &mut self,
+        content_blocks: Vec<acp::ContentBlock>,
+        file_path: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(thread_view) = self.active_thread_view(cx) else {
+            log::info!(
+                "surmount merge review: Review Diff active thread not ready (file={file_path:?})"
+            );
+            return false;
+        };
+
+        let file_label = file_path.unwrap_or("branch diff").to_string();
+        thread_view.update(cx, |thread_view, cx| {
+            let loading = thread_view.is_loading_contents;
+            thread_view.message_editor.update(cx, |editor, cx| {
+                editor.set_message(content_blocks, window, cx);
+            });
+            let editor_empty = thread_view.message_editor.read(cx).is_empty(cx);
+            thread_view.send(window, cx);
+            let still_idle = thread_view.thread.read(cx).status() == ThreadStatus::Idle;
+            log::info!(
+                "surmount merge review: Review Diff sent on active thread (file={file_label}, loading={loading}, editor_was_empty={editor_empty}, still_idle={still_idle})"
+            );
+        });
+        self.focus_handle(cx).focus(window, cx);
+        true
+    }
+
     pub(crate) fn start_merge_review_plan(
         &mut self,
         session: &crate::merge_review::MergeReviewSession,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.prepare_for_merge_review(window, cx);
+        crate::merge_review::clear_pending_summary_capture(cx);
         let prompt = crate::merge_review::merge_review_plan_prompt(session);
         self.external_thread(
             None,
@@ -3922,6 +4005,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         if resume_thread_id.is_none() && !self.has_open_project(cx) {
+            log::warn!("external_thread: skipped (no open project)");
             return;
         }
 
@@ -4247,7 +4331,7 @@ impl AgentPanel {
             if self.is_grok_build_context(cx)
                 && (self.initial_state_loading
                     || self.grok_immersive_startup_in_progress()
-                    || self.grok_immersive_must_stay_maximized())
+                    || self.grok_immersive_must_stay_maximized(cx))
             {
                 self.initial_state_loading = false;
                 self.sync_zed_todos_thread_view(cx);
@@ -4934,20 +5018,23 @@ impl AgentPanel {
         // The surface lives on the left as the primary content of the expanded Agent Panel.
         // Using ensure-open + prepare + zoom guarantees the desired default on project first
         // open even when load() has already opened the surface from persisted settings.
-        if let BaseView::AgentThread { conversation_view } = &self.base_view {
-            let cv = conversation_view.read(cx);
-            if let Some(acp) = cv.root_thread(cx) {
-                let acp_read = acp.read(cx);
-                if let Some(native_conn) = acp_read
-                    .connection()
-                    .clone()
-                    .downcast::<agent::NativeAgentConnection>()
-                {
-                    if let Some(native_thread) = native_conn.thread(&acp_read.session_id(), cx) {
-                        if native_thread.read(cx).is_grok_build_profile(cx) {
-                            self.mark_grok_categorized_surface_pending(cx);
-                            if self.should_ensure_grok_categorized_surface(cx) {
-                                self.ensure_grok_categorized_surface(window, cx);
+        if !crate::merge_review::merge_review_workflow_engaged(cx) {
+            if let BaseView::AgentThread { conversation_view } = &self.base_view {
+                let cv = conversation_view.read(cx);
+                if let Some(acp) = cv.root_thread(cx) {
+                    let acp_read = acp.read(cx);
+                    if let Some(native_conn) = acp_read
+                        .connection()
+                        .clone()
+                        .downcast::<agent::NativeAgentConnection>()
+                    {
+                        if let Some(native_thread) = native_conn.thread(&acp_read.session_id(), cx)
+                        {
+                            if native_thread.read(cx).is_grok_build_profile(cx) {
+                                self.mark_grok_categorized_surface_pending(cx);
+                                if self.should_ensure_grok_categorized_surface(cx) {
+                                    self.ensure_grok_categorized_surface(window, cx);
+                                }
                             }
                         }
                     }
@@ -4961,7 +5048,8 @@ impl AgentPanel {
         // dock in Full Agent Mode with zoom) the focused primary view on panel creation,
         // so starting with Grok feels like the immersive standalone Grok Build TUI rather
         // than the normal editor with a side panel.
-        if self.is_grok_build_context(cx) {
+        if self.is_grok_build_context(cx) && !crate::merge_review::merge_review_workflow_engaged(cx)
+        {
             self.focus_handle(cx).focus(window, cx);
         }
 
@@ -5113,6 +5201,9 @@ impl AgentPanel {
     /// forces zoom if needed. This is the mechanism that makes the default primary
     /// left categorized experience stick for Grok on first open and thread activation.
     fn should_ensure_grok_categorized_surface(&self, cx: &mut Context<Self>) -> bool {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            return false;
+        }
         if self.grok_categorized_surface_user_dismissed {
             return false;
         }
@@ -5151,13 +5242,19 @@ impl AgentPanel {
     }
 
     /// True when palette toggle must not close or un-maximize grok agent mode.
-    fn grok_immersive_must_stay_maximized(&self) -> bool {
+    fn grok_immersive_must_stay_maximized(&self, cx: &App) -> bool {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            return false;
+        }
         self.grok_immersive_startup_in_progress()
             || (self.is_grok_selected_for_immersive_launch()
                 && matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))))
     }
 
     fn arm_grok_immersive_startup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            return;
+        }
         self.mark_grok_categorized_surface_pending(cx);
         self.schedule_grok_immersive_startup_bootstrap(window, cx);
         self.defer_ensure_grok_categorized_surface(window, cx);
@@ -5173,10 +5270,13 @@ impl AgentPanel {
     }
 
     fn reassert_grok_immersive_maximized(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            return;
+        }
         if self.grok_categorized_surface_user_dismissed {
             return;
         }
-        if !self.grok_immersive_must_stay_maximized()
+        if !self.grok_immersive_must_stay_maximized(cx)
             && !self.is_grok_selected_for_immersive_launch()
         {
             return;
@@ -5237,6 +5337,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            return;
+        }
         if self.grok_immersive_startup_bootstrap_scheduled || self.grok_immersive_startup_logged {
             return;
         }
@@ -5247,6 +5350,14 @@ impl AgentPanel {
         let workspace = self.workspace.clone();
         let panel = cx.entity().downgrade();
         window.defer(cx, move |window, cx| {
+            if crate::merge_review::merge_review_workflow_engaged(cx) {
+                if let Some(panel) = panel.upgrade() {
+                    panel.update(cx, |panel, _cx| {
+                        panel.grok_immersive_startup_bootstrap_scheduled = false;
+                    });
+                }
+                return;
+            }
             let Some(workspace) = workspace.upgrade() else {
                 return;
             };
@@ -5274,6 +5385,13 @@ impl AgentPanel {
     }
 
     fn defer_grok_immersive_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            self.log_grok_immersive_debug(
+                "ensure_grok_immersive_zoom: skipped (merge review active)",
+                cx,
+            );
+            return;
+        }
         if !self.is_grok_build_context(cx) && !self.grok_categorized_surface_pending {
             self.log_grok_immersive_debug(
                 "ensure_grok_immersive_zoom: skipped (not grok startup)",
@@ -5301,6 +5419,9 @@ impl AgentPanel {
     }
 
     fn apply_grok_immersive_workspace_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            return;
+        }
         if self.grok_immersive_zoom_apply_in_flight {
             return;
         }
@@ -5564,6 +5685,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            return;
+        }
         if self.grok_startup_immersive_visually_ready(cx) {
             self.log_grok_immersive_startup_once(cx);
             return;
@@ -5603,6 +5727,9 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            return;
+        }
         if self.grok_immersive_startup_logged || self.grok_panel_reveal_scheduled {
             return;
         }
@@ -5613,6 +5740,14 @@ impl AgentPanel {
         let workspace = self.workspace.clone();
         let panel = cx.entity().downgrade();
         window.defer(cx, move |window, cx| {
+            if crate::merge_review::merge_review_workflow_engaged(cx) {
+                if let Some(panel) = panel.upgrade() {
+                    panel.update(cx, |panel, _cx| {
+                        panel.grok_panel_reveal_scheduled = false;
+                    });
+                }
+                return;
+            }
             let revealed = if let Some(workspace) = workspace.upgrade() {
                 workspace.update(cx, |workspace, cx| {
                     // open_panel avoids reveal_panel's dismiss_zoomed_items_to_reveal,
@@ -5682,6 +5817,10 @@ impl AgentPanel {
     }
 
     fn ensure_grok_categorized_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            log::info!("ensure_grok_categorized_surface: skipped (merge review active)");
+            return;
+        }
         if self.grok_categorized_surface_user_dismissed {
             return;
         }
@@ -6146,6 +6285,9 @@ impl AgentPanel {
                 if view.read(cx).root_thread(cx).is_none() {
                     return;
                 }
+                if crate::merge_review::merge_review_workflow_engaged(cx) {
+                    return;
+                }
                 if (this.is_active || this.grok_categorized_surface_pending)
                     && (this.is_grok_build_context(cx)
                         || Self::conversation_is_grok_build(view.read(cx), cx))
@@ -6592,7 +6734,7 @@ impl Panel for AgentPanel {
         log::debug!("AgentPanel set_active called: active={}", active);
         if !active
             && (self.grok_immersive_startup_in_progress()
-                || self.grok_immersive_must_stay_maximized())
+                || self.grok_immersive_must_stay_maximized(cx))
         {
             if self.grok_immersive_startup_in_progress() {
                 self.mark_agent_dock_open_hint(false);
@@ -6615,7 +6757,10 @@ impl Panel for AgentPanel {
                 "AgentPanel set_active: was_grok={} based on selected_agent",
                 was_grok
             );
-            if was_grok && !self.grok_immersive_startup_logged {
+            if was_grok
+                && !self.grok_immersive_startup_logged
+                && !crate::merge_review::merge_review_workflow_engaged(cx)
+            {
                 self.mark_grok_categorized_surface_pending(cx);
             }
             self.ensure_thread_initialized(window, cx);
@@ -8498,6 +8643,15 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         self.reassert_grok_immersive_maximized(window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn schedule_grok_immersive_reveal_until_ready_for_tests(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.schedule_grok_immersive_reveal_until_ready(window, cx);
     }
 
     #[cfg(test)]
@@ -11776,8 +11930,12 @@ mod tests {
             "prompt should mention theirs branch"
         );
         assert!(
-            body_text.contains("editing the file directly"),
-            "prompt should instruct the agent to edit the file"
+            body_text.contains("resolve_merge_conflict"),
+            "prompt should instruct the agent to use resolve_merge_conflict"
+        );
+        assert!(
+            body_text.contains("Use edit_file only for true merge/synthesis"),
+            "prompt should reserve edit_file for synthesis"
         );
 
         let (resource_text, resource_uri) = expect_resource_block(&blocks[3]);

@@ -1323,7 +1323,6 @@ impl ThreadMetadataStore {
         self.kv_db.save_global_json(key, &wrapper)
     }
 
-    #[cfg(test)]
     pub(crate) fn delete_global(&self, key: &[u8]) -> anyhow::Result<()> {
         self.kv_db.delete_global(key)
     }

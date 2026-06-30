@@ -25,12 +25,15 @@ use crate::{
     GrepTool,
     ListAgentsAndModelsTool,
     ListDirectoryTool,
+    MergeReviewDiffTool,
+    MergeReviewTriageTool,
     MonitorTool,
     MovePathTool,
     ProjectSnapshot,
     ReadFileTool,
     RememberTool,
     RenameTool,
+    ResolveMergeConflictTool,
     SpawnAgentTool,
     SystemPromptTemplate,
     Template,
@@ -2080,6 +2083,9 @@ impl Thread {
         self.add_tool(RememberTool::new(self.project.clone()));
         self.add_tool(GetCommandOrSubagentOutputTool::new(environment.clone()));
         self.add_tool(EnterPlanModeTool);
+        self.add_tool(ResolveMergeConflictTool::new(self.project.clone()));
+        self.add_tool(MergeReviewTriageTool::new(self.project.clone()));
+        self.add_tool(MergeReviewDiffTool::new(self.project.clone()));
 
         self.add_tool(CreateThreadTool::new(environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment));

@@ -577,12 +577,20 @@ pub mod surmount {
     actions!(
         surmount,
         [
-            /// Populate and open the Surmount merge review queue against upstream main.
+            /// Populate merge review session, open Branch Diff vs upstream main, and post a plan in the agent thread.
             StartMergeReview,
-            /// Reopen the persisted Surmount merge review queue.
+            /// Resume a saved merge review session (Branch Diff + agent thread); does not open the prototype file-list tab.
             OpenMergeReview,
+            /// End the active merge review session and restore docks collapsed for focus layout.
+            EndMergeReview,
             /// Mark the active Branch Diff file as an open merge-review question.
             MarkMergeReviewOpenQuestion,
+            /// Select the next merge-review file in Branch Diff (left tree is collapsed during focus layout).
+            MergeReviewNextFile,
+            /// Resolve the active conflicted file by keeping the fork version (`git checkout --ours`).
+            ResolveMergeReviewConflictOurs,
+            /// Resolve the active conflicted file by taking the upstream merge version (`git checkout --theirs`).
+            ResolveMergeReviewConflictTheirs,
         ]
     );
 }
