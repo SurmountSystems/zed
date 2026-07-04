@@ -620,6 +620,17 @@ pub fn init(cx: &mut App) {
                     }
                 })
                 .register_action(|workspace, action: &ReviewBranchDiff, window, cx| {
+                    if crate::merge_review::intercept_review_branch_diff_note_modal(
+                        workspace,
+                        window,
+                        cx,
+                        action.diff_text.as_ref(),
+                        action.base_ref.as_ref(),
+                        action.file_path.as_deref(),
+                    ) {
+                        return;
+                    }
+
                     let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
                         log::warn!("ReviewBranchDiff: no agent panel");
                         return;
@@ -627,25 +638,13 @@ pub fn init(cx: &mut App) {
 
                     let merge_review_active =
                         crate::merge_review::merge_review_workflow_engaged(cx);
+                    let clarifying_note =
+                        crate::merge_review::take_merge_review_clarifying_note(cx);
                     let file_path = action.file_path.as_deref();
-
-                    let mention_uri = MentionUri::GitDiff {
-                        base_ref: action.base_ref.to_string(),
-                    };
-                    let diff_uri = mention_uri.to_uri().to_string();
-
                     let project = workspace.project().clone();
-                    let prompt = crate::merge_review::branch_diff_review_prompt(
-                        &project,
-                        cx,
-                        action.base_ref.as_ref(),
-                        file_path,
-                    )
-                    .unwrap_or_else(|| {
-                        "Please review this branch diff carefully. Point out any issues, \
+                    let fallback_prompt = "Please review this branch diff carefully. Point out any issues, \
                          potential bugs, or improvement opportunities you find."
-                            .to_string()
-                    });
+                        .to_string();
 
                     if let Some(file_path) = file_path {
                         if let Err(error) =
@@ -656,6 +655,151 @@ pub fn init(cx: &mut App) {
                             );
                         }
                     }
+
+                    if merge_review_active {
+                        workspace.open_panel::<AgentPanel>(window, cx);
+                    } else {
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                    }
+
+                    panel.update(cx, |panel, cx| {
+                        if merge_review_active {
+                            panel.prepare_for_merge_review(window, cx);
+                        }
+                    });
+
+                    let is_conflict = file_path.is_some_and(|path| {
+                        crate::merge_review::merge_review_conflict_file(&project, cx, path)
+                    });
+
+                    if is_conflict {
+                        let Some(file_path) = file_path.map(str::to_string) else {
+                            return;
+                        };
+                        let Some(worktree_root) =
+                            crate::merge_review::worktree_root_for_merge_review(&project, cx)
+                        else {
+                            log::error!(
+                                "surmount merge review: conflict Review Diff missing worktree (file={file_path})"
+                            );
+                            return;
+                        };
+                        let base_ref = action.base_ref.to_string();
+                        let workspace_weak = cx.entity().downgrade();
+                        log::info!(
+                            "surmount merge review: conflict Review Diff loading sides (file={file_path})"
+                        );
+                        window.spawn(cx, async move |cx| {
+                            let sides_result = crate::merge_review::load_merge_review_conflict_sides(
+                                worktree_root.as_path(),
+                                &file_path,
+                            )
+                            .await;
+                            workspace_weak
+                                .update_in(cx, |workspace, window, cx| {
+                                    let sides = match sides_result {
+                                        Ok(sides) => sides,
+                                        Err(error) => {
+                                            struct ReviewBranchDiffToast;
+                                            log::error!(
+                                                "surmount merge review: conflict sides failed for {file_path}: {error:#}"
+                                            );
+                                            workspace.show_toast(
+                                                workspace::Toast::new(
+                                                    workspace::notifications::NotificationId::unique::<ReviewBranchDiffToast>(),
+                                                    format!(
+                                                        "Review Diff failed to load conflict sides for {file_path}"
+                                                    ),
+                                                ),
+                                                cx,
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    let project = workspace.project().clone();
+                                    let prompt = crate::merge_review::merge_review_append_user_note(
+                                        crate::merge_review::branch_diff_review_prompt(
+                                            &project,
+                                            cx,
+                                            &base_ref,
+                                            Some(file_path.as_str()),
+                                        )
+                                        .unwrap_or_else(|| fallback_prompt.clone()),
+                                        clarifying_note.as_deref(),
+                                    );
+                                    let content_blocks =
+                                        crate::merge_review::merge_review_conflict_review_content_blocks(
+                                            &prompt,
+                                            &file_path,
+                                            &sides,
+                                        );
+                                    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                                        return;
+                                    };
+                                    let active_thread_ready = merge_review_active
+                                        && panel.read(cx).active_thread_view(cx).is_some();
+                                    log::info!(
+                                        "surmount merge review: conflict Review Diff dispatch (file={file_path}, ours_bytes={}, theirs_bytes={}, working_bytes={}, active_thread_ready={active_thread_ready})",
+                                        sides.ours_text.len(),
+                                        sides.theirs_text.len(),
+                                        sides.working_text.len(),
+                                    );
+                                    panel.update(cx, |panel, cx| {
+                                        if active_thread_ready {
+                                            cx.defer_in(window, move |panel, window, cx| {
+                                                panel.submit_merge_review_branch_diff(
+                                                    content_blocks,
+                                                    Some(file_path.as_str()),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        } else {
+                                            panel.external_thread(
+                                                None,
+                                                None,
+                                                None,
+                                                Some(SharedString::from(format!(
+                                                    "Merge review · {file_path}"
+                                                ))),
+                                                Some(AgentInitialContent::ContentBlock {
+                                                    blocks: content_blocks,
+                                                    auto_submit: true,
+                                                }),
+                                                true,
+                                                AgentThreadSource::GitPanel,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    });
+                                    if merge_review_active {
+                                        workspace.focus_panel::<AgentPanel>(window, cx);
+                                    }
+                                })
+                                .ok();
+                        })
+                        .detach();
+                        if merge_review_active {
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                        }
+                        return;
+                    }
+
+                    let mention_uri = MentionUri::GitDiff {
+                        base_ref: action.base_ref.to_string(),
+                    };
+                    let diff_uri = mention_uri.to_uri().to_string();
+                    let prompt = crate::merge_review::merge_review_append_user_note(
+                        crate::merge_review::branch_diff_review_prompt(
+                            &project,
+                            cx,
+                            action.base_ref.as_ref(),
+                            file_path,
+                        )
+                        .unwrap_or(fallback_prompt),
+                        clarifying_note.as_deref(),
+                    );
 
                     let content_blocks = vec![
                         acp::ContentBlock::Text(acp::TextContent::new(prompt)),
@@ -677,16 +821,7 @@ pub fn init(cx: &mut App) {
                         action.diff_text.len(),
                     );
 
-                    if merge_review_active {
-                        workspace.open_panel::<AgentPanel>(window, cx);
-                    } else {
-                        workspace.focus_panel::<AgentPanel>(window, cx);
-                    }
-
                     panel.update(cx, |panel, cx| {
-                        if merge_review_active {
-                            panel.prepare_for_merge_review(window, cx);
-                        }
                         if active_thread_ready {
                             let file_path = file_path.map(str::to_string);
                             cx.defer_in(window, move |panel, window, cx| {
@@ -3934,6 +4069,30 @@ impl AgentPanel {
         if matches!(self.overlay_view, Some(OverlayView::ZedTodosSurface(_))) {
             self.clear_overlay(false, window, cx, true);
         }
+    }
+
+    pub(crate) fn send_merge_review_follow_up(
+        &mut self,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(thread_view) = self.active_thread_view(cx) else {
+            log::info!("surmount merge review: follow-up skipped (no active thread)");
+            return false;
+        };
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.message_editor.update(cx, |editor, cx| {
+                editor.set_message(
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+                    window,
+                    cx,
+                );
+            });
+            thread_view.send(window, cx);
+        });
+        self.focus_handle(cx).focus(window, cx);
+        true
     }
 
     pub(crate) fn submit_merge_review_branch_diff(

@@ -1446,10 +1446,13 @@ mod tests {
             // resolve_merge_conflict runs git checkout --ours/--theirs during merge
             // review; permission is enforced by merge-review workflow context.
             "resolve_merge_conflict",
-            // merge_review_triage / merge_review_diff are read-only git helpers for
-            // Surmount merge review (replace script/surmount-merge-triage).
+            "merge_review_record_decision",
+            // merge_review_triage / merge_review_diff / merge_review_conflict_sides /
+            // merge_review_verify_conflict_resolved are read-only git helpers for Surmount merge review.
             "merge_review_triage",
             "merge_review_diff",
+            "merge_review_conflict_sides",
+            "merge_review_verify_conflict_resolved",
         ];
 
         let tool_info_ids: Vec<&str> = TOOLS.iter().map(|t| t.id).collect();

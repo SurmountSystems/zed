@@ -2,9 +2,9 @@
 name: refactor-debug
 description: Use for fixing clusters of test failures after a refactor. Forces one-test-at-a-time execution using only scoped single-test commands, minimal context reads from stack traces only, real edits before re-testing, explicit todo tracking (exact test name as todo title), and targeted compaction per test file. The agent never runs broad or multi-threaded exploration commands.
 ---
-ONE TEST AT A TIME. NO BROAD RUNS. ONLY SCOPED SINGLE-TEST COMMANDS. NO SUB-AGENTS. NO TASKS. NEVER MODIFY TESTS.
+ONE TEST AT A TIME. NO BROAD RUNS. ONLY SCOPED SINGLE-TEST COMMANDS. NEVER MODIFY TESTS.
 
-> NO SUB-AGENTS / TASKS: You are strictly forbidden from creating, starting, spawning, or working with any sub-agent, parallel agent, or "Task" (including the Grok Build task system). This rule is absolute. You must run all commands directly in the main conversation. Never delegate work to Tasks or sub-agents. Violating this rule will result in the immediate termination of this conversation with no warning and the termination of any spawned processes. Just because the system allows you to create Tasks does not mean you are permitted to do so.
+> While this skill is active, run all debugging in the main conversation (no sub-agents or ad-hoc Tasks). Does not override `/implement` when the human invokes it for a separate scoped change.
 
 > NEVER MODIFY TESTS: The agent must never change test assertions, expectations, or test logic to make a test pass. If a test appears to be incorrect, the agent must explicitly notify the user and must not edit the test. It should instead move on to other failing tests.
 
@@ -45,7 +45,7 @@ Workflow:
 Never:
 - Run or suggest any broad or multi-threaded workspace command.
 - Modify, drop flags from, or run any command other than the exact scoped single-test form above while in refactor-debug mode.
-- Create, start, or use any "Task" (Grok Build task system), sub-agent, or parallel work item.
+- Spawn sub-agents or ad-hoc Tasks while this skill is active.
 - Ask the human to run scoped single-test commands during focused debugging work.
 - Modify any test assertions, expectations, or test logic to make a test pass.
 - Perform more than one expanded read per test under the Production Logic Exception without explicit user approval.
@@ -55,7 +55,7 @@ Never:
 
 Prioritize:
 - Strict scoping to one exact test at all times (via todo title).
-- Zero sub-agents, Tasks, or autonomous parallel work of any kind.
+- Sub-agents or parallel work while this skill is active.
 - Never modifying tests to fit current behavior.
 - Correct and timely application of the Production Logic Exception when the narrow 10-line read does not contain the root cause.
 - Token efficiency through minimal reads and proactive compaction.

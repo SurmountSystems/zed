@@ -591,6 +591,26 @@ pub mod surmount {
             ResolveMergeReviewConflictOurs,
             /// Resolve the active conflicted file by taking the upstream merge version (`git checkout --theirs`).
             ResolveMergeReviewConflictTheirs,
+            /// Scoped agent turn to discuss an active merge conflict (ours/theirs/working embeds).
+            DiscussMergeReviewConflict,
+            /// Scoped agent turn to synthesize a conflict resolution under human direction.
+            SynthesizeMergeReviewConflict,
+            /// Record a documented conflict decision for the active file (session capture).
+            RecordMergeReviewConflictDecision,
+            /// Confirm keep-fork outcome for the active conflict file (GUI decision gate).
+            ConfirmMergeReviewDecisionKeepFork,
+            /// Confirm take-upstream outcome for the active conflict file (GUI decision gate).
+            ConfirmMergeReviewDecisionTakeUpstream,
+            /// Confirm synthesize outcome for the active conflict file (GUI decision gate).
+            ConfirmMergeReviewDecisionSynthesize,
+            /// Open conflict test todos follow-up for the active file.
+            OpenMergeReviewConflictTodos,
+            /// Draft SURMOUNT.md section prose from confirmed merge-review summaries in the active section.
+            DraftMergeReviewSection,
+            /// Preview merging upstream main via `git merge-tree` before the human runs `git merge`.
+            PreviewMergeReviewMerge,
+            /// Draft merge commit message from session memory (human still runs `git commit`).
+            DraftMergeReviewCommitMessage,
         ]
     );
 }

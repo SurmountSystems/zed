@@ -1,13 +1,13 @@
 ---
 name: branch-differences-documenter
-description: Use for systematically producing a concise natural-language record of technical differences between Zed upstream main and the surmount branch. The skill actively guides a todo-driven, chunk-by-chunk or category-by-category review process. It proposes de-duplicated category structures and inserts explicit TODO: notes for any uncertainty or needed human judgment. Read-only git commands (diff, log, show, etc.) may be run autonomously per .rules; mutating git requires the human. No sub-agents or tasks of any kind.
+description: Use for systematically producing a concise natural-language record of technical differences between Zed upstream main and the surmount branch. The skill actively guides a todo-driven, chunk-by-chunk or category-by-category review process. It proposes de-duplicated category structures and inserts explicit TODO: notes for any uncertainty or needed human judgment. Read-only git commands (diff, log, show, etc.) may be run autonomously per .rules; mutating git requires the human. Main conversation while this skill is active.
 ---
 
 # Branch Differences Documenter
 
 **Core binding rules (these override everything else):**
 
-> NO SUB-AGENTS / TASKS: You are strictly forbidden from creating, starting, spawning, or working with any sub-agent, parallel agent, or "Task" (including the Grok Build task system). This rule is absolute. You must run all work directly in the main conversation. Never delegate work to Tasks or sub-agents. Violating this rule will result in the immediate termination of this conversation with no warning. Just because the system allows you to create Tasks does not mean you are permitted to do so.
+> While this skill is active, run branch-diff documentation in the main conversation (no sub-agents). Does not override `/implement` when the human invokes it.
 
 > READ-ONLY GIT MAY RUN AUTONOMOUSLY: Per `.rules`, you may run read-only git commands yourself when you have 100% confidence they cannot alter branch state, the working tree, the index, remotes, or stash (`git diff`, `git log`, `git show`, `git status`, `git branch` list-only, `git rev-parse`, `git merge-base`, etc.). Run them directly — never simulate or assume output. For any mutating or uncertain command, suggest the exact command for the human to run and wait for pasted output.
 

@@ -1,14 +1,17 @@
 use git_ui::project_diff::{
-    BranchDiffToolbar, MergeReviewBranchDiffControls, MergeReviewConflictOutcomeHint, ReviewDiff,
+    BranchDiffToolbar, MergeReviewBranchDiffControls, MergeReviewConflictOutcomeHint,
+    MergeReviewConflictWorkshopPhase, MergeReviewGitMode, ReviewDiff,
 };
-use gpui::{Action, AnyElement, Context, FocusHandle, ParentElement, Window};
+use gpui::{Action, AnyElement, Context, FocusHandle, Hsla, ParentElement, Window, rgb};
 use ui::{
-    Button, ButtonStyle, Color, Divider, Icon, IconName, IconSize, KeyBinding, Label, LabelSize,
-    TintColor, Tooltip, prelude::*,
+    Color, Icon, IconName, IconSize, KeyBinding, Label, LabelSize, Tooltip, prelude::*,
 };
 use zed_actions::surmount::{
-    EndMergeReview, MergeReviewNextFile, ResolveMergeReviewConflictOurs,
-    ResolveMergeReviewConflictTheirs,
+    ConfirmMergeReviewDecisionKeepFork, ConfirmMergeReviewDecisionSynthesize,
+    ConfirmMergeReviewDecisionTakeUpstream, DiscussMergeReviewConflict,
+    DraftMergeReviewCommitMessage, EndMergeReview, MergeReviewNextFile,
+    OpenMergeReviewConflictTodos, PreviewMergeReviewMerge, ResolveMergeReviewConflictOurs,
+    ResolveMergeReviewConflictTheirs, SynthesizeMergeReviewConflict,
 };
 
 pub const RAIL_BTN_REVIEW_DIFF: &str = "Review Diff";
@@ -17,12 +20,43 @@ pub const RAIL_BTN_NEXT_FILE: &str = "Next file →";
 pub const RAIL_BTN_KEEP_FORK: &str = "Keep fork";
 pub const RAIL_BTN_TAKE_UPSTREAM: &str = "Take upstream";
 pub const RAIL_BTN_END: &str = "End merge review";
+pub const RAIL_BTN_DISCUSS_CONFLICT: &str = "Discuss conflict";
+pub const RAIL_BTN_DISCUSSING: &str = "Discussing…";
+pub const RAIL_BTN_SYNTHESIZE: &str = "Synthesize";
+pub const RAIL_BTN_COMPLETE_TESTS: &str = "Complete tests";
+pub const RAIL_BTN_PREVIEW_MERGE: &str = "Preview merge";
+pub const RAIL_BTN_DRAFT_COMMIT_MESSAGE: &str = "Draft commit message";
+
+/// Merge review workflow control border (`#0f0`), dark-mode first.
+pub fn merge_review_workflow_green_border() -> Hsla {
+    rgb(0x00ff00).into()
+}
+
+pub fn merge_review_workflow_danger_border() -> Hsla {
+    rgb(0xff0000).into()
+}
+
+pub fn merge_review_workflow_label_color() -> Color {
+    Color::Custom(rgb(0xffffff).into())
+}
+
+pub fn merge_review_workflow_primary_fill() -> Hsla {
+    gpui::hsla(0., 0., 0.12, 1.)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeReviewWorkflowButtonTier {
+    Primary,
+    Available,
+    Danger,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeReviewUiStep {
     AllComplete,
     ReviewWorking,
-    ConflictResolve {
+    ConflictWorkshop {
+        phase: MergeReviewConflictWorkshopPhase,
         emphasize: Option<MergeReviewConflictOutcomeHint>,
     },
     SummarizedNext,
@@ -38,12 +72,18 @@ pub enum MergeReviewPrimaryAction {
     TakeUpstream,
     NextFile,
     ReviewDiff,
+    DiscussConflict,
+    DiscussConflictWorking,
+    SynthesizeConflict,
+    ConfirmKeepFork,
+    ConfirmTakeUpstream,
+    ConfirmSynthesize,
+    CompleteTests,
 }
 
 pub fn merge_review_session_complete(cx: &gpui::App) -> bool {
-    crate::merge_review::load_session(cx).is_some_and(|session| {
-        !session.items.is_empty() && session.reviewed_count() == session.items.len()
-    })
+    crate::merge_review::load_session(cx)
+        .is_some_and(|session| crate::merge_review::session_summarized_complete(&session))
 }
 
 pub fn merge_review_ui_step(
@@ -58,8 +98,16 @@ pub fn merge_review_ui_step(
     if in_flight || controls.awaiting_agent_summary {
         return MergeReviewUiStep::ReviewWorking;
     }
-    if controls.show_conflict_resolution {
-        return MergeReviewUiStep::ConflictResolve {
+    if let Some(phase) = controls.conflict_workshop_phase {
+        if phase != MergeReviewConflictWorkshopPhase::NotSummarized {
+            return MergeReviewUiStep::ConflictWorkshop {
+                phase,
+                emphasize: controls.suggested_outcome,
+            };
+        }
+    } else if controls.show_conflict_resolution {
+        return MergeReviewUiStep::ConflictWorkshop {
+            phase: MergeReviewConflictWorkshopPhase::DiscussReady,
             emphasize: controls.suggested_outcome,
         };
     }
@@ -76,9 +124,29 @@ pub fn merge_review_primary_action(step: MergeReviewUiStep) -> MergeReviewPrimar
     match step {
         MergeReviewUiStep::AllComplete => MergeReviewPrimaryAction::EndMergeReview,
         MergeReviewUiStep::ReviewWorking => MergeReviewPrimaryAction::ReviewDiffWorking,
-        MergeReviewUiStep::ConflictResolve { emphasize } => match emphasize {
-            Some(MergeReviewConflictOutcomeHint::KeepFork) => MergeReviewPrimaryAction::KeepFork,
-            _ => MergeReviewPrimaryAction::TakeUpstream,
+        MergeReviewUiStep::ConflictWorkshop { phase, emphasize } => match phase {
+            MergeReviewConflictWorkshopPhase::NotSummarized => {
+                MergeReviewPrimaryAction::ReviewDiff
+            }
+            MergeReviewConflictWorkshopPhase::DiscussReady => {
+                MergeReviewPrimaryAction::DiscussConflict
+            }
+            MergeReviewConflictWorkshopPhase::Discussing => {
+                MergeReviewPrimaryAction::DiscussConflictWorking
+            }
+            MergeReviewConflictWorkshopPhase::RecordDecision => match emphasize {
+                Some(MergeReviewConflictOutcomeHint::TakeUpstream) => {
+                    MergeReviewPrimaryAction::ConfirmTakeUpstream
+                }
+                Some(MergeReviewConflictOutcomeHint::Synthesize) => {
+                    MergeReviewPrimaryAction::ConfirmSynthesize
+                }
+                _ => MergeReviewPrimaryAction::ConfirmKeepFork,
+            },
+            MergeReviewConflictWorkshopPhase::CompleteTests => {
+                MergeReviewPrimaryAction::CompleteTests
+            }
+            MergeReviewConflictWorkshopPhase::ReadyToAdvance => MergeReviewPrimaryAction::NextFile,
         },
         MergeReviewUiStep::SummarizedNext | MergeReviewUiStep::PickFile => {
             MergeReviewPrimaryAction::NextFile
@@ -94,7 +162,7 @@ pub fn render_merge_review_step_rail(
     file_selected: bool,
     is_ai_enabled: bool,
     focus_handle: &FocusHandle,
-    window: &mut Window,
+    _window: &mut Window,
     cx: &mut Context<BranchDiffToolbar>,
 ) -> AnyElement {
     if !is_ai_enabled {
@@ -109,153 +177,438 @@ pub fn render_merge_review_step_rail(
         session_complete,
     );
     let primary = merge_review_primary_action(step);
-    let show_conflict_buttons = controls.is_conflict_file || controls.show_conflict_resolution;
-
-    h_flex()
-        .gap_2()
-        .items_center()
-        .flex_wrap()
-        .child(
-            Label::new(controls.progress_label.clone())
-                .size(LabelSize::Default)
-                .color(Color::Muted),
-        )
-        .child(Divider::vertical())
-        .child(rail_button(
-            toolbar,
-            "merge-review-rail-next-file",
-            RAIL_BTN_NEXT_FILE,
-            primary == MergeReviewPrimaryAction::NextFile,
-            false,
-            TintColor::Accent,
-            &MergeReviewNextFile,
-            focus_handle,
-            window,
-            cx,
+    let workshop_phase = controls.conflict_workshop_phase;
+    let mut rail = h_flex().gap_2().items_center().flex_wrap().child(
+        Label::new(format!(
+            "{} · {}",
+            controls.progress_label, controls.step_label
         ))
-        .child({
-            let review_primary = matches!(
-                primary,
-                MergeReviewPrimaryAction::ReviewDiff | MergeReviewPrimaryAction::ReviewDiffWorking
-            );
-            let review_disabled = review_in_progress
-                || matches!(
-                    step,
-                    MergeReviewUiStep::SummarizedNext
-                        | MergeReviewUiStep::ConflictResolve { .. }
-                        | MergeReviewUiStep::AllComplete
-                );
-            let review_label = if review_in_progress {
-                RAIL_BTN_REVIEW_WORKING
-            } else {
-                RAIL_BTN_REVIEW_DIFF
-            };
-            let review_tint = if review_in_progress {
-                TintColor::Accent
-            } else {
-                TintColor::Success
-            };
-            rail_button(
-                toolbar,
-                "merge-review-rail-review-diff",
-                review_label,
-                review_primary,
-                review_disabled,
-                review_tint,
-                &ReviewDiff,
-                focus_handle,
-                window,
-                cx,
-            )
-            .start_icon(
-                Icon::new(IconName::ZedAssistant)
-                    .size(IconSize::Small)
-                    .color(Color::Success),
-            )
-        })
-        .when(show_conflict_buttons, |this| {
-            this.child(rail_button(
-                toolbar,
-                "merge-review-rail-keep-fork",
-                RAIL_BTN_KEEP_FORK,
-                primary == MergeReviewPrimaryAction::KeepFork,
-                false,
-                TintColor::Success,
-                &ResolveMergeReviewConflictOurs,
-                focus_handle,
-                window,
-                cx,
-            ))
-            .child(rail_button(
-                toolbar,
-                "merge-review-rail-take-upstream",
-                RAIL_BTN_TAKE_UPSTREAM,
-                primary == MergeReviewPrimaryAction::TakeUpstream,
-                false,
-                TintColor::Accent,
-                &ResolveMergeReviewConflictTheirs,
-                focus_handle,
-                window,
-                cx,
-            ))
-        })
-        .child(rail_button(
+        .size(LabelSize::Default)
+        .color(Color::Muted),
+    );
+    for spec in workflow_button_specs(
+        step,
+        primary,
+        review_in_progress,
+        workshop_phase,
+        controls.git_mode,
+    ) {
+        rail = rail.child(merge_review_workflow_button(
             toolbar,
-            "merge-review-rail-end",
-            RAIL_BTN_END,
-            primary == MergeReviewPrimaryAction::EndMergeReview,
-            false,
-            TintColor::Error,
-            &EndMergeReview,
+            spec.id,
+            spec.label,
+            spec.tier,
+            spec.disabled,
+            spec.tooltip,
+            spec.action.as_ref(),
             focus_handle,
-            window,
             cx,
-        ))
-        .into_any()
+        ));
+    }
+    rail.child(merge_review_workflow_button(
+        toolbar,
+        "merge-review-rail-end",
+        RAIL_BTN_END,
+        if session_complete {
+            MergeReviewWorkflowButtonTier::Primary
+        } else {
+            MergeReviewWorkflowButtonTier::Danger
+        },
+        false,
+        "End merge review session and restore docks",
+        &EndMergeReview,
+        focus_handle,
+        cx,
+    ))
+    .into_any()
 }
 
-fn rail_button(
+pub(crate) struct WorkflowButtonSpec {
+    pub(crate) id: &'static str,
+    pub(crate) label: &'static str,
+    tier: MergeReviewWorkflowButtonTier,
+    disabled: bool,
+    tooltip: &'static str,
+    action: Box<dyn Action>,
+}
+
+#[cfg(test)]
+pub(crate) fn workflow_button_labels(
+    step: MergeReviewUiStep,
+    primary: MergeReviewPrimaryAction,
+    review_in_progress: bool,
+    workshop_phase: Option<MergeReviewConflictWorkshopPhase>,
+    git_mode: MergeReviewGitMode,
+) -> Vec<&'static str> {
+    workflow_button_specs(
+        step,
+        primary,
+        review_in_progress,
+        workshop_phase,
+        git_mode,
+    )
+    .into_iter()
+    .map(|spec| spec.label)
+    .collect()
+}
+
+pub(crate) fn workflow_button_specs(
+    step: MergeReviewUiStep,
+    primary: MergeReviewPrimaryAction,
+    review_in_progress: bool,
+    workshop_phase: Option<MergeReviewConflictWorkshopPhase>,
+    git_mode: MergeReviewGitMode,
+) -> Vec<WorkflowButtonSpec> {
+    let tier = |is_primary: bool, disabled: bool| {
+        if disabled {
+            MergeReviewWorkflowButtonTier::Available
+        } else if is_primary {
+            MergeReviewWorkflowButtonTier::Primary
+        } else {
+            MergeReviewWorkflowButtonTier::Available
+        }
+    };
+    let mut specs = Vec::new();
+    let push = |specs: &mut Vec<WorkflowButtonSpec>, spec: WorkflowButtonSpec| {
+        specs.push(spec);
+    };
+
+    match step {
+        MergeReviewUiStep::AllComplete => {
+            push(
+                &mut specs,
+                WorkflowButtonSpec {
+                    id: "merge-review-rail-draft-commit",
+                    label: RAIL_BTN_DRAFT_COMMIT_MESSAGE,
+                    tier: MergeReviewWorkflowButtonTier::Primary,
+                    disabled: false,
+                    tooltip: "Draft merge commit message from session memory",
+                    action: Box::new(DraftMergeReviewCommitMessage),
+                },
+            );
+        }
+        MergeReviewUiStep::ReviewWorking => {
+            push(
+                &mut specs,
+                WorkflowButtonSpec {
+                    id: "merge-review-rail-review-diff",
+                    label: RAIL_BTN_REVIEW_WORKING,
+                    tier: MergeReviewWorkflowButtonTier::Primary,
+                    disabled: true,
+                    tooltip: "Agent summarizing this file",
+                    action: Box::new(ReviewDiff),
+                },
+            );
+        }
+        MergeReviewUiStep::ReviewReady => {
+            push(
+                &mut specs,
+                WorkflowButtonSpec {
+                    id: "merge-review-rail-review-diff",
+                    label: RAIL_BTN_REVIEW_DIFF,
+                    tier: MergeReviewWorkflowButtonTier::Primary,
+                    disabled: false,
+                    tooltip: "Scoped agent turn to summarize this diff",
+                    action: Box::new(ReviewDiff),
+                },
+            );
+        }
+        MergeReviewUiStep::PickFile | MergeReviewUiStep::SummarizedNext => {
+            push(
+                &mut specs,
+                WorkflowButtonSpec {
+                    id: "merge-review-rail-next-file",
+                    label: RAIL_BTN_NEXT_FILE,
+                    tier: MergeReviewWorkflowButtonTier::Primary,
+                    disabled: false,
+                    tooltip: "Select the next merge-review file",
+                    action: Box::new(MergeReviewNextFile),
+                },
+            );
+        }
+        MergeReviewUiStep::ConflictWorkshop { phase, .. } => match phase {
+            MergeReviewConflictWorkshopPhase::NotSummarized => {
+                push(
+                    &mut specs,
+                    WorkflowButtonSpec {
+                        id: "merge-review-rail-review-diff",
+                        label: if review_in_progress {
+                            RAIL_BTN_REVIEW_WORKING
+                        } else {
+                            RAIL_BTN_REVIEW_DIFF
+                        },
+                        tier: MergeReviewWorkflowButtonTier::Primary,
+                        disabled: review_in_progress,
+                        tooltip: "Summarize this conflict file before resolving",
+                        action: Box::new(ReviewDiff),
+                    },
+                );
+            }
+            MergeReviewConflictWorkshopPhase::DiscussReady => {
+                push(
+                    &mut specs,
+                    WorkflowButtonSpec {
+                        id: "merge-review-rail-discuss",
+                        label: RAIL_BTN_DISCUSS_CONFLICT,
+                        tier: tier(primary == MergeReviewPrimaryAction::DiscussConflict, false),
+                        disabled: false,
+                        tooltip: "Scoped Q&A — optional direction in note popover, then send",
+                        action: Box::new(DiscussMergeReviewConflict),
+                    },
+                );
+                if git_mode == MergeReviewGitMode::MergeInProgress {
+                    push(
+                        &mut specs,
+                        WorkflowButtonSpec {
+                            id: "merge-review-rail-keep-fork",
+                            label: RAIL_BTN_KEEP_FORK,
+                            tier: tier(primary == MergeReviewPrimaryAction::KeepFork, false),
+                            disabled: false,
+                            tooltip: "Resolve with git checkout --ours",
+                            action: Box::new(ResolveMergeReviewConflictOurs),
+                        },
+                    );
+                    push(
+                        &mut specs,
+                        WorkflowButtonSpec {
+                            id: "merge-review-rail-take-upstream",
+                            label: RAIL_BTN_TAKE_UPSTREAM,
+                            tier: tier(primary == MergeReviewPrimaryAction::TakeUpstream, false),
+                            disabled: false,
+                            tooltip: "Resolve with git checkout --theirs",
+                            action: Box::new(ResolveMergeReviewConflictTheirs),
+                        },
+                    );
+                    push(
+                        &mut specs,
+                        WorkflowButtonSpec {
+                            id: "merge-review-rail-synthesize",
+                            label: RAIL_BTN_SYNTHESIZE,
+                            tier: tier(
+                                primary == MergeReviewPrimaryAction::SynthesizeConflict,
+                                false,
+                            ),
+                            disabled: false,
+                            tooltip: "Agent synthesizes — add direction in composer, then Send",
+                            action: Box::new(SynthesizeMergeReviewConflict),
+                        },
+                    );
+                }
+            }
+            MergeReviewConflictWorkshopPhase::Discussing => {
+                push(
+                    &mut specs,
+                    WorkflowButtonSpec {
+                        id: "merge-review-rail-discussing",
+                        label: RAIL_BTN_DISCUSSING,
+                        tier: MergeReviewWorkflowButtonTier::Primary,
+                        disabled: true,
+                        tooltip: "Discuss turn in progress",
+                        action: Box::new(DiscussMergeReviewConflict),
+                    },
+                );
+                if git_mode == MergeReviewGitMode::MergeInProgress {
+                    push(
+                        &mut specs,
+                        WorkflowButtonSpec {
+                            id: "merge-review-rail-keep-fork",
+                            label: RAIL_BTN_KEEP_FORK,
+                            tier: MergeReviewWorkflowButtonTier::Available,
+                            disabled: false,
+                            tooltip: "Resolve with git checkout --ours",
+                            action: Box::new(ResolveMergeReviewConflictOurs),
+                        },
+                    );
+                    push(
+                        &mut specs,
+                        WorkflowButtonSpec {
+                            id: "merge-review-rail-take-upstream",
+                            label: RAIL_BTN_TAKE_UPSTREAM,
+                            tier: MergeReviewWorkflowButtonTier::Available,
+                            disabled: false,
+                            tooltip: "Resolve with git checkout --theirs",
+                            action: Box::new(ResolveMergeReviewConflictTheirs),
+                        },
+                    );
+                    push(
+                        &mut specs,
+                        WorkflowButtonSpec {
+                            id: "merge-review-rail-synthesize",
+                            label: RAIL_BTN_SYNTHESIZE,
+                            tier: MergeReviewWorkflowButtonTier::Available,
+                            disabled: false,
+                            tooltip: "Agent synthesizes — add direction in composer, then Send",
+                            action: Box::new(SynthesizeMergeReviewConflict),
+                        },
+                    );
+                }
+            }
+            MergeReviewConflictWorkshopPhase::RecordDecision => {
+                push(
+                    &mut specs,
+                    WorkflowButtonSpec {
+                        id: "merge-review-rail-record-keep",
+                        label: RAIL_BTN_KEEP_FORK,
+                        tier: tier(primary == MergeReviewPrimaryAction::ConfirmKeepFork, false),
+                        disabled: false,
+                        tooltip: "Record decision: keep fork version",
+                        action: Box::new(ConfirmMergeReviewDecisionKeepFork),
+                    },
+                );
+                push(
+                    &mut specs,
+                    WorkflowButtonSpec {
+                        id: "merge-review-rail-record-upstream",
+                        label: RAIL_BTN_TAKE_UPSTREAM,
+                        tier: tier(
+                            primary == MergeReviewPrimaryAction::ConfirmTakeUpstream,
+                            false,
+                        ),
+                        disabled: false,
+                        tooltip: "Record decision: take upstream version",
+                        action: Box::new(ConfirmMergeReviewDecisionTakeUpstream),
+                    },
+                );
+                push(
+                    &mut specs,
+                    WorkflowButtonSpec {
+                        id: "merge-review-rail-record-synthesize",
+                        label: RAIL_BTN_SYNTHESIZE,
+                        tier: tier(
+                            primary == MergeReviewPrimaryAction::ConfirmSynthesize,
+                            false,
+                        ),
+                        disabled: false,
+                        tooltip: "Record decision: synthesize",
+                        action: Box::new(ConfirmMergeReviewDecisionSynthesize),
+                    },
+                );
+            }
+            MergeReviewConflictWorkshopPhase::CompleteTests => {
+                push(
+                    &mut specs,
+                    WorkflowButtonSpec {
+                        id: "merge-review-rail-complete-tests",
+                        label: RAIL_BTN_COMPLETE_TESTS,
+                        tier: MergeReviewWorkflowButtonTier::Primary,
+                        disabled: false,
+                        tooltip: "Open conflict Plan Todos",
+                        action: Box::new(OpenMergeReviewConflictTodos),
+                    },
+                );
+            }
+            MergeReviewConflictWorkshopPhase::ReadyToAdvance => {
+                push(
+                    &mut specs,
+                    WorkflowButtonSpec {
+                        id: "merge-review-rail-next-file",
+                        label: RAIL_BTN_NEXT_FILE,
+                        tier: MergeReviewWorkflowButtonTier::Primary,
+                        disabled: false,
+                        tooltip: "Advance to the next merge-review file",
+                        action: Box::new(MergeReviewNextFile),
+                    },
+                );
+            }
+        },
+    }
+    if git_mode == MergeReviewGitMode::PreMerge {
+        push(
+            &mut specs,
+            WorkflowButtonSpec {
+                id: "merge-review-rail-preview-merge",
+                label: RAIL_BTN_PREVIEW_MERGE,
+                tier: MergeReviewWorkflowButtonTier::Available,
+                disabled: false,
+                tooltip: "Preview git merge-tree before running git merge (human-gated)",
+                action: Box::new(PreviewMergeReviewMerge),
+            },
+        );
+    }
+    let _ = workshop_phase;
+    specs
+}
+
+fn merge_review_workflow_button(
     _toolbar: &BranchDiffToolbar,
     id: &'static str,
     label: &'static str,
-    primary: bool,
+    tier: MergeReviewWorkflowButtonTier,
     disabled: bool,
-    tint: TintColor,
+    tooltip_text: &'static str,
     action: &dyn Action,
     focus_handle: &FocusHandle,
-    _window: &mut Window,
     cx: &mut Context<BranchDiffToolbar>,
-) -> Button {
-    let mut button = Button::new(id, label);
-    if primary {
-        button = button.style(ButtonStyle::Tinted(tint));
+) -> AnyElement {
+    let green = merge_review_workflow_green_border();
+    let danger = merge_review_workflow_danger_border();
+    let muted_border = gpui::hsla(0., 0., 0.35, 1.);
+    let border_color = if disabled {
+        muted_border
     } else {
-        button = button.style(ButtonStyle::Outlined);
-    }
-    if disabled {
-        button = button.disabled(true);
+        match tier {
+            MergeReviewWorkflowButtonTier::Danger => danger,
+            _ => green,
+        }
+    };
+    let label_color = if disabled {
+        Color::Muted
     } else {
-        button = button.key_binding(KeyBinding::for_action_in(action, focus_handle, cx));
-    }
-    let action_label = label;
+        merge_review_workflow_label_color()
+    };
     let action_for_click = action.boxed_clone();
     let action_for_tooltip = action.boxed_clone();
-    button
+    let keybinding = (!disabled).then(|| KeyBinding::for_action_in(action, focus_handle, cx));
+    div()
+        .id(id)
+        .h(px(32.))
+        .px_2()
+        .flex()
+        .items_center()
+        .gap_1()
+        .border_1()
+        .border_color(border_color)
+        .when(tier == MergeReviewWorkflowButtonTier::Primary && !disabled, |this| {
+            this.bg(merge_review_workflow_primary_fill())
+        })
+        .when(disabled, |this| this.opacity(0.4).cursor_not_allowed())
+        .when(!disabled, |this| {
+            this.cursor_pointer().hover(|this| {
+                this.bg(merge_review_workflow_primary_fill().opacity(0.85))
+            })
+        })
+        .child(
+            Label::new(label)
+                .size(LabelSize::Default)
+                .color(label_color),
+        )
+        .when(
+            id == "merge-review-rail-review-diff" && !disabled,
+            |this| {
+                this.child(
+                    Icon::new(IconName::ZedAssistant)
+                        .size(IconSize::Small)
+                        .color(label_color),
+                )
+            },
+        )
         .tooltip({
             let focus_handle = focus_handle.clone();
             move |_, cx| {
                 Tooltip::with_meta_in(
-                    action_label,
+                    tooltip_text,
                     Some(action_for_tooltip.as_ref()),
-                    action_label,
+                    tooltip_text,
                     &focus_handle,
                     cx,
                 )
             }
         })
-        .on_click(cx.listener(move |this, _, window, cx| {
-            if !disabled {
+        .when(!disabled, |this| {
+            this.on_click(cx.listener(move |this, _, window, cx| {
                 this.dispatch_action(action_for_click.as_ref(), window, cx);
-            }
-        }))
+            }))
+        })
+        .when_some(keybinding, |this, binding| this.child(binding))
+        .into_any()
 }

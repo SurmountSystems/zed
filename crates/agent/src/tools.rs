@@ -22,8 +22,10 @@ mod move_path_tool;
 mod read_file_tool;
 mod rename_tool;
 pub use merge_review_triage_tool::{
-    MergeReviewDiffTool, MergeReviewDiffToolInput, MergeReviewTriageTool,
-    MergeReviewTriageToolInput,
+    MergeReviewConflictSidesTool, MergeReviewConflictSidesToolInput, MergeReviewDiffTool,
+    MergeReviewDiffToolInput, MergeReviewRecordDecisionOutcome, MergeReviewRecordDecisionTool,
+    MergeReviewRecordDecisionToolInput, MergeReviewTriageTool, MergeReviewTriageToolInput,
+    MergeReviewVerifyConflictResolvedTool, MergeReviewVerifyConflictResolvedToolInput,
 };
 mod resolve_merge_conflict_tool;
 pub use resolve_merge_conflict_tool::{
@@ -584,6 +586,7 @@ tools! {
     GrepTool,
     ListAgentsAndModelsTool,
     ListDirectoryTool,
+    MergeReviewConflictSidesTool,
     MergeReviewDiffTool,
     MergeReviewTriageTool,
     MonitorTool,

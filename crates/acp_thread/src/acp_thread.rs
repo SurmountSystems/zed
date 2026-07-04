@@ -2326,6 +2326,8 @@ impl AcpThread {
     const MERGE_REVIEW_FILE_PROMPT_MARKER: &'static str =
         "Summarize this file for merging upstream";
     const MERGE_REVIEW_SCOPED_TURN_MARKER: &'static str = "This is a scoped single-file turn";
+    const MERGE_REVIEW_CONFLICT_TURN_MARKER: &'static str =
+        "This file has an active merge conflict";
     const MERGE_REVIEW_FORMAT_RETRY_MARKER: &'static str =
         "missing the required Summary: and Outcome: lines";
     const DISCIPLINE_KICKBACK_MARKER: &'static str = "autonomous work discipline rules";
@@ -2355,6 +2357,7 @@ impl AcpThread {
     fn is_merge_review_file_prompt(text: &str) -> bool {
         text.contains(Self::MERGE_REVIEW_FILE_PROMPT_MARKER)
             || text.contains(Self::MERGE_REVIEW_SCOPED_TURN_MARKER)
+            || text.contains(Self::MERGE_REVIEW_CONFLICT_TURN_MARKER)
     }
 
     /// True while the thread is answering a per-file merge review prompt, including
@@ -7404,6 +7407,55 @@ mod tests {
                 "second assistant revision must not inject another kickback (got {kickback_count})"
             );
             let _ = app;
+        });
+    }
+
+    #[gpui::test]
+    async fn test_merge_review_conflict_turn_stays_scoped_after_kickback(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block(
+                None,
+                acp::ContentBlock::Text(acp::TextContent::new(
+                    "This file has an active merge conflict while merging upstream `origin/main` into the Surmount fork.\n\
+                     File: lib.rs\n\
+                     This is a scoped single-file turn — do not use todo_write or plan entries.\n",
+                )),
+                cx,
+            );
+            thread.push_assistant_content_block_with_indent(
+                acp::ContentBlock::Text(acp::TextContent::new(
+                    "Which side owns the zoom hook?\n",
+                )),
+                false,
+                false,
+                cx,
+            );
+            thread.push_user_content_block(
+                None,
+                acp::ContentBlock::Text(acp::TextContent::new(
+                    "Your response violated the Autonomous Work Discipline Rules.\n\
+                     Please revise your last response to comply with all three rules.",
+                )),
+                cx,
+            );
+            assert!(
+                thread.merge_review_file_turn_scoped_for_tests(),
+                "conflict workshop kickback must not end merge review scoping"
+            );
         });
     }
 

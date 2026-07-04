@@ -2476,6 +2476,24 @@ impl Editor {
             project.get_permalink_to_line(&buffer, selection, cx)
         })
     }
+
+    /// Takes all stored comments from all hunks, clearing the storage.
+    pub(super) fn take_all_review_comments(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Vec<(DiffHunkKey, Vec<StoredReviewComment>)> {
+        self.dismiss_all_diff_review_overlays(cx);
+        let comments = std::mem::take(&mut self.stored_review_comments);
+        self.next_review_comment_id = 0;
+        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
+        cx.notify();
+        comments
+    }
+
+    /// Takes all diff review comments and formats them for the agent panel.
+    pub fn formatted_diff_review_comments_for_agent(&mut self, cx: &mut Context<Self>) -> String {
+        format_diff_review_comments(&self.take_all_review_comments(cx))
+    }
 }
 
 #[cfg(test)]
@@ -2498,21 +2516,20 @@ impl Editor {
         Some((start_row, end_row))
     }
 
-    /// Takes all stored comments from all hunks, clearing the storage.
-    /// Returns a Vec of (hunk_key, comments) pairs.
-    pub(super) fn take_all_review_comments(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Vec<(DiffHunkKey, Vec<StoredReviewComment>)> {
-        // Dismiss all overlays when taking comments (e.g., when sending to agent)
-        self.dismiss_all_diff_review_overlays(cx);
-        let comments = std::mem::take(&mut self.stored_review_comments);
-        // Reset the ID counter since all comments have been taken
-        self.next_review_comment_id = 0;
-        cx.emit(EditorEvent::ReviewCommentsChanged { total_count: 0 });
-        cx.notify();
-        comments
+}
+
+fn format_diff_review_comments(comments: &[(DiffHunkKey, Vec<StoredReviewComment>)]) -> String {
+    let mut parts = Vec::new();
+    for (key, hunk_comments) in comments {
+        let path = key.file_path.as_unix_str();
+        for comment in hunk_comments {
+            let text = comment.comment.trim();
+            if !text.is_empty() {
+                parts.push(format!("File: {path}\n{text}"));
+            }
+        }
     }
+    parts.join("\n\n")
 }
 
 impl EditorSnapshot {

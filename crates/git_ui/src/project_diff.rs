@@ -846,6 +846,15 @@ impl ProjectDiff {
         self.review_comment_count
     }
 
+    /// Takes all diff review comments from the primary editor and formats them for the agent.
+    pub fn take_review_comments_for_agent(&mut self, cx: &mut Context<Self>) -> String {
+        self.editor.update(cx, |splittable, cx| {
+            splittable
+                .rhs_editor()
+                .update(cx, |editor, cx| editor.formatted_diff_review_comments_for_agent(cx))
+        })
+    }
+
     pub fn review_diff_in_flight(&self) -> bool {
         self.review_diff_in_flight
     }
@@ -2223,6 +2232,23 @@ pub enum MergeReviewConflictOutcomeHint {
     NeedsHuman,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum MergeReviewGitMode {
+    #[default]
+    PreMerge,
+    MergeInProgress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeReviewConflictWorkshopPhase {
+    NotSummarized,
+    DiscussReady,
+    Discussing,
+    RecordDecision,
+    CompleteTests,
+    ReadyToAdvance,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeReviewBranchDiffControls {
     pub workflow_active: bool,
@@ -2235,6 +2261,9 @@ pub struct MergeReviewBranchDiffControls {
     pub suggested_outcome: Option<MergeReviewConflictOutcomeHint>,
     /// True after Review Diff was sent until the agent summary is captured.
     pub awaiting_agent_summary: bool,
+    pub conflict_workshop_phase: Option<MergeReviewConflictWorkshopPhase>,
+    pub git_mode: MergeReviewGitMode,
+    pub unmerged_count: u32,
 }
 
 type MergeReviewStepRailRendererFn = fn(
@@ -2377,6 +2406,9 @@ fn merge_review_branch_diff_controls(
             show_conflict_resolution: false,
             suggested_outcome: None,
             awaiting_agent_summary: false,
+            conflict_workshop_phase: None,
+            git_mode: MergeReviewGitMode::PreMerge,
+            unmerged_count: 0,
         })
 }
 

@@ -1490,6 +1490,157 @@ impl ConversationView {
         }
     }
 
+    fn dispatch_merge_review_capture_on_stop(
+        &mut self,
+        result: crate::merge_review::MergeReviewCaptureOnStop,
+        session_id: &acp::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            crate::merge_review::MergeReviewCaptureOnStop::Captured(captured_path) => {
+                log::info!(
+                    "surmount merge review: captured Summary from agent reply (file={captured_path})"
+                );
+                let open_question_captured = crate::merge_review::load_session(cx)
+                    .and_then(|session| {
+                        crate::merge_review::item_for_path(&session, &captured_path).map(|item| {
+                            item.review_state
+                                == crate::merge_review::MergeReviewState::OpenQuestion
+                        })
+                    })
+                    .unwrap_or(false);
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        let advanced =
+                            crate::merge_review::advance_merge_review_to_next_file_with_sync(
+                                workspace, window, cx, false,
+                            );
+                        crate::merge_review::notify_merge_review_ui_changed_with_sync(
+                            workspace, cx, false,
+                        );
+                        if open_question_captured {
+                            crate::merge_review::request_merge_review_open_question_todo(
+                                workspace,
+                                &captured_path,
+                                window,
+                                cx,
+                            );
+                        }
+                        workspace.show_toast(
+                            crate::merge_review::merge_review_summary_capture_toast(
+                                &captured_path,
+                                advanced,
+                                cx,
+                            ),
+                            cx,
+                        );
+                    });
+                }
+            }
+            crate::merge_review::MergeReviewCaptureOnStop::FormatRetryRequested { path, prompt } => {
+                log::info!(
+                    "surmount merge review: requesting Summary/Outcome format retry for {path}"
+                );
+                if let Some(active) = self.thread_view(session_id) {
+                    active.update(cx, |view, cx| {
+                        view.message_editor.update(cx, |editor, cx| {
+                            editor.set_message(
+                                vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+                                window,
+                                cx,
+                            );
+                        });
+                        view.send(window, cx);
+                    });
+                }
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
+                        workspace.show_toast(
+                            crate::merge_review::merge_review_toast(format!(
+                                "Formatting {path} — agent will add Summary: and Outcome: lines."
+                            )),
+                            cx,
+                        );
+                    });
+                }
+            }
+            crate::merge_review::MergeReviewCaptureOnStop::CommitMessageCaptured => {
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
+                        workspace.show_toast(
+                            crate::merge_review::merge_review_toast(
+                                "Merge commit message draft captured — edit in the modal.",
+                            ),
+                            cx,
+                        );
+                    });
+                }
+            }
+            crate::merge_review::MergeReviewCaptureOnStop::CommitMessageFormatRetryRequested {
+                prompt,
+            } => {
+                log::info!("surmount merge review: requesting merge commit message format retry");
+                if let Some(active) = self.thread_view(session_id) {
+                    active.update(cx, |view, cx| {
+                        view.message_editor.update(cx, |editor, cx| {
+                            editor.set_message(
+                                vec![acp::ContentBlock::Text(acp::TextContent::new(prompt))],
+                                window,
+                                cx,
+                            );
+                        });
+                        view.send(window, cx);
+                    });
+                }
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
+                        workspace.show_toast(
+                            crate::merge_review::merge_review_toast(
+                                "Formatting merge commit message — agent will add Merge commit message: line.",
+                            ),
+                            cx,
+                        );
+                    });
+                }
+            }
+            crate::merge_review::MergeReviewCaptureOnStop::CommitMessageCaptureAbandoned => {
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
+                        workspace.show_toast(
+                            crate::merge_review::merge_review_toast(
+                                "Could not capture merge commit message — click Draft commit message to retry.",
+                            ),
+                            cx,
+                        );
+                    });
+                }
+            }
+            crate::merge_review::MergeReviewCaptureOnStop::Abandoned(path) => {
+                use git_ui::project_diff::ReviewDiff;
+
+                if let Some(workspace) = self.workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
+                        workspace.show_toast(
+                            crate::merge_review::merge_review_toast(format!(
+                                "Could not capture {path} — click Review Diff to retry."
+                            ))
+                            .on_click("Review Diff", move |_, cx| {
+                                cx.dispatch_action(ReviewDiff.boxed_clone().as_ref());
+                            }),
+                            cx,
+                        );
+                    });
+                }
+            }
+        }
+    }
+
     fn handle_thread_event(
         &mut self,
         thread: &Entity<AcpThread>,
@@ -1532,6 +1683,40 @@ impl ConversationView {
                     active.update(cx, |active, cx| {
                         active.auto_expand_streaming_thought(cx);
                     });
+                }
+                if !is_subagent && crate::merge_review::merge_review_workflow_engaged(cx) {
+                    let tool_completion = thread.read(cx).entries().get(*index).and_then(|entry| {
+                        let acp_thread::AgentThreadEntry::ToolCall(tool_call) = entry else {
+                            return None;
+                        };
+                        if !matches!(tool_call.status, acp_thread::ToolCallStatus::Completed) {
+                            return None;
+                        }
+                        let tool_name = tool_call.tool_name.as_ref()?.to_string();
+                        let raw_input = tool_call.raw_input.clone()?;
+                        Some((tool_name, raw_input))
+                    });
+                    if let Some((tool_name, raw_input)) = tool_completion {
+                        let decision_path =
+                            crate::merge_review::handle_merge_review_tool_completion(
+                                tool_name.as_str(),
+                                &raw_input,
+                                cx,
+                            );
+                        if let Some(workspace) = self.workspace.upgrade() {
+                            workspace.update(cx, |workspace, cx| {
+                                crate::merge_review::maybe_sync_merge_review_todos_from_active_thread(
+                                    workspace, cx,
+                                );
+                                if let Some(path) = decision_path {
+                                    crate::merge_review::install_merge_review_conflict_todos_for_path(
+                                        workspace, window, cx, &path,
+                                    );
+                                }
+                                crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
+                            });
+                        }
+                    }
                 }
             }
             AcpThreadEvent::EntriesRemoved(range) => {
@@ -1599,90 +1784,28 @@ impl ConversationView {
                             _ => None,
                         });
                 let end_turn = matches!(stop_reason, acp::StopReason::EndTurn);
-                match crate::merge_review::handle_merge_review_reply_on_stop(
+                if let Some(capture_result) = crate::merge_review::handle_merge_review_reply_on_stop(
                     reply_text.as_deref(),
                     end_turn,
                     cx,
                 ) {
-                    Some(crate::merge_review::MergeReviewCaptureOnStop::Captured(
-                        captured_path,
-                    )) => {
-                        log::info!(
-                            "surmount merge review: captured Summary from agent reply (file={captured_path})"
-                        );
-                        if let Some(workspace) = self.workspace.upgrade() {
-                            workspace.update(cx, |workspace, cx| {
-                                let advanced =
-                                    crate::merge_review::advance_merge_review_to_next_file(
-                                        workspace, window, cx,
-                                    );
-                                crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
-                                workspace.show_toast(
-                                    crate::merge_review::merge_review_summary_capture_toast(
-                                        &captured_path,
-                                        advanced,
-                                        cx,
-                                    ),
-                                    cx,
-                                );
-                            });
-                        }
-                    }
-                    Some(crate::merge_review::MergeReviewCaptureOnStop::FormatRetryRequested {
-                        path,
-                        prompt,
-                    }) => {
-                        log::info!(
-                            "surmount merge review: requesting Summary/Outcome format retry for {path}"
-                        );
-                        if let Some(active) = self.thread_view(&session_id) {
-                            active.update(cx, |view, cx| {
-                                view.message_editor.update(cx, |editor, cx| {
-                                    editor.set_message(
-                                        vec![acp::ContentBlock::Text(acp::TextContent::new(
-                                            prompt,
-                                        ))],
+                    let session_id = session_id.clone();
+                    let conversation_weak = cx.weak_entity();
+                    window
+                        .spawn(cx, async move |cx| {
+                            conversation_weak
+                                .update_in(cx, |conversation, window, cx| {
+                                    conversation.dispatch_merge_review_capture_on_stop(
+                                        capture_result,
+                                        &session_id,
                                         window,
                                         cx,
                                     );
-                                });
-                                view.send(window, cx);
-                            });
-                        }
-                        if let Some(workspace) = self.workspace.upgrade() {
-                            workspace.update(cx, |workspace, cx| {
-                                crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
-                                workspace.show_toast(
-                                    crate::merge_review::merge_review_toast(format!(
-                                        "Formatting {path} — agent will add Summary: and Outcome: lines."
-                                    )),
-                                    cx,
-                                );
-                            });
-                        }
-                    }
-                    Some(crate::merge_review::MergeReviewCaptureOnStop::Abandoned(path)) => {
-                        use git_ui::project_diff::ReviewDiff;
-
-                        if let Some(workspace) = self.workspace.upgrade() {
-                            workspace.update(cx, |workspace, cx| {
-                                crate::merge_review::notify_merge_review_ui_changed(workspace, cx);
-                                workspace.show_toast(
-                                    crate::merge_review::merge_review_toast(format!(
-                                        "Could not capture {path} — click Review Diff to retry."
-                                    ))
-                                    .on_click(
-                                        "Review Diff",
-                                        move |_, cx| {
-                                            cx.dispatch_action(ReviewDiff.boxed_clone().as_ref());
-                                        },
-                                    ),
-                                    cx,
-                                );
-                            });
-                        }
-                    }
-                    None => {}
+                                })
+                                .log_err();
+                            anyhow::Ok(())
+                        })
+                        .detach();
                 }
 
                 let should_send_queued = if let Some(active) = self.root_thread_view() {

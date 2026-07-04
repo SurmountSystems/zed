@@ -74,7 +74,7 @@ The **human queue** for merge review is: **open Plan Todos for this merge sessio
 
 ### 1. Plan
 
-You run `git fetch` and `git merge origin/main`.
+**Start Merge Review** runs `git fetch origin` automatically. You run `git merge origin/main` when ready (merge stays human-gated).
 
 Triage lists changed paths (read-only git). The agent produces a **review plan**: order of SURMOUNT sections, conflicts first, clusters of related files. The plan is a guide, not the product — the product is **understood diffs**.
 
@@ -89,7 +89,7 @@ For each file (or when you open it), you see:
 1. **The diff** — for conflicts, **split view** (fork left, upstream right).
 2. **A summary panel** (or thread message): what changed, fork vs upstream, ties to earlier reviews, `Outcome:` line, confidence.
 3. **Row hints**: SURMOUNT section, reviewed or not, uncertain or auto-cleared.
-4. **Conflict resolution** (after summary): colored **Keep fork** / **Take upstream** toolbar buttons (`git checkout --ours/--theirs` + `git add`), or agent `resolve_merge_conflict`. Manual marker stripping is only for true synthesis.
+4. **Conflict resolution** (after summary, only while `MERGE_HEAD` is present): **Keep fork** / **Take upstream** workflow buttons (`git checkout --ours/--theirs` + `git add`), or agent `resolve_merge_conflict`. Manual marker stripping is only for true synthesis. Before merge starts, resolve buttons are hidden.
 
 You can accept the summary, correct it, or open the agent on the hunk. Corrections **update the running explanation** so the next file in that section is cheaper.
 
@@ -151,7 +151,13 @@ If prose is drafted but a doc gap remains, a `TODO:` in that paragraph is fine �
 
 ## Branch Diff UI (minimal)
 
-**Step rail** (Branch Diff toolbar while merge review workflow is engaged): always shows `reviewed/N`, **Next file →**, **Review Diff**, conflict buttons when applicable, and **End merge review**. Exactly one button is tinted (primary) for the obvious next action — never a dead toolbar state.
+**Step rail** (Branch Diff toolbar while merge review workflow is engaged): always shows `reviewed/N`, **Next file →**, **Review Diff**, conflict buttons when applicable, and **End merge review**. Workflow controls use a literal **`#0f0` 1px square green border** (dark-mode first — not theme accent tokens). Exactly one button is primary for the obvious next action — never a dead toolbar state.
+
+**Note popover:** Agent-facing rail actions (**Review Diff**, **Discuss conflict**, **Synthesize**, **Keep fork** / **Take upstream** / **Synthesize** record, **Send Review to Agent**, **Draft section**) open a square modal with optional direction text before the turn is sent. Empty note + **Continue** is fine.
+
+**Gated merge modal (PreMerge):** While `MERGE_HEAD` is absent, the step rail offers **Preview merge** (palette: **Preview Merge Review Merge**). A square `#0f0` modal runs `git merge-tree` async, shows conflict count + summary + scrollable preview (truncates very long output; full output logged). Buttons: **Cancel**, **Copy merge command** (`git merge origin/main`), **I've started the merge** (refreshes session git state). Zed never runs `git merge` — human does.
+
+**Commit message modal (AllComplete):** When all files are summarized, the rail offers **Draft commit message** (palette: **Draft Merge Review Commit Message**). Agent drafts from `running_notes`, `patterns`, and conflict decisions; a square `#0f0` modal shows an editable multiline field with **Copy message** + **Done**. Draft is stored on the session (`pending_merge_commit_message`); human still runs `git commit`.
 
 | State | Step rail primary | Agent panel toolbar |
 |-------|-------------------|---------------------|
@@ -159,8 +165,13 @@ If prose is drafted but a doc gap remains, a `TODO:` in that paragraph is fine �
 | Review ready | **Review Diff** (green) | snippet + `?` only after summarize |
 | Summarizing | **Summarizing…** (accent, disabled) | agent panel shows file prompt |
 | Summarized | **Next file →** | snippet + `?` |
-| Conflict resolve | **Keep fork** or **Take upstream** | snippet + `?` |
-| All complete | **End merge review** (red) | — |
+| Conflict summarized + markers | **Discuss conflict** | 3 embeds, Q&A |
+| Human chose synthesis | **Synthesize** | `edit_file` merge, not marker strip |
+| Markers cleared | **Keep fork** / **Take upstream** / **Synthesize** (record) | GUI buttons store decision + rationale; agent `merge_review_record_decision` is optional |
+| Decision stored | **Complete tests** | `todo_write` × 3 (auto-posted) |
+| Todos done | **Next file →** | gate passes |
+| All complete | **Draft commit message** + **End merge review** (red) | commit message modal |
+| PreMerge (no `MERGE_HEAD`) | **Preview merge** (alongside normal rail) | gated merge-tree modal |
 
 - **Start:** palette **Start Merge Review** or Branch Diff **Merge review** (accent; hidden while a session is already active).
 - **Summary toast:** `Saved path (N/M).` with embedded click action (**Review Diff**, **Next file →**, conflict button, or **End**).
@@ -168,11 +179,19 @@ If prose is drafted but a doc gap remains, a `TODO:` in that paragraph is fine �
 
 ## Build order
 
-**Done:** TOML mapping; triage script; session storage; Review Diff + session memory; Start/Resume/End workflow; auto-capture `Summary:` / `Pattern:` / `Outcome:`; `patterns` + `categories_completed` on capture; minimal toolbar + headers above; prototype tab stays closed; Grok immersive suppression during merge review; dock restore on End; conflict split diff + colored **Keep fork** / **Take upstream** toolbar buttons; agent `resolve_merge_conflict` ACP tool (git checkout, not marker stripping).
+**Done:** TOML mapping; triage script; session storage; Review Diff + session memory; Start/Resume/End workflow; auto-capture `Summary:` / `Pattern:` / `Outcome:`; `patterns` + `categories_completed` on capture; minimal toolbar + headers above; prototype tab stays closed; Grok immersive suppression during merge review; dock restore on End; conflict split diff + `#0f0` workflow rail; agent `resolve_merge_conflict` ACP tool (git checkout, not marker stripping); Branch Diff ↔ session path bridging (`item_for_branch_diff_path`); session completion via `review_state` (not prototype verdict); Plan Todo request on `OpenQuestion` capture; palette **Draft Merge Review Section**; dotted-path regression tests; conflict workshop (3-way embeds, Discuss/Synthesize/Record/Complete tests rail); `merge_review_conflict_sides` / `merge_review_record_decision` / `merge_review_verify_conflict_resolved` ACP tools; GUI decision buttons + native Plan Todo install + advance gates; `MERGE_REVIEW_CONFLICT_TURN_MARKER`; toolbar conflict context card; prior-section decision hints; **Send Review to Agent** wired during merge review; auto `git fetch origin` on Start; git mode (`PreMerge` / `MergeInProgress`) + unmerged count; session git refresh on Resume and after resolve; note popover before agent-facing rail actions; **gated merge modal** (`git merge-tree` preview, copy command, reconcile git state); **commit message draft modal** (agent prompt + editable copy field, session `pending_merge_commit_message`).
 
-**Next:** Manual verify on a real conflicted merge (Review Diff → Outcome → colored buttons or tool).
+**Next:** Manual verify on a real conflicted merge (7-step checklist):
 
-**Then:** Auto-apply high-confidence outcomes; section-level SURMOUNT.md draft; Plan Todo ↔ session sync.
+1. Start merge review on real `git merge origin/main` with ≥1 conflict
+2. Review Diff → summary captured
+3. Discuss conflict → agent asks clarifying Q
+4. Keep fork / Take upstream **or** Synthesize
+5. Record decision → session shows rationale
+6. Three Plan Todos appear and can be completed
+7. Next file → advances; End merge review restores docks
+
+**Then:** Auto-apply high-confidence outcomes (opt-in, not implemented).
 
 ## Requirements → tests (red/green)
 
@@ -206,15 +225,42 @@ CARGO_TERM_QUIET=true cargo nextest run -p agent_ui -p git_ui -p project -p git 
 | Grok reassert blocked during session | `test_merge_review_blocks_grok_reassert_after_workflow` |
 | End restores collapsed docks + clears session | `test_merge_review_end_restores_collapsed_docks` |
 | Triage script ↔ Rust paths | `triage_script_matches_load_session_paths` |
+| Dotted Branch Diff path ↔ session item | `item_for_branch_diff_path_resolves_dotted_session_paths` |
+| Next file queue with undotted current path | `next_merge_review_file_path_resolves_canonical_current_path` |
+| End rail when all summarized | `test_merge_review_session_complete_offers_end_rail` |
+| Conflict controls with dotted session path | `merge_review_branch_diff_controls_resolves_dotted_paths` |
+| `Outcome: needs_human` → open question | `capture_summary_marks_open_question_on_needs_human_outcome` |
+| Section draft prompt | `merge_review_section_draft_prompt_includes_section_summaries` |
+| Plan Todo prompt template | `merge_review_open_question_todo_prompt_includes_path_and_section` |
+| Record decision tool input | `merge_review_record_decision_tool_input_deserializes` (agent) |
+| Verify conflict resolved | `merge_review_verify_conflict_resolved_json_reports_cleared_file` (agent) |
+| Decision stored via tool bridge | `apply_record_decision_tool_input_stores_on_session_item` |
+| Tool completion records decision | `handle_merge_review_tool_completion_records_decision` |
+| Todo completion sync | `sync_conflict_todo_completion_marks_complete_when_three_todos_done` |
+| Advance blocked on open todos | `conflict_file_ready_for_advance_blocks_open_todos` |
+| Advance allowed when complete | `conflict_file_ready_for_advance_allows_when_complete` |
+| Prior section decisions in prompt | `merge_review_conflict_file_prompt_includes_prior_section_decisions` |
+| RecordDecision workshop phase | `conflict_workshop_phase_record_decision_when_markers_cleared` |
+| CompleteTests workshop phase | `conflict_workshop_phase_complete_tests_when_decision_no_todos_done` |
+| Conflict scoped turn after kickback | `test_merge_review_conflict_turn_stays_scoped_after_kickback` (acp_thread) |
+| SendReviewToAgent prompt | `merge_review_send_review_comments_prompt_includes_comments` |
+| Pending-scroll navigation in Branch Diff | `git_panel` untracked `move_to_repo_relative_path` test |
+| Merge-tree preview parsing | `parse_merge_tree_preview_counts_conflicts_and_truncates` |
+| Commit message prompt | `merge_review_commit_message_prompt_includes_session_memory` |
+| PreMerge Preview merge rail | `workflow_button_specs_includes_preview_merge_in_pre_merge` |
+| AllComplete commit draft rail | `workflow_button_specs_includes_draft_commit_on_all_complete` |
+| Commit message capture | `try_capture_merge_review_commit_message_from_reply_stores_draft` |
+| Commit message format retry | `handle_merge_review_reply_on_stop_commit_message_format_retry` |
+| Commit message abandon + clear | `handle_merge_review_reply_on_stop_commit_message_abandons_on_failure`, `clear_pending_merge_commit_message_capture_clears_stuck_flag` |
 
-## Still to decide
+## Locked decisions
 
-- **Summary granularity** — one summary per file vs per conflict hunk vs per logical edit in large files.
-- **Where summaries live** — beside diff, agent thread only, or both synced.
-- **Confidence thresholds** — when auto-clear is allowed without human (policy + tests).
-- **Batch summarize** — agent summarizes next 10 files using memory before human opens any (faster shrink of uncertain set).
-- **Fate of the prototype tab** — summary dashboard (“12 explained, 3 Plan Todos open”) vs delete.
-- **Todo shape** — one todo per file vs per hunk vs per SURMOUNT section cluster.
+- **Summary granularity:** per file (current).
+- **Where summaries live:** Branch Diff header snippet + session `running_notes` + agent thread.
+- **Auto-apply outcomes:** not in this release — human or `resolve_merge_conflict` only.
+- **Batch summarize:** skill-only — agent may call `merge_review_diff` on next paths in the same section using session memory; user still confirms via Review Diff capture.
+- **Prototype tab:** stays closed; verdict-based completion removed from Branch Diff workflow.
+- **Plan Todo shape:** one todo per open-question file, title `Merge: <path>`.
 
 ## Pointers
 

@@ -41,7 +41,6 @@ pub struct XAiLanguageModelProvider {
 pub struct State {
     api_key_state: ApiKeyState,
     session_token: Option<String>,
-    refresh_token: Option<String>,
     credentials_provider: Arc<dyn CredentialsProvider>,
 }
 
@@ -68,17 +67,6 @@ impl State {
             credentials_provider,
             cx,
         )
-    }
-
-    fn set_session_tokens(
-        &mut self,
-        session_token: Option<String>,
-        refresh_token: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.session_token = session_token;
-        self.refresh_token = refresh_token;
-        cx.notify();
     }
 
     fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
@@ -118,7 +106,6 @@ impl XAiLanguageModelProvider {
             State {
                 api_key_state: ApiKeyState::new(Self::api_url(cx), (*API_KEY_ENV_VAR).clone()),
                 session_token: None,
-                refresh_token: None,
                 credentials_provider,
             }
         });
