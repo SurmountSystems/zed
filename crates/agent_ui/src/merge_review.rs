@@ -4,25 +4,25 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result};
 use collections::HashMap;
+use editor::Editor;
 use git::commit::parse_git_diff_name_status;
 use git_ui::project_diff::ProjectDiff;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use gpui::{
-    Action, App, AsyncApp, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, Render, ScrollHandle, SharedString, WeakEntity, Window,
+    Action, App, AsyncApp, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, Render, ScrollHandle, SharedString, WeakEntity, Window,
 };
-use editor::Editor;
 use project::{Project, git_store::Repository};
 use serde::{Deserialize, Serialize};
 use ui::{
     Button, ButtonStyle, Color, Icon, IconButton, IconName, IconSize, Label, Tooltip,
     WithScrollbar, prelude::*,
 };
-use util::ResultExt as _;
 use ui_input::InputField;
+use util::ResultExt as _;
 use workspace::{
-    Item, ItemHandle, ModalView, Panel, Toast, ToolbarItemEvent,
-    ToolbarItemLocation, ToolbarItemView, Workspace,
+    Item, ItemHandle, ModalView, Panel, Toast, ToolbarItemEvent, ToolbarItemLocation,
+    ToolbarItemView, Workspace,
     dock::{DockPosition, PanelEvent},
     item::{ItemBufferKind, ItemEvent},
     notifications::{NotificationId, NotifyTaskExt},
@@ -48,16 +48,18 @@ pub const MANIFEST_FILE: &str = "surmount-merge-categories.toml";
 pub const SESSION_STORAGE_KEY: &[u8] = b"surmount_merge_review_session";
 const CLARIFYING_NOTE_KEY: &[u8] = b"surmount_merge_review_clarifying_note";
 pub(crate) const MERGE_REVIEW_READY_TOAST: &str =
-    "Step 1: click a changed file in the list. Step 2: click the green Review Diff button.";
-pub(crate) const MERGE_REVIEW_STEP_PICK_FILE: &str = "Step 1 · Pick a file in the list";
-pub(crate) const MERGE_REVIEW_STEP_REVIEW_READY: &str =
-    "Step 2 · Click Review Diff to summarize this file";
-pub(crate) const MERGE_REVIEW_STEP_SUMMARIZING: &str = "Step 2 · Agent summarizing this file…";
-pub(crate) const MERGE_REVIEW_STEP_FILE_DONE: &str = "Step 3 · Pick next file in the list";
-pub(crate) const MERGE_REVIEW_STEP_CONFLICT_RESOLVE: &str =
-    "Step 4 · Apply resolution (colored buttons)";
-pub(crate) const MERGE_REVIEW_STEP_CONFLICT_REVIEW: &str =
-    "Step 2 · Review Diff — compare fork (left) vs upstream (right)";
+    "Merge review ready — click **Preview merge** when you are ready to run `git merge`.";
+pub(crate) const MERGE_REVIEW_STEP_PREPARE: &str = "Prepare";
+pub(crate) const MERGE_REVIEW_STEP_REVIEW_READY: &str = "Review Diff";
+pub(crate) const MERGE_REVIEW_STEP_SUMMARIZING: &str = "Summarizing…";
+pub(crate) const MERGE_REVIEW_STEP_NEXT_FILE: &str = "Next file";
+pub(crate) const MERGE_REVIEW_STEP_CONFLICT_RESOLVE: &str = "Resolve conflict";
+pub(crate) const MERGE_REVIEW_STEP_CONFLICT_REVIEW: &str = "Summarize this conflict";
+/// Shown when all conflicts are resolved but non-conflict changed files remain unreviewed.
+pub(crate) const MERGE_REVIEW_STEP_CONFLICT_CLEANUP: &str =
+    "Conflicts resolved — review remaining files";
+pub(crate) const MERGE_REVIEW_OUT_OF_ORDER_TOAST_SUFFIX: &str =
+    " — click **Next file →** to advance";
 pub(crate) const MERGE_REVIEW_BRANCH_DIFF_BUTTON: &str = "Merge review";
 pub(crate) const MERGE_REVIEW_END_BRANCH_DIFF_BUTTON: &str = "End merge review";
 pub(crate) const MERGE_REVIEW_ENDED_TOAST: &str = "Merge review ended.";
@@ -269,6 +271,9 @@ pub struct MergeReviewSession {
     pub pending_merge_commit_message_capture: bool,
     #[serde(default)]
     pub pending_merge_commit_message_format_retries: u8,
+    /// Linear queue position while merge is in progress; `None` in PreMerge or legacy sessions.
+    #[serde(default)]
+    pub queue_cursor_path: Option<String>,
 }
 
 pub fn clarifying_note_pending(cx: &App) -> bool {
@@ -291,37 +296,21 @@ pub fn take_merge_review_clarifying_note(cx: &mut App) -> Option<String> {
     let json = crate::thread_metadata_store::ThreadMetadataStore::global(cx)
         .read(cx)
         .load_global_json(CLARIFYING_NOTE_KEY)?;
-    crate::thread_metadata_store::ThreadMetadataStore::global(cx)
-        .update(cx, |store, _| {
-            store.delete_global(CLARIFYING_NOTE_KEY).log_err();
-        });
+    crate::thread_metadata_store::ThreadMetadataStore::global(cx).update(cx, |store, _| {
+        store.delete_global(CLARIFYING_NOTE_KEY).log_err();
+    });
     serde_json::from_str(&json).ok().flatten()
 }
 
 pub fn intercept_review_branch_diff_note_modal(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-    diff_text: &str,
-    base_ref: &str,
-    file_path: Option<&str>,
+    _workspace: &mut Workspace,
+    _window: &mut Window,
+    _cx: &mut Context<Workspace>,
+    _diff_text: &str,
+    _base_ref: &str,
+    _file_path: Option<&str>,
 ) -> bool {
-    if !merge_review_workflow_engaged(cx) || clarifying_note_pending(cx) {
-        return false;
-    }
-    open_merge_review_note_modal(
-        workspace,
-        window,
-        cx,
-        "Review Diff",
-        "What should the summary emphasize?",
-        MergeReviewNoteContinuation::ReviewBranchDiff {
-            diff_text: diff_text.into(),
-            base_ref: base_ref.into(),
-            file_path: file_path.map(Into::into),
-        },
-    );
-    true
+    false
 }
 
 pub fn merge_review_append_user_note(prompt: String, user_note: Option<&str>) -> String {
@@ -331,9 +320,16 @@ pub fn merge_review_append_user_note(prompt: String, user_note: Option<&str>) ->
     format!("Human direction:\n{note}\n\n{prompt}")
 }
 
-pub async fn detect_merge_review_git_mode(worktree_root: &Path) -> git_ui::project_diff::MergeReviewGitMode {
+pub async fn detect_merge_review_git_mode(
+    worktree_root: &Path,
+) -> git_ui::project_diff::MergeReviewGitMode {
     use git_ui::project_diff::MergeReviewGitMode;
-    match run_git(worktree_root, &["rev-parse", "-q", "--verify", "MERGE_HEAD"]).await {
+    match run_git(
+        worktree_root,
+        &["rev-parse", "-q", "--verify", "MERGE_HEAD"],
+    )
+    .await
+    {
         Ok(_) => MergeReviewGitMode::MergeInProgress,
         Err(_) => MergeReviewGitMode::PreMerge,
     }
@@ -378,10 +374,7 @@ pub async fn refresh_merge_review_git_state(
     Ok(())
 }
 
-pub fn spawn_refresh_merge_review_git_state(
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
+pub fn spawn_refresh_merge_review_git_state(window: &mut Window, cx: &mut Context<Workspace>) {
     let Some(worktree_root) = load_session(cx)
         .and_then(|session| session.worktree_root)
         .map(PathBuf::from)
@@ -396,13 +389,44 @@ pub fn spawn_refresh_merge_review_git_state(
                 .ok()
                 .flatten()
                 .context("merge review session missing during git refresh")?;
+            let prev_mode = session.git_mode;
+            let prev_unmerged = session.unmerged_count;
+            let upstream_ref = session.upstream_ref.clone();
             refresh_merge_review_git_state(&mut session, worktree_root.as_path())
                 .await
                 .log_err();
+            reconcile_merge_review_queue_cursor(&mut session);
+            let merge_started = merge_review_merge_started(prev_mode, prev_unmerged, &session);
+            let auto_select = if merge_started {
+                initialize_merge_review_queue_cursor(&mut session);
+                session
+                    .queue_cursor_path
+                    .clone()
+                    .map(|path| (session.unmerged_count, path))
+            } else {
+                None
+            };
             workspace_weak
-                .update(cx, |workspace, cx| {
+                .update_in(cx, |workspace, window, cx| {
                     save_session(cx, &session).log_err();
                     notify_merge_review_ui_changed(workspace, cx);
+                    if let Some((conflict_count, start_path)) = auto_select {
+                        spawn_select_merge_review_queue_file_when_ready(
+                            workspace_weak.clone(),
+                            upstream_ref,
+                            conflict_count,
+                            start_path,
+                            window,
+                            cx,
+                        );
+                    } else {
+                        workspace.show_toast(
+                            merge_review_toast(
+                                "Refreshed merge review git state — continue when `git merge` is in progress.",
+                            ),
+                            cx,
+                        );
+                    }
                 })
                 .ok();
             anyhow::Ok(())
@@ -466,8 +490,7 @@ pub fn parse_merge_tree_preview(raw: &str) -> MergeTreePreview {
              {removed_count} remove(s)."
         )
     };
-    let (display_text, truncated) =
-        truncate_merge_tree_preview(raw, MERGE_TREE_PREVIEW_MAX_CHARS);
+    let (display_text, truncated) = truncate_merge_tree_preview(raw, MERGE_TREE_PREVIEW_MAX_CHARS);
     MergeTreePreview {
         conflict_count,
         merged_count,
@@ -514,7 +537,11 @@ pub struct MergeReviewGatedMergeModal {
 }
 
 impl MergeReviewGatedMergeModal {
-    fn new_loading(upstream_ref: SharedString, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+    fn new_loading(
+        upstream_ref: SharedString,
+        workspace: WeakEntity<Workspace>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             merge_command: merge_review_merge_command(upstream_ref.as_ref()).into(),
             upstream_ref,
@@ -554,14 +581,8 @@ impl MergeReviewGatedMergeModal {
         cx.emit(DismissEvent);
         cx.spawn(async move |_, cx| {
             workspace
-                .update_in(cx, |workspace, window, cx| {
+                .update_in(cx, |_, window, cx| {
                     spawn_refresh_merge_review_git_state(window, cx);
-                    workspace.show_toast(
-                        merge_review_toast(
-                            "Refreshed merge review git state — continue when `git merge` is in progress.",
-                        ),
-                        cx,
-                    );
                 })
                 .ok();
         })
@@ -961,10 +982,7 @@ impl Render for MergeReviewCommitMessageModal {
                             .p_2()
                             .border_b_1()
                             .border_color(green)
-                            .child(
-                                Label::new("Merge commit message draft")
-                                    .color(Color::Default),
-                            ),
+                            .child(Label::new("Merge commit message draft").color(Color::Default)),
                     )
                     .child(
                         div()
@@ -1168,13 +1186,17 @@ pub fn open_merge_review_commit_message_modal(
         return;
     };
     let mut initial_draft = session.pending_merge_commit_message.clone();
-    let mut waiting_for_draft = initial_draft.is_none() && session.pending_merge_commit_message_capture;
+    let mut waiting_for_draft =
+        initial_draft.is_none() && session.pending_merge_commit_message_capture;
     if initial_draft.is_none() && !session.pending_merge_commit_message_capture {
         request_merge_review_commit_message_draft(workspace, window, cx);
         waiting_for_draft = true;
     }
     if let Some(session) = load_session(cx) {
-        initial_draft = session.pending_merge_commit_message.clone().or(initial_draft);
+        initial_draft = session
+            .pending_merge_commit_message
+            .clone()
+            .or(initial_draft);
         if initial_draft.is_none() {
             waiting_for_draft = session.pending_merge_commit_message_capture;
         }
@@ -1251,9 +1273,7 @@ impl MergeReviewNoteModal {
         cx.spawn(async move |_, cx| {
             workspace
                 .update_in(cx, |workspace, window, cx| {
-                    run_merge_review_note_continuation(
-                        workspace, window, cx, continuation, note,
-                    );
+                    run_merge_review_note_continuation(workspace, window, cx, continuation, note);
                 })
                 .ok();
         })
@@ -1704,14 +1724,18 @@ fn reveal_branch_diff_for_merge_review(
     true
 }
 
-fn select_first_merge_review_file(
+fn select_merge_review_queue_cursor_file(
     workspace: &mut Workspace,
     session: &MergeReviewSession,
     upstream_ref: &str,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> bool {
-    let Some(first_path) = session.items.first().map(|item| item.path.as_str()) else {
+    let first_path = session
+        .queue_cursor_path
+        .clone()
+        .or_else(|| first_unreviewed_merge_review_queue_path(session));
+    let Some(first_path) = first_path.as_deref() else {
         return false;
     };
     let Some(diff) = workspace.items_of_type::<ProjectDiff>(cx).find(|item| {
@@ -1727,10 +1751,71 @@ fn select_first_merge_review_file(
     });
     if selected {
         prepare_merge_review_selected_file(&diff, first_path, window, cx);
-        log::info!("surmount merge review: selected first file {first_path}");
+        log::info!("surmount merge review: selected queue file {first_path}");
         workspace.focus_center_pane(window, cx);
     }
     selected
+}
+
+fn spawn_select_merge_review_queue_file_when_ready(
+    workspace_weak: WeakEntity<Workspace>,
+    upstream_ref: String,
+    conflict_count: u32,
+    start_path: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    window
+        .spawn(cx, async move |cx| {
+            use std::time::Duration;
+
+            // Fallback poll when Branch Diff is not ready yet. No clean readiness event on
+            // ProjectDiff today — see review Issue 12 (wontfix until a hook exists).
+            const MAX_SELECT_ATTEMPTS: u32 = 24;
+            for attempt in 0..MAX_SELECT_ATTEMPTS {
+                if attempt > 0 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                }
+                let Some(workspace) = workspace_weak.upgrade() else {
+                    break;
+                };
+                let selected = workspace
+                    .update_in(cx, |workspace, window, cx| {
+                        let Some(session) = load_session(cx) else {
+                            return false;
+                        };
+                        select_merge_review_queue_cursor_file(
+                            workspace,
+                            &session,
+                            &upstream_ref,
+                            window,
+                            cx,
+                        )
+                    })
+                    .ok()
+                    .unwrap_or(false);
+                if selected {
+                    let Some(workspace) = workspace_weak.upgrade() else {
+                        break;
+                    };
+                    workspace.update_in(cx, |workspace, _window, cx| {
+                        let toast = if conflict_count > 0 {
+                            format!(
+                                "Merge in progress · {conflict_count} conflicts — starting with {start_path}"
+                            )
+                        } else {
+                            format!("Merge in progress — starting with {start_path}")
+                        };
+                        workspace.show_toast(merge_review_toast(toast), cx);
+                    })?;
+                    break;
+                }
+            }
+            anyhow::Ok(())
+        })
+        .detach();
 }
 
 fn prepare_merge_review_selected_file(
@@ -1740,9 +1825,7 @@ fn prepare_merge_review_selected_file(
     cx: &mut Context<Workspace>,
 ) {
     let is_conflict = load_session(cx)
-        .and_then(|session| {
-            item_for_branch_diff_path(&session, path).map(|item| item.disposition)
-        })
+        .and_then(|session| item_for_branch_diff_path(&session, path).map(|item| item.disposition))
         .is_some_and(|disposition| disposition == ReviewDisposition::Conflict);
     if is_conflict {
         diff.update(cx, |diff, cx| {
@@ -1891,7 +1974,13 @@ pub fn build_session(
             item
         })
         .collect::<Vec<_>>();
-    items.sort_by(|left, right| left.path.cmp(&right.path));
+    items.sort_by(|left, right| {
+        let left_conflict = left.disposition == ReviewDisposition::Conflict;
+        let right_conflict = right.disposition == ReviewDisposition::Conflict;
+        right_conflict
+            .cmp(&left_conflict)
+            .then_with(|| left.path.cmp(&right.path))
+    });
     MergeReviewSession {
         merge_base,
         upstream_ref,
@@ -1915,6 +2004,7 @@ pub fn build_session(
         pending_merge_commit_message: None,
         pending_merge_commit_message_capture: false,
         pending_merge_commit_message_format_retries: 0,
+        queue_cursor_path: None,
     }
 }
 
@@ -1999,10 +2089,8 @@ pub fn session_path_for_branch_diff(
     session: &MergeReviewSession,
     branch_diff_path: &str,
 ) -> Option<String> {
-    canonical_merge_review_path(session, branch_diff_path).or_else(|| {
-        item_for_path(session, branch_diff_path)
-            .map(|item| item.path.clone())
-    })
+    canonical_merge_review_path(session, branch_diff_path)
+        .or_else(|| item_for_path(session, branch_diff_path).map(|item| item.path.clone()))
 }
 
 pub fn session_summarized_complete(session: &MergeReviewSession) -> bool {
@@ -2049,8 +2137,8 @@ pub fn store_file_summary(
     summary: String,
     open_question: bool,
 ) -> Result<()> {
-    let normalized = session_path_for_branch_diff(session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let normalized =
+        session_path_for_branch_diff(session, path).unwrap_or_else(|| path.replace('\\', "/"));
     let item = session
         .items
         .iter_mut()
@@ -2219,9 +2307,9 @@ pub fn handle_merge_review_reply_on_stop(
                         session.pending_merge_commit_message_format_retries += 1;
                         save_session(cx, &session).log_err();
                         let prompt = merge_review_commit_message_format_retry_prompt();
-                        return Some(MergeReviewCaptureOnStop::CommitMessageFormatRetryRequested {
-                            prompt,
-                        });
+                        return Some(
+                            MergeReviewCaptureOnStop::CommitMessageFormatRetryRequested { prompt },
+                        );
                     }
                 }
             }
@@ -2304,14 +2392,15 @@ fn parse_suggested_outcome_from_summary(summary: &str) -> Option<MergeReviewSugg
 }
 
 pub fn extract_decision_outcome_from_reply(text: &str) -> Option<MergeReviewSuggestedOutcome> {
-    text.lines().find_map(|line| {
-        let trimmed = line.trim();
-        trimmed
-            .strip_prefix("Decision:")
-            .or_else(|| trimmed.strip_prefix("decision:"))
-            .map(str::trim)
-    })
-    .and_then(parse_suggested_outcome_label)
+    text.lines()
+        .find_map(|line| {
+            let trimmed = line.trim();
+            trimmed
+                .strip_prefix("Decision:")
+                .or_else(|| trimmed.strip_prefix("decision:"))
+                .map(str::trim)
+        })
+        .and_then(parse_suggested_outcome_label)
 }
 
 pub fn extract_rationale_from_reply(text: &str) -> Option<String> {
@@ -2410,9 +2499,8 @@ pub fn branch_diff_review_prompt(
         return Some(surmount_merge_review_prompt(base_ref, None));
     };
     let item = item_for_branch_diff_path(&session, file_path)?;
-    let prompt_path = session_path_for_branch_diff(&session, file_path).unwrap_or_else(|| {
-        file_path.replace('\\', "/")
-    });
+    let prompt_path = session_path_for_branch_diff(&session, file_path)
+        .unwrap_or_else(|| file_path.replace('\\', "/"));
     if item.disposition == ReviewDisposition::Conflict {
         Some(merge_review_conflict_file_prompt(
             &session,
@@ -2518,10 +2606,7 @@ pub fn merge_review_conflict_review_content_blocks(
     ]
 }
 
-pub fn worktree_root_for_merge_review(
-    project: &Entity<Project>,
-    cx: &App,
-) -> Option<PathBuf> {
+pub fn worktree_root_for_merge_review(project: &Entity<Project>, cx: &App) -> Option<PathBuf> {
     let root = surmount_repository(project, cx)
         .or_else(|| project.read(cx).active_repository(cx))?
         .read(cx)
@@ -2557,8 +2642,8 @@ pub fn conflict_workshop_phase_for_item(
     if item.disposition != ReviewDisposition::Conflict {
         return None;
     }
-    let canonical = session_path_for_branch_diff(session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let canonical =
+        session_path_for_branch_diff(session, path).unwrap_or_else(|| path.replace('\\', "/"));
     if session.pending_conflict_discuss_path.as_deref() == Some(canonical.as_str())
         || session.pending_conflict_synthesize_path.as_deref() == Some(canonical.as_str())
     {
@@ -2584,8 +2669,8 @@ pub fn conflict_workshop_phase_for_item(
 
 pub fn set_pending_conflict_workshop(cx: &mut App, path: &str, synthesize: bool) -> Result<()> {
     let mut session = load_session(cx).context("no merge review session")?;
-    let capture_path = session_path_for_branch_diff(&session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let capture_path =
+        session_path_for_branch_diff(&session, path).unwrap_or_else(|| path.replace('\\', "/"));
     if synthesize {
         session.pending_conflict_synthesize_path = Some(capture_path);
         session.pending_conflict_discuss_path = None;
@@ -2702,8 +2787,7 @@ pub fn sync_conflict_todo_completion_for_item(
     };
     let all_complete = tracked_ids.iter().all(|id| {
         plan_entries.iter().any(|(entry_id, status)| {
-            entry_id == id
-                && *status == agent_client_protocol::schema::PlanEntryStatus::Completed
+            entry_id == id && *status == agent_client_protocol::schema::PlanEntryStatus::Completed
         })
     });
     if all_complete {
@@ -2732,9 +2816,7 @@ fn conflict_decisions_in_section(session: &MergeReviewSession, section: &str) ->
     let lines = session
         .items
         .iter()
-        .filter(|item| {
-            item.surmount_section == section && item.conflict_decision.is_some()
-        })
+        .filter(|item| item.surmount_section == section && item.conflict_decision.is_some())
         .filter_map(|item| {
             let decision = item.conflict_decision.as_ref()?;
             Some(format!(
@@ -2746,7 +2828,10 @@ fn conflict_decisions_in_section(session: &MergeReviewSession, section: &str) ->
     if lines.is_empty() {
         String::new()
     } else {
-        format!("Prior conflict decisions in this section:\n{}\n\n", lines.join("\n"))
+        format!(
+            "Prior conflict decisions in this section:\n{}\n\n",
+            lines.join("\n")
+        )
     }
 }
 
@@ -2860,13 +2945,17 @@ fn capture_merge_review_todo_ids_from_tool_input(
     if let Some(path) = session
         .items
         .iter()
-        .find(|item| item.review_state == MergeReviewState::OpenQuestion && item.open_question_todo_id.is_none())
+        .find(|item| {
+            item.review_state == MergeReviewState::OpenQuestion
+                && item.open_question_todo_id.is_none()
+        })
         .map(|item| item.path.clone())
     {
         if let Some(id) = todos.iter().find_map(|todo| {
             let content = todo.get("content")?.as_str()?;
             let expected = format!("Merge: {path}");
-            content.contains(expected.as_str())
+            content
+                .contains(expected.as_str())
                 .then(|| todo.get("id")?.as_str().map(str::to_string))
         }) {
             if let Some(item) = session.items.iter_mut().find(|item| item.path == path) {
@@ -2881,8 +2970,8 @@ pub fn store_conflict_decision(
     path: &str,
     decision: MergeReviewConflictDecision,
 ) -> Result<()> {
-    let normalized = session_path_for_branch_diff(session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let normalized =
+        session_path_for_branch_diff(session, path).unwrap_or_else(|| path.replace('\\', "/"));
     let item = session
         .items
         .iter_mut()
@@ -2906,8 +2995,8 @@ pub fn conflict_file_ready_for_advance(
     path: &str,
     worktree_root: &Path,
 ) -> Result<(), &'static str> {
-    let normalized = session_path_for_branch_diff(session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let normalized =
+        session_path_for_branch_diff(session, path).unwrap_or_else(|| path.replace('\\', "/"));
     let Some(item) = item_for_path(session, &normalized) else {
         return Err("file not in merge review session");
     };
@@ -2931,8 +3020,8 @@ pub fn conflict_file_ready_for_advance(
 
 pub fn set_pending_summary_capture(cx: &mut App, path: &str) -> Result<()> {
     let mut session = load_session(cx).context("no merge review session")?;
-    let capture_path = session_path_for_branch_diff(&session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let capture_path =
+        session_path_for_branch_diff(&session, path).unwrap_or_else(|| path.replace('\\', "/"));
     session.pending_summary_path = Some(capture_path);
     session.pending_summary_format_retries = 0;
     save_session(cx, &session)
@@ -2990,12 +3079,11 @@ pub fn finalize_merge_review_branch_diff_controls(
         return;
     }
     controls.review_diff_ready = true;
-    if let Some(session) = load_session(cx) {
-        let progress = merge_review_progress_label(&session);
+    if load_session(cx).is_some() {
         controls.step_label = if controls.is_conflict_file {
-            format!("{progress} · {MERGE_REVIEW_STEP_CONFLICT_REVIEW}").into()
+            MERGE_REVIEW_STEP_CONFLICT_REVIEW.into()
         } else {
-            format!("{progress} · {MERGE_REVIEW_STEP_REVIEW_READY}").into()
+            MERGE_REVIEW_STEP_REVIEW_READY.into()
         };
     }
 }
@@ -3083,29 +3171,267 @@ fn capture_patterns_from_reply(session: &mut MergeReviewSession, reply_text: &st
     }
 }
 
-pub fn next_merge_review_file_path(
+pub fn set_merge_review_queue_cursor(session: &mut MergeReviewSession, path: &str) {
+    let normalized = path.replace('\\', "/");
+    session.queue_cursor_path =
+        Some(canonical_merge_review_path(session, &normalized).unwrap_or(normalized));
+}
+
+pub fn first_unreviewed_merge_review_conflict_path(session: &MergeReviewSession) -> Option<String> {
+    session
+        .items
+        .iter()
+        .find(|item| {
+            item.disposition == ReviewDisposition::Conflict
+                && item.review_state == MergeReviewState::NotReviewed
+        })
+        .map(|item| item.path.clone())
+}
+
+pub fn first_unreviewed_merge_review_item_path(session: &MergeReviewSession) -> Option<String> {
+    session
+        .items
+        .iter()
+        .find(|item| item.review_state == MergeReviewState::NotReviewed)
+        .map(|item| item.path.clone())
+}
+
+pub fn first_unreviewed_merge_review_queue_path(session: &MergeReviewSession) -> Option<String> {
+    first_unreviewed_merge_review_conflict_path(session)
+        .or_else(|| first_unreviewed_merge_review_item_path(session))
+}
+
+pub fn merge_review_queue_cursor_valid(session: &MergeReviewSession, cursor: &str) -> bool {
+    let canonical =
+        canonical_merge_review_path(session, cursor).unwrap_or_else(|| cursor.replace('\\', "/"));
+    session.items.iter().any(|item| item.path == canonical)
+}
+
+pub fn reconcile_merge_review_queue_cursor(session: &mut MergeReviewSession) {
+    let Some(cursor) = session.queue_cursor_path.clone() else {
+        return;
+    };
+    if merge_review_queue_cursor_valid(session, &cursor) {
+        return;
+    }
+    session.queue_cursor_path = None;
+    initialize_merge_review_queue_cursor(session);
+}
+
+pub fn initialize_merge_review_queue_cursor(session: &mut MergeReviewSession) {
+    if session.git_mode != git_ui::project_diff::MergeReviewGitMode::MergeInProgress {
+        return;
+    }
+    if session
+        .queue_cursor_path
+        .as_ref()
+        .is_some_and(|cursor| merge_review_queue_cursor_valid(session, cursor))
+    {
+        return;
+    }
+    if let Some(path) = first_unreviewed_merge_review_queue_path(session) {
+        set_merge_review_queue_cursor(session, &path);
+    }
+}
+
+/// True when git refresh observes merge engagement: PreMerge→MergeInProgress, or
+/// first appearance of unmerged paths while already in MergeInProgress.
+pub fn merge_review_merge_started(
+    prev_mode: git_ui::project_diff::MergeReviewGitMode,
+    prev_unmerged: u32,
+    session: &MergeReviewSession,
+) -> bool {
+    (prev_mode == git_ui::project_diff::MergeReviewGitMode::PreMerge
+        && session.git_mode == git_ui::project_diff::MergeReviewGitMode::MergeInProgress)
+        || (session.git_mode == git_ui::project_diff::MergeReviewGitMode::MergeInProgress
+            && prev_unmerged == 0
+            && session.unmerged_count > 0)
+}
+
+pub fn merge_review_progress_label_for_toast(session: &MergeReviewSession) -> String {
+    if session.git_mode == git_ui::project_diff::MergeReviewGitMode::MergeInProgress {
+        if let Some(cursor) = session.queue_cursor_path.as_deref() {
+            return merge_review_queue_position_label(session, cursor);
+        }
+    }
+    merge_review_progress_label(session)
+}
+
+pub fn merge_review_prepare_label(session: &MergeReviewSession) -> String {
+    format!(
+        "{} · {} changed files",
+        MERGE_REVIEW_STEP_PREPARE,
+        session.items.len()
+    )
+}
+
+pub fn merge_review_queue_position_label(session: &MergeReviewSession, path: &str) -> String {
+    let canonical =
+        canonical_merge_review_path(session, path).unwrap_or_else(|| path.replace('\\', "/"));
+    let total = session.items.len();
+    let position = session
+        .items
+        .iter()
+        .position(|item| item.path == canonical)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    format!("File {position}/{total} · {canonical}")
+}
+
+pub fn merge_review_queue_locked(cx: &App) -> bool {
+    load_session(cx).is_some_and(|session| {
+        session.git_mode == git_ui::project_diff::MergeReviewGitMode::MergeInProgress
+            && session.queue_cursor_path.is_some()
+    })
+}
+
+pub fn merge_review_out_of_order_selection_toast(path: &str, cx: &App) -> Option<String> {
+    if !merge_review_queue_locked(cx) {
+        return None;
+    }
+    let session = load_session(cx)?;
+    let cursor = session.queue_cursor_path.as_ref()?;
+    let canonical =
+        canonical_merge_review_path(&session, path).unwrap_or_else(|| path.replace('\\', "/"));
+    let cursor_canonical =
+        canonical_merge_review_path(&session, cursor).unwrap_or_else(|| cursor.replace('\\', "/"));
+    if canonical == cursor_canonical {
+        return None;
+    }
+    Some(format!(
+        "Merge review is on {}{}",
+        merge_review_queue_position_label(&session, cursor),
+        MERGE_REVIEW_OUT_OF_ORDER_TOAST_SUFFIX
+    ))
+}
+
+pub fn merge_review_allow_file_navigation(
+    repo_path: &str,
+    workspace: Entity<Workspace>,
+    cx: &mut App,
+) -> bool {
+    if let Some(toast) = merge_review_out_of_order_selection_toast(repo_path, cx) {
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(merge_review_toast(toast), cx);
+        });
+        false
+    } else {
+        true
+    }
+}
+
+fn merge_review_queue_search_start_index(
+    session: &MergeReviewSession,
+    current_path: Option<&str>,
+) -> Option<usize> {
+    session
+        .queue_cursor_path
+        .as_deref()
+        .and_then(|cursor| {
+            let normalized = canonical_merge_review_path(session, cursor)
+                .unwrap_or_else(|| cursor.replace('\\', "/"));
+            session
+                .items
+                .iter()
+                .position(|item| item.path == normalized)
+        })
+        .or_else(|| {
+            current_path.and_then(|current| {
+                let normalized = canonical_merge_review_path(session, current)
+                    .unwrap_or_else(|| current.replace('\\', "/"));
+                session
+                    .items
+                    .iter()
+                    .position(|item| item.path == normalized)
+            })
+        })
+}
+
+pub fn merge_review_next_file_blocked_message(
     session: &MergeReviewSession,
     current_path: Option<&str>,
 ) -> Option<String> {
     if session.items.is_empty() {
+        return Some("Merge review queue is empty.".into());
+    }
+    let start_index = merge_review_queue_search_start_index(session, current_path);
+    if let Some(index) = start_index {
+        if session.items[index].review_state == MergeReviewState::OpenQuestion {
+            let label = merge_review_queue_position_label(&session, &session.items[index].path);
+            return Some(format!(
+                "Cannot advance — {label} has an open question. Resolve it before **Next file →**."
+            ));
+        }
+    }
+    let search_from = start_index.map(|index| index + 1).unwrap_or(0);
+    for item in session.items.iter().skip(search_from) {
+        match item.review_state {
+            MergeReviewState::OpenQuestion => {
+                let label = merge_review_queue_position_label(&session, &item.path);
+                return Some(format!(
+                    "Cannot advance — resolve open question at {label} first."
+                ));
+            }
+            MergeReviewState::NotReviewed => return None,
+            MergeReviewState::Summarized => {}
+        }
+    }
+    if start_index.is_none() {
+        for item in &session.items {
+            match item.review_state {
+                MergeReviewState::OpenQuestion => {
+                    let label = merge_review_queue_position_label(&session, &item.path);
+                    return Some(format!(
+                        "Cannot advance — resolve open question at {label} first."
+                    ));
+                }
+                MergeReviewState::NotReviewed => return None,
+                MergeReviewState::Summarized => {}
+            }
+        }
+    }
+    if session_summarized_complete(session) {
+        Some("All files reviewed — click **End merge review**.".into())
+    } else {
+        Some("No more files in the merge review queue.".into())
+    }
+}
+
+pub fn next_merge_review_file_path(
+    session: &MergeReviewSession,
+    current_path: Option<&str>,
+) -> Option<String> {
+    if merge_review_next_file_blocked_message(session, current_path).is_some() {
         return None;
     }
-    let start_index = current_path.and_then(|current| {
-        let normalized = canonical_merge_review_path(session, current)
-            .unwrap_or_else(|| current.replace('\\', "/"));
-        session
-            .items
-            .iter()
-            .position(|item| item.path == normalized)
-    });
-    let len = session.items.len();
-    for offset in 1..=len {
-        let index = start_index
-            .map(|start| (start + offset) % len)
-            .unwrap_or(offset - 1);
-        let item = &session.items[index];
+    // Re-land on the queue cursor when UI selection lags behind after advance.
+    if let Some(cursor) = session.queue_cursor_path.as_deref() {
+        let normalized = canonical_merge_review_path(session, cursor)
+            .unwrap_or_else(|| cursor.replace('\\', "/"));
+        if let Some(item) = session.items.iter().find(|item| item.path == normalized) {
+            if item.review_state == MergeReviewState::NotReviewed {
+                let current_normalized = current_path.map(|current| {
+                    canonical_merge_review_path(session, current)
+                        .unwrap_or_else(|| current.replace('\\', "/"))
+                });
+                if current_normalized.as_deref() != Some(normalized.as_str()) {
+                    return Some(normalized);
+                }
+            }
+        }
+    }
+    let start_index = merge_review_queue_search_start_index(session, current_path);
+    let search_from = start_index.map(|index| index + 1).unwrap_or(0);
+    for item in session.items.iter().skip(search_from) {
         if item.review_state == MergeReviewState::NotReviewed {
             return Some(item.path.clone());
+        }
+    }
+    if start_index.is_none() {
+        for item in &session.items {
+            if item.review_state == MergeReviewState::NotReviewed {
+                return Some(item.path.clone());
+            }
         }
     }
     None
@@ -3156,18 +3482,20 @@ pub fn advance_merge_review_to_next_file_with_sync(
             .map(Path::new)
             .or_else(|| fallback_worktree.as_deref().map(Path::new));
         if let Some(worktree_root) = worktree_root {
-            if let Err(reason) = conflict_file_ready_for_advance(&session, current_path, worktree_root)
+            if let Err(reason) =
+                conflict_file_ready_for_advance(&session, current_path, worktree_root)
             {
-                log::warn!(
-                    "surmount merge review: Next file blocked for {current_path}: {reason}"
-                );
+                log::warn!("surmount merge review: Next file blocked for {current_path}: {reason}");
                 workspace.show_toast(merge_review_toast(reason), cx);
                 return false;
             }
         }
     }
     let Some(next_path) = next_merge_review_file_path(&session, current_path.as_deref()) else {
-        log::warn!("surmount merge review: Next file ignored (empty session queue)");
+        let message = merge_review_next_file_blocked_message(&session, current_path.as_deref())
+            .unwrap_or_else(|| "Could not advance to the next file.".into());
+        log::warn!("surmount merge review: Next file blocked: {message}");
+        workspace.show_toast(merge_review_toast(message), cx);
         return false;
     };
     let Some(diff) = workspace.items_of_type::<ProjectDiff>(cx).find(|item| {
@@ -3177,8 +3505,19 @@ pub fn advance_merge_review_to_next_file_with_sync(
         )
     }) else {
         log::warn!("surmount merge review: Next file ignored (Branch Diff not open)");
+        workspace.show_toast(
+            merge_review_toast(
+                "Could not open the next file — open Branch Diff for this merge review first.",
+            ),
+            cx,
+        );
         return false;
     };
+    let previous_cursor = session.queue_cursor_path;
+    if let Some(mut session) = load_session(cx) {
+        set_merge_review_queue_cursor(&mut session, &next_path);
+        save_session(cx, &session).log_err();
+    }
     let selected = diff.update(cx, |diff, cx| {
         diff.move_to_repo_relative_path(&next_path, window, cx)
     });
@@ -3192,13 +3531,23 @@ pub fn advance_merge_review_to_next_file_with_sync(
         log::warn!(
             "surmount merge review: Next file could not open {next_path} in Branch Diff multibuffer"
         );
+        if let Some(mut session) = load_session(cx) {
+            session.queue_cursor_path = previous_cursor;
+            save_session(cx, &session).log_err();
+        }
+        workspace.show_toast(
+            merge_review_toast(format!(
+                "Could not open {next_path} in Branch Diff — ensure the file is in the diff list."
+            )),
+            cx,
+        );
     }
     selected
 }
 
 pub fn merge_review_summary_saved_toast(path: &str, advanced_to_next: bool, cx: &App) -> String {
     let progress = load_session(cx)
-        .map(|session| merge_review_progress_label(&session))
+        .map(|session| merge_review_progress_label_for_toast(&session))
         .unwrap_or_else(|| "?/?".to_string());
     if advanced_to_next {
         format!("Saved {path} ({progress}). Advanced to next file — click green Review Diff.")
@@ -3220,10 +3569,11 @@ pub fn merge_review_summary_capture_toast(
     };
     use git_ui::project_diff::ReviewDiff;
 
-    let progress = load_session(cx)
-        .map(|session| merge_review_progress_label(&session))
-        .unwrap_or_else(|| "?/?".to_string());
     let session = load_session(cx);
+    let progress = session
+        .as_ref()
+        .map(merge_review_progress_label_for_toast)
+        .unwrap_or_else(|| "?/?".to_string());
     let session_complete = session
         .as_ref()
         .is_some_and(|session| session_summarized_complete(session));
@@ -3334,6 +3684,10 @@ pub fn clear_merge_review_session(cx: &mut App) -> Result<()> {
     Ok(())
 }
 
+/// Ends the merge review session immediately (no note modal).
+///
+/// Per plan, only **Record decision** opens the optional note popover; **End merge review** is
+/// immediate by design so finishing the workflow stays fast.
 pub fn end_merge_review_workflow(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -3411,12 +3765,7 @@ impl MergeReviewView {
         session.focus_layout_active = true;
         if let Some(repo) = surmount_repository(&project, cx).or_else(|| {
             project.read(cx).active_repository(cx).filter(|repo| {
-                is_surmount_workspace(
-                    repo.read(cx)
-                        .snapshot()
-                        .work_directory_abs_path
-                        .as_ref(),
-                )
+                is_surmount_workspace(repo.read(cx).snapshot().work_directory_abs_path.as_ref())
             })
         }) {
             session.worktree_root = Some(
@@ -3477,7 +3826,8 @@ impl MergeReviewView {
                 use std::time::Duration;
 
                 let mut branch_diff_ready = false;
-                for attempt in 0..120 {
+                const MAX_BRANCH_DIFF_ATTEMPTS: u32 = 24;
+                for attempt in 0..MAX_BRANCH_DIFF_ATTEMPTS {
                     if attempt > 0 {
                         cx.background_executor()
                             .timer(Duration::from_millis(50))
@@ -3535,44 +3885,14 @@ impl MergeReviewView {
                 })?;
 
                 if branch_diff_ready {
-                    let session_paths = session_for_plan
-                        .items
-                        .first()
-                        .map(|item| item.path.clone());
-                    let upstream_select = upstream_for_find.clone();
-                    for attempt in 0..80 {
-                        if attempt > 0 {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(50))
-                                .await;
-                        }
-                        let Some(workspace) = workspace_weak.upgrade() else {
-                            break;
-                        };
-                        let selected = workspace
-                            .update_in(cx, |workspace, window, cx| {
-                                select_first_merge_review_file(
-                                    workspace,
-                                    &session_for_plan,
-                                    &upstream_select,
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .ok()
-                            .unwrap_or(false);
-                        if selected {
-                            break;
-                        }
-                    }
                     let Some(workspace) = workspace_weak.upgrade() else {
                         return anyhow::Ok(());
                     };
+                    let item_count = session_for_plan.items.len();
                     workspace.update_in(cx, |workspace, _window, cx| {
-                        let toast = if session_paths.is_some() {
+                        let toast = if item_count > 0 {
                             format!(
-                                "{} First file selected — green Review Diff is ready.",
-                                MERGE_REVIEW_READY_TOAST
+                                "{MERGE_REVIEW_READY_TOAST} ({item_count} changed files.)"
                             )
                         } else {
                             MERGE_REVIEW_READY_TOAST.to_string()
@@ -3631,7 +3951,7 @@ impl MergeReviewView {
             if let Err(error) = run_git(&worktree_root, &["fetch", "origin"]).await {
                 log::warn!("surmount merge review: git fetch origin failed: {error:#}");
             }
-            let session = populate_session_from_git(
+            let mut session = populate_session_from_git(
                 project,
                 &worktree_root,
                 manifest,
@@ -3653,15 +3973,46 @@ impl MergeReviewView {
                     session.upstream_ref
                 );
             }
+            let merge_in_progress_auto_select =
+                if session.git_mode == git_ui::project_diff::MergeReviewGitMode::MergeInProgress {
+                    initialize_merge_review_queue_cursor(&mut session);
+                    session
+                        .queue_cursor_path
+                        .clone()
+                        .map(|path| (session.upstream_ref.clone(), session.unmerged_count, path))
+                } else {
+                    None
+                };
             if let Some(workspace) = workspace_handle_for_task.upgrade() {
                 workspace.update_in(cx, |workspace, window, cx| {
-                    Self::open_merge_review_workflow(
-                        workspace,
-                        session,
-                        project_for_workflow,
-                        window,
-                        cx,
-                    );
+                    if let Some((upstream_ref, conflict_count, start_path)) =
+                        merge_in_progress_auto_select
+                    {
+                        save_session(cx, &session).log_err();
+                        Self::open_merge_review_workflow(
+                            workspace,
+                            session,
+                            project_for_workflow.clone(),
+                            window,
+                            cx,
+                        );
+                        spawn_select_merge_review_queue_file_when_ready(
+                            workspace_handle_for_task.clone(),
+                            upstream_ref,
+                            conflict_count,
+                            start_path,
+                            window,
+                            cx,
+                        );
+                    } else {
+                        Self::open_merge_review_workflow(
+                            workspace,
+                            session,
+                            project_for_workflow,
+                            window,
+                            cx,
+                        );
+                    }
                 })?;
             } else {
                 log::error!("surmount merge review: workspace dropped before deploy");
@@ -3687,11 +4038,34 @@ impl MergeReviewView {
                         refresh_merge_review_git_state(&mut session, Path::new(&worktree_root))
                             .await
                             .log_err();
+                        reconcile_merge_review_queue_cursor(&mut session);
+                        let resume_auto_select = if session.git_mode
+                            == git_ui::project_diff::MergeReviewGitMode::MergeInProgress
+                        {
+                            initialize_merge_review_queue_cursor(&mut session);
+                            session.queue_cursor_path.clone().map(|path| {
+                                (session.upstream_ref.clone(), session.unmerged_count, path)
+                            })
+                        } else {
+                            None
+                        };
                         workspace_weak.update_in(cx, |workspace, window, cx| {
                             save_session(cx, &session).log_err();
                             Self::open_merge_review_workflow(
                                 workspace, session, project, window, cx,
                             );
+                            if let Some((upstream_ref, conflict_count, start_path)) =
+                                resume_auto_select
+                            {
+                                spawn_select_merge_review_queue_file_when_ready(
+                                    workspace_weak.clone(),
+                                    upstream_ref,
+                                    conflict_count,
+                                    start_path,
+                                    window,
+                                    cx,
+                                );
+                            }
                         })?;
                         anyhow::Ok(())
                     })
@@ -3722,14 +4096,7 @@ impl MergeReviewView {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        if !advance_merge_review_to_next_file(workspace, window, cx) {
-            workspace.show_toast(
-                merge_review_toast(
-                    "Could not open the next file — ensure Branch Diff is open for this merge.",
-                ),
-                cx,
-            );
-        }
+        advance_merge_review_to_next_file(workspace, window, cx);
     }
 
     fn resolve_conflict_ours(
@@ -4198,7 +4565,7 @@ impl Render for MergeReviewToolbar {
                 return div();
             }
             return h_flex().gap_2().items_center().child(
-                Label::new(MERGE_REVIEW_STEP_PICK_FILE)
+                Label::new("Select a changed file in Branch Diff")
                     .size(LabelSize::Small)
                     .color(Color::Warning),
             );
@@ -4208,7 +4575,7 @@ impl Render for MergeReviewToolbar {
                 return div();
             }
             return h_flex().gap_2().items_center().child(
-                Label::new(MERGE_REVIEW_STEP_PICK_FILE)
+                Label::new("Select a changed file in Branch Diff")
                     .size(LabelSize::Small)
                     .color(Color::Warning),
             );
@@ -4222,13 +4589,12 @@ impl Render for MergeReviewToolbar {
         let worktree_root = session.worktree_root.as_deref().map(Path::new);
         let conflict_phase = (item.disposition == ReviewDisposition::Conflict
             && item.review_state == MergeReviewState::Summarized)
-            .then(|| {
-                conflict_workshop_phase_for_item(&session, item, &path, worktree_root)
-            })
+            .then(|| conflict_workshop_phase_for_item(&session, item, &path, worktree_root))
             .flatten();
-        let conflict_context = item.conflict_decision.as_ref().map(|decision| {
-            format!("{:?}: {}", decision.outcome, decision.rationale)
-        });
+        let conflict_context = item
+            .conflict_decision
+            .as_ref()
+            .map(|decision| format!("{:?}: {}", decision.outcome, decision.rationale));
         h_flex()
             .gap_2()
             .items_center()
@@ -4245,7 +4611,8 @@ impl Render for MergeReviewToolbar {
                 };
                 let todo_note = if item.conflict_todos_complete {
                     "todos done"
-                } else if !item.conflict_test_todo_ids.is_empty() || item.conflict_decision.is_some()
+                } else if !item.conflict_test_todo_ids.is_empty()
+                    || item.conflict_decision.is_some()
                 {
                     "todos pending"
                 } else {
@@ -4361,20 +4728,47 @@ fn conflict_outcome_hint_for_toolbar(
     }
 }
 
+fn merge_review_conflict_cleanup_banner(session: &MergeReviewSession) -> Option<SharedString> {
+    if session.git_mode != git_ui::project_diff::MergeReviewGitMode::MergeInProgress
+        || session.unmerged_count > 0
+    {
+        return None;
+    }
+    let has_unreviewed_non_conflict = session.items.iter().any(|item| {
+        item.review_state == MergeReviewState::NotReviewed
+            && item.disposition != ReviewDisposition::Conflict
+    });
+    if has_unreviewed_non_conflict {
+        Some(MERGE_REVIEW_STEP_CONFLICT_CLEANUP.into())
+    } else {
+        None
+    }
+}
+
+fn merge_review_step_label_or_conflict_cleanup(
+    session: &MergeReviewSession,
+    step_label: SharedString,
+) -> SharedString {
+    if !step_label.is_empty() {
+        return step_label;
+    }
+    merge_review_conflict_cleanup_banner(session).unwrap_or(step_label)
+}
+
 fn conflict_workshop_step_label(
-    progress: &str,
     phase: Option<git_ui::project_diff::MergeReviewConflictWorkshopPhase>,
 ) -> SharedString {
     use git_ui::project_diff::MergeReviewConflictWorkshopPhase;
-    let step = match phase {
-        Some(MergeReviewConflictWorkshopPhase::DiscussReady) => "Discuss conflict",
-        Some(MergeReviewConflictWorkshopPhase::Discussing) => "Discussing conflict…",
-        Some(MergeReviewConflictWorkshopPhase::RecordDecision) => "Record decision",
-        Some(MergeReviewConflictWorkshopPhase::CompleteTests) => "Complete conflict tests",
-        Some(MergeReviewConflictWorkshopPhase::ReadyToAdvance) => MERGE_REVIEW_STEP_FILE_DONE,
-        _ => MERGE_REVIEW_STEP_CONFLICT_RESOLVE,
-    };
-    format!("{progress} · {step}").into()
+    match phase {
+        Some(MergeReviewConflictWorkshopPhase::DiscussReady) => "Discuss conflict".into(),
+        Some(MergeReviewConflictWorkshopPhase::Discussing) => "Discussing conflict…".into(),
+        Some(MergeReviewConflictWorkshopPhase::RecordDecision) => "Record decision".into(),
+        Some(MergeReviewConflictWorkshopPhase::CompleteTests) => "Complete conflict tests".into(),
+        Some(MergeReviewConflictWorkshopPhase::ReadyToAdvance) => {
+            MERGE_REVIEW_STEP_NEXT_FILE.into()
+        }
+        _ => MERGE_REVIEW_STEP_CONFLICT_RESOLVE.into(),
+    }
 }
 
 fn merge_review_branch_diff_controls(
@@ -4401,45 +4795,48 @@ fn merge_review_branch_diff_controls(
     }
     controls.workflow_active = true;
     let Some(session) = load_session(cx) else {
-        controls.step_label = MERGE_REVIEW_STEP_PICK_FILE.into();
         return controls;
     };
-    let progress = merge_review_progress_label(&session);
     controls.git_mode = session.git_mode;
     controls.unmerged_count = session.unmerged_count;
-    let progress = if session.unmerged_count > 0 {
-        format!("{progress} · {} conflicts", session.unmerged_count)
-    } else {
-        progress
-    };
-    controls.progress_label = progress.clone().into();
+    if session.git_mode == git_ui::project_diff::MergeReviewGitMode::PreMerge {
+        controls.progress_label = merge_review_prepare_label(&session).into();
+        controls.step_label = SharedString::default();
+        controls.review_diff_ready = false;
+        return controls;
+    }
     let Some(path) = selected_path else {
-        controls.step_label = format!("{progress} · {MERGE_REVIEW_STEP_PICK_FILE}").into();
+        if let Some(cursor) = session.queue_cursor_path.as_deref() {
+            controls.progress_label = merge_review_queue_position_label(&session, cursor).into();
+        } else {
+            controls.progress_label = merge_review_progress_label(&session).into();
+        }
+        controls.step_label =
+            merge_review_step_label_or_conflict_cleanup(&session, SharedString::default());
         return controls;
     };
-    let canonical_path = session_path_for_branch_diff(&session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let canonical_path =
+        session_path_for_branch_diff(&session, path).unwrap_or_else(|| path.replace('\\', "/"));
+    controls.progress_label = merge_review_queue_position_label(&session, &canonical_path).into();
     if session.pending_summary_path.as_deref() == Some(canonical_path.as_str()) {
         controls.awaiting_agent_summary = true;
         controls.review_diff_ready = false;
-        controls.step_label = format!("{progress} · {MERGE_REVIEW_STEP_SUMMARIZING}").into();
+        controls.step_label = MERGE_REVIEW_STEP_SUMMARIZING.into();
         if let Some(item) = item_for_branch_diff_path(&session, path) {
             controls.is_conflict_file = item.disposition == ReviewDisposition::Conflict;
         }
         return controls;
     }
     let Some(item) = item_for_branch_diff_path(&session, path) else {
-        controls.step_label = format!("{progress} · {MERGE_REVIEW_STEP_PICK_FILE}").into();
+        controls.step_label =
+            merge_review_step_label_or_conflict_cleanup(&session, SharedString::default());
         return controls;
     };
     controls.is_conflict_file = item.disposition == ReviewDisposition::Conflict;
     controls.suggested_outcome = item
         .suggested_outcome
         .map(conflict_outcome_hint_for_toolbar);
-    let worktree_root = session
-        .worktree_root
-        .as_deref()
-        .map(Path::new);
+    let worktree_root = session.worktree_root.as_deref().map(Path::new);
     controls.conflict_workshop_phase =
         conflict_workshop_phase_for_item(&session, item, path, worktree_root);
     if controls.is_conflict_file && item.review_state == MergeReviewState::Summarized {
@@ -4453,7 +4850,7 @@ fn merge_review_branch_diff_controls(
             );
         controls.current_file_done = true;
         controls.review_diff_ready = false;
-        controls.step_label = conflict_workshop_step_label(&progress, controls.conflict_workshop_phase);
+        controls.step_label = conflict_workshop_step_label(controls.conflict_workshop_phase);
         if controls.conflict_workshop_phase
             != Some(git_ui::project_diff::MergeReviewConflictWorkshopPhase::NotSummarized)
         {
@@ -4463,18 +4860,19 @@ fn merge_review_branch_diff_controls(
     if item.review_state == MergeReviewState::Summarized {
         controls.current_file_done = true;
         controls.review_diff_ready = false;
-        controls.step_label = format!("{progress} · {MERGE_REVIEW_STEP_FILE_DONE}").into();
+        controls.step_label = MERGE_REVIEW_STEP_NEXT_FILE.into();
         return controls;
     }
     if file_selected {
         controls.review_diff_ready = true;
         controls.step_label = if controls.is_conflict_file {
-            format!("{progress} · {MERGE_REVIEW_STEP_CONFLICT_REVIEW}").into()
+            MERGE_REVIEW_STEP_CONFLICT_REVIEW.into()
         } else {
-            format!("{progress} · {MERGE_REVIEW_STEP_REVIEW_READY}").into()
+            MERGE_REVIEW_STEP_REVIEW_READY.into()
         };
     } else {
-        controls.step_label = format!("{progress} · {MERGE_REVIEW_STEP_PICK_FILE}").into();
+        controls.step_label =
+            merge_review_step_label_or_conflict_cleanup(&session, SharedString::default());
     }
     controls
 }
@@ -4494,6 +4892,9 @@ pub fn init(cx: &mut App) {
     );
     git_ui::project_diff::set_merge_review_finalize_controls(
         finalize_merge_review_branch_diff_controls,
+    );
+    git_ui::project_diff::set_merge_review_file_navigation_guard(
+        merge_review_allow_file_navigation,
     );
     cx.observe_new(|_workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
@@ -4520,40 +4921,30 @@ pub fn init(cx: &mut App) {
         workspace.register_action(MergeReviewView::resolve_conflict_ours);
         workspace.register_action(MergeReviewView::resolve_conflict_theirs);
         workspace.register_action(|workspace, _: &DiscussMergeReviewConflict, window, cx| {
-            open_merge_review_note_modal(
-                workspace,
-                window,
-                cx,
-                "Discuss conflict",
-                "What should the agent focus on?",
-                MergeReviewNoteContinuation::DiscussConflict,
-            );
+            dispatch_merge_review_conflict_workshop(workspace, window, cx, false, None);
         });
         workspace.register_action(|workspace, _: &SynthesizeMergeReviewConflict, window, cx| {
-            open_merge_review_note_modal(
-                workspace,
-                window,
-                cx,
-                "Synthesize resolution",
-                "Constraints or preferences for the merged result?",
-                MergeReviewNoteContinuation::SynthesizeConflict,
-            );
+            dispatch_merge_review_conflict_workshop(workspace, window, cx, true, None);
         });
-        workspace.register_action(|workspace, _: &RecordMergeReviewConflictDecision, window, cx| {
-            record_merge_review_conflict_decision(workspace, window, cx);
-        });
-        workspace.register_action(|workspace, _: &ConfirmMergeReviewDecisionKeepFork, window, cx| {
-            open_merge_review_note_modal(
-                workspace,
-                window,
-                cx,
-                "Keep fork",
-                "Rationale or caveats to record?",
-                MergeReviewNoteContinuation::ConfirmDecision(
-                    MergeReviewSuggestedOutcome::KeepFork,
-                ),
-            );
-        });
+        workspace.register_action(
+            |workspace, _: &RecordMergeReviewConflictDecision, window, cx| {
+                record_merge_review_conflict_decision(workspace, window, cx);
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &ConfirmMergeReviewDecisionKeepFork, window, cx| {
+                open_merge_review_note_modal(
+                    workspace,
+                    window,
+                    cx,
+                    "Keep fork",
+                    "Rationale or caveats to record?",
+                    MergeReviewNoteContinuation::ConfirmDecision(
+                        MergeReviewSuggestedOutcome::KeepFork,
+                    ),
+                );
+            },
+        );
         workspace.register_action(
             |workspace, _: &ConfirmMergeReviewDecisionTakeUpstream, window, cx| {
                 open_merge_review_note_modal(
@@ -4568,44 +4959,28 @@ pub fn init(cx: &mut App) {
                 );
             },
         );
-        workspace.register_action(|workspace, _: &ConfirmMergeReviewDecisionSynthesize, window, cx| {
-            open_merge_review_note_modal(
-                workspace,
-                window,
-                cx,
-                "Synthesize",
-                "Rationale or caveats to record?",
-                MergeReviewNoteContinuation::ConfirmDecision(
-                    MergeReviewSuggestedOutcome::Synthesize,
-                ),
-            );
-        });
-        workspace.register_action(|workspace, _: &OpenMergeReviewConflictTodos, window, cx| {
-            open_merge_review_conflict_todos(workspace, window, cx);
-        });
-        workspace.register_action(|workspace, _: &SendReviewToAgent, window, cx| {
-            if merge_review_workflow_engaged(cx) {
+        workspace.register_action(
+            |workspace, _: &ConfirmMergeReviewDecisionSynthesize, window, cx| {
                 open_merge_review_note_modal(
                     workspace,
                     window,
                     cx,
-                    "Send review to agent",
-                    "Extra context for the agent?",
-                    MergeReviewNoteContinuation::SendReviewComments,
+                    "Synthesize",
+                    "Rationale or caveats to record?",
+                    MergeReviewNoteContinuation::ConfirmDecision(
+                        MergeReviewSuggestedOutcome::Synthesize,
+                    ),
                 );
-            } else {
-                send_merge_review_comments_to_agent(workspace, window, cx, None);
-            }
+            },
+        );
+        workspace.register_action(|workspace, _: &OpenMergeReviewConflictTodos, window, cx| {
+            open_merge_review_conflict_todos(workspace, window, cx);
+        });
+        workspace.register_action(|workspace, _: &SendReviewToAgent, window, cx| {
+            send_merge_review_comments_to_agent(workspace, window, cx, None);
         });
         workspace.register_action(|workspace, _: &DraftMergeReviewSection, window, cx| {
-            open_merge_review_note_modal(
-                workspace,
-                window,
-                cx,
-                "Draft SURMOUNT section",
-                "Angle or emphasis for this section draft?",
-                MergeReviewNoteContinuation::DraftSection,
-            );
+            draft_merge_review_section(workspace, window, cx, None);
         });
         workspace.register_action(|workspace, _: &PreviewMergeReviewMerge, window, cx| {
             open_merge_review_gated_merge_modal(workspace, window, cx);
@@ -4752,10 +5127,7 @@ pub fn merge_review_open_question_todo_title(path: &str) -> String {
 }
 
 pub fn merge_review_open_question_todo_prompt(item: &MergeReviewItem) -> String {
-    let summary = item
-        .summary
-        .as_deref()
-        .unwrap_or("Needs a decision.");
+    let summary = item.summary.as_deref().unwrap_or("Needs a decision.");
     format!(
         "Create exactly one Plan Todo via todo_write for this merge-review open question.\n\
          Title: {}\n\
@@ -4845,9 +5217,7 @@ pub fn request_merge_review_open_question_todo(
     panel.update(cx, |panel, cx| {
         panel.send_merge_review_follow_up(prompt, window, cx);
     });
-    log::info!(
-        "surmount merge review: requested Plan Todo for open question ({path})"
-    );
+    log::info!("surmount merge review: requested Plan Todo for open question ({path})");
 }
 
 pub fn merge_review_send_review_comments_prompt(
@@ -4855,7 +5225,8 @@ pub fn merge_review_send_review_comments_prompt(
     path: &str,
     comments: &str,
 ) -> String {
-    let Some(item) = item_for_path(session, path).or_else(|| item_for_branch_diff_path(session, path))
+    let Some(item) =
+        item_for_path(session, path).or_else(|| item_for_branch_diff_path(session, path))
     else {
         return format!(
             "This file has an active merge conflict while merging upstream into the Surmount fork.\n\
@@ -4906,18 +5277,12 @@ pub fn send_merge_review_comments_to_agent(
         return;
     };
     let Some(path) = project_diff.read(cx).active_file_repo_path(cx) else {
-        workspace.show_toast(
-            merge_review_toast("Pick a file in Branch Diff first."),
-            cx,
-        );
+        workspace.show_toast(merge_review_toast("Pick a file in Branch Diff first."), cx);
         return;
     };
     let comments = project_diff.update(cx, |diff, cx| diff.take_review_comments_for_agent(cx));
     if comments.trim().is_empty() {
-        workspace.show_toast(
-            merge_review_toast("No review comments to send."),
-            cx,
-        );
+        workspace.show_toast(merge_review_toast("No review comments to send."), cx);
         return;
     };
     let prompt = merge_review_append_user_note(
@@ -5082,7 +5447,11 @@ fn conflict_decision_rationale(
             MergeReviewSuggestedOutcome::NeedsHuman => "Needs human judgment.".into(),
         };
     }
-    if let Some(summary) = item.summary.as_deref().filter(|summary| !summary.is_empty()) {
+    if let Some(summary) = item
+        .summary
+        .as_deref()
+        .filter(|summary| !summary.is_empty())
+    {
         return format!("Human confirmed {outcome:?} after workshop review. Summary: {summary}");
     }
     format!("Human confirmed {outcome:?} via merge review conflict workshop.")
@@ -5124,8 +5493,8 @@ pub fn install_merge_review_conflict_todos_for_path(
     let Some(mut session) = load_session(cx) else {
         return false;
     };
-    let normalized = session_path_for_branch_diff(&session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let normalized =
+        session_path_for_branch_diff(&session, path).unwrap_or_else(|| path.replace('\\', "/"));
     let Some(item) = session.items.iter().find(|item| item.path == normalized) else {
         return false;
     };
@@ -5189,7 +5558,11 @@ pub fn install_merge_review_conflict_todos_for_path(
     thread.update(cx, |thread, cx| {
         thread.update_plan(acp::Plan::new(plan_entries), cx);
     });
-    if let Some(item) = session.items.iter_mut().find(|item| item.path == normalized) {
+    if let Some(item) = session
+        .items
+        .iter_mut()
+        .find(|item| item.path == normalized)
+    {
         item.conflict_test_todo_ids = todo_ids;
     }
     session.pending_conflict_todos_path = None;
@@ -5212,8 +5585,8 @@ fn confirm_merge_review_decision_for_path(
     let Some(mut session) = load_session(cx) else {
         return false;
     };
-    let normalized = session_path_for_branch_diff(&session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let normalized =
+        session_path_for_branch_diff(&session, path).unwrap_or_else(|| path.replace('\\', "/"));
     let item = session
         .items
         .iter()
@@ -5224,11 +5597,17 @@ fn confirm_merge_review_decision_for_path(
         return false;
     };
     if item.disposition != ReviewDisposition::Conflict {
-        workspace.show_toast(merge_review_toast("Active file is not a merge-review conflict."), cx);
+        workspace.show_toast(
+            merge_review_toast("Active file is not a merge-review conflict."),
+            cx,
+        );
         return false;
     };
     if item.conflict_decision.is_some() {
-        workspace.show_toast(merge_review_toast("Conflict decision already recorded."), cx);
+        workspace.show_toast(
+            merge_review_toast("Conflict decision already recorded."),
+            cx,
+        );
         return false;
     };
     let worktree_root = session.worktree_root.as_deref().map(Path::new);
@@ -5298,7 +5677,9 @@ pub fn confirm_merge_review_decision(
         );
         return;
     };
-    confirm_merge_review_decision_for_path(workspace, window, cx, &path, outcome, false, human_note);
+    confirm_merge_review_decision_for_path(
+        workspace, window, cx, &path, outcome, false, human_note,
+    );
 }
 
 pub fn maybe_auto_confirm_merge_review_decision_after_resolve(
@@ -5322,13 +5703,10 @@ pub fn record_merge_review_conflict_decision(
 ) {
     let outcome = load_session(cx)
         .and_then(|session| {
-            workspace
-                .items_of_type::<ProjectDiff>(cx)
-                .find_map(|diff| {
-                    let path = diff.read(cx).active_file_repo_path(cx)?;
-                    item_for_branch_diff_path(&session, &path)
-                        .and_then(|item| item.suggested_outcome)
-                })
+            workspace.items_of_type::<ProjectDiff>(cx).find_map(|diff| {
+                let path = diff.read(cx).active_file_repo_path(cx)?;
+                item_for_branch_diff_path(&session, &path).and_then(|item| item.suggested_outcome)
+            })
         })
         .unwrap_or(MergeReviewSuggestedOutcome::KeepFork);
     confirm_merge_review_decision(workspace, window, cx, outcome, None);
@@ -5336,8 +5714,8 @@ pub fn record_merge_review_conflict_decision(
 
 pub fn set_pending_conflict_record(cx: &mut App, path: &str) -> Result<()> {
     let mut session = load_session(cx).context("no merge review session")?;
-    let capture_path = session_path_for_branch_diff(&session, path)
-        .unwrap_or_else(|| path.replace('\\', "/"));
+    let capture_path =
+        session_path_for_branch_diff(&session, path).unwrap_or_else(|| path.replace('\\', "/"));
     session.pending_conflict_record_path = Some(capture_path);
     save_session(cx, &session)
 }
@@ -5378,10 +5756,7 @@ pub fn draft_merge_review_section(
     user_note: Option<&str>,
 ) {
     let Some(session) = load_session(cx) else {
-        workspace.show_toast(
-            merge_review_toast("No active merge review session."),
-            cx,
-        );
+        workspace.show_toast(merge_review_toast("No active merge review session."), cx);
         return;
     };
     let section = workspace
@@ -5395,8 +5770,7 @@ pub fn draft_merge_review_section(
         })
         .flatten()
         .and_then(|path| {
-            item_for_branch_diff_path(&session, &path)
-                .map(|item| item.surmount_section.clone())
+            item_for_branch_diff_path(&session, &path).map(|item| item.surmount_section.clone())
         })
         .or_else(|| session.categories_completed.iter().next().cloned());
     let Some(section) = section else {
@@ -5408,8 +5782,10 @@ pub fn draft_merge_review_section(
         );
         return;
     };
-    let prompt =
-        merge_review_append_user_note(merge_review_section_draft_prompt(&session, &section), user_note);
+    let prompt = merge_review_append_user_note(
+        merge_review_section_draft_prompt(&session, &section),
+        user_note,
+    );
     let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
         return;
     };
@@ -5658,6 +6034,22 @@ paths = ["Cargo.toml"]
         assert_eq!(item.review_state, MergeReviewState::NotReviewed);
         assert!(session.running_notes.is_empty());
         assert!(session.patterns.is_empty());
+        assert_eq!(session.queue_cursor_path, None);
+    }
+
+    #[test]
+    fn queue_cursor_path_roundtrips_through_json() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("lib.rs".into(), true)],
+        );
+        set_merge_review_queue_cursor(&mut session, "lib.rs");
+        let json = serde_json::to_string(&session).unwrap();
+        let loaded: MergeReviewSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.queue_cursor_path.as_deref(), Some("lib.rs"));
     }
 
     #[test]
@@ -5880,8 +6272,7 @@ paths = ["Cargo.toml"]
             [(".cargo/audit.toml".into(), true)],
         );
         session.items[0].review_state = MergeReviewState::Summarized;
-        let item =
-            item_for_branch_diff_path(&session, "cargo/audit.toml").expect("conflict item");
+        let item = item_for_branch_diff_path(&session, "cargo/audit.toml").expect("conflict item");
         assert_eq!(item.disposition, ReviewDisposition::Conflict);
         assert_eq!(item.review_state, MergeReviewState::Summarized);
     }
@@ -6177,12 +6568,10 @@ paths = ["Cargo.toml"]
         smol::block_on(async {
             let fixture = GitMergeFixture::new();
             fixture.begin_conflicted_merge();
-            let sides = load_merge_review_conflict_sides(
-                fixture.path(),
-                "crates/editor/src/editor.rs",
-            )
-            .await
-            .expect("conflict sides");
+            let sides =
+                load_merge_review_conflict_sides(fixture.path(), "crates/editor/src/editor.rs")
+                    .await
+                    .expect("conflict sides");
             assert!(sides.ours_text.contains("fork editor"));
             assert!(sides.theirs_text.contains("upstream editor"));
             assert!(sides.working_text.contains("<<<<<<<"));
@@ -6346,23 +6735,25 @@ paths = ["Cargo.toml"]
             [("lib.rs".into(), false)],
         );
         store_file_summary(&mut session, "lib.rs", "Keep ours.".into(), false).unwrap();
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "lib.rs");
         cx.update(|cx| {
             crate::merge_review::init(cx);
-            session.focus_layout_active = true;
             save_session(cx, &session).expect("save session");
             let controls = merge_review_branch_diff_controls(true, Some("lib.rs"), cx);
             assert!(controls.workflow_active);
             assert!(controls.current_file_done);
             assert!(!controls.review_diff_ready);
             assert!(
-                controls.step_label.contains(MERGE_REVIEW_STEP_FILE_DONE),
+                controls.step_label.contains(MERGE_REVIEW_STEP_NEXT_FILE),
                 "got {}",
                 controls.step_label
             );
             assert!(
-                controls.step_label.starts_with("1/1"),
+                controls.progress_label.contains("File 1/1 · lib.rs"),
                 "got {}",
-                controls.step_label
+                controls.progress_label
             );
         });
     }
@@ -6458,12 +6849,9 @@ paths = ["Cargo.toml"]
         cx.update(|cx| {
             crate::merge_review::init(cx);
             save_session(cx, &session).expect("save session");
-            let path = handle_merge_review_tool_completion(
-                "merge_review_record_decision",
-                &input,
-                cx,
-            )
-            .expect("recorded");
+            let path =
+                handle_merge_review_tool_completion("merge_review_record_decision", &input, cx)
+                    .expect("recorded");
             assert_eq!(path, "lib.rs");
             let loaded = load_session(cx).expect("session");
             let item = item_for_path(&loaded, "lib.rs").unwrap();
@@ -6500,12 +6888,7 @@ paths = ["Cargo.toml"]
         let item = item_for_path(&session, "lib.rs").unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("lib.rs"), "resolved\n").expect("write");
-        let phase = conflict_workshop_phase_for_item(
-            &session,
-            item,
-            "lib.rs",
-            Some(dir.path()),
-        );
+        let phase = conflict_workshop_phase_for_item(&session, item, "lib.rs", Some(dir.path()));
         use git_ui::project_diff::MergeReviewConflictWorkshopPhase;
         assert_eq!(phase, Some(MergeReviewConflictWorkshopPhase::CompleteTests));
     }
@@ -6519,7 +6902,11 @@ paths = ["Cargo.toml"]
             "origin/main".into(),
             [("lib.rs".into(), true)],
         );
-        let item = session.items.iter_mut().find(|item| item.path == "lib.rs").unwrap();
+        let item = session
+            .items
+            .iter_mut()
+            .find(|item| item.path == "lib.rs")
+            .unwrap();
         item.review_state = MergeReviewState::Summarized;
         item.conflict_decision = Some(MergeReviewConflictDecision {
             outcome: MergeReviewSuggestedOutcome::KeepFork,
@@ -6575,14 +6962,12 @@ paths = ["Cargo.toml"]
         let item = item_for_path(&session, "lib.rs").unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("lib.rs"), "resolved\n").expect("write");
-        let phase = conflict_workshop_phase_for_item(
-            &session,
-            item,
-            "lib.rs",
-            Some(dir.path()),
-        );
+        let phase = conflict_workshop_phase_for_item(&session, item, "lib.rs", Some(dir.path()));
         use git_ui::project_diff::MergeReviewConflictWorkshopPhase;
-        assert_eq!(phase, Some(MergeReviewConflictWorkshopPhase::RecordDecision));
+        assert_eq!(
+            phase,
+            Some(MergeReviewConflictWorkshopPhase::RecordDecision)
+        );
     }
 
     #[test]
@@ -6594,7 +6979,11 @@ paths = ["Cargo.toml"]
             "origin/main".into(),
             [("lib.rs".into(), true)],
         );
-        let item = session.items.iter_mut().find(|item| item.path == "lib.rs").unwrap();
+        let item = session
+            .items
+            .iter_mut()
+            .find(|item| item.path == "lib.rs")
+            .unwrap();
         item.review_state = MergeReviewState::Summarized;
         item.conflict_decision = Some(MergeReviewConflictDecision {
             outcome: MergeReviewSuggestedOutcome::KeepFork,
@@ -6620,10 +7009,7 @@ paths = ["Cargo.toml"]
             &manifest,
             "abc".into(),
             "origin/main".into(),
-            [
-                ("a.rs".into(), true),
-                ("b.rs".into(), true),
-            ],
+            [("a.rs".into(), true), ("b.rs".into(), true)],
         );
         store_conflict_decision(
             &mut session,
@@ -6728,6 +7114,31 @@ paths = ["Cargo.toml"]
         });
     }
 
+    #[gpui::test]
+    fn merge_review_summary_saved_toast_includes_locked_queue_position(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save session");
+            let toast = merge_review_summary_saved_toast("alpha.rs", false, cx);
+            assert!(toast.contains("File 1/2 · alpha.rs"), "{toast}");
+            assert!(toast.contains("Next file"), "{toast}");
+        });
+    }
+
     #[test]
     fn merge_review_append_user_note_prefixes_prompt() {
         let prompt = merge_review_append_user_note("Base prompt.".into(), Some("focus on hook"));
@@ -6788,9 +7199,11 @@ paths = ["Cargo.toml"]
             ));
             let loaded = load_session(cx).expect("session");
             assert!(loaded.running_notes.contains("[lib.rs] Discuss:"));
-            assert!(loaded
-                .running_notes
-                .contains("Should we keep the fork hook?"));
+            assert!(
+                loaded
+                    .running_notes
+                    .contains("Should we keep the fork hook?")
+            );
             assert!(loaded.pending_conflict_discuss_path.is_none());
         });
     }
@@ -6839,14 +7252,17 @@ paths = ["Cargo.toml"]
 
     #[test]
     fn extract_merge_commit_message_from_reply_parses_prefix() {
-        let reply = "Here is a draft.\nMerge commit message: Merge origin/main into surmount\n\nBody line.";
+        let reply =
+            "Here is a draft.\nMerge commit message: Merge origin/main into surmount\n\nBody line.";
         let message = extract_merge_commit_message_from_reply(reply).expect("message");
         assert!(message.starts_with("Merge origin/main into surmount"));
         assert!(message.contains("Body line."));
     }
 
     #[gpui::test]
-    fn try_capture_merge_review_commit_message_from_reply_stores_draft(cx: &mut gpui::TestAppContext) {
+    fn try_capture_merge_review_commit_message_from_reply_stores_draft(
+        cx: &mut gpui::TestAppContext,
+    ) {
         use crate::test_support::init_test;
 
         init_test(cx);
@@ -6877,7 +7293,9 @@ paths = ["Cargo.toml"]
     }
 
     #[gpui::test]
-    fn handle_merge_review_reply_on_stop_commit_message_format_retry(cx: &mut gpui::TestAppContext) {
+    fn handle_merge_review_reply_on_stop_commit_message_format_retry(
+        cx: &mut gpui::TestAppContext,
+    ) {
         use crate::test_support::init_test;
 
         init_test(cx);
@@ -6989,10 +7407,34 @@ paths = ["Cargo.toml"]
     }
 
     #[test]
+    fn build_session_sorts_conflicts_before_non_conflicts() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [
+                ("zebra.rs".into(), false),
+                ("alpha.rs".into(), true),
+                ("beta.rs".into(), false),
+                ("gamma.rs".into(), true),
+            ],
+        );
+        assert_eq!(
+            session
+                .items
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha.rs", "gamma.rs", "beta.rs", "zebra.rs"]
+        );
+    }
+
+    #[test]
     fn workflow_button_specs_includes_preview_merge_in_pre_merge() {
         use crate::merge_review_step_rail::{
-            MergeReviewPrimaryAction, MergeReviewUiStep, RAIL_BTN_PREVIEW_MERGE,
-            workflow_button_labels,
+            MergeReviewPrimaryAction, MergeReviewUiStep, RAIL_BTN_NEXT_FILE,
+            RAIL_BTN_PREVIEW_MERGE, RAIL_BTN_REVIEW_DIFF, workflow_button_labels,
         };
         use git_ui::project_diff::MergeReviewGitMode;
 
@@ -7003,9 +7445,18 @@ paths = ["Cargo.toml"]
             None,
             MergeReviewGitMode::PreMerge,
         );
+        assert_eq!(
+            labels,
+            vec![RAIL_BTN_PREVIEW_MERGE],
+            "PreMerge must offer Preview merge as the only workflow button"
+        );
         assert!(
-            labels.contains(&RAIL_BTN_PREVIEW_MERGE),
-            "PreMerge must offer Preview merge"
+            !labels.contains(&RAIL_BTN_NEXT_FILE),
+            "PreMerge must not offer Next file"
+        );
+        assert!(
+            !labels.contains(&RAIL_BTN_REVIEW_DIFF),
+            "PreMerge must not offer Review Diff"
         );
 
         let in_progress = workflow_button_labels(
@@ -7019,6 +7470,973 @@ paths = ["Cargo.toml"]
             !in_progress.contains(&RAIL_BTN_PREVIEW_MERGE),
             "Preview merge hidden while merge is in progress"
         );
+    }
+
+    #[test]
+    fn pre_merge_rail_preview_merge_is_only_primary_tier() {
+        use crate::merge_review_step_rail::{
+            MergeReviewPrimaryAction, MergeReviewUiStep, MergeReviewWorkflowButtonTier,
+            workflow_button_specs,
+        };
+        use git_ui::project_diff::MergeReviewGitMode;
+
+        let specs = workflow_button_specs(
+            MergeReviewUiStep::PickFile,
+            MergeReviewPrimaryAction::NextFile,
+            false,
+            None,
+            MergeReviewGitMode::PreMerge,
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].label,
+            crate::merge_review_step_rail::RAIL_BTN_PREVIEW_MERGE
+        );
+        assert_eq!(specs[0].tier, MergeReviewWorkflowButtonTier::Primary);
+    }
+
+    #[gpui::test]
+    fn pre_merge_branch_diff_controls_show_prepare_label(cx: &mut gpui::TestAppContext) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("a.rs".into(), false), ("b.rs".into(), false)],
+        );
+        session.focus_layout_active = true;
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            let controls = merge_review_branch_diff_controls(false, None, cx);
+            assert_eq!(
+                controls.progress_label.as_ref(),
+                "Prepare · 2 changed files"
+            );
+            assert!(!controls.review_diff_ready);
+            assert!(
+                controls.step_label.is_empty(),
+                "PreMerge must leave step_label empty, got {}",
+                controls.step_label
+            );
+        });
+    }
+
+    #[test]
+    fn workflow_button_labels_merge_in_progress_review_diff_primary_on_conflict() {
+        use crate::merge_review_step_rail::{
+            MergeReviewPrimaryAction, MergeReviewUiStep, MergeReviewWorkflowButtonTier,
+            RAIL_BTN_REVIEW_DIFF, workflow_button_labels, workflow_button_specs,
+        };
+        use git_ui::project_diff::{MergeReviewConflictWorkshopPhase, MergeReviewGitMode};
+
+        let labels = workflow_button_labels(
+            MergeReviewUiStep::ConflictWorkshop {
+                phase: MergeReviewConflictWorkshopPhase::NotSummarized,
+                emphasize: None,
+            },
+            MergeReviewPrimaryAction::ReviewDiff,
+            false,
+            Some(MergeReviewConflictWorkshopPhase::NotSummarized),
+            MergeReviewGitMode::MergeInProgress,
+        );
+        assert_eq!(labels.first().copied(), Some(RAIL_BTN_REVIEW_DIFF));
+
+        let specs = workflow_button_specs(
+            MergeReviewUiStep::ConflictWorkshop {
+                phase: MergeReviewConflictWorkshopPhase::NotSummarized,
+                emphasize: None,
+            },
+            MergeReviewPrimaryAction::ReviewDiff,
+            false,
+            Some(MergeReviewConflictWorkshopPhase::NotSummarized),
+            MergeReviewGitMode::MergeInProgress,
+        );
+        assert_eq!(
+            specs.first().map(|spec| spec.tier),
+            Some(MergeReviewWorkflowButtonTier::Primary)
+        );
+    }
+
+    #[test]
+    fn next_merge_review_file_path_respects_queue_order_without_wrap() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [
+                ("alpha.rs".into(), true),
+                ("beta.rs".into(), false),
+                ("gamma.rs".into(), false),
+            ],
+        );
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        session.items[0].review_state = MergeReviewState::Summarized;
+        assert_eq!(
+            next_merge_review_file_path(&session, None).as_deref(),
+            Some("beta.rs")
+        );
+        set_merge_review_queue_cursor(&mut session, "gamma.rs");
+        session.items[2].review_state = MergeReviewState::Summarized;
+        assert_eq!(next_merge_review_file_path(&session, None), None);
+    }
+
+    #[test]
+    fn resume_after_merge_sets_queue_cursor_path_to_first_unreviewed_conflict() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [
+                ("beta.rs".into(), false),
+                ("alpha.rs".into(), true),
+                ("gamma.rs".into(), true),
+            ],
+        );
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        session.items[0].review_state = MergeReviewState::Summarized;
+        initialize_merge_review_queue_cursor(&mut session);
+        assert_eq!(
+            session.queue_cursor_path.as_deref(),
+            Some("gamma.rs"),
+            "must skip reviewed conflicts and land on first unreviewed conflict"
+        );
+    }
+
+    #[test]
+    fn resume_preserves_valid_existing_queue_cursor() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "beta.rs");
+        initialize_merge_review_queue_cursor(&mut session);
+        assert_eq!(session.queue_cursor_path.as_deref(), Some("beta.rs"));
+    }
+
+    #[test]
+    fn merge_review_prepare_label_formats_changed_file_count() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [
+                ("a.rs".into(), false),
+                ("b.rs".into(), false),
+                ("c.rs".into(), false),
+            ],
+        );
+        assert_eq!(
+            merge_review_prepare_label(&session),
+            "Prepare · 3 changed files"
+        );
+    }
+
+    #[test]
+    fn merge_review_merge_started_detects_transition_and_assigns_cursor() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true)],
+        );
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        assert!(merge_review_merge_started(
+            git_ui::project_diff::MergeReviewGitMode::PreMerge,
+            0,
+            &session,
+        ));
+        session.unmerged_count = 2;
+        assert!(merge_review_merge_started(
+            git_ui::project_diff::MergeReviewGitMode::MergeInProgress,
+            0,
+            &session,
+        ));
+        assert!(!merge_review_merge_started(
+            git_ui::project_diff::MergeReviewGitMode::MergeInProgress,
+            2,
+            &session,
+        ));
+
+        initialize_merge_review_queue_cursor(&mut session);
+        assert_eq!(session.queue_cursor_path.as_deref(), Some("alpha.rs"));
+    }
+
+    #[test]
+    fn initialize_merge_review_queue_cursor_uses_first_unreviewed_item() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), false), ("beta.rs".into(), false)],
+        );
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        session.unmerged_count = 0;
+        initialize_merge_review_queue_cursor(&mut session);
+        assert_eq!(
+            session.queue_cursor_path.as_deref(),
+            Some("alpha.rs"),
+            "clean merge must still engage linear queue at first unreviewed file"
+        );
+    }
+
+    #[test]
+    fn reconcile_merge_review_queue_cursor_resets_unknown_path() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true)],
+        );
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        session.queue_cursor_path = Some("deleted/path.rs".into());
+        reconcile_merge_review_queue_cursor(&mut session);
+        assert_eq!(session.queue_cursor_path.as_deref(), Some("alpha.rs"));
+        assert_eq!(
+            merge_review_queue_position_label(&session, "alpha.rs"),
+            "File 1/1 · alpha.rs"
+        );
+    }
+
+    #[test]
+    fn next_merge_review_file_path_stops_at_open_question() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [
+                ("alpha.rs".into(), false),
+                ("beta.rs".into(), false),
+                ("gamma.rs".into(), false),
+            ],
+        );
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        session.items[0].review_state = MergeReviewState::Summarized;
+        session.items[1].review_state = MergeReviewState::OpenQuestion;
+        assert_eq!(next_merge_review_file_path(&session, None), None);
+    }
+
+    #[test]
+    fn next_merge_review_file_path_blocks_when_cursor_is_open_question() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [
+                ("alpha.rs".into(), false),
+                ("beta.rs".into(), false),
+                ("gamma.rs".into(), false),
+            ],
+        );
+        set_merge_review_queue_cursor(&mut session, "beta.rs");
+        session.items[0].review_state = MergeReviewState::Summarized;
+        session.items[1].review_state = MergeReviewState::OpenQuestion;
+        session.items[2].review_state = MergeReviewState::NotReviewed;
+        assert_eq!(
+            next_merge_review_file_path(&session, None),
+            None,
+            "must not skip past OpenQuestion at cursor to gamma.rs"
+        );
+        let message = merge_review_next_file_blocked_message(&session, None).expect("message");
+        assert!(message.contains("open question"), "{message}");
+        assert!(message.contains("File 2/3 · beta.rs"), "{message}");
+    }
+
+    #[test]
+    fn merge_review_next_file_blocked_message_end_of_queue() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), false), ("beta.rs".into(), false)],
+        );
+        for item in &mut session.items {
+            item.review_state = MergeReviewState::Summarized;
+        }
+        let message =
+            merge_review_next_file_blocked_message(&session, None).expect("queue complete");
+        assert!(message.contains("End merge review"), "{message}");
+    }
+
+    #[test]
+    fn next_merge_review_file_path_prefers_cursor_over_current_path() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [
+                ("alpha.rs".into(), false),
+                ("beta.rs".into(), false),
+                ("gamma.rs".into(), false),
+            ],
+        );
+        set_merge_review_queue_cursor(&mut session, "beta.rs");
+        session.items[0].review_state = MergeReviewState::Summarized;
+        assert_eq!(
+            next_merge_review_file_path(&session, Some("alpha.rs")).as_deref(),
+            Some("beta.rs"),
+            "cursor at beta.rs (NotReviewed) must re-land on cursor when UI selection lags on alpha.rs"
+        );
+    }
+
+    #[gpui::test]
+    fn merge_review_out_of_order_selection_toast_blocks_mismatched_path(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        session.focus_layout_active = true;
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            assert!(merge_review_out_of_order_selection_toast("alpha.rs", cx).is_none());
+            let toast = merge_review_out_of_order_selection_toast("beta.rs", cx).expect("toast");
+            assert!(toast.contains("File 1/2 · alpha.rs"));
+            assert!(toast.contains(MERGE_REVIEW_OUT_OF_ORDER_TOAST_SUFFIX));
+        });
+    }
+
+    #[gpui::test]
+    async fn merge_review_allow_file_navigation_respects_canonical_alias_and_no_cursor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("agents/skills/surmount-merge-review/SKILL.md".into(), false)],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "agents/skills/surmount-merge-review/SKILL.md");
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.update(|_, cx| {
+            assert!(merge_review_allow_file_navigation(
+                ".agents/skills/surmount-merge-review/SKILL.md",
+                workspace.clone(),
+                cx
+            ));
+            session.queue_cursor_path = None;
+            save_session(cx, &session).expect("save");
+            assert!(merge_review_allow_file_navigation(
+                "other.rs",
+                workspace.clone(),
+                cx
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn merge_review_allow_file_navigation_respects_cursor_and_pre_merge(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        cx.update(|_, cx| {
+            assert!(merge_review_allow_file_navigation(
+                "alpha.rs",
+                workspace.clone(),
+                cx
+            ));
+            assert!(!merge_review_allow_file_navigation(
+                "beta.rs",
+                workspace.clone(),
+                cx
+            ));
+
+            let mut pre_merge = session;
+            pre_merge.git_mode = git_ui::project_diff::MergeReviewGitMode::PreMerge;
+            pre_merge.queue_cursor_path = Some("alpha.rs".into());
+            save_session(cx, &pre_merge).expect("save");
+            assert!(merge_review_allow_file_navigation(
+                "beta.rs",
+                workspace.clone(),
+                cx
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn intercept_review_branch_diff_note_modal_returns_false(cx: &mut gpui::TestAppContext) {
+        use crate::test_support::init_test;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+
+        init_test(cx);
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let intercepted = workspace.update_in(cx, |workspace, window, cx| {
+            intercept_review_branch_diff_note_modal(
+                workspace,
+                window,
+                cx,
+                "diff",
+                "origin/main",
+                Some("lib.rs"),
+            )
+        });
+        assert!(!intercepted);
+    }
+
+    async fn setup_merge_review_branch_diff_fixture(
+        cx: &mut gpui::TestAppContext,
+        paths: &[(&str, &str)],
+    ) -> (
+        gpui::Entity<Workspace>,
+        gpui::VisualTestContext,
+        gpui::Entity<git_ui::project_diff::ProjectDiff>,
+        gpui::Entity<project::Project>,
+    ) {
+        use crate::test_support::init_test;
+        use git_ui::project_diff::ProjectDiff;
+        use gpui::VisualTestContext;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+        use workspace::MultiWorkspace;
+
+        init_test(cx);
+        cx.update(|cx| {
+            git_ui::init(cx);
+        });
+        let mut tree = json!({ ".git": {} });
+        if let Some(obj) = tree.as_object_mut() {
+            for (path, content) in paths {
+                obj.insert((*path).into(), (*content).into());
+            }
+        }
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), tree).await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let index_entries = paths
+            .iter()
+            .map(|(path, content)| (*path, (*content).to_string()))
+            .collect::<Vec<_>>();
+        fs.set_head_and_index_for_repo(path!("/project/.git").as_ref(), &index_entries);
+        let merge_base_entries = paths
+            .iter()
+            .map(|(path, content)| {
+                let base = format!("{content}base");
+                (*path, base)
+            })
+            .collect::<Vec<_>>();
+        fs.set_merge_base_content_for_repo(path!("/project/.git").as_ref(), &merge_base_entries);
+        cx.run_until_parked();
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .expect("workspace");
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        let diff = cx
+            .update(|window, cx| {
+                ProjectDiff::spawn_test_branch_diff(
+                    project.clone(),
+                    workspace.clone(),
+                    "origin/main".into(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("merge branch diff");
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(diff.clone()), None, true, window, cx);
+        });
+        for _ in 0..40 {
+            cx.run_until_parked();
+        }
+        (workspace, cx, diff, project)
+    }
+
+    #[gpui::test]
+    async fn advance_merge_review_to_next_file_rolls_back_cursor_on_failed_navigation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        session.items[0].review_state = MergeReviewState::Summarized;
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let advanced = workspace.update_in(cx, |workspace, window, cx| {
+            advance_merge_review_to_next_file_with_sync(workspace, window, cx, false)
+        });
+        assert!(!advanced, "advance must fail without Branch Diff open");
+        cx.update(|_, cx| {
+            let session = load_session(cx).expect("session");
+            assert_eq!(
+                session.queue_cursor_path.as_deref(),
+                Some("alpha.rs"),
+                "cursor must stay unchanged when Branch Diff is missing"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn advance_merge_review_to_next_file_rolls_back_cursor_when_move_fails(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use git_ui::project_diff::{
+            clear_merge_review_file_navigation_guard_test_override,
+            set_merge_review_file_navigation_guard_for_tests,
+        };
+
+        let (workspace, mut cx, diff, _project) = setup_merge_review_branch_diff_fixture(
+            cx,
+            &[("alpha.rs", "alpha head\n"), ("beta.rs", "beta head\n")],
+        )
+        .await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        session.items[0].review_state = MergeReviewState::Summarized;
+        cx.update(|_, cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            set_merge_review_file_navigation_guard_for_tests(|path, _, _| path == "alpha.rs");
+        });
+        diff.update_in(&mut cx, |diff, window, cx| {
+            diff.move_to_repo_relative_path("alpha.rs", window, cx)
+        });
+        let advanced = workspace.update_in(&mut cx, |workspace, window, cx| {
+            advance_merge_review_to_next_file_with_sync(workspace, window, cx, false)
+        });
+        assert!(
+            !advanced,
+            "advance must fail when guard blocks navigation to beta.rs"
+        );
+        cx.update(|_, cx| {
+            let session = load_session(cx).expect("session");
+            assert_eq!(
+                session.queue_cursor_path.as_deref(),
+                Some("alpha.rs"),
+                "cursor must roll back when move_to_repo_relative_path returns false"
+            );
+            clear_merge_review_file_navigation_guard_test_override();
+        });
+    }
+
+    #[gpui::test]
+    async fn advance_merge_review_to_next_file_happy_path(cx: &mut gpui::TestAppContext) {
+        let (workspace, mut cx, diff, _project) = setup_merge_review_branch_diff_fixture(
+            cx,
+            &[("alpha.rs", "alpha head\n"), ("beta.rs", "beta head\n")],
+        )
+        .await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        session.items[0].review_state = MergeReviewState::Summarized;
+        cx.update(|_, cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+        diff.update_in(&mut cx, |diff, window, cx| {
+            assert!(
+                diff.move_to_repo_relative_path("alpha.rs", window, cx),
+                "fixture must select alpha.rs in Branch Diff"
+            );
+        });
+        let advanced = workspace.update_in(&mut cx, |workspace, window, cx| {
+            advance_merge_review_to_next_file_with_sync(workspace, window, cx, false)
+        });
+        assert!(advanced, "advance must succeed with Branch Diff open");
+        cx.update(|_, cx| {
+            let session = load_session(cx).expect("session");
+            assert_eq!(
+                session.queue_cursor_path.as_deref(),
+                Some("beta.rs"),
+                "happy-path advance must persist cursor on next file"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn advance_merge_review_to_next_file_shows_blocked_toast(cx: &mut gpui::TestAppContext) {
+        use workspace::notifications::NotificationId;
+
+        let (workspace, mut cx, diff, _project) = setup_merge_review_branch_diff_fixture(
+            cx,
+            &[("alpha.rs", "alpha head\n"), ("beta.rs", "beta head\n")],
+        )
+        .await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        session.items[0].review_state = MergeReviewState::OpenQuestion;
+        cx.update(|_, cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+        diff.update_in(&mut cx, |diff, window, cx| {
+            diff.move_to_repo_relative_path("alpha.rs", window, cx)
+        });
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.clear_all_notifications(cx);
+            let advanced =
+                advance_merge_review_to_next_file_with_sync(workspace, window, cx, false);
+            assert!(!advanced, "open question must block advance");
+            assert!(
+                workspace.notification_ids().iter().any(|id| {
+                    matches!(
+                        id,
+                        NotificationId::Named(name) if name.as_ref() == "surmount-merge-review"
+                    )
+                }),
+                "advance path must show blocked toast"
+            );
+        });
+    }
+
+    #[test]
+    fn merge_started_suppresses_generic_refresh_toast() {
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true)],
+        );
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        session.unmerged_count = 2;
+        let merge_started = merge_review_merge_started(
+            git_ui::project_diff::MergeReviewGitMode::PreMerge,
+            0,
+            &session,
+        );
+        let auto_select = if merge_started {
+            initialize_merge_review_queue_cursor(&mut session);
+            session
+                .queue_cursor_path
+                .clone()
+                .map(|path| (session.unmerged_count, path))
+        } else {
+            None
+        };
+        assert!(merge_started);
+        assert!(
+            auto_select.is_some(),
+            "merge_started must take auto_select path instead of generic refresh toast"
+        );
+    }
+
+    #[gpui::test]
+    fn conflict_cleanup_banner_when_unmerged_clear_but_files_remain(cx: &mut gpui::TestAppContext) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [
+                ("alpha.rs".into(), true),
+                ("beta.rs".into(), false),
+                ("gamma.rs".into(), false),
+            ],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        session.unmerged_count = 0;
+        session.items[0].review_state = MergeReviewState::Summarized;
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            let controls = merge_review_branch_diff_controls(false, None, cx);
+            assert!(
+                controls
+                    .step_label
+                    .contains(MERGE_REVIEW_STEP_CONFLICT_CLEANUP),
+                "step_label was {}",
+                controls.step_label
+            );
+        });
+    }
+
+    #[test]
+    fn all_complete_draft_commit_is_primary_end_is_danger() {
+        use crate::merge_review_step_rail::{
+            MergeReviewPrimaryAction, MergeReviewUiStep, MergeReviewWorkflowButtonTier,
+            RAIL_BTN_DRAFT_COMMIT_MESSAGE, workflow_button_specs,
+        };
+        use git_ui::project_diff::MergeReviewGitMode;
+
+        let specs = workflow_button_specs(
+            MergeReviewUiStep::AllComplete,
+            MergeReviewPrimaryAction::EndMergeReview,
+            false,
+            None,
+            MergeReviewGitMode::MergeInProgress,
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].label, RAIL_BTN_DRAFT_COMMIT_MESSAGE);
+        assert_eq!(specs[0].tier, MergeReviewWorkflowButtonTier::Primary);
+        // End merge review is rendered separately and is always Danger (never primary).
+    }
+
+    #[gpui::test]
+    async fn advance_merge_review_to_next_file_updates_cursor_through_guard(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        session.items[0].review_state = MergeReviewState::Summarized;
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let next = next_merge_review_file_path(&session, Some("alpha.rs")).expect("next");
+        assert_eq!(next, "beta.rs");
+        set_merge_review_queue_cursor(&mut session, &next);
+        cx.update(|_, cx| {
+            save_session(cx, &session).expect("save");
+            assert!(!merge_review_allow_file_navigation(
+                "alpha.rs",
+                workspace.clone(),
+                cx
+            ));
+            assert!(merge_review_allow_file_navigation(
+                "beta.rs",
+                workspace.clone(),
+                cx
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn discuss_and_synthesize_actions_skip_note_modal(cx: &mut gpui::TestAppContext) {
+        use crate::test_support::init_test;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+        use zed_actions::surmount::{DiscussMergeReviewConflict, SynthesizeMergeReviewConflict};
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true)],
+        );
+        session.focus_layout_active = true;
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            window.dispatch_action(DiscussMergeReviewConflict.boxed_clone(), cx);
+            assert!(
+                workspace.active_modal::<MergeReviewNoteModal>(cx).is_none(),
+                "Discuss conflict must not open note modal"
+            );
+            window.dispatch_action(SynthesizeMergeReviewConflict.boxed_clone(), cx);
+            assert!(
+                workspace.active_modal::<MergeReviewNoteModal>(cx).is_none(),
+                "Synthesize must not open note modal"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn record_decision_confirm_opens_note_modal(cx: &mut gpui::TestAppContext) {
+        use crate::test_support::init_test;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+        use zed_actions::surmount::ConfirmMergeReviewDecisionKeepFork;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true)],
+        );
+        session.focus_layout_active = true;
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_merge_review_note_modal(
+                workspace,
+                window,
+                cx,
+                "Keep fork",
+                "Rationale or caveats to record?",
+                MergeReviewNoteContinuation::ConfirmDecision(MergeReviewSuggestedOutcome::KeepFork),
+            );
+            assert!(
+                workspace.active_modal::<MergeReviewNoteModal>(cx).is_some(),
+                "Record decision confirm must open note modal"
+            );
+        });
+        workspace.update_in(cx, |_, window, cx| {
+            window.dispatch_action(ConfirmMergeReviewDecisionKeepFork.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(
+                workspace.active_modal::<MergeReviewNoteModal>(cx).is_some(),
+                "registered ConfirmKeepFork action must open note modal"
+            );
+        });
     }
 
     #[test]
@@ -7073,9 +8491,7 @@ paths = ["Cargo.toml"]
                     show_conflict_resolution: true,
                     is_conflict_file: true,
                     suggested_outcome: Some(MergeReviewConflictOutcomeHint::KeepFork),
-                    conflict_workshop_phase: Some(
-                        MergeReviewConflictWorkshopPhase::DiscussReady,
-                    ),
+                    conflict_workshop_phase: Some(MergeReviewConflictWorkshopPhase::DiscussReady),
                     ..base.clone()
                 },
                 false,
@@ -7219,8 +8635,7 @@ paths = ["Cargo.toml"]
         cx.update(|cx| {
             crate::merge_review::init(cx);
             save_session(cx, &session).expect("save");
-            let controls =
-                merge_review_branch_diff_controls(true, Some("cargo/audit.toml"), cx);
+            let controls = merge_review_branch_diff_controls(true, Some("cargo/audit.toml"), cx);
             assert!(controls.show_conflict_resolution);
             assert!(controls.current_file_done);
         });
@@ -7251,7 +8666,9 @@ paths = ["Cargo.toml"]
             [(".cargo/audit.toml".into(), false)],
         );
         session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
         session.pending_summary_path = Some(".cargo/audit.toml".into());
+        set_merge_review_queue_cursor(&mut session, ".cargo/audit.toml");
 
         cx.update(|_, cx| {
             crate::merge_review::init(cx);
@@ -7290,8 +8707,10 @@ paths = ["Cargo.toml"]
         init_test(cx);
         let mut session = test_session_with_ambiguous_items(3);
         session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
         let file_path = session.items[0].path.clone();
         session.pending_summary_path = Some(file_path.clone());
+        set_merge_review_queue_cursor(&mut session, &file_path);
         cx.update(|cx| {
             crate::merge_review::init(cx);
             save_session(cx, &session).expect("save session");
@@ -7312,8 +8731,10 @@ paths = ["Cargo.toml"]
         init_test(cx);
         let mut session = test_session_with_ambiguous_items(3);
         session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
         let file_path = session.items[0].path.clone();
         session.pending_summary_path = Some(file_path.clone());
+        set_merge_review_queue_cursor(&mut session, &file_path);
         cx.update(|cx| {
             crate::merge_review::init(cx);
             save_session(cx, &session).expect("save session");
@@ -7337,7 +8758,9 @@ paths = ["Cargo.toml"]
         init_test(cx);
         let mut session = test_session_with_ambiguous_items(3);
         session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
         let file_path = session.items[0].path.clone();
+        set_merge_review_queue_cursor(&mut session, &file_path);
         cx.update(|cx| {
             crate::merge_review::init(cx);
             save_session(cx, &session).expect("save session");
@@ -7383,28 +8806,17 @@ paths = ["Cargo.toml"]
     fn merge_review_user_visible_strings_are_stable() {
         assert_eq!(
             MERGE_REVIEW_READY_TOAST,
-            "Step 1: click a changed file in the list. Step 2: click the green Review Diff button."
+            "Merge review ready — click **Preview merge** when you are ready to run `git merge`."
         );
+        assert_eq!(MERGE_REVIEW_STEP_PREPARE, "Prepare");
+        assert_eq!(MERGE_REVIEW_STEP_REVIEW_READY, "Review Diff");
+        assert_eq!(MERGE_REVIEW_STEP_NEXT_FILE, "Next file");
+        assert_eq!(MERGE_REVIEW_STEP_CONFLICT_REVIEW, "Summarize this conflict");
         assert_eq!(
-            MERGE_REVIEW_STEP_PICK_FILE,
-            "Step 1 · Pick a file in the list"
+            MERGE_REVIEW_OUT_OF_ORDER_TOAST_SUFFIX,
+            " — click **Next file →** to advance"
         );
-        assert_eq!(
-            MERGE_REVIEW_STEP_REVIEW_READY,
-            "Step 2 · Click Review Diff to summarize this file"
-        );
-        assert_eq!(
-            MERGE_REVIEW_STEP_FILE_DONE,
-            "Step 3 · Pick next file in the list"
-        );
-        assert_eq!(
-            MERGE_REVIEW_STEP_CONFLICT_REVIEW,
-            "Step 2 · Review Diff — compare fork (left) vs upstream (right)"
-        );
-        assert_eq!(
-            MERGE_REVIEW_STEP_CONFLICT_RESOLVE,
-            "Step 4 · Apply resolution (colored buttons)"
-        );
+        assert_eq!(MERGE_REVIEW_STEP_CONFLICT_RESOLVE, "Resolve conflict");
         assert_eq!(
             merge_review_branch_diff_button_label(),
             MERGE_REVIEW_BRANCH_DIFF_BUTTON
@@ -8087,7 +9499,9 @@ paths = ["Cargo.toml"]
         let (workspace, mut cx) =
             setup_zoomed_agent_workspace_with_surmount(cx, project_root).await;
         let project = workspace.read_with(&cx, |workspace, _| workspace.project().clone());
-        let session = test_session_with_ambiguous_items(3);
+        let mut session = test_session_with_ambiguous_items(3);
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "lib.rs");
 
         workspace.update_in(&mut cx, |workspace, window, cx| {
             MergeReviewView::open_merge_review_workflow(workspace, session, project, window, cx);
@@ -8095,10 +9509,6 @@ paths = ["Cargo.toml"]
         for _ in 0..40 {
             cx.run_until_parked();
         }
-
-        cx.update(|_, cx| {
-            stash_merge_review_clarifying_note(cx, Some("skip note modal".into()));
-        });
 
         cx.update(|window, cx| {
             window.dispatch_action(

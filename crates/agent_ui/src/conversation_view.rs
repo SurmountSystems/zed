@@ -1505,8 +1505,7 @@ impl ConversationView {
                 let open_question_captured = crate::merge_review::load_session(cx)
                     .and_then(|session| {
                         crate::merge_review::item_for_path(&session, &captured_path).map(|item| {
-                            item.review_state
-                                == crate::merge_review::MergeReviewState::OpenQuestion
+                            item.review_state == crate::merge_review::MergeReviewState::OpenQuestion
                         })
                     })
                     .unwrap_or(false);
@@ -1538,7 +1537,10 @@ impl ConversationView {
                     });
                 }
             }
-            crate::merge_review::MergeReviewCaptureOnStop::FormatRetryRequested { path, prompt } => {
+            crate::merge_review::MergeReviewCaptureOnStop::FormatRetryRequested {
+                path,
+                prompt,
+            } => {
                 log::info!(
                     "surmount merge review: requesting Summary/Outcome format retry for {path}"
                 );

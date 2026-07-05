@@ -1551,6 +1551,8 @@ pub struct AcpThread {
     /// gradually to create a fluid typing effect instead of choppy chunk-at-a-time
     /// updates.
     streaming_text_buffer: Option<StreamingTextBuffer>,
+    /// Per assistant-message guard: discipline/formatting kickbacks fire at most once per streamed reply.
+    grok_output_discipline_kickback_sent: bool,
 }
 
 struct StreamingTextBuffer {
@@ -1760,6 +1762,7 @@ impl AcpThread {
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
+            grok_output_discipline_kickback_sent: false,
         }
     }
 
@@ -2323,6 +2326,7 @@ impl AcpThread {
     }
 
     /// Keep in sync with `agent_ui::merge_review::merge_review_file_prompt`.
+    const MERGE_REVIEW_PLAN_PROMPT_MARKER: &'static str = "Merge review session for upstream";
     const MERGE_REVIEW_FILE_PROMPT_MARKER: &'static str =
         "Summarize this file for merging upstream";
     const MERGE_REVIEW_SCOPED_TURN_MARKER: &'static str = "This is a scoped single-file turn";
@@ -2355,7 +2359,8 @@ impl AcpThread {
     }
 
     fn is_merge_review_file_prompt(text: &str) -> bool {
-        text.contains(Self::MERGE_REVIEW_FILE_PROMPT_MARKER)
+        text.contains(Self::MERGE_REVIEW_PLAN_PROMPT_MARKER)
+            || text.contains(Self::MERGE_REVIEW_FILE_PROMPT_MARKER)
             || text.contains(Self::MERGE_REVIEW_SCOPED_TURN_MARKER)
             || text.contains(Self::MERGE_REVIEW_CONFLICT_TURN_MARKER)
     }
@@ -2393,7 +2398,7 @@ impl AcpThread {
         let path_style = self.project.read(cx).path_style(cx);
 
         let merge_review_scoped = self.merge_review_file_turn_scoped();
-        if self.is_grok() && !merge_review_scoped {
+        if self.is_grok() && !merge_review_scoped && !self.grok_output_discipline_kickback_sent {
             if let acp::ContentBlock::Text(tc) = &chunk {
                 if let Err(violations) = Self::validate_grok_output_formatting(&tc.text) {
                     let correction = format!(
@@ -2405,48 +2410,49 @@ impl AcpThread {
                         violations
                     );
                     let text_block = acp::ContentBlock::Text(acp::TextContent::new(correction));
+                    self.grok_output_discipline_kickback_sent = true;
                     self.push_user_content_block(None, text_block, cx);
-                }
-
-                // Combined enforcement for the autonomous discipline rules: produce one clear correction when the model
-                // either stops while work remains or fails to emit the required completion notification.
-                let stop_violation = self.plan.would_violate_autonomous_discipline(&tc.text);
-                let notification_violation = self.is_grok()
-                    && self
+                } else {
+                    // Combined enforcement for the autonomous discipline rules: produce one clear correction when the model
+                    // either stops while work remains or fails to emit the required completion notification.
+                    let stop_violation = self.plan.would_violate_autonomous_discipline(&tc.text);
+                    let notification_violation = self
                         .plan
                         .requires_explicit_completion_notification(&tc.text);
 
-                if stop_violation || notification_violation {
-                    let mut correction = String::from(
-                        "Your previous response violated the Autonomous Work Discipline rules:\n\n",
-                    );
-
-                    if stop_violation {
-                        correction.push_str("A. You attempted to stop while the living plan (tracked via todo_write and visible in the categorized todos surface) still has pending items.\n");
-                        correction.push_str(
-                            "   1. Stopping when there are still tasks is not acceptable.\n",
+                    if stop_violation || notification_violation {
+                        let mut correction = String::from(
+                            "Your previous response violated the Autonomous Work Discipline rules:\n\n",
                         );
-                        correction.push_str("   2. Continue autonomously using the available tools until every pending entry is resolved or you explicitly hand control back.\n\n");
+
+                        if stop_violation {
+                            correction.push_str("A. You attempted to stop while the living plan (tracked via todo_write and visible in the categorized todos surface) still has pending items.\n");
+                            correction.push_str(
+                                "   1. Stopping when there are still tasks is not acceptable.\n",
+                            );
+                            correction.push_str("   2. Continue autonomously using the available tools until every pending entry is resolved or you explicitly hand control back.\n\n");
+                        }
+
+                        if notification_violation {
+                            correction.push_str("B. You concluded the turn without the required explicit completion notification.\n");
+                            correction.push_str("   1. When all work is genuinely finished you MUST state: 'All current independent work is complete. No further autonomous actions are possible without additional direction.'\n");
+                            correction.push_str("   2. This notification must be present so the categorized todos surface can record the correct state.\n\n");
+                        }
+
+                        correction.push_str("   When naming or referencing tasks (in todo_write, plan entries, categorized todos), always use the T-<n>-task-<id> syntax (e.g. T-17-task-refactor-parser) for stable cross-turn traceability.\n\n");
+                        correction.push_str("Please revise your last response to comply with all three rules (never stop while tasks remain, always emit the exact completion notification when done, and apply the CWD-based RO/Destructive classification using proper T-<n>-task-<id> references).");
+
+                        log::info!(
+                            "acp_thread: injecting Grok discipline kickback (stop={stop_violation}, notification={notification_violation})"
+                        );
+                        let text_block = acp::ContentBlock::Text(acp::TextContent::new(correction));
+                        self.grok_output_discipline_kickback_sent = true;
+                        self.push_user_content_block(None, text_block, cx);
                     }
-
-                    if notification_violation {
-                        correction.push_str("B. You concluded the turn without the required explicit completion notification.\n");
-                        correction.push_str("   1. When all work is genuinely finished you MUST state: 'All current independent work is complete. No further autonomous actions are possible without additional direction.'\n");
-                        correction.push_str("   2. This notification must be present so the categorized todos surface can record the correct state.\n\n");
-                    }
-
-                    correction.push_str("   When naming or referencing tasks (in todo_write, plan entries, categorized todos), always use the T-<n>-task-<id> syntax (e.g. T-17-task-refactor-parser) for stable cross-turn traceability.\n\n");
-                    correction.push_str("Please revise your last response to comply with all three rules (never stop while tasks remain, always emit the exact completion notification when done, and apply the CWD-based RO/Destructive classification using proper T-<n>-task-<id> references).");
-
-                    log::info!(
-                        "acp_thread: injecting Grok discipline kickback (stop={stop_violation}, notification={notification_violation})"
-                    );
-                    let text_block = acp::ContentBlock::Text(acp::TextContent::new(correction));
-                    self.push_user_content_block(None, text_block, cx);
                 }
             }
         } else if self.is_grok() && merge_review_scoped {
-            log::info!("acp_thread: skipping Grok output discipline for merge review file turn");
+            log::debug!("acp_thread: skipping Grok output discipline for merge review scoped turn");
         }
 
         // For text chunks going to an existing Markdown block, buffer for smooth
@@ -2495,6 +2501,7 @@ impl AcpThread {
                 AssistantMessageChunk::Message { block }
             };
 
+            self.grok_output_discipline_kickback_sent = false;
             self.push_entry(
                 AgentThreadEntry::AssistantMessage(AssistantMessage {
                     chunks: vec![chunk],
@@ -7331,6 +7338,65 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_merge_review_plan_prompt_skips_autonomous_discipline_kickback(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        thread.update(cx, |thread, cx| {
+            thread.plan.entries.clear();
+            let plan_prompt = "Merge review session for upstream `origin/main` into the Surmount fork.\n\
+                 202 files changed; propose review order by SURMOUNT section.\n";
+            thread.push_user_content_block(
+                None,
+                acp::ContentBlock::Text(acp::TextContent::new(plan_prompt)),
+                cx,
+            );
+            for chunk in ["A. Review ", "agent_ui ", "first.\n"] {
+                thread.push_assistant_content_block_with_indent(
+                    acp::ContentBlock::Text(acp::TextContent::new(chunk)),
+                    false,
+                    false,
+                    cx,
+                );
+            }
+        });
+        thread.read_with(cx, |thread, app| {
+            let correction_count = thread
+                .entries
+                .iter()
+                .filter(|entry| {
+                    if let AgentThreadEntry::UserMessage(user_message) = entry {
+                        user_message
+                            .content
+                            .to_markdown(app)
+                            .contains("Autonomous Work Discipline rules")
+                    } else {
+                        false
+                    }
+                })
+                .count();
+            assert_eq!(
+                correction_count, 0,
+                "merge review plan turn must not inject discipline kickback per chunk"
+            );
+            assert!(thread.merge_review_file_turn_scoped_for_tests());
+        });
+    }
+
+    #[gpui::test]
     async fn test_merge_review_file_turn_stays_scoped_after_injected_kickback(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -7411,7 +7477,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_merge_review_conflict_turn_stays_scoped_after_kickback(cx: &mut gpui::TestAppContext) {
+    async fn test_merge_review_conflict_turn_stays_scoped_after_kickback(
+        cx: &mut gpui::TestAppContext,
+    ) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;

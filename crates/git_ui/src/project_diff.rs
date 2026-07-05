@@ -36,6 +36,8 @@ use project::{
 };
 use settings::{Settings, SettingsStore};
 use std::any::{Any, TypeId};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::RwLock;
 use std::sync::{Arc, OnceLock};
 use theme::ActiveTheme;
 use ui::{
@@ -595,6 +597,21 @@ impl ProjectDiff {
         })
     }
 
+    /// Test helper: opens a merge-base Branch Diff without going through workspace deploy.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_test_branch_diff(
+        project: Entity<Project>,
+        workspace: Entity<Workspace>,
+        base_ref: SharedString,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
+        let Some(repository) = project.read(cx).active_repository(cx) else {
+            return Task::ready(Err(anyhow::anyhow!("no active repository")));
+        };
+        Self::new_with_branch_base(project, workspace, base_ref, repository, window, cx)
+    }
+
     fn new(
         project: Entity<Project>,
         workspace: Entity<Workspace>,
@@ -738,6 +755,10 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let path = entry.repo_path.as_ref().to_proto();
+        if !merge_review_file_navigation_allowed(&path, &self.workspace, cx) {
+            return;
+        }
         let Some(git_repo) = self.branch_diff.read(cx).repo() else {
             return;
         };
@@ -760,6 +781,21 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let path = {
+            let Some(git_repo) = self.branch_diff.read(cx).repo() else {
+                return;
+            };
+            let Some(repo_path) = git_repo
+                .read(cx)
+                .project_path_to_repo_path(project_path, cx)
+            else {
+                return;
+            };
+            repo_path.as_ref().to_proto()
+        };
+        if !merge_review_file_navigation_allowed(&path, &self.workspace, cx) {
+            return;
+        }
         let Some(git_repo) = self.branch_diff.read(cx).repo() else {
             return;
         };
@@ -785,6 +821,9 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !merge_review_file_navigation_allowed(path, &self.workspace, cx) {
+            return false;
+        }
         let Ok(repo_path) = RepoPath::new(path) else {
             return false;
         };
@@ -849,9 +888,9 @@ impl ProjectDiff {
     /// Takes all diff review comments from the primary editor and formats them for the agent.
     pub fn take_review_comments_for_agent(&mut self, cx: &mut Context<Self>) -> String {
         self.editor.update(cx, |splittable, cx| {
-            splittable
-                .rhs_editor()
-                .update(cx, |editor, cx| editor.formatted_diff_review_comments_for_agent(cx))
+            splittable.rhs_editor().update(cx, |editor, cx| {
+                editor.formatted_diff_review_comments_for_agent(cx)
+            })
         })
     }
 
@@ -2284,6 +2323,7 @@ type MergeReviewBranchDiffControlsFn =
 type MergeReviewBranchDiffButtonLabelFn = fn() -> &'static str;
 type MergeReviewEndBranchDiffButtonLabelFn = fn() -> &'static str;
 type MergeReviewFinalizeControlsFn = fn(&mut MergeReviewBranchDiffControls, bool, &Workspace, &App);
+type MergeReviewFileNavigationGuardFn = fn(&str, gpui::Entity<Workspace>, &mut App) -> bool;
 
 static MERGE_REVIEW_HEADER_LABEL: OnceLock<MergeReviewHeaderLabelFn> = OnceLock::new();
 static MERGE_REVIEW_SESSION_ACTIVE: OnceLock<MergeReviewSessionActiveFn> = OnceLock::new();
@@ -2295,6 +2335,27 @@ static MERGE_REVIEW_END_BRANCH_DIFF_BUTTON_LABEL: OnceLock<MergeReviewEndBranchD
     OnceLock::new();
 static MERGE_REVIEW_STEP_RAIL_RENDERER: OnceLock<MergeReviewStepRailRendererFn> = OnceLock::new();
 static MERGE_REVIEW_FINALIZE_CONTROLS: OnceLock<MergeReviewFinalizeControlsFn> = OnceLock::new();
+static MERGE_REVIEW_FILE_NAVIGATION_GUARD: OnceLock<MergeReviewFileNavigationGuardFn> =
+    OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+static MERGE_REVIEW_FILE_NAVIGATION_GUARD_TEST_OVERRIDE: RwLock<
+    Option<MergeReviewFileNavigationGuardFn>,
+> = RwLock::new(None);
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_merge_review_file_navigation_guard_for_tests(guard: MergeReviewFileNavigationGuardFn) {
+    *MERGE_REVIEW_FILE_NAVIGATION_GUARD_TEST_OVERRIDE
+        .write()
+        .expect("guard test override lock") = Some(guard);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_merge_review_file_navigation_guard_test_override() {
+    *MERGE_REVIEW_FILE_NAVIGATION_GUARD_TEST_OVERRIDE
+        .write()
+        .expect("guard test override lock") = None;
+}
 
 pub fn set_merge_review_header_label(renderer: MergeReviewHeaderLabelFn) {
     let _ = MERGE_REVIEW_HEADER_LABEL.set(renderer);
@@ -2322,6 +2383,32 @@ pub fn set_merge_review_step_rail_renderer(renderer: MergeReviewStepRailRenderer
 
 pub fn set_merge_review_finalize_controls(finalize: MergeReviewFinalizeControlsFn) {
     let _ = MERGE_REVIEW_FINALIZE_CONTROLS.set(finalize);
+}
+
+pub fn set_merge_review_file_navigation_guard(guard: MergeReviewFileNavigationGuardFn) {
+    let _ = MERGE_REVIEW_FILE_NAVIGATION_GUARD.set(guard);
+}
+
+fn merge_review_file_navigation_allowed(
+    repo_path: &str,
+    workspace: &WeakEntity<Workspace>,
+    cx: &mut App,
+) -> bool {
+    let Some(workspace) = workspace.upgrade() else {
+        return true;
+    };
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(guard) = MERGE_REVIEW_FILE_NAVIGATION_GUARD_TEST_OVERRIDE
+        .read()
+        .expect("guard test override lock")
+        .as_ref()
+    {
+        return guard(repo_path, workspace, cx);
+    }
+    MERGE_REVIEW_FILE_NAVIGATION_GUARD
+        .get()
+        .map(|guard| guard(repo_path, workspace, cx))
+        .unwrap_or(true)
 }
 
 fn render_merge_review_step_rail(
@@ -3597,5 +3684,51 @@ mod tests {
         let paths_b = diff_item.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
         assert_eq!(paths_b.len(), 1);
         assert_eq!(*paths_b[0], *"b.txt");
+    }
+
+    #[gpui::test]
+    async fn merge_review_guard_blocks_move_to_repo_relative_path(cx: &mut TestAppContext) {
+        fn block_bar(path: &str, _workspace: gpui::Entity<Workspace>, _cx: &mut App) -> bool {
+            path != "bar"
+        }
+        set_merge_review_file_navigation_guard_for_tests(block_bar);
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "bar": "BAR\n",
+                "foo": "FOO\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace, window, cx)
+        });
+        cx.run_until_parked();
+
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("bar", "bar\n".into()), ("foo", "foo\n".into())],
+        );
+        cx.run_until_parked();
+
+        let allowed = cx.update_window_entity(&diff, |diff, window, cx| {
+            diff.move_to_repo_relative_path("foo", window, cx)
+        });
+        assert!(allowed, "guard should allow navigation to foo");
+
+        let blocked = cx.update_window_entity(&diff, |diff, window, cx| {
+            diff.move_to_repo_relative_path("bar", window, cx)
+        });
+        assert!(!blocked, "guard should block navigation to bar");
+        clear_merge_review_file_navigation_guard_test_override();
     }
 }

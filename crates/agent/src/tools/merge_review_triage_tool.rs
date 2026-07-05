@@ -294,7 +294,9 @@ impl AgentTool for MergeReviewRecordDecisionTool {
             let parsed = input.recv().await.map_err(|e| e.to_string())?;
             let worktree_root = project
                 .read_with(cx, |project, cx| project_worktree_root(project, cx))
-                .ok_or_else(|| "no project worktree for merge review record decision".to_string())?;
+                .ok_or_else(|| {
+                    "no project worktree for merge review record decision".to_string()
+                })?;
             let json = merge_review_record_decision_json(&worktree_root, &parsed)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -715,11 +717,8 @@ mod tests {
             let path = fixture.path();
             let file = "crates/editor/src/editor.rs";
             git_cmd(path, &["checkout", "--ours", file]);
-            std::fs::write(
-                path.join(file),
-                "resolved editor without markers\n",
-            )
-            .expect("write resolved");
+            std::fs::write(path.join(file), "resolved editor without markers\n")
+                .expect("write resolved");
             git_cmd(path, &["add", file]);
             let json = merge_review_verify_conflict_resolved_json(path, file)
                 .await
@@ -738,10 +737,7 @@ mod tests {
         assert_eq!(regions[0].start_line, 2);
         assert_eq!(regions[0].end_line, 6);
         assert_eq!(regions[0].ours_lines, vec!["fork editor".to_string()]);
-        assert_eq!(
-            regions[0].theirs_lines,
-            vec!["upstream editor".to_string()]
-        );
+        assert_eq!(regions[0].theirs_lines, vec!["upstream editor".to_string()]);
     }
 
     #[test]
@@ -757,15 +753,21 @@ mod tests {
             .await
             .expect("conflict sides json");
             assert_eq!(json["path"], "crates/editor/src/editor.rs");
-            assert!(json["ours_text"]
-                .as_str()
-                .is_some_and(|text| text.contains("fork editor")));
-            assert!(json["theirs_text"]
-                .as_str()
-                .is_some_and(|text| text.contains("upstream editor")));
-            assert!(json["working_text"]
-                .as_str()
-                .is_some_and(|text| text.contains("<<<<<<<")));
+            assert!(
+                json["ours_text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("fork editor"))
+            );
+            assert!(
+                json["theirs_text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("upstream editor"))
+            );
+            assert!(
+                json["working_text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("<<<<<<<"))
+            );
             let regions = json["regions"].as_array().expect("regions array");
             assert_eq!(regions.len(), 1);
             assert_eq!(regions[0]["ours_lines"][0], "fork editor");

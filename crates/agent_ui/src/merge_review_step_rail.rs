@@ -3,9 +3,7 @@ use git_ui::project_diff::{
     MergeReviewConflictWorkshopPhase, MergeReviewGitMode, ReviewDiff,
 };
 use gpui::{Action, AnyElement, Context, FocusHandle, Hsla, ParentElement, Window, rgb};
-use ui::{
-    Color, Icon, IconName, IconSize, KeyBinding, Label, LabelSize, Tooltip, prelude::*,
-};
+use ui::{Color, Icon, IconName, IconSize, KeyBinding, Label, LabelSize, Tooltip, prelude::*};
 use zed_actions::surmount::{
     ConfirmMergeReviewDecisionKeepFork, ConfirmMergeReviewDecisionSynthesize,
     ConfirmMergeReviewDecisionTakeUpstream, DiscussMergeReviewConflict,
@@ -125,9 +123,7 @@ pub fn merge_review_primary_action(step: MergeReviewUiStep) -> MergeReviewPrimar
         MergeReviewUiStep::AllComplete => MergeReviewPrimaryAction::EndMergeReview,
         MergeReviewUiStep::ReviewWorking => MergeReviewPrimaryAction::ReviewDiffWorking,
         MergeReviewUiStep::ConflictWorkshop { phase, emphasize } => match phase {
-            MergeReviewConflictWorkshopPhase::NotSummarized => {
-                MergeReviewPrimaryAction::ReviewDiff
-            }
+            MergeReviewConflictWorkshopPhase::NotSummarized => MergeReviewPrimaryAction::ReviewDiff,
             MergeReviewConflictWorkshopPhase::DiscussReady => {
                 MergeReviewPrimaryAction::DiscussConflict
             }
@@ -178,13 +174,15 @@ pub fn render_merge_review_step_rail(
     );
     let primary = merge_review_primary_action(step);
     let workshop_phase = controls.conflict_workshop_phase;
+    let status_label = if controls.step_label.is_empty() {
+        controls.progress_label.to_string()
+    } else {
+        format!("{} · {}", controls.progress_label, controls.step_label)
+    };
     let mut rail = h_flex().gap_2().items_center().flex_wrap().child(
-        Label::new(format!(
-            "{} · {}",
-            controls.progress_label, controls.step_label
-        ))
-        .size(LabelSize::Default)
-        .color(Color::Muted),
+        Label::new(status_label)
+            .size(LabelSize::Default)
+            .color(Color::Muted),
     );
     for spec in workflow_button_specs(
         step,
@@ -209,11 +207,7 @@ pub fn render_merge_review_step_rail(
         toolbar,
         "merge-review-rail-end",
         RAIL_BTN_END,
-        if session_complete {
-            MergeReviewWorkflowButtonTier::Primary
-        } else {
-            MergeReviewWorkflowButtonTier::Danger
-        },
+        MergeReviewWorkflowButtonTier::Danger,
         false,
         "End merge review session and restore docks",
         &EndMergeReview,
@@ -226,7 +220,7 @@ pub fn render_merge_review_step_rail(
 pub(crate) struct WorkflowButtonSpec {
     pub(crate) id: &'static str,
     pub(crate) label: &'static str,
-    tier: MergeReviewWorkflowButtonTier,
+    pub(crate) tier: MergeReviewWorkflowButtonTier,
     disabled: bool,
     tooltip: &'static str,
     action: Box<dyn Action>,
@@ -240,16 +234,10 @@ pub(crate) fn workflow_button_labels(
     workshop_phase: Option<MergeReviewConflictWorkshopPhase>,
     git_mode: MergeReviewGitMode,
 ) -> Vec<&'static str> {
-    workflow_button_specs(
-        step,
-        primary,
-        review_in_progress,
-        workshop_phase,
-        git_mode,
-    )
-    .into_iter()
-    .map(|spec| spec.label)
-    .collect()
+    workflow_button_specs(step, primary, review_in_progress, workshop_phase, git_mode)
+        .into_iter()
+        .map(|spec| spec.label)
+        .collect()
 }
 
 pub(crate) fn workflow_button_specs(
@@ -272,6 +260,21 @@ pub(crate) fn workflow_button_specs(
     let push = |specs: &mut Vec<WorkflowButtonSpec>, spec: WorkflowButtonSpec| {
         specs.push(spec);
     };
+
+    if git_mode == MergeReviewGitMode::PreMerge {
+        push(
+            &mut specs,
+            WorkflowButtonSpec {
+                id: "merge-review-rail-preview-merge",
+                label: RAIL_BTN_PREVIEW_MERGE,
+                tier: MergeReviewWorkflowButtonTier::Primary,
+                disabled: false,
+                tooltip: "Preview git merge-tree before running git merge (human-gated)",
+                action: Box::new(PreviewMergeReviewMerge),
+            },
+        );
+        return specs;
+    }
 
     match step {
         MergeReviewUiStep::AllComplete => {
@@ -352,7 +355,7 @@ pub(crate) fn workflow_button_specs(
                         label: RAIL_BTN_DISCUSS_CONFLICT,
                         tier: tier(primary == MergeReviewPrimaryAction::DiscussConflict, false),
                         disabled: false,
-                        tooltip: "Scoped Q&A — optional direction in note popover, then send",
+                        tooltip: "Scoped Q&A about this conflict — sends immediately",
                         action: Box::new(DiscussMergeReviewConflict),
                     },
                 );
@@ -512,19 +515,6 @@ pub(crate) fn workflow_button_specs(
             }
         },
     }
-    if git_mode == MergeReviewGitMode::PreMerge {
-        push(
-            &mut specs,
-            WorkflowButtonSpec {
-                id: "merge-review-rail-preview-merge",
-                label: RAIL_BTN_PREVIEW_MERGE,
-                tier: MergeReviewWorkflowButtonTier::Available,
-                disabled: false,
-                tooltip: "Preview git merge-tree before running git merge (human-gated)",
-                action: Box::new(PreviewMergeReviewMerge),
-            },
-        );
-    }
     let _ = workshop_phase;
     specs
 }
@@ -568,30 +558,27 @@ fn merge_review_workflow_button(
         .gap_1()
         .border_1()
         .border_color(border_color)
-        .when(tier == MergeReviewWorkflowButtonTier::Primary && !disabled, |this| {
-            this.bg(merge_review_workflow_primary_fill())
-        })
+        .when(
+            tier == MergeReviewWorkflowButtonTier::Primary && !disabled,
+            |this| this.bg(merge_review_workflow_primary_fill()),
+        )
         .when(disabled, |this| this.opacity(0.4).cursor_not_allowed())
         .when(!disabled, |this| {
-            this.cursor_pointer().hover(|this| {
-                this.bg(merge_review_workflow_primary_fill().opacity(0.85))
-            })
+            this.cursor_pointer()
+                .hover(|this| this.bg(merge_review_workflow_primary_fill().opacity(0.85)))
         })
         .child(
             Label::new(label)
                 .size(LabelSize::Default)
                 .color(label_color),
         )
-        .when(
-            id == "merge-review-rail-review-diff" && !disabled,
-            |this| {
-                this.child(
-                    Icon::new(IconName::ZedAssistant)
-                        .size(IconSize::Small)
-                        .color(label_color),
-                )
-            },
-        )
+        .when(id == "merge-review-rail-review-diff" && !disabled, |this| {
+            this.child(
+                Icon::new(IconName::ZedAssistant)
+                    .size(IconSize::Small)
+                    .color(label_color),
+            )
+        })
         .tooltip({
             let focus_handle = focus_handle.clone();
             move |_, cx| {

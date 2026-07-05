@@ -2515,7 +2515,6 @@ impl Editor {
             .unwrap_or(end_point.row);
         Some((start_row, end_row))
     }
-
 }
 
 fn format_diff_review_comments(comments: &[(DiffHunkKey, Vec<StoredReviewComment>)]) -> String {

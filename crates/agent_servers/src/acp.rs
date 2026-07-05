@@ -82,7 +82,11 @@ fn is_grok_ignored_acp_notification_line(line: &str) -> bool {
     };
     matches!(
         method,
-        "_x.ai/settings/update" | "_x.ai/announcements/update"
+        "_x.ai/settings/update"
+            | "_x.ai/announcements/update"
+            | "_x.ai/mcp/servers_updated"
+            | "_x.ai/sessions/changed"
+            | "_x.ai/models/update"
     )
 }
 
@@ -2674,7 +2678,13 @@ mod tests {
     #[test]
     fn grok_xai_extension_notifications_are_dropped_at_transport() {
         // Surmount: swallow xAI extension notifications Zed has no handler for yet.
-        for method in ["_x.ai/settings/update", "_x.ai/announcements/update"] {
+        for method in [
+            "_x.ai/settings/update",
+            "_x.ai/announcements/update",
+            "_x.ai/mcp/servers_updated",
+            "_x.ai/sessions/changed",
+            "_x.ai/models/update",
+        ] {
             let line = format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{{}}}}"#);
             assert!(
                 should_drop_grok_acp_transport_line(&line),

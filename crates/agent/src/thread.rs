@@ -26,10 +26,10 @@ use crate::{
     ListAgentsAndModelsTool,
     ListDirectoryTool,
     MergeReviewConflictSidesTool,
-    MergeReviewRecordDecisionTool,
-    MergeReviewVerifyConflictResolvedTool,
     MergeReviewDiffTool,
+    MergeReviewRecordDecisionTool,
     MergeReviewTriageTool,
+    MergeReviewVerifyConflictResolvedTool,
     MonitorTool,
     MovePathTool,
     ProjectSnapshot,
@@ -2091,7 +2091,9 @@ impl Thread {
         self.add_tool(MergeReviewDiffTool::new(self.project.clone()));
         self.add_tool(MergeReviewConflictSidesTool::new(self.project.clone()));
         self.add_tool(MergeReviewRecordDecisionTool::new(self.project.clone()));
-        self.add_tool(MergeReviewVerifyConflictResolvedTool::new(self.project.clone()));
+        self.add_tool(MergeReviewVerifyConflictResolvedTool::new(
+            self.project.clone(),
+        ));
 
         self.add_tool(CreateThreadTool::new(environment.clone()));
         self.add_tool(ListAgentsAndModelsTool::new(environment));

@@ -72,19 +72,27 @@ The **human queue** for merge review is: **open Plan Todos for this merge sessio
 
 ## What you should experience
 
-### 1. Plan
+### 1. Plan (PreMerge)
 
-**Start Merge Review** runs `git fetch origin` automatically. You run `git merge origin/main` when ready (merge stays human-gated).
+**Start Merge Review** runs `git fetch origin` automatically. Branch Diff opens against `origin/main`, but **no file is auto-selected** — you are not dropped into a random diff.
 
-Triage lists changed paths (read-only git). The agent produces a **review plan**: order of SURMOUNT sections, conflicts first, clusters of related files. The plan is a guide, not the product — the product is **understood diffs**.
+The step rail shows **`Prepare · N changed files`** with a single green primary action: **Preview merge**. Run `git merge origin/main` yourself when ready (merge stays human-gated). The gated merge-tree modal confirms conflict count before you start.
 
-### 2. Review in Branch Diff (main UI)
+Triage lists changed paths (read-only git). The agent produces a **review plan**: conflicts first, then path order. The plan is a guide — the product is **understood diffs**.
 
-**Branch Diff** against `origin/main` stays the spine: file list, real hunks in the center.
+### 2. Review in Branch Diff (MergeInProgress)
 
-Starting merge review collapses the **left project tree** and **bottom terminal** so Branch Diff and the agent panel get the space (same idea as maximized agent mode, but Branch Diff stays center and the agent dock stays on the right). Collapsed docks are remembered on the session for restore later.
+After you start the merge (`git merge origin/main` or **I've started the merge** in the preview modal), Zed detects `MERGE_HEAD`, refreshes git state, and **auto-selects the first unreviewed file** in queue order (conflicts first, then path order). Toast: `Merge in progress · M conflicts — starting with crates/…`.
 
-For each file (or when you open it), you see:
+**Branch Diff** stays the spine: file list, real hunks in the center. The rail shows **`File 3/12 · crates/foo.rs`** plus the workshop sub-step (Review Diff, Discuss conflict, etc.). **One green primary button** per step — never contradictory CTAs.
+
+The queue is **linear and locked**: you cannot click ahead in the file list. Out-of-order clicks toast `Merge review is on File 3/12 · crates/foo.rs — click **Next file →** to advance`. Use **Next file →** to advance.
+
+Clean merges (0 conflicts) still engage the linear queue: cursor initializes to the first unreviewed changed file.
+
+Starting merge review collapses the **left project tree** and **bottom terminal** so Branch Diff and the agent panel get the space. Collapsed docks are remembered on the session for restore later.
+
+For each file in queue order, you see:
 
 1. **The diff** — for conflicts, **split view** (fork left, upstream right).
 2. **A summary panel** (or thread message): what changed, fork vs upstream, ties to earlier reviews, `Outcome:` line, confidence.
@@ -151,9 +159,9 @@ If prose is drafted but a doc gap remains, a `TODO:` in that paragraph is fine �
 
 ## Branch Diff UI (minimal)
 
-**Step rail** (Branch Diff toolbar while merge review workflow is engaged): always shows `reviewed/N`, **Next file →**, **Review Diff**, conflict buttons when applicable, and **End merge review**. Workflow controls use a literal **`#0f0` 1px square green border** (dark-mode first — not theme accent tokens). Exactly one button is primary for the obvious next action — never a dead toolbar state.
+**Step rail** (Branch Diff toolbar while merge review workflow is engaged): phase-gated — **PreMerge** shows only **Preview merge** (green primary); **MergeInProgress** shows one green primary per workshop step (Review Diff, Discuss conflict, Next file →, etc.) plus **End merge review** (red when incomplete). Workflow controls use a literal **`#0f0` 1px square green border** (dark-mode first — not theme accent tokens).
 
-**Note popover:** Agent-facing rail actions (**Review Diff**, **Discuss conflict**, **Synthesize**, **Keep fork** / **Take upstream** / **Synthesize** record, **Send Review to Agent**, **Draft section**) open a square modal with optional direction text before the turn is sent. Empty note + **Continue** is fine.
+**Note popover:** Only **Record decision** (Keep fork / Take upstream / Synthesize confirm) opens the optional-direction modal. Review Diff, Discuss, Synthesize, Next file, Preview merge, and **End merge review** dispatch immediately — no modal intercept (End is immediate by design for speed).
 
 **Gated merge modal (PreMerge):** While `MERGE_HEAD` is absent, the step rail offers **Preview merge** (palette: **Preview Merge Review Merge**). A square `#0f0` modal runs `git merge-tree` async, shows conflict count + summary + scrollable preview (truncates very long output; full output logged). Buttons: **Cancel**, **Copy merge command** (`git merge origin/main`), **I've started the merge** (refreshes session git state). Zed never runs `git merge` — human does.
 
@@ -161,17 +169,16 @@ If prose is drafted but a doc gap remains, a `TODO:` in that paragraph is fine �
 
 | State | Step rail primary | Agent panel toolbar |
 |-------|-------------------|---------------------|
-| Pick file | **Next file →** (accent) | hidden when workflow engaged |
-| Review ready | **Review Diff** (green) | snippet + `?` only after summarize |
-| Summarizing | **Summarizing…** (accent, disabled) | agent panel shows file prompt |
-| Summarized | **Next file →** | snippet + `?` |
+| PreMerge | **Preview merge** only | hidden when workflow engaged |
+| First conflict (auto-selected) | **Review Diff** (green) | agent panel shows file prompt |
+| Summarizing | **Summarizing…** (disabled) | agent panel shows file prompt |
+| Summarized (non-conflict) | **Next file →** | snippet + `?` |
 | Conflict summarized + markers | **Discuss conflict** | 3 embeds, Q&A |
 | Human chose synthesis | **Synthesize** | `edit_file` merge, not marker strip |
-| Markers cleared | **Keep fork** / **Take upstream** / **Synthesize** (record) | GUI buttons store decision + rationale; agent `merge_review_record_decision` is optional |
+| Markers cleared | **Keep fork** / **Take upstream** / **Synthesize** (record) | note modal on record confirm only |
 | Decision stored | **Complete tests** | `todo_write` × 3 (auto-posted) |
 | Todos done | **Next file →** | gate passes |
 | All complete | **Draft commit message** + **End merge review** (red) | commit message modal |
-| PreMerge (no `MERGE_HEAD`) | **Preview merge** (alongside normal rail) | gated merge-tree modal |
 
 - **Start:** palette **Start Merge Review** or Branch Diff **Merge review** (accent; hidden while a session is already active).
 - **Summary toast:** `Saved path (N/M).` with embedded click action (**Review Diff**, **Next file →**, conflict button, or **End**).
@@ -247,7 +254,29 @@ CARGO_TERM_QUIET=true cargo nextest run -p agent_ui -p git_ui -p project -p git 
 | Pending-scroll navigation in Branch Diff | `git_panel` untracked `move_to_repo_relative_path` test |
 | Merge-tree preview parsing | `parse_merge_tree_preview_counts_conflicts_and_truncates` |
 | Commit message prompt | `merge_review_commit_message_prompt_includes_session_memory` |
-| PreMerge Preview merge rail | `workflow_button_specs_includes_preview_merge_in_pre_merge` |
+| Conflicts sort before non-conflicts in session | `build_session_sorts_conflicts_before_non_conflicts` |
+| PreMerge Preview merge primary only | `workflow_button_specs_includes_preview_merge_in_pre_merge` |
+| MergeInProgress Review Diff primary on conflict | `workflow_button_labels_merge_in_progress_review_diff_primary_on_conflict` |
+| Queue order without wrap-around | `next_merge_review_file_path_respects_queue_order_without_wrap` |
+| Resume sets queue cursor to first unreviewed conflict | `resume_after_merge_sets_queue_cursor_path_to_first_unreviewed_conflict` |
+| List guard blocks out-of-order clicks | `merge_review_out_of_order_selection_toast_blocks_mismatched_path` |
+| List guard allows cursor path / PreMerge | `merge_review_allow_file_navigation_respects_cursor_and_pre_merge` |
+| Note modal: Review Diff no intercept | `intercept_review_branch_diff_note_modal_returns_false` |
+| Merge-started detection + cursor | `merge_review_merge_started_detects_transition_and_assigns_cursor` |
+| `queue_cursor_path` serde default | `test_item_serde_backward_compat`, `queue_cursor_path_roundtrips_through_json` |
+| PreMerge rail primary tier + prepare label | `pre_merge_rail_preview_merge_is_only_primary_tier` |
+| OpenQuestion stops queue advance | `next_merge_review_file_path_stops_at_open_question`, `next_merge_review_file_path_blocks_when_cursor_is_open_question` |
+| Next file advance + cursor rollback | `advance_merge_review_to_next_file_rolls_back_cursor_on_failed_navigation`, `advance_merge_review_to_next_file_updates_cursor_through_guard` |
+| Summary toast `File N/M` in locked queue | `merge_review_summary_saved_toast_includes_locked_queue_position` |
+| Guard canonical alias + no-cursor permissive | `merge_review_allow_file_navigation_respects_canonical_alias_and_no_cursor` |
+| Discuss/Synthesize skip note modal | `discuss_and_synthesize_actions_skip_note_modal` |
+| Record decision opens note modal | `record_decision_confirm_opens_note_modal` |
+| git_ui guard blocks `move_to_repo_relative_path` | `merge_review_guard_blocks_move_to_repo_relative_path` (git_ui) |
+| Clean merge cursor init | `initialize_merge_review_queue_cursor_uses_first_unreviewed_item` |
+| Stale cursor reset on refresh | `reconcile_merge_review_queue_cursor_resets_unknown_path` |
+| Prepare label | `merge_review_prepare_label_formats_changed_file_count` |
+| MergeInProgress Review Diff primary tier | `workflow_button_labels_merge_in_progress_review_diff_primary_on_conflict` |
+| Cursor priority over current_path | `next_merge_review_file_path_prefers_cursor_over_current_path` |
 | AllComplete commit draft rail | `workflow_button_specs_includes_draft_commit_on_all_complete` |
 | Commit message capture | `try_capture_merge_review_commit_message_from_reply_stores_draft` |
 | Commit message format retry | `handle_merge_review_reply_on_stop_commit_message_format_retry` |
