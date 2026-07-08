@@ -34,6 +34,11 @@ pub fn is_active() -> bool {
     std::env::var(ENV_VAR).ok().as_deref() == Some("1")
 }
 
+/// Headless stdio sessions open a workspace directly instead of the welcome flow.
+pub fn skip_onboarding() -> bool {
+    is_active()
+}
+
 /// Prepares the process environment for agent-stdio mode.
 ///
 /// Sets stateless + a11y flags, isolates user data, and routes logs to stderr.

@@ -346,7 +346,7 @@ impl ThreadSearchBar {
                     });
                 }
                 _ => {
-                    for markdown in collect_markdowns(entry_ix, entry, &entry_view_state, cx) {
+                    for markdown in collect_markdowns(entry) {
                         let source = markdown.read(cx).source().clone();
                         targets.push(SearchTarget::Markdown {
                             entry_ix,
@@ -879,75 +879,56 @@ fn nav_button(
         .tooltip(move |_window, cx| Tooltip::for_action_in(tooltip, action, &focus_handle, cx))
 }
 
-fn collect_markdowns(
-    entry_ix: usize,
-    entry: &AgentThreadEntry,
-    entry_view_state: &EntryViewState,
-    cx: &App,
-) -> Vec<Entity<Markdown>> {
+fn collect_markdowns(entry: &AgentThreadEntry) -> Vec<Entity<Markdown>> {
     let mut out = Vec::new();
     match entry {
         AgentThreadEntry::UserMessage(_) => {}
         AgentThreadEntry::AssistantMessage(message) => {
-            for (chunk_ix, chunk) in message.chunks.iter().enumerate() {
+            for chunk in &message.chunks {
                 match chunk {
-                    AssistantMessageChunk::Message { block, .. } => {
+                    AssistantMessageChunk::Message { block, .. }
+                    | AssistantMessageChunk::Thought { block, .. } => {
                         if let Some(md) = block.markdown() {
                             out.push(md.clone());
                         }
                     }
-                    AssistantMessageChunk::Thought { block, .. }
-                        if entry_view_state
-                            .thinking_block_state((entry_ix, chunk_ix), cx)
-                            .0 =>
-                    {
-                        if let Some(md) = block.markdown() {
-                            out.push(md.clone());
-                        }
-                    }
-                    AssistantMessageChunk::Thought { .. } => {}
                 }
             }
         }
         AgentThreadEntry::ToolCall(tool_call) => {
             out.push(tool_call.label.clone());
-            if entry_view_state.is_tool_call_expanded(&tool_call.id) {
-                out.extend(
-                    tool_call
-                        .content
-                        .iter()
-                        .filter_map(|content| match content {
-                            ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }) => {
-                                Some(markdown.clone())
-                            }
-                            ToolCallContent::ContentBlock(ContentBlock::EmbeddedResource {
-                                markdown: Some(markdown),
-                                ..
-                            }) => Some(markdown.clone()),
-                            ToolCallContent::ContentBlock(
-                                ContentBlock::Empty
-                                | ContentBlock::EmbeddedResource { markdown: None, .. }
-                                | ContentBlock::ResourceLink { .. }
-                                | ContentBlock::Image { .. },
-                            )
-                            | ToolCallContent::Diff(_)
-                            | ToolCallContent::Terminal(_) => None,
-                        }),
-                );
-            }
+            out.extend(
+                tool_call
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }) => {
+                            Some(markdown.clone())
+                        }
+                        ToolCallContent::ContentBlock(ContentBlock::EmbeddedResource {
+                            markdown: Some(markdown),
+                            ..
+                        }) => Some(markdown.clone()),
+                        ToolCallContent::ContentBlock(
+                            ContentBlock::Empty
+                            | ContentBlock::EmbeddedResource { markdown: None, .. }
+                            | ContentBlock::ResourceLink { .. }
+                            | ContentBlock::Image { .. },
+                        )
+                        | ToolCallContent::Diff(_)
+                        | ToolCallContent::Terminal(_) => None,
+                    }),
+            );
         }
         AgentThreadEntry::CompletedPlan(entries) => {
             out.extend(entries.iter().map(|e| e.content.clone()))
         }
-        AgentThreadEntry::ContextCompaction(compaction)
-            if entry_view_state.is_compaction_expanded(entry_ix) =>
-        {
+        AgentThreadEntry::ContextCompaction(compaction) => {
             if let Some(summary) = &compaction.summary {
                 out.push(summary.clone());
             }
         }
         AgentThreadEntry::Elicitation(_) => {}
-        AgentThreadEntry::ContextCompaction(_) => {}
     }
     out
 }

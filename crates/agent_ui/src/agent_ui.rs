@@ -269,6 +269,9 @@ actions!(
         RemoveFirstQueuedMessage,
         /// Edits the first message in the queue (the next one to be sent).
         EditFirstQueuedMessage,
+        /// Toggles steering for the first queued message: when on, it interrupts
+        /// the agent at its next step instead of waiting for it to finish.
+        ToggleSteerFirstQueuedMessage,
         /// Clears all messages from the queue.
         ClearMessageQueue,
         /// Opens the permission granularity dropdown for the current tool call.
@@ -297,6 +300,14 @@ actions!(
         ScrollOutputToPreviousMessage,
         /// Scroll the output to the next user message.
         ScrollOutputToNextMessage,
+        /// Closes the thread search bar.
+        DismissThreadSearch,
+        /// Selects the next thread search match.
+        SelectNextThreadMatch,
+        /// Selects the previous thread search match.
+        SelectPreviousThreadMatch,
+        /// Toggles in-thread search over the current agent thread's contents.
+        ToggleSearch,
         /// Import agent threads from other Zed release channels (e.g. Preview, Nightly).
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.

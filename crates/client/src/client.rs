@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result, anyhow};
 use async_tungstenite::tungstenite::{
     client::IntoClientRequest,
     error::Error as WebsocketError,
-    http::{HeaderValue, Request, StatusCode},
+    http::{HeaderValue, StatusCode},
 };
 use clock::SystemClock;
 use cloud_api_client::LlmApiToken;
@@ -19,14 +19,15 @@ use cloud_api_client::websocket_protocol::MessageToClient;
 use cloud_api_client::{ClientApiError, CloudApiClient};
 use cloud_api_types::OrganizationId;
 use credentials_provider::CredentialsProvider;
-use feature_flags::FeatureFlagAppExt as _;
 use futures::{
-    AsyncReadExt, FutureExt, SinkExt, Stream, StreamExt, TryFutureExt as _, TryStreamExt,
-    channel::{mpsc, oneshot},
+    FutureExt, SinkExt, Stream, StreamExt, TryFutureExt as _, TryStreamExt,
+    channel::mpsc,
     future::BoxFuture,
     stream::BoxStream,
 };
 use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt, WeakEntity, actions};
+#[cfg(any(test, feature = "test-support"))]
+use futures::channel::oneshot;
 use http_client::{HttpClient, HttpClientWithUrl, http, read_proxy_from_env};
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
@@ -34,11 +35,10 @@ use proxy::connect_proxy_stream;
 use rand::prelude::*;
 use release_channel::{AppVersion, ReleaseChannel};
 use rpc::proto::{AnyTypedEnvelope, EnvelopedMessage, PeerId, RequestMessage};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use settings::{RegisterSetting, Settings, SettingsContent};
 use std::{
     any::TypeId,
-    convert::TryFrom,
     future::Future,
     marker::PhantomData,
     path::PathBuf,
@@ -405,6 +405,7 @@ impl ClientCredentialsProvider {
     }
 
     /// Writes the credentials to the provider.
+    #[cfg(any(test, feature = "test-support"))]
     fn write_credentials<'a>(
         &'a self,
         user_id: u64,
@@ -549,10 +550,10 @@ pub struct TelemetrySettings {
 }
 
 impl settings::Settings for TelemetrySettings {
-    fn from_settings(content: &SettingsContent) -> Self {
+    fn from_settings(_content: &SettingsContent) -> Self {
         #[cfg(any(test, feature = "test-support"))]
         {
-            let telemetry = content.telemetry.as_ref().unwrap();
+            let telemetry = _content.telemetry.as_ref().unwrap();
             return Self {
                 diagnostics: telemetry.diagnostics.unwrap(),
                 metrics: telemetry.metrics.unwrap(),
@@ -893,8 +894,8 @@ impl Client {
 
     pub async fn sign_in(
         self: &Arc<Self>,
-        try_provider: bool,
-        cx: &AsyncApp,
+        _try_provider: bool,
+        _cx: &AsyncApp,
     ) -> Result<Credentials> {
         #[cfg(not(any(test, feature = "test-support")))]
         {
@@ -903,82 +904,87 @@ impl Client {
             ));
         }
 
-        let is_reauthenticating = if self.status().borrow().is_signed_out() {
-            self.set_status(Status::Authenticating, cx);
-            false
-        } else {
-            self.set_status(Status::Reauthenticating, cx);
-            true
-        };
-
-        let mut credentials = None;
-
-        let old_credentials = self.state.read().credentials.clone();
-        if let Some(old_credentials) = old_credentials
-            && self.validate_credentials(&old_credentials, cx).await?
+        #[cfg(any(test, feature = "test-support"))]
         {
-            credentials = Some(old_credentials);
-        }
-
-        if credentials.is_none()
-            && try_provider
-            && let Some(stored_credentials) = self.credentials_provider.read_credentials(cx).await
-        {
-            if self.validate_credentials(&stored_credentials, cx).await? {
-                credentials = Some(stored_credentials);
+            let is_reauthenticating = if self.status().borrow().is_signed_out() {
+                self.set_status(Status::Authenticating, _cx);
+                false
             } else {
-                self.credentials_provider
-                    .delete_credentials(cx)
-                    .await
-                    .log_err();
+                self.set_status(Status::Reauthenticating, _cx);
+                true
+            };
+
+            let mut credentials = None;
+
+            let old_credentials = self.state.read().credentials.clone();
+            if let Some(old_credentials) = old_credentials
+                && self.validate_credentials(&old_credentials, _cx).await?
+            {
+                credentials = Some(old_credentials);
             }
-        }
 
-        if credentials.is_none() {
-            let mut status_rx = self.status();
-            let _ = status_rx.next().await;
-            futures::select_biased! {
-                authenticate = self.authenticate(cx).fuse() => {
-                    match authenticate {
-                        Ok(creds) => {
-                            if IMPERSONATE_LOGIN.is_none() {
-                                self.credentials_provider
-                                    .write_credentials(creds.user_id, creds.access_token.clone(), cx)
-                                    .await
-                                    .log_err();
+            if credentials.is_none()
+                && _try_provider
+                && let Some(stored_credentials) =
+                    self.credentials_provider.read_credentials(_cx).await
+            {
+                if self.validate_credentials(&stored_credentials, _cx).await? {
+                    credentials = Some(stored_credentials);
+                } else {
+                    self.credentials_provider
+                        .delete_credentials(_cx)
+                        .await
+                        .log_err();
+                }
+            }
+
+            if credentials.is_none() {
+                let mut status_rx = self.status();
+                let _ = status_rx.next().await;
+                futures::select_biased! {
+                    authenticate = self.authenticate(_cx).fuse() => {
+                        match authenticate {
+                            Ok(creds) => {
+                                if IMPERSONATE_LOGIN.is_none() {
+                                    self.credentials_provider
+                                        .write_credentials(creds.user_id, creds.access_token.clone(), _cx)
+                                        .await
+                                        .log_err();
+                                }
+
+                                credentials = Some(creds);
+                            },
+                            Err(err) => {
+                                self.set_status(Status::AuthenticationError, _cx);
+                                return Err(err);
                             }
-
-                            credentials = Some(creds);
-                        },
-                        Err(err) => {
-                            self.set_status(Status::AuthenticationError, cx);
-                            return Err(err);
                         }
                     }
-                }
-                _ = status_rx.next().fuse() => {
-                    return Err(anyhow!("authentication canceled"));
+                    _ = status_rx.next().fuse() => {
+                        return Err(anyhow!("authentication canceled"));
+                    }
                 }
             }
+
+            let credentials = credentials.unwrap();
+            self.set_id(credentials.user_id);
+            self.cloud_client
+                .set_credentials(credentials.user_id as u32, credentials.access_token.clone());
+            self.state.write().credentials = Some(credentials.clone());
+            self.set_status(
+                if is_reauthenticating {
+                    Status::Reauthenticated
+                } else {
+                    Status::Authenticated
+                },
+                _cx,
+            );
+
+            Ok(credentials)
         }
-
-        let credentials = credentials.unwrap();
-        self.set_id(credentials.user_id);
-        self.cloud_client
-            .set_credentials(credentials.user_id as u32, credentials.access_token.clone());
-        self.state.write().credentials = Some(credentials.clone());
-        self.set_status(
-            if is_reauthenticating {
-                Status::Reauthenticated
-            } else {
-                Status::Authenticated
-            },
-            cx,
-        );
-
-        Ok(credentials)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     async fn validate_credentials(
         self: &Arc<Self>,
         credentials: &Credentials,
@@ -1001,6 +1007,7 @@ impl Client {
     ///
     /// The connection is re-established with exponential backoff if it drops or fails to
     /// establish.
+    #[cfg(any(test, feature = "test-support"))]
     fn connect_to_cloud(self: &Arc<Self>, cx: &AsyncApp) {
         let this = self.clone();
         let task = cx.spawn(async move |cx| {
@@ -1033,6 +1040,7 @@ impl Client {
 
     /// Runs a single attempt of the cloud websocket connection, returning once the connection
     /// closes (cleanly or otherwise) or fails to establish.
+    #[cfg(any(test, feature = "test-support"))]
     async fn run_cloud_connection(self: &Arc<Self>, cx: &mut AsyncApp) -> Result<()> {
         let connect_task = cx.update({
             let cloud_client = self.cloud_client.clone();
@@ -1062,8 +1070,8 @@ impl Client {
     /// Only Zed staff automatically connect to Collab.
     pub async fn sign_in_with_optional_connect(
         self: &Arc<Self>,
-        try_provider: bool,
-        cx: &AsyncApp,
+        _try_provider: bool,
+        _cx: &AsyncApp,
     ) -> Result<()> {
         #[cfg(not(any(test, feature = "test-support")))]
         {
@@ -1072,48 +1080,51 @@ impl Client {
             ));
         }
 
-        // Don't try to sign in again if we're already connected to Collab, as it will temporarily disconnect us.
-        if self.status().borrow().is_connected() {
-            return Ok(());
-        }
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            // Don't try to sign in again if we're already connected to Collab, as it will temporarily disconnect us.
+            if self.status().borrow().is_connected() {
+                return Ok(());
+            }
 
-        let (is_staff_tx, is_staff_rx) = oneshot::channel::<bool>();
-        let mut is_staff_tx = Some(is_staff_tx);
-        cx.update(|cx| {
-            cx.on_flags_ready(move |state, _cx| {
-                if let Some(is_staff_tx) = is_staff_tx.take() {
-                    is_staff_tx.send(state.is_staff).log_err();
-                }
-            })
-            .detach();
-        });
-
-        let credentials = self.sign_in(try_provider, cx).await?;
-
-        self.connect_to_cloud(cx);
-
-        cx.update(move |cx| {
-            cx.spawn({
-                let client = self.clone();
-                async move |cx| {
-                    let is_staff = is_staff_rx.await?;
-                    if is_staff {
-                        match client.connect_with_credentials(credentials, cx).await {
-                            ConnectionResult::Timeout => Err(anyhow!("connection timed out")),
-                            ConnectionResult::ConnectionReset => Err(anyhow!("connection reset")),
-                            ConnectionResult::Result(result) => {
-                                result.context("client auth and connect")
-                            }
-                        }
-                    } else {
-                        Ok(())
+            let (is_staff_tx, is_staff_rx) = oneshot::channel::<bool>();
+            let mut is_staff_tx = Some(is_staff_tx);
+            _cx.update(|cx| {
+                cx.on_flags_ready(move |state, _cx| {
+                    if let Some(is_staff_tx) = is_staff_tx.take() {
+                        is_staff_tx.send(state.is_staff).log_err();
                     }
-                }
-            })
-            .detach_and_log_err(cx);
-        });
+                })
+                .detach();
+            });
 
-        Ok(())
+            let credentials = self.sign_in(_try_provider, _cx).await?;
+
+            self.connect_to_cloud(_cx);
+
+            _cx.update(move |cx| {
+                cx.spawn({
+                    let client = self.clone();
+                    async move |cx| {
+                        let is_staff = is_staff_rx.await?;
+                        if is_staff {
+                            match client.connect_with_credentials(credentials, cx).await {
+                                ConnectionResult::Timeout => Err(anyhow!("connection timed out")),
+                                ConnectionResult::ConnectionReset => Err(anyhow!("connection reset")),
+                                ConnectionResult::Result(result) => {
+                                    result.context("client auth and connect")
+                                }
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    }
+                })
+                .detach_and_log_err(cx);
+            });
+
+            Ok(())
+        }
     }
 
     pub async fn connect(
@@ -1286,6 +1297,7 @@ impl Client {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn authenticate(self: &Arc<Self>, cx: &AsyncApp) -> Task<Result<Credentials>> {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(callback) = self.authenticate.read().as_ref() {
@@ -1458,53 +1470,6 @@ impl Client {
             Err(anyhow!(
                 "Surmount does not use Zed Cloud sign-in. Use local agents and API keys instead."
             ))
-        })
-    }
-
-    async fn authenticate_as_admin(
-        self: &Arc<Self>,
-        http: Arc<HttpClientWithUrl>,
-        login: String,
-        api_token: String,
-    ) -> Result<Credentials> {
-        #[derive(Serialize)]
-        struct ImpersonateUserBody {
-            github_login: String,
-        }
-
-        #[derive(Deserialize)]
-        struct ImpersonateUserResponse {
-            user_id: u64,
-            access_token: String,
-        }
-
-        let url = self
-            .http
-            .build_zed_cloud_url("/internal/users/impersonate")?;
-        let request = Request::post(url.as_str())
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {api_token}"))
-            .body(
-                serde_json::to_string(&ImpersonateUserBody {
-                    github_login: login,
-                })?
-                .into(),
-            )?;
-
-        let mut response = http.send(request).await?;
-        let mut body = String::new();
-        response.body_mut().read_to_string(&mut body).await?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "admin user request failed {} - {}",
-            response.status().as_u16(),
-            body,
-        );
-        let response: ImpersonateUserResponse = serde_json::from_str(&body)?;
-
-        Ok(Credentials {
-            user_id: response.user_id,
-            access_token: response.access_token,
         })
     }
 
@@ -1762,6 +1727,7 @@ impl Client {
             .push(Box::new(handler));
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn handle_message_to_client(self: &Arc<Client>, message: MessageToClient, cx: &AsyncApp) {
         cx.update(|cx| {
             for handler in self.message_to_client_handlers.lock().iter() {
