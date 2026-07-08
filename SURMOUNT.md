@@ -43,6 +43,10 @@ CARGO_TERM_QUIET=true cargo nextest run -p agent_ui -p git_ui -p project -p git 
   -E 'test(merge_review) | test(branch_diff)'
 ```
 
+## Agent stdio (headless dogfood)
+
+`agent-stdio` is a **default** feature on the `zed` crate (`crates/zed/Cargo.toml`). A plain `cargo build --release -p zed` includes `--agent-stdio` / `ZED_AGENT_STDIO=1` and the TOON stdio control plane. On upstream merges, keep `default = ["agent-stdio"]` unless deliberately dropping dogfood support.
+
 ## Upstream services stripped (merge policy)
 
 Surmount is a local-first fork. It does **not** phone home to Zed Cloud for sign-in, metrics, crash upload, or usage telemetry. When merging upstream `main`, **keep Surmount stubs** — do not re-enable upstream paths without an explicit maintainer decision.

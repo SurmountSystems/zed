@@ -5,8 +5,8 @@ Spawn a headless/offscreen Zed instance controlled over stdio using the TOON pro
 ## Spawn
 
 ```bash
-# Build once
-cargo build --release -p zed --features agent-stdio
+# Build once (agent-stdio is a default feature on the Surmount fork)
+cargo build --release -p zed
 
 # Run with isolated temp user data (recommended)
 target/release/zed --agent-stdio
@@ -17,6 +17,16 @@ ZED_AGENT_STDIO=1 target/release/zed
 # Custom user data directory
 target/release/zed --agent-stdio --user-data-dir /tmp/my-zed-agent
 ```
+
+## Preflight (before a long release build)
+
+Release builds are slow — verify startup once before dogfood:
+
+```bash
+timeout 3s target/release/zed --agent-stdio --user-data-dir /tmp/zed-preflight 2>/tmp/zed-preflight.log | head -1
+```
+
+Expect first stdout line to include `event:ready`. If the process exits with no output, read `/tmp/zed-preflight.log` for panics (e.g. duplicate GPUI action registration).
 
 ## I/O model
 

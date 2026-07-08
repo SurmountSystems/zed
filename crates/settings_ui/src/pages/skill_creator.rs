@@ -26,7 +26,7 @@ use workspace::MultiWorkspace;
 use crate::{SettingsUiFile, SettingsWindow, all_projects};
 
 actions!(
-    skill_creator,
+    settings_skill_creator,
     [SaveSkill, Cancel, FocusNextField, FocusPreviousField,]
 );
 
