@@ -372,10 +372,11 @@ impl Render for TitleBar {
                 .when(
                     user.is_none()
                         && is_signed_out_or_auth_error
+                        && client::zed_cloud_ui_enabled()
                         && TitleBarSettings::get_global(cx).show_sign_in,
                     |this| this.child(self.render_sign_in_button(cx)),
                 )
-                .when(is_signing_in, |this| {
+                .when(is_signing_in && client::zed_cloud_ui_enabled(), |this| {
                     this.child(
                         Label::new("Signing in…")
                             .size(LabelSize::Small)

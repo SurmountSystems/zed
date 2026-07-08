@@ -279,6 +279,9 @@ impl Onboarding {
     }
 
     fn handle_sign_in(&mut self, _: &SignIn, window: &mut Window, cx: &mut Context<Self>) {
+        if !client::zed_cloud_ui_enabled() {
+            return;
+        }
         let client = Client::global(cx);
         let workspace = self.workspace.clone();
 

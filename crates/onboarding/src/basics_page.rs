@@ -583,6 +583,23 @@ fn render_registry_agent_button(
 }
 
 fn render_zed_agent_button(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoElement {
+    if !client::zed_cloud_ui_enabled() {
+        return AgentSetupButton::new("zed-agent-onboarding")
+            .icon(
+                Icon::new(IconName::ZedAgent)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .name("Zed Agent")
+            .state(
+                Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Success)
+                    .into_any_element(),
+            )
+            .disabled(true);
+    }
+
     let client = Client::global(cx);
     let status = *client.status().borrow();
 

@@ -386,8 +386,10 @@ impl RenderOnce for ZedAiOnboarding {
                 Some(Plan::ZedVip) => self.render_vip_plan_state(cx),
                 Some(Plan::ZedStudent) => self.render_student_plan_state(cx),
             }
-        } else {
+        } else if client::zed_cloud_ui_enabled() {
             self.render_sign_in_disclaimer(cx)
+        } else {
+            div().into_any_element()
         }
     }
 }

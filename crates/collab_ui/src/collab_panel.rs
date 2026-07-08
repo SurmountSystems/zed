@@ -2641,6 +2641,18 @@ impl CollabPanel {
     }
 
     fn render_signed_out(&mut self, cx: &mut Context<Self>) -> Div {
+        if !client::zed_cloud_ui_enabled() {
+            return v_flex()
+                .p_4()
+                .size_full()
+                .text_center()
+                .justify_center()
+                .child(
+                    Label::new("Collaboration is not available in Surmount.")
+                        .color(Color::Muted),
+                );
+        }
+
         let collab_blurb = "Work with your team in realtime with collaborative editing, voice, shared notes and more.";
 
         // Two distinct "not connected" states:

@@ -13,6 +13,11 @@ This means:
 
 The external grok binary and its ACP interface are now legacy compatibility only. They may be used optionally by users who still run the standalone TUI, but they are no longer the source of truth or a required path for new work.
 
+Authentication direction
+- Zed Cloud browser sign-in, telemetry, and collab upsell UI are stripped in Surmount (see SURMOUNT.md § Upstream services stripped).
+- **Goal:** replicate Grok Build authentication inside Zed (xAI/API keys, `~/.grok` CLI login state, env-based provider config) as the primary agent auth story — not zed.dev OAuth.
+- Not implemented yet; current path is local agents + per-provider API keys until native Grok auth UX lands.
+
 Guiding Constraints (non-negotiable)
 - Full native replacement is the only primary path. Incremental bridging is rejected.
 - Linux-first for *platform UX* porting (cold start, keymaps, notifications), then Mac/Windows — not for agent availability; agents and agent-panel workflows stay cross-platform (see AGENTS.md § No OS–agent coupling).

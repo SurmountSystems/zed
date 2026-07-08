@@ -204,6 +204,7 @@ impl Telemetry {
             subscribers: Vec::new(),
         }));
 
+        #[cfg(any(test, feature = "test-support"))]
         cx.background_spawn({
             let state = state.clone();
             let os_version = os_version();
@@ -215,6 +216,11 @@ impl Telemetry {
             }
         })
         .detach();
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            let os_version = os_version();
+            state.lock().os_version = Some(os_version);
+        }
 
         cx.observe_global::<SettingsStore>({
             let state = state.clone();
@@ -362,11 +368,21 @@ impl Telemetry {
     }
 
     pub fn metrics_enabled(self: &Arc<Self>) -> bool {
-        self.state.lock().settings.metrics
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            return self.state.lock().settings.metrics;
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        false
     }
 
     pub fn diagnostics_enabled(self: &Arc<Self>) -> bool {
-        self.state.lock().settings.diagnostics
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            return self.state.lock().settings.diagnostics;
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        false
     }
 
     pub fn set_authenticated_user_info(
@@ -557,8 +573,12 @@ impl Telemetry {
     }
 
     fn report_event(self: &Arc<Self>, mut event: Event) {
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            return;
+        }
+
         let mut state = self.state.lock();
-        // RUST_LOG=telemetry=trace to debug telemetry events
         log::trace!(target: "telemetry", "{:?}", event);
 
         if !state.settings.metrics {
@@ -651,6 +671,11 @@ impl Telemetry {
     }
 
     pub async fn flush_events_inner(self: &Arc<Self>) -> Result<()> {
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            return Ok(());
+        }
+
         let (json_bytes, request_body) = {
             let mut state = self.state.lock();
             state.first_event_date_time = None;

@@ -43,6 +43,28 @@ CARGO_TERM_QUIET=true cargo nextest run -p agent_ui -p git_ui -p project -p git 
   -E 'test(merge_review) | test(branch_diff)'
 ```
 
+## Upstream services stripped (merge policy)
+
+Surmount is a local-first fork. It does **not** phone home to Zed Cloud for sign-in, metrics, crash upload, or usage telemetry. When merging upstream `main`, **keep Surmount stubs** — do not re-enable upstream paths without an explicit maintainer decision.
+
+| Area | Upstream | Surmount | Merge resolution |
+|------|----------|----------|------------------|
+| Zed Cloud sign-in | Browser OAuth + RSA-encrypted access token (`rpc::auth` keypair, `Client::authenticate_with_browser`) | Disabled; returns error directing users to local agents/API keys | Keep Surmount stub; drop `rsa` reintroduction |
+| Telemetry settings | User-toggleable `telemetry.metrics` / `telemetry.diagnostics` | Forced off in release (`TelemetrySettings::from_settings`, `metrics_enabled` / `diagnostics_enabled`) | Keep forced-off release path; defaults in `assets/settings/default.json` stay `false` |
+| Event pipeline | `telemetry::send_event` → queue → HTTP flush + `telemetry.log` | `send_event` no-op; `report_event` / `flush_events_inner` no-op in release | Keep no-ops in non-test builds |
+| `rpc::auth` | RSA encrypt/decrypt + `random_token` | `random_token` only (collab dev token helper) | Keep slim `auth.rs`; no `rsa` workspace dep |
+| Sign-in UI | Title bar, AI onboarding, welcome flow, collab panel, Zed Cloud model settings | Hidden via `client::zed_cloud_ui_enabled()` (false in release); `title_bar.show_sign_in` forced off | Keep Surmount hides; do not restore Sign In buttons or auto `authenticate()` on startup |
+
+**Touch files on conflict:** `crates/rpc/src/auth.rs`, `crates/rpc/Cargo.toml`, `Cargo.toml` (workspace deps), `crates/client/src/client.rs` (`zed_cloud_ui_enabled`, `authenticate_with_browser`, `sign_in`, `TelemetrySettings`), `crates/client/src/telemetry.rs`, `crates/telemetry/src/telemetry.rs`, `crates/title_bar/`, `crates/ai_onboarding/`, `crates/onboarding/`, `crates/collab_ui/src/collab_panel.rs`, `crates/language_models/src/provider/cloud.rs`, `crates/zed/src/main.rs` (`authenticate`), `assets/settings/default.json`.
+
+### Grok Build authentication (goal, not implemented)
+
+Stripping Zed Cloud sign-in is **not** a rejection of agent authentication. Surmount's target is **Grok Build–parity auth inside Zed**: whatever Grok Build uses to reach xAI (API keys, session tokens, CLI login state under `~/.grok`, provider env vars, etc.) should work natively in the agent panel without browser OAuth to zed.dev.
+
+**Today:** users configure local agents and provider API keys (see `docs/src/ai/use-api-access.md`); `client::zed_cloud_ui_enabled()` stays false in release.
+
+**Goal (document only for now):** first-class Grok Build auth UX and credential plumbing in Zed — discover/login state from the Grok CLI layout, surface status in agent settings, and keep it separate from the disabled Zed Cloud `SignIn` path. Do not restore RSA/`authenticate_with_browser` when implementing this; add a Surmount-specific path (likely `agent_servers`, `agent_settings`, native Grok profile).
+
 ## Documentation map
 
 | Layer | Location | Audience |

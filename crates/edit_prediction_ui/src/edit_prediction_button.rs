@@ -439,7 +439,11 @@ impl Render for EditPredictionButton {
                             let description = if !enabled {
                                 "Disabled For This File"
                             } else if zed_cloud_needs_sign_in {
-                                "Sign In Or Configure a Provider"
+                                if client::zed_cloud_ui_enabled() {
+                                    "Sign In Or Configure a Provider"
+                                } else {
+                                    "Configure a Provider"
+                                }
                             } else if provider_unavailable || show_editor_predictions {
                                 tooltip_meta
                             } else {

@@ -19,6 +19,10 @@ description: Use when syncing upstream main into the Surmount fork. Branch Diff 
 
 > RED/GREEN TDD WHEN DIAGNOSING BUGS: `cargo test -p agent_ui merge_review::tests::<test_name>`. One test at a time.
 
+## Upstream services stripped
+
+On conflicts in `crates/client`, `crates/rpc`, `crates/telemetry`, or `assets/settings/default.json`: keep Surmount no-ops (no Zed Cloud sign-in, no outbound telemetry/metrics). See SURMOUNT.md § Upstream services stripped. Outcome is usually `keep_fork` unless the human opts back in.
+
 ## When to use
 
 - Before, during, or after `git merge origin/main` on `surmount`
