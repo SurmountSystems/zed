@@ -12,14 +12,13 @@ use std::{
 
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
 use agent_settings::UserAgentsMd;
 use collections::HashSet;
 use itertools::Itertools;
 use project::AgentId;
 use serde::{Deserialize, Serialize};
-use settings::{LanguageModelProviderSetting, LanguageModelSelection};
 
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
@@ -29,13 +28,14 @@ use zed_actions::{
         ResolveConflictedFilesWithAgent, ResolveConflictsWithAgent, ReviewBranchDiff,
     },
     assistant::{
-        CreateSkillFromUrl, FocusAgent, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules,
-        OpenRulesLibrary, OpenSkillCreator, Toggle, ToggleFocus,
+        CreateSkillFromUrl, FocusAgent, ManageSkills, OpenGlobalAgentsMdRules,
+        OpenProjectAgentsMdRules, OpenSkillCreator, Toggle, ToggleFocus,
     },
 };
 
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
+use crate::agent_configuration::AgentConfiguration;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::AgentContextSource;
 use crate::terminal_thread_metadata_store::{
@@ -63,7 +63,6 @@ use crate::{
     ShowThreadMetadata,
     ToggleNewThreadMenu,
     ToggleOptionsMenu,
-    agent_configuration::{AgentConfiguration, AssistantConfigurationEvent},
     // Re-export the categorized persistent agent surface components
     // (approvals, plans, monitors, memory) plus upstream integration points.
     conversation_view::{
@@ -121,6 +120,14 @@ use workspace::{
 const MIN_PANEL_WIDTH: Pixels = px(300.);
 /// Panel identity key for dock/workspace layout.
 const AGENT_PANEL_KEY: &str = "agent_panel";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadTitleRegenerationResult {
+    NotOpen,
+    Started,
+    NoModel,
+    AlreadyGenerating,
+}
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
@@ -495,7 +502,7 @@ pub fn init(cx: &mut App) {
                         });
                     }
                 })
-                .register_action(|workspace, action: &OpenRulesLibrary, window, cx| {
+                .register_action(|workspace, action: &ManageSkills, window, cx| {
                     if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
                         workspace.focus_panel::<AgentPanel>(window, cx);
                         panel.update(cx, |panel, cx| {
@@ -1368,7 +1375,6 @@ impl From<AgentThread> for BaseView {
 }
 
 enum OverlayView {
-    Configuration,
     ZedTodosSurface(Entity<ZedTodosDockPrototype>),
 }
 
@@ -1376,7 +1382,6 @@ enum VisibleSurface<'a> {
     Uninitialized,
     AgentThread(&'a Entity<ConversationView>),
     Terminal(&'a Entity<TerminalView>),
-    Configuration(Option<&'a Entity<AgentConfiguration>>),
     ZedTodosSurface(Option<&'a Entity<ZedTodosDockPrototype>>),
 }
 
@@ -1397,7 +1402,6 @@ impl BaseView {
 impl OverlayView {
     pub fn which_font_size_used(&self) -> WhichFontSize {
         match self {
-            OverlayView::Configuration => WhichFontSize::None,
             OverlayView::ZedTodosSurface(_) => WhichFontSize::AgentFont,
         }
     }
@@ -2668,7 +2672,7 @@ impl AgentPanel {
                 Err(error) => {
                     log::error!("failed to spawn agent panel terminal: {error:#}");
                     workspace
-                        .update(cx, |workspace, cx| workspace.show_error(&error, cx))
+                        .update(cx, |workspace, cx| workspace.show_error(error, cx))
                         .log_err();
                     this.update(cx, |this, cx| {
                         if this.pending_terminal_spawn == Some(terminal_id) {
@@ -3167,7 +3171,6 @@ impl AgentPanel {
                     terminal_id: active_id
                 } if *active_id == terminal_id
             )
-            || matches!(self.overlay_view, Some(OverlayView::Configuration))
         {
             return false;
         }
@@ -4186,12 +4189,12 @@ impl AgentPanel {
 
     fn deploy_rules_library(
         &mut self,
-        _action: &OpenRulesLibrary,
+        _action: &ManageSkills,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // The legacy Rules action is rerouted to the skill creator so the
-        // existing keyboard shortcut (still bound to `OpenRulesLibrary` in
+        // existing keyboard shortcut (still bound to `ManageSkills` in
         // the default keymaps) and any persisted user keymap entries keep
         // working.
         self.deploy_skill_creator(&OpenSkillCreator, window, cx);
@@ -4433,42 +4436,70 @@ impl AgentPanel {
     }
 
     pub(crate) fn open_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.overlay_view, Some(OverlayView::Configuration)) {
-            self.clear_overlay(true, window, cx, true);
-            return;
-        }
+        window.dispatch_action(
+            Box::new(zed_actions::OpenSettingsPage {
+                page: "AI".to_string(),
+                target: None,
+            }),
+            cx,
+        );
+    }
 
-        let agent_server_store = self.project.read(cx).agent_server_store().clone();
-        let context_server_store = self.project.read(cx).context_server_store();
-        let fs = self.fs.clone();
+    pub fn open_thread_as_markdown(
+        &mut self,
+        thread_id: ThreadId,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(conversation_view) = self.conversation_view_for_id(&thread_id, cx).cloned() else {
+            return false;
+        };
+        let Some(thread_view) = conversation_view.read(cx).root_thread_view() else {
+            return false;
+        };
+        thread_view.update(cx, |thread, cx| {
+            thread
+                .open_thread_as_markdown(workspace, window, cx)
+                .detach_and_log_err(cx);
+        });
+        true
+    }
 
-        self.configuration = Some(cx.new(|cx| {
-            AgentConfiguration::new(
-                fs,
-                agent_server_store,
-                self.connection_store.clone(),
-                context_server_store,
-                self.context_server_registry.clone(),
-                self.language_registry.clone(),
-                self.workspace.clone(),
-                window,
-                cx,
-            )
-        }));
+    pub fn regenerate_thread_title(
+        &mut self,
+        thread_id: ThreadId,
+        cx: &mut Context<Self>,
+    ) -> ThreadTitleRegenerationResult {
+        let Some(conversation_view) = self.conversation_view_for_id(&thread_id, cx).cloned() else {
+            return ThreadTitleRegenerationResult::NotOpen;
+        };
+        Self::regenerate_conversation_thread_title(conversation_view, cx)
+    }
 
-        if let Some(configuration) = self.configuration.as_ref() {
-            self.configuration_subscription = Some(cx.subscribe_in(
-                configuration,
-                window,
-                Self::handle_agent_configuration_event,
-            ));
-        }
-
-        self.set_overlay(OverlayView::Configuration, true, window, cx);
-
-        if let Some(configuration) = self.configuration.as_ref() {
-            configuration.focus_handle(cx).focus(window, cx);
-        }
+    fn regenerate_conversation_thread_title(
+        conversation_view: Entity<ConversationView>,
+        cx: &mut App,
+    ) -> ThreadTitleRegenerationResult {
+        let Some(thread) = conversation_view.read(cx).as_native_thread(cx) else {
+            return ThreadTitleRegenerationResult::NotOpen;
+        };
+        let thread_id = conversation_view.read(cx).parent_id();
+        thread.update(cx, |thread, cx| {
+            if thread.is_generating_title() {
+                ThreadTitleRegenerationResult::AlreadyGenerating
+            } else if thread.summarization_model().is_none() {
+                ThreadTitleRegenerationResult::NoModel
+            } else if thread.regenerate_title_with_callback(cx, move |title, cx| {
+                ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                    store.set_generated_title(thread_id, title, cx);
+                });
+            }) {
+                ThreadTitleRegenerationResult::Started
+            } else {
+                ThreadTitleRegenerationResult::AlreadyGenerating
+            }
+        })
     }
 
     pub(crate) fn open_zed_todos_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4895,53 +4926,6 @@ impl AgentPanel {
             .detach_and_log_err(cx);
     }
 
-    fn handle_agent_configuration_event(
-        &mut self,
-        _entity: &Entity<AgentConfiguration>,
-        event: &AssistantConfigurationEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            AssistantConfigurationEvent::NewThread(provider) => {
-                if LanguageModelRegistry::read_global(cx)
-                    .default_model()
-                    .is_none_or(|model| model.provider.id() != provider.id())
-                    && let Some(model) = provider.default_model(cx)
-                {
-                    update_settings_file(self.fs.clone(), cx, move |settings, _| {
-                        let provider = model.provider_id().0.to_string();
-                        let enable_thinking = model.supports_thinking();
-                        let effort = model
-                            .default_effort_level()
-                            .map(|effort| effort.value.to_string());
-                        let model = model.id().0.to_string();
-                        settings
-                            .agent
-                            .get_or_insert_default()
-                            .set_model(LanguageModelSelection {
-                                provider: LanguageModelProviderSetting(provider),
-                                model,
-                                enable_thinking,
-                                effort,
-                                speed: None,
-                            })
-                    });
-                }
-
-                self.activate_new_thread(true, AgentThreadSource::AgentPanel, window, cx);
-                if let Some((thread, model)) = self
-                    .active_native_agent_thread(cx)
-                    .zip(provider.default_model(cx))
-                {
-                    thread.update(cx, |thread, cx| {
-                        thread.set_model(model, cx);
-                    });
-                }
-            }
-        }
-    }
-
     pub fn workspace_id(&self) -> Option<WorkspaceId> {
         self.workspace_id
     }
@@ -4960,6 +4944,13 @@ impl AgentPanel {
     pub(crate) fn visible_conversation_view(&self) -> Option<&Entity<ConversationView>> {
         match self.visible_surface() {
             VisibleSurface::AgentThread(conversation_view) => Some(conversation_view),
+            _ => None,
+        }
+    }
+
+    pub fn visible_terminal_view(&self) -> Option<&Entity<TerminalView>> {
+        match self.visible_surface() {
+            VisibleSurface::Terminal(terminal_view) => Some(terminal_view),
             _ => None,
         }
     }
@@ -5218,6 +5209,7 @@ impl AgentPanel {
         cx.emit(AgentPanelEvent::ActiveViewChanged);
     }
 
+    #[allow(dead_code)]
     fn set_overlay(
         &mut self,
         overlay: OverlayView,
@@ -5631,11 +5623,8 @@ impl AgentPanel {
         let dock_has_thread_view = self
             .overlay_view
             .as_ref()
-            .and_then(|overlay| match overlay {
-                OverlayView::ZedTodosSurface(dock) => {
-                    Some(dock.read(cx).has_attached_thread_view(cx))
-                }
-                _ => None,
+            .map(|overlay| match overlay {
+                OverlayView::ZedTodosSurface(dock) => dock.read(cx).has_attached_thread_view(cx),
             })
             .unwrap_or(false);
         GrokImmersiveDiagnostics {
@@ -6096,9 +6085,6 @@ impl AgentPanel {
     fn visible_surface(&self) -> VisibleSurface<'_> {
         if let Some(overlay_view) = &self.overlay_view {
             return match overlay_view {
-                OverlayView::Configuration => {
-                    VisibleSurface::Configuration(self.configuration.as_ref())
-                }
                 OverlayView::ZedTodosSurface(zed_todos_dock_prototype) => {
                     VisibleSurface::ZedTodosSurface(Some(zed_todos_dock_prototype))
                 }
@@ -6793,13 +6779,6 @@ impl Focusable for AgentPanel {
             VisibleSurface::Uninitialized => self.focus_handle.clone(),
             VisibleSurface::AgentThread(conversation_view) => conversation_view.focus_handle(cx),
             VisibleSurface::Terminal(terminal_view) => terminal_view.focus_handle(cx),
-            VisibleSurface::Configuration(configuration) => {
-                if let Some(configuration) = configuration {
-                    configuration.focus_handle(cx)
-                } else {
-                    self.focus_handle.clone()
-                }
-            }
             VisibleSurface::ZedTodosSurface(zed_todos_dock_prototype) => {
                 if let Some(zed_todos_dock_prototype) = zed_todos_dock_prototype {
                     zed_todos_dock_prototype.focus_handle(cx)
@@ -7386,9 +7365,6 @@ impl AgentPanel {
                     Label::new("Terminal").into_any_element()
                 }
             }
-            VisibleSurface::Configuration(_) => {
-                Label::new("Settings").truncate().into_any_element()
-            }
             VisibleSurface::ZedTodosSurface(_) => {
                 Label::new("Full Agent Mode").truncate().into_any_element()
             }
@@ -7432,7 +7408,7 @@ impl AgentPanel {
         conversation_view.update(cx, |conversation_view, cx| {
             if let Some(thread) = conversation_view.as_native_thread(cx) {
                 thread.update(cx, |thread, cx| {
-                    if thread.can_generate_title(cx) {
+                    if thread.can_generate_title() {
                         thread.generate_title(cx);
                         cx.notify();
                     }
@@ -7448,7 +7424,7 @@ impl AgentPanel {
     ) -> impl IntoElement {
         let focus_handle = self.focus_handle(cx);
         // Resolve menu shortcuts at the thread root; the active editor can
-        // shadow panel-level commands such as OpenRulesLibrary.
+        // shadow panel-level commands such as ManageSkills.
         let menu_action_context = match &self.base_view {
             BaseView::AgentThread { conversation_view } => conversation_view
                 .read(cx)
@@ -7472,7 +7448,7 @@ impl AgentPanel {
                 conversation_view.has_user_submitted_prompt(cx)
                     && conversation_view
                         .as_native_thread(cx)
-                        .is_some_and(|thread| thread.read(cx).can_generate_title(cx))
+                        .is_some_and(|thread| thread.read(cx).can_generate_title())
             });
 
         let has_auth_methods = match &self.base_view {
@@ -7548,7 +7524,7 @@ impl AgentPanel {
                                 .header("Skills")
                                 .entry(
                                     "Create Skill…",
-                                    Some(Box::new(OpenRulesLibrary::default())),
+                                    Some(Box::new(ManageSkills)),
                                     |window, cx| {
                                         window.dispatch_action(Box::new(OpenSkillCreator), cx);
                                     },
@@ -7557,6 +7533,7 @@ impl AgentPanel {
                                     window.dispatch_action(
                                         Box::new(zed_actions::OpenSettingsAt {
                                             path: "agent.skills".to_string(),
+                                            target: None,
                                         }),
                                         cx,
                                     );
@@ -7618,7 +7595,7 @@ impl AgentPanel {
                                 }
 
                                 menu = menu.entry("Rules Library", None, |_window, cx| {
-                                    cx.open_url(&zed_urls::rules_docs(cx));
+                                    cx.open_url(&zed_urls::skills_docs(cx));
                                 });
 
                                 menu = menu.separator();
@@ -8628,9 +8605,6 @@ impl Render for AgentPanel {
                 VisibleSurface::Terminal(terminal_view) => parent
                     .child(terminal_view.clone())
                     .child(self.render_drag_target(cx)),
-                VisibleSurface::Configuration(configuration) => {
-                    parent.children(configuration.cloned())
-                }
                 VisibleSurface::ZedTodosSurface(zed_todos_dock_prototype) => parent.child(
                     div()
                         .flex_1()
@@ -9041,7 +9015,7 @@ mod tests {
         active_session_id, active_thread_id, open_thread_with_connection,
         open_thread_with_custom_connection, register_test_sidebar, send_message,
     };
-    use acp_thread::{AgentConnection, StubAgentConnection, ThreadStatus, UserMessageId};
+    use acp_thread::{AgentConnection, StubAgentConnection, ThreadStatus};
     use action_log::ActionLog;
     use anyhow::{Result, anyhow};
     use feature_flags::FeatureFlagAppExt;
@@ -9316,7 +9290,6 @@ mod tests {
             cx.new(|cx| {
                 AcpThread::new(
                     None,
-                    None,
                     title,
                     Some(work_dirs),
                     self,
@@ -9420,7 +9393,6 @@ mod tests {
 
         fn prompt(
             &self,
-            _id: UserMessageId,
             params: acp::PromptRequest,
             _cx: &mut App,
         ) -> Task<Result<acp::PromptResponse>> {
@@ -13272,7 +13244,7 @@ mod tests {
         );
         assert!(
             cx.debug_bounds("KEY_BINDING-l").is_some(),
-            "Create Skill… menu item should show the OpenRulesLibrary shortcut"
+            "Create Skill… menu item should show the ManageSkills shortcut"
         );
     }
 
@@ -13328,26 +13300,20 @@ mod tests {
             assert!(!panel.is_overlay_open());
         });
 
-        // Simulate the Settings overlay being open on top of the draft.
-        // We don't go through `open_configuration` here because it would
-        // build provider configuration views, which call into
-        // `LanguageModelProvider::configuration_view` — unimplemented for
-        // the fake provider used in tests. The bug being exercised lives
-        // entirely in the overlay/base-view bookkeeping, so toggling the
-        // overlay flag directly is sufficient.
+        // Simulate the Zed todos overlay being open on top of the draft.
         panel.update_in(&mut cx, |panel, window, cx| {
-            panel.set_overlay(OverlayView::Configuration, true, window, cx);
+            panel.open_zed_todos_surface(window, cx);
         });
         cx.run_until_parked();
 
         panel.read_with(&cx, |panel, _cx| {
             assert!(
                 panel.is_overlay_open(),
-                "precondition: Settings overlay should be open"
+                "precondition: overlay should be open"
             );
         });
 
-        // Dispatching `NewThread` while Settings is open must dismiss the
+        // Dispatching `NewThread` while overlay is open must dismiss the
         // overlay so the user actually sees the new thread. Previously
         // this was a silent no-op: `activate_draft` early-returned without
         // clearing the overlay because the base view already held the
@@ -14057,9 +14023,6 @@ mod tests {
             .expect("test terminal should be inserted");
         cx.run_until_parked();
 
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.set_overlay(OverlayView::Configuration, true, window, cx);
-        });
         panel.update(&mut cx, |panel, cx| {
             panel.emit_test_terminal_bell(terminal_id, cx);
         });
@@ -14090,9 +14053,6 @@ mod tests {
         )]);
         open_thread_with_connection(&panel, connection, &mut cx);
 
-        panel.update_in(&mut cx, |panel, window, cx| {
-            panel.set_overlay(OverlayView::Configuration, true, window, cx);
-        });
         send_message(&panel, &mut cx);
 
         cx.windows()
@@ -14787,17 +14747,14 @@ mod tests {
             request_token_usage: HashMap::default(),
             model: None,
             profile: None,
-            imported: false,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
-            // Same resolution pattern as other files: keep our Grok native
-            // artifacts field + integrate upstream sandboxed terminal field.
-            native_grok_artifacts: None,
             sandboxed_terminal_temp_dir: None,
+            sandbox_grants: Default::default(),
         };
 
         let thread_store = cx.update(|cx| ThreadStore::global(cx));
@@ -16553,7 +16510,6 @@ mod tests {
             cx.new(|cx| {
                 AcpThread::new(
                     None,
-                    None,
                     title,
                     Some(work_dirs),
                     self,
@@ -16658,7 +16614,6 @@ mod tests {
 
         fn prompt(
             &self,
-            _id: UserMessageId,
             params: acp::PromptRequest,
             _cx: &mut App,
         ) -> Task<Result<acp::PromptResponse>> {

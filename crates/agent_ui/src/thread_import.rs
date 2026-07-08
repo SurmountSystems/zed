@@ -1,6 +1,6 @@
 use acp_thread::AgentSessionListRequest;
 use agent::ThreadStore;
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use chrono::Utc;
 use collections::HashSet;
 use db::sqlez;
@@ -66,21 +66,24 @@ impl CrossChannelImportOnboarding {
 /// Returns the list of non-Dev, non-current release channels that have
 /// at least one thread in their database.  The result is suitable for
 /// building a user-facing message ("from Zed Preview and Nightly").
-pub fn channels_with_threads(cx: &App) -> Vec<ReleaseChannel> {
+pub fn channels_with_threads(cx: &App) -> Task<Vec<SharedString>> {
     let Some(current_channel) = ReleaseChannel::try_global(cx) else {
-        return Vec::new();
+        return Task::ready(Vec::new());
     };
     let database_dir = paths::database_dir();
 
-    ReleaseChannel::ALL
-        .iter()
-        .copied()
-        .filter(|channel| {
-            *channel != current_channel
-                && *channel != ReleaseChannel::Dev
-                && channel_has_threads(database_dir, *channel)
-        })
-        .collect()
+    cx.background_spawn(async move {
+        ReleaseChannel::ALL
+            .iter()
+            .copied()
+            .filter(|channel| {
+                *channel != current_channel
+                    && *channel != ReleaseChannel::Dev
+                    && channel_has_threads(database_dir, *channel)
+            })
+            .map(|channel| SharedString::new_static(channel.display_name()))
+            .collect()
+    })
 }
 
 #[derive(Clone)]

@@ -4,7 +4,7 @@ use std::{
 };
 
 use agent::{ThreadStore, ZED_AGENT_ID};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet};
@@ -883,6 +883,26 @@ impl ThreadMetadataStore {
         }
         let metadata = ThreadMetadata {
             title_override: Some(title_override),
+            ..existing.clone()
+        };
+        self.save(metadata, cx);
+    }
+
+    pub fn set_generated_title(
+        &mut self,
+        thread_id: ThreadId,
+        title: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.entry(thread_id) else {
+            return;
+        };
+        if existing.title.as_ref() == Some(&title) && existing.title_override.is_none() {
+            return;
+        }
+        let metadata = ThreadMetadata {
+            title: Some(title),
+            title_override: None,
             ..existing.clone()
         };
         self.save(metadata, cx);
@@ -2289,7 +2309,7 @@ mod tests {
     use acp_thread::StubAgentConnection;
     use action_log::ActionLog;
     use agent::DbThread;
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     use gpui::{TestAppContext, VisualTestContext};
     use project::FakeFs;
     use project::Project;
@@ -2309,7 +2329,6 @@ mod tests {
             request_token_usage: Default::default(),
             model: None,
             profile: None,
-            imported: false,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
@@ -2319,8 +2338,8 @@ mod tests {
             // Keep our Grok native artifacts (Grok memory artifacts / artifacts bridging + native
             // prompt injection) + integrate upstream sandboxed terminal field (additive,
             // no conflict with surmount charter or categorized todos surface work).
-            native_grok_artifacts: None,
             sandboxed_terminal_temp_dir: None,
+            sandbox_grants: Default::default(),
         }
     }
 
@@ -2469,6 +2488,39 @@ mod tests {
             assert_eq!(metadata.title.as_deref(), Some("Agent Generated Title"));
             assert_eq!(metadata.title_override.as_deref(), Some("User Title"));
             assert_eq!(metadata.display_title().as_ref(), "User Title");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_store_set_generated_title_clears_title_override(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mut metadata = make_metadata(
+            "session-1",
+            "Old Generated Title",
+            Utc::now(),
+            PathList::default(),
+        );
+        metadata.title_override = Some("User Title".into());
+        let thread_id = metadata.thread_id;
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(metadata, cx);
+                store.set_generated_title(thread_id, "New Generated Title".into(), cx);
+            });
+        });
+
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            let metadata = store.entry(thread_id).expect("metadata should be cached");
+            assert_eq!(metadata.title.as_deref(), Some("New Generated Title"));
+            assert_eq!(metadata.title_override, None);
+            assert_eq!(metadata.display_title().as_ref(), "New Generated Title");
         });
     }
 
@@ -3429,7 +3481,6 @@ mod tests {
             cx.new(|cx| {
                 acp_thread::AcpThread::new(
                     Some(regular_session_id.clone()),
-                    None,
                     Some("Subagent Thread".into()),
                     None,
                     connection.clone(),
@@ -5543,23 +5594,23 @@ where
     }
 }
 
-impl From<agent_client_protocol::schema::SessionId> for ArchivedSessionId {
-    fn from(value: agent_client_protocol::schema::SessionId) -> Self {
+impl From<agent_client_protocol::schema::v1::SessionId> for ArchivedSessionId {
+    fn from(value: agent_client_protocol::schema::v1::SessionId) -> Self {
         Self(value.0.as_bytes().to_vec())
     }
 }
-impl From<ArchivedSessionId> for agent_client_protocol::schema::SessionId {
+impl From<ArchivedSessionId> for agent_client_protocol::schema::v1::SessionId {
     fn from(value: ArchivedSessionId) -> Self {
-        agent_client_protocol::schema::SessionId::new(arc_str_from_archived_bytes(&value.0))
+        agent_client_protocol::schema::v1::SessionId::new(arc_str_from_archived_bytes(&value.0))
     }
 }
 
-impl rkyv::with::ArchiveWith<agent_client_protocol::schema::SessionId> for ArchivedSessionId {
+impl rkyv::with::ArchiveWith<agent_client_protocol::schema::v1::SessionId> for ArchivedSessionId {
     type Archived = ArchivedSessionId;
     type Resolver = ();
 
     fn resolve_with(
-        _field: &agent_client_protocol::schema::SessionId,
+        _field: &agent_client_protocol::schema::v1::SessionId,
         _resolver: Self::Resolver,
         out: rkyv::Place<Self::Archived>,
     ) {
@@ -5569,7 +5620,7 @@ impl rkyv::with::ArchiveWith<agent_client_protocol::schema::SessionId> for Archi
 
 impl
     rkyv::with::SerializeWith<
-        agent_client_protocol::schema::SessionId,
+        agent_client_protocol::schema::v1::SessionId,
         rkyv::rancor::Strategy<
             rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
             rkyv::rancor::Error,
@@ -5577,7 +5628,7 @@ impl
     > for ArchivedSessionId
 {
     fn serialize_with(
-        field: &agent_client_protocol::schema::SessionId,
+        field: &agent_client_protocol::schema::v1::SessionId,
         _serializer: &mut rkyv::rancor::Strategy<
             rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
             rkyv::rancor::Error,
@@ -5590,7 +5641,7 @@ impl
 
 impl<'b>
     rkyv::with::SerializeWith<
-        agent_client_protocol::schema::SessionId,
+        agent_client_protocol::schema::v1::SessionId,
         rkyv::rancor::Strategy<
             rkyv::ser::Serializer<
                 rkyv::util::AlignedVec,
@@ -5602,7 +5653,7 @@ impl<'b>
     > for ArchivedSessionId
 {
     fn serialize_with<'s>(
-        field: &agent_client_protocol::schema::SessionId,
+        field: &agent_client_protocol::schema::v1::SessionId,
         serializer: &mut rkyv::rancor::Strategy<
             rkyv::ser::Serializer<
                 rkyv::util::AlignedVec,
@@ -5630,28 +5681,28 @@ impl<'b>
 impl
     rkyv::with::DeserializeWith<
         ArchivedSessionId,
-        agent_client_protocol::schema::SessionId,
+        agent_client_protocol::schema::v1::SessionId,
         rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     > for ArchivedSessionId
 {
     fn deserialize_with(
         field: &ArchivedSessionId,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
-    ) -> Result<agent_client_protocol::schema::SessionId, rkyv::rancor::Error> {
-        Ok(agent_client_protocol::schema::SessionId::new(
+    ) -> Result<agent_client_protocol::schema::v1::SessionId, rkyv::rancor::Error> {
+        Ok(agent_client_protocol::schema::v1::SessionId::new(
             arc_str_from_archived_bytes(&field.0),
         ))
     }
 }
 
-impl rkyv::with::ArchiveWith<Option<agent_client_protocol::schema::SessionId>>
+impl rkyv::with::ArchiveWith<Option<agent_client_protocol::schema::v1::SessionId>>
     for ArchivedSessionId
 {
     type Archived = ArchivedSessionId;
     type Resolver = ();
 
     fn resolve_with(
-        _field: &Option<agent_client_protocol::schema::SessionId>,
+        _field: &Option<agent_client_protocol::schema::v1::SessionId>,
         _resolver: Self::Resolver,
         out: rkyv::Place<Self::Archived>,
     ) {
@@ -5661,7 +5712,7 @@ impl rkyv::with::ArchiveWith<Option<agent_client_protocol::schema::SessionId>>
 
 impl
     rkyv::with::SerializeWith<
-        Option<agent_client_protocol::schema::SessionId>,
+        Option<agent_client_protocol::schema::v1::SessionId>,
         rkyv::rancor::Strategy<
             rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
             rkyv::rancor::Error,
@@ -5669,7 +5720,7 @@ impl
     > for ArchivedSessionId
 {
     fn serialize_with(
-        field: &Option<agent_client_protocol::schema::SessionId>,
+        field: &Option<agent_client_protocol::schema::v1::SessionId>,
         _serializer: &mut rkyv::rancor::Strategy<
             rkyv::ser::Serializer<rkyv::util::AlignedVec, (), rkyv::ser::sharing::Share>,
             rkyv::rancor::Error,
@@ -5682,7 +5733,7 @@ impl
 
 impl<'b>
     rkyv::with::SerializeWith<
-        Option<agent_client_protocol::schema::SessionId>,
+        Option<agent_client_protocol::schema::v1::SessionId>,
         rkyv::rancor::Strategy<
             rkyv::ser::Serializer<
                 rkyv::util::AlignedVec,
@@ -5694,7 +5745,7 @@ impl<'b>
     > for ArchivedSessionId
 {
     fn serialize_with<'s>(
-        field: &Option<agent_client_protocol::schema::SessionId>,
+        field: &Option<agent_client_protocol::schema::v1::SessionId>,
         serializer: &mut rkyv::rancor::Strategy<
             rkyv::ser::Serializer<
                 rkyv::util::AlignedVec,
@@ -5725,15 +5776,15 @@ impl<'b>
 impl
     rkyv::with::DeserializeWith<
         ArchivedSessionId,
-        Option<agent_client_protocol::schema::SessionId>,
+        Option<agent_client_protocol::schema::v1::SessionId>,
         rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
     > for ArchivedSessionId
 {
     fn deserialize_with(
         field: &ArchivedSessionId,
         _deserializer: &mut rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>,
-    ) -> Result<Option<agent_client_protocol::schema::SessionId>, rkyv::rancor::Error> {
-        Ok(Some(agent_client_protocol::schema::SessionId::new(
+    ) -> Result<Option<agent_client_protocol::schema::v1::SessionId>, rkyv::rancor::Error> {
+        Ok(Some(agent_client_protocol::schema::v1::SessionId::new(
             arc_str_from_archived_bytes(&field.0),
         )))
     }

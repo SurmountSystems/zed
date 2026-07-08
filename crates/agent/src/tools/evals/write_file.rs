@@ -208,6 +208,8 @@ impl WriteToolTest {
                 current_turn_id: None,
                 prior_turn_summary: None,
                 sandboxing: false,
+                is_linux: cfg!(target_os = "linux"),
+                is_windows: cfg!(target_os = "windows"),
             };
             let templates = Templates::new();
             template.render(&templates)?

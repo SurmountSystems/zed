@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use crate::DEFAULT_THREAD_TITLE;
 use crate::thread_metadata_store::{ThreadMetadata, ThreadMetadataStore};
 use acp_thread::MentionUri;
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use editor::{CompletionProvider, Editor, code_context_menus::COMPLETION_MENU_MAX_WIDTH};
 use futures::FutureExt as _;
@@ -380,6 +380,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                 new_text: format!("@{} ", mode.keyword()),
                 label: CodeLabel::plain(mode.label().to_string(), None),
                 icon_path: Some(mode.icon().path().into()),
+                icon_color: None,
                 documentation: None,
                 source: project::CompletionSource::Custom,
                 match_start: None,
@@ -437,6 +438,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             match_start: None,
             snippet_deduplication_key: None,
             icon_path: Some(icon_for_completion),
+            icon_color: None,
             confirm: Some(confirm_completion_callback(
                 title,
                 source_range.start,
@@ -495,6 +497,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             match_start: None,
             snippet_deduplication_key: None,
             icon_path: Some(icon_path),
+            icon_color: None,
             confirm: Some(confirm_completion_callback(
                 crease_text,
                 source_range.start,
@@ -559,6 +562,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             documentation: None,
             source: project::CompletionSource::Custom,
             icon_path: Some(completion_icon_path),
+            icon_color: None,
             match_start: None,
             snippet_deduplication_key: None,
             insert_text_mode: None,
@@ -625,6 +629,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             documentation: None,
             source: project::CompletionSource::Custom,
             icon_path: Some(icon_path),
+            icon_color: None,
             match_start: None,
             snippet_deduplication_key: None,
             insert_text_mode: None,
@@ -666,6 +671,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             documentation: None,
             source: project::CompletionSource::Custom,
             icon_path: Some(icon_path),
+            icon_color: None,
             match_start: None,
             snippet_deduplication_key: None,
             insert_text_mode: None,
@@ -716,6 +722,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             new_text,
             label: CodeLabel::plain(action.label().to_string(), None),
             icon_path: Some(action.icon().path().into()),
+            icon_color: None,
             documentation: None,
             source: project::CompletionSource::Custom,
             match_start: None,
@@ -810,6 +817,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             documentation: None,
             source: project::CompletionSource::Custom,
             icon_path: Some(icon_path),
+            icon_color: None,
             match_start: None,
             snippet_deduplication_key: None,
             insert_text_mode: None,
@@ -852,6 +860,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             documentation: None,
             source: project::CompletionSource::Custom,
             icon_path: Some(icon_path),
+            icon_color: None,
             match_start: None,
             snippet_deduplication_key: None,
             insert_text_mode: None,
@@ -1383,6 +1392,7 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                     ),
                                     source: project::CompletionSource::Custom,
                                     icon_path: Some(icon_path),
+                                    icon_color: None,
                                     match_start: None,
                                     snippet_deduplication_key: None,
                                     insert_text_mode: None,
@@ -1423,6 +1433,7 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                                     ),
                                     source: project::CompletionSource::Custom,
                                     icon_path: None,
+                                    icon_color: None,
                                     match_start: None,
                                     snippet_deduplication_key: None,
                                     insert_text_mode: None,

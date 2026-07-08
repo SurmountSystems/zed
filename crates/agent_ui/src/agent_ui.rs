@@ -42,7 +42,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ::ui::IconName;
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{AgentProfileId, AgentSettings};
 use command_palette_hooks::CommandPaletteFilter;
 use editor::{Editor, SelectionEffects, scroll::Autoscroll};
@@ -73,13 +73,16 @@ use crate::agent_configuration::{ConfigureContextServerModal, ManageProfilesModa
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
     AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, MaxIdleRetainedThreads, TerminalId,
+    ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
+pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
+pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{
-    ConversationView, ZedTodos, ZedTodosComponent, ZedTodosDockPrototype,
+    ConversationView, StateChange, ZedTodos, ZedTodosComponent, ZedTodosDockPrototype,
     collect_background_monitor_tool_calls, collect_pending_approval_tool_calls,
     render_approval_row, render_background_task_row, render_grok_memory_items, render_risk_chip,
     render_zed_todos_categorized_surface,
@@ -806,7 +809,7 @@ fn update_command_palette_filter(cx: &mut App) {
             TypeId::of::<ToggleEditPrediction>(),
         ];
 
-        let open_rules_library_action = [TypeId::of::<zed_actions::assistant::OpenRulesLibrary>()];
+        let open_rules_library_action = [TypeId::of::<zed_actions::assistant::ManageSkills>()];
         let skill_creator_actions = [
             TypeId::of::<zed_actions::assistant::OpenSkillCreator>(),
             TypeId::of::<zed_actions::assistant::CreateSkillFromUrl>(),
@@ -937,7 +940,9 @@ fn update_active_language_model_from_settings(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_settings::{AgentProfileId, AgentSettings};
+    use agent_settings::{
+        AgentProfileId, AgentSettings, AutoCompactSettings, AutoCompactThreshold,
+    };
     use command_palette_hooks::CommandPaletteFilter;
     use editor::actions::AcceptEditPrediction;
     use gpui::{BorrowAppContext, TestAppContext, px};
@@ -971,6 +976,7 @@ mod tests {
             inline_assistant_model: None,
             inline_assistant_use_streaming_tools: false,
             commit_message_model: None,
+            commit_message_include_project_rules: false,
             commit_message_instructions: None,
             thread_summary_model: None,
             inline_alternatives: vec![],
@@ -981,13 +987,19 @@ mod tests {
             play_sound_when_agent_done: PlaySoundWhenAgentDone::Never,
             single_file_review: false,
             model_parameters: vec![],
+            auto_compact: AutoCompactSettings {
+                enabled: false,
+                threshold: AutoCompactThreshold::DEFAULT,
+            },
             enable_feedback: false,
             expand_edit_card: true,
             expand_terminal_card: true,
+            terminal_init_command: None,
             cancel_generation_on_terminal_stop: true,
             use_modifier_to_send: true,
             message_editor_min_lines: 1,
             tool_permissions: Default::default(),
+            sandbox_permissions: Default::default(),
             show_turn_stats: false,
             show_merge_conflict_indicator: true,
             sidebar_side: Default::default(),

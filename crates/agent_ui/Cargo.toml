@@ -94,12 +94,14 @@ release_channel.workspace = true
 remote.workspace = true
 remote_connection.workspace = true
 rope.workspace = true
-skill_creator.workspace = true
+sandbox.workspace = true
 schemars.workspace = true
+search.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true
 settings.workspace = true
+skill_creator.workspace = true
 smol.workspace = true
 toml.workspace = true
 streaming_diff.workspace = true
@@ -113,6 +115,7 @@ theme_settings.workspace = true
 time.workspace = true
 ui.workspace = true
 ui_input.workspace = true
+unicode-segmentation.workspace = true
 url.workspace = true
 util.workspace = true
 uuid.workspace = true
@@ -148,6 +151,7 @@ remote_server = { workspace = true, features = ["test-support"] }
 
 search = { workspace = true, features = ["test-support"] }
 semver.workspace = true
+shlex.workspace = true
 reqwest_client.workspace = true
 tempfile.workspace = true
 vim.workspace = true

@@ -1,5 +1,5 @@
 use acp_thread::{SUBAGENT_SESSION_INFO_META_KEY, SubagentSessionInfo};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
@@ -44,11 +44,6 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one.
     #[serde(default)]
     pub session_id: Option<acp::SessionId>,
-    #[serde(default)]
-    pub persona: Option<String>,
-    /// Capability mode for the spawned subagent. Use "read-only" to restrict the subagent to analysis and non-mutating operations only (Grok-style read-only subagents and plan-phase delegation). Defaults to full capabilities when omitted.
-    #[serde(default)]
-    pub capability_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,27 +141,11 @@ impl AgentTool for SpawnAgentTool {
                     session_info: None,
                 })?;
 
-            let persona = input
-                .persona
-                .as_deref()
-                .map(acp_thread::AgentPersona::from_name);
-            let capability_mode = input
-                .capability_mode
-                .as_deref()
-                .map(acp_thread::AgentCapabilityMode::from_name);
-
-            let label_for_title = if !input.label.trim().is_empty() {
-                Some(input.label.clone())
-            } else {
-                None
-            };
-
             let (subagent, mut session_info) = cx.update(|cx| {
                 let subagent = if let Some(session_id) = input.session_id {
                     self.environment.resume_subagent(session_id, cx)
                 } else {
-                    self.environment
-                        .create_subagent(input.label, persona, capability_mode, cx)
+                    self.environment.create_subagent(input.label, cx)
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,
@@ -177,24 +156,13 @@ impl AgentTool for SpawnAgentTool {
                     session_id: subagent.id(),
                     message_start_index: subagent.num_entries(cx),
                     message_end_index: None,
-                    persona,
-                    capability_mode,
+                    persona: None,
+                    capability_mode: None,
                 };
 
                 event_stream.subagent_spawned(subagent.id());
-                event_stream.subagent_updated(subagent.id());
-
-                let title = label_for_title.unwrap_or_else(|| {
-                    format!(
-                        "Spawned {} subagent",
-                        session_info
-                            .persona
-                            .map(|p| p.display_name().to_string())
-                            .unwrap_or_else(|| "subagent".to_string())
-                    )
-                });
                 event_stream.update_fields_with_meta(
-                    acp::ToolCallUpdateFields::new().title(Some(title)),
+                    acp::ToolCallUpdateFields::new(),
                     Some(acp::Meta::from_iter([(
                         SUBAGENT_SESSION_INFO_META_KEY.into(),
                         serde_json::json!(&session_info),
@@ -219,8 +187,6 @@ impl AgentTool for SpawnAgentTool {
 
             session_info.message_end_index =
                 cx.update(|cx| Some(subagent.num_entries(cx).saturating_sub(1)));
-
-            event_stream.subagent_updated(session_info.session_id.clone());
 
             let meta = Some(acp::Meta::from_iter([(
                 SUBAGENT_SESSION_INFO_META_KEY.into(),

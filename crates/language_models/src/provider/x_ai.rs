@@ -2,23 +2,22 @@ use anyhow::Result;
 use collections::BTreeMap;
 use credentials_provider::CredentialsProvider;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
-use gpui::{AnyView, App, AsyncApp, Context, Entity, Task, TaskExt, Window};
-use http_client::HttpClient;
+use gpui::{App, AppContext, AsyncApp, Context, Entity, SharedString, Task};
+use http_client::{CustomHeaders, HttpClient};
 use language_model::{
-    ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelEffortLevel, LanguageModelId, LanguageModelName,
-    LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
-    LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
-    LanguageModelToolSchemaFormat, RateLimiter, env_var,
+    ApiKeyConfiguration, ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel,
+    LanguageModelCompletionError, LanguageModelCompletionEvent, LanguageModelEffortLevel,
+    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
+    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
+    LanguageModelToolChoice, LanguageModelToolSchemaFormat, ProviderSettingsView, RateLimiter,
+    env_var,
 };
 use open_ai::ResponseStreamEvent;
 pub use settings::XaiAvailableModel as AvailableModel;
 use settings::{Settings, SettingsStore};
 use std::sync::{Arc, LazyLock};
 use strum::IntoEnumIterator;
-use ui::{ButtonLink, ConfiguredApiCard, List, ListBulletItem, prelude::*};
-use ui_input::InputField;
-use util::ResultExt;
+use ui::IconName;
 use x_ai::XAI_API_URL;
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("x_ai");
@@ -31,6 +30,7 @@ static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
 pub struct XAiSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
+    pub custom_headers: CustomHeaders,
 }
 
 pub struct XAiLanguageModelProvider {
@@ -40,21 +40,12 @@ pub struct XAiLanguageModelProvider {
 
 pub struct State {
     api_key_state: ApiKeyState,
-    session_token: Option<String>,
     credentials_provider: Arc<dyn CredentialsProvider>,
 }
 
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.api_key_state.has_key() || self.session_token.is_some()
-    }
-
-    fn active_credential(&self, cx: &App) -> Option<String> {
-        if let Some(token) = &self.session_token {
-            return Some(token.clone());
-        }
-        let api_url = XAiLanguageModelProvider::api_url(cx);
-        self.api_key_state.key(&api_url).map(|k| k.to_string())
+        self.api_key_state.has_key()
     }
 
     fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -70,9 +61,6 @@ impl State {
     }
 
     fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
-        if self.session_token.is_some() {
-            return Task::ready(Ok(()));
-        }
         let credentials_provider = self.credentials_provider.clone();
         let api_url = XAiLanguageModelProvider::api_url(cx);
         self.api_key_state.load_if_needed(
@@ -105,7 +93,6 @@ impl XAiLanguageModelProvider {
             .detach();
             State {
                 api_key_state: ApiKeyState::new(Self::api_url(cx), (*API_KEY_ENV_VAR).clone()),
-                session_token: None,
                 credentials_provider,
             }
         });
@@ -206,19 +193,19 @@ impl LanguageModelProvider for XAiLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
-    fn configuration_view(
-        &self,
-        _target_agent: language_model::ConfigurationViewTargetAgent,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> AnyView {
-        cx.new(|cx| ConfigurationView::new(self.state.clone(), window, cx))
-            .into()
+    fn settings_view(&self, cx: &mut App) -> Option<ProviderSettingsView> {
+        let state = self.state.read(cx);
+        Some(ProviderSettingsView::ApiKey(ApiKeyConfiguration::new(
+            state.api_key_state.has_key(),
+            state.api_key_state.is_from_env_var(),
+            state.api_key_state.env_var_name().clone(),
+            "https://console.x.ai/team/default/api-keys".into(),
+        )))
     }
 
-    fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>> {
+    fn set_api_key(&self, api_key: Option<String>, cx: &mut App) -> Task<Result<()>> {
         self.state
-            .update(cx, |state, cx| state.set_api_key(None, cx))
+            .update(cx, |state, cx| state.set_api_key(api_key, cx))
     }
 }
 
@@ -244,22 +231,26 @@ impl XAiLanguageModel {
     > {
         let http_client = self.http_client.clone();
 
-        let (credential, api_url) = self.state.read_with(cx, |state, cx| {
+        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, cx| {
             let api_url = XAiLanguageModelProvider::api_url(cx);
-            (state.active_credential(cx), api_url)
+            let extra_headers = XAiLanguageModelProvider::settings(cx)
+                .custom_headers
+                .clone();
+            (state.api_key_state.key(&api_url), api_url, extra_headers)
         });
 
         let future = self.request_limiter.stream(async move {
             let provider = PROVIDER_NAME;
-            let Some(credential) = credential else {
+            let Some(api_key) = api_key else {
                 return Err(LanguageModelCompletionError::NoApiKey { provider });
             };
             let request = open_ai::stream_completion(
                 http_client.as_ref(),
                 provider.0.as_str(),
                 &api_url,
-                &credential,
+                &api_key,
                 request,
+                &extra_headers,
             );
             let response = request.await?;
             Ok(response)
@@ -290,36 +281,6 @@ fn default_thinking_reasoning_effort(model: &x_ai::Model) -> Option<open_ai::Rea
     }
 }
 
-#[cfg(test)]
-fn supported_thinking_effort_levels(model: &x_ai::Model) -> Vec<LanguageModelEffortLevel> {
-    let supported_efforts = x_ai_reasoning_efforts(model);
-    if supported_efforts.is_empty() {
-        return Vec::new();
-    }
-
-    let default_effort = default_thinking_reasoning_effort(model);
-    supported_efforts
-        .iter()
-        .copied()
-        .filter_map(|effort| {
-            let (name, value) = match effort {
-                open_ai::ReasoningEffort::None => return None,
-                open_ai::ReasoningEffort::Minimal => ("Minimal", "minimal"),
-                open_ai::ReasoningEffort::Low => ("Low", "low"),
-                open_ai::ReasoningEffort::Medium => ("Medium", "medium"),
-                open_ai::ReasoningEffort::High => ("High", "high"),
-                open_ai::ReasoningEffort::XHigh => ("Extra High", "xhigh"),
-            };
-
-            Some(LanguageModelEffortLevel {
-                name: name.into(),
-                value: value.into(),
-                is_default: Some(effort) == default_effort,
-            })
-        })
-        .collect()
-}
-
 fn reasoning_effort_for_request(
     request: &LanguageModelRequest,
     model: &x_ai::Model,
@@ -342,6 +303,31 @@ fn reasoning_effort_for_request(
     } else {
         None
     }
+}
+
+fn supported_thinking_effort_levels(model: &x_ai::Model) -> Vec<LanguageModelEffortLevel> {
+    let default_effort = default_thinking_reasoning_effort(model);
+    x_ai_reasoning_efforts(model)
+        .iter()
+        .copied()
+        .filter_map(|effort| {
+            let (name, value) = match effort {
+                open_ai::ReasoningEffort::None => return None,
+                open_ai::ReasoningEffort::Minimal => ("Minimal", "minimal"),
+                open_ai::ReasoningEffort::Low => ("Low", "low"),
+                open_ai::ReasoningEffort::Medium => ("Medium", "medium"),
+                open_ai::ReasoningEffort::High => ("High", "high"),
+                open_ai::ReasoningEffort::XHigh => ("Extra High", "xhigh"),
+                open_ai::ReasoningEffort::Max => return None, // Not supported by any xAI models
+            };
+
+            Some(LanguageModelEffortLevel {
+                name: name.into(),
+                value: value.into(),
+                is_default: Some(effort) == default_effort,
+            })
+        })
+        .collect()
 }
 
 impl LanguageModel for XAiLanguageModel {
@@ -369,41 +355,6 @@ impl LanguageModel for XAiLanguageModel {
         self.model.supports_images()
     }
 
-    fn supports_thinking(&self) -> bool {
-        !self.supported_effort_levels().is_empty()
-    }
-
-    fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
-        let levels = match &self.model {
-            x_ai::Model::Grok43 | x_ai::Model::Grok420Reasoning => vec!["low", "medium", "high"],
-            x_ai::Model::Custom {
-                reasoning_effort_levels: Some(l),
-                ..
-            } => l.iter().map(|s| s.as_str()).collect(),
-            _ => Vec::new(),
-        };
-        if levels.is_empty() {
-            return Vec::new();
-        }
-        levels
-            .into_iter()
-            .map(|level| {
-                let (name, is_default) = match level {
-                    "low" | "minimal" => ("Low", false),
-                    "medium" => ("Medium", true),
-                    "high" => ("High", false),
-                    "xhigh" | "extra-high" => ("Extra High", false),
-                    other => (other, false),
-                };
-                LanguageModelEffortLevel {
-                    name: name.into(),
-                    value: level.into(),
-                    is_default,
-                }
-            })
-            .collect()
-    }
-
     fn supports_streaming_tools(&self) -> bool {
         true
     }
@@ -414,6 +365,14 @@ impl LanguageModel for XAiLanguageModel {
             | LanguageModelToolChoice::Any
             | LanguageModelToolChoice::None => true,
         }
+    }
+
+    fn supports_thinking(&self) -> bool {
+        self.model.supports_reasoning_effort()
+    }
+
+    fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
+        supported_thinking_effort_levels(&self.model)
     }
 
     fn tool_input_format(&self) -> LanguageModelToolSchemaFormat {
@@ -454,9 +413,6 @@ impl LanguageModel for XAiLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        // Accepted upstream helper for reasoning effort (cleaner extraction).
-        // Our Grok effort level support (from XaiAvailableModel + custom models)
-        // continues to flow through the model + request.
         let reasoning_effort = reasoning_effort_for_request(&request, &self.model);
         let request = crate::provider::open_ai::into_open_ai(
             request,
@@ -464,6 +420,7 @@ impl LanguageModel for XAiLanguageModel {
             self.model.supports_parallel_tool_calls(),
             self.model.supports_prompt_cache_key(),
             self.max_output_tokens(),
+            crate::provider::open_ai::ChatCompletionMaxTokensParameter::MaxCompletionTokens,
             reasoning_effort,
             false,
         );
@@ -473,87 +430,6 @@ impl LanguageModel for XAiLanguageModel {
             Ok(mapper.map_stream(completions.await?).boxed())
         }
         .boxed()
-    }
-}
-
-struct ConfigurationView {
-    api_key_editor: Entity<InputField>,
-    state: Entity<State>,
-    load_credentials_task: Option<Task<()>>,
-}
-
-impl ConfigurationView {
-    fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let api_key_editor = cx.new(|cx| {
-            InputField::new(
-                window,
-                cx,
-                "xai-0000000000000000000000000000000000000000000000000",
-            )
-            .label("API key")
-        });
-
-        cx.observe(&state, |_, _, cx| {
-            cx.notify();
-        })
-        .detach();
-
-        let load_credentials_task = Some(cx.spawn_in(window, {
-            let state = state.clone();
-            async move |this, cx| {
-                if let Some(task) = Some(state.update(cx, |state, cx| state.authenticate(cx))) {
-                    // We don't log an error, because "not signed in" is also an error.
-                    let _ = task.await;
-                }
-                this.update(cx, |this, cx| {
-                    this.load_credentials_task = None;
-                    cx.notify();
-                })
-                .log_err();
-            }
-        }));
-
-        Self {
-            api_key_editor,
-            state,
-            load_credentials_task,
-        }
-    }
-
-    fn save_api_key(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        let api_key = self.api_key_editor.read(cx).text(cx).trim().to_string();
-        if api_key.is_empty() {
-            return;
-        }
-
-        // url changes can cause the editor to be displayed again
-        self.api_key_editor
-            .update(cx, |editor, cx| editor.set_text("", window, cx));
-
-        let state = self.state.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            state
-                .update(cx, |state, cx| state.set_api_key(Some(api_key), cx))
-                .await
-        })
-        .detach_and_log_err(cx);
-    }
-
-    fn reset_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.api_key_editor
-            .update(cx, |input, cx| input.set_text("", window, cx));
-
-        let state = self.state.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            state
-                .update(cx, |state, cx| state.set_api_key(None, cx))
-                .await
-        })
-        .detach_and_log_err(cx);
-    }
-
-    fn should_render_editor(&self, cx: &mut Context<Self>) -> bool {
-        !self.state.read(cx).is_authenticated()
     }
 }
 
@@ -604,66 +480,5 @@ mod tests {
             reasoning_effort_for_request(&request, &x_ai::Model::Grok43),
             Some(open_ai::ReasoningEffort::None)
         );
-    }
-}
-
-impl Render for ConfigurationView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let env_var_set = self.state.read(cx).api_key_state.is_from_env_var();
-        let configured_card_label = if env_var_set {
-            format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable")
-        } else {
-            let api_url = XAiLanguageModelProvider::api_url(cx);
-            if api_url == XAI_API_URL {
-                "API key configured".to_string()
-            } else {
-                format!("API key configured for {}", api_url)
-            }
-        };
-
-        let api_key_section = if self.should_render_editor(cx) {
-            v_flex()
-                .on_action(cx.listener(Self::save_api_key))
-                .child(Label::new("To use Zed's agent with xAI, you need to add an API key. Follow these steps:"))
-                .child(
-                    List::new()
-                        .child(
-                            ListBulletItem::new("")
-                                .child(Label::new("Create one by visiting"))
-                                .child(ButtonLink::new("xAI console", "https://console.x.ai/team/default/api-keys"))
-                        )
-                        .child(
-                            ListBulletItem::new("Paste your API key below and hit enter to start using the agent")
-                        ),
-                )
-                .child(self.api_key_editor.clone())
-                .child(
-                    Label::new(format!(
-                        "You can also set the {API_KEY_ENV_VAR_NAME} environment variable and restart Zed."
-                    ))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                )
-                .child(
-                    Label::new("Note that xAI is a custom OpenAI-compatible provider.")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .into_any_element()
-        } else {
-            ConfiguredApiCard::new(configured_card_label)
-                .disabled(env_var_set)
-                .when(env_var_set, |this| {
-                    this.tooltip_label(format!("To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable."))
-                })
-                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)))
-                .into_any_element()
-        };
-
-        if self.load_credentials_task.is_some() {
-            div().child(Label::new("Loading credentials…")).into_any()
-        } else {
-            v_flex().size_full().child(api_key_section).into_any()
-        }
     }
 }

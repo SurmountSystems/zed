@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use acp_thread::{AcpThread, AgentThreadEntry};
 use agent::ThreadStore;
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use collections::HashMap;
 use editor::{Editor, EditorEvent, EditorMode, MinimapVisibility, SizingBehavior};
 use gpui::{
@@ -76,7 +76,7 @@ impl EntryViewState {
         match thread_entry {
             AgentThreadEntry::UserMessage(message) => {
                 let can_rewind = thread.read(cx).supports_truncate(cx);
-                let has_id = message.id.is_some();
+                let has_id = message.id().is_some();
                 let is_subagent = thread.read(cx).parent_session_id().is_some();
                 let chunks = message.chunks.clone();
                 if let Some(Entry::UserMessage(editor)) = self.entries.get_mut(index) {
@@ -243,11 +243,12 @@ impl EntryViewState {
                     self.set_entry(index, Entry::CompletedPlan);
                 }
             }
-            AgentThreadEntry::ContextCompaction => {
+            AgentThreadEntry::ContextCompaction(_) => {
                 if !matches!(self.entries.get(index), Some(Entry::ContextCompaction)) {
                     self.set_entry(index, Entry::ContextCompaction);
                 }
             }
+            AgentThreadEntry::Elicitation(_) => {}
         };
     }
 
@@ -527,7 +528,7 @@ mod tests {
     use std::sync::Arc;
 
     use acp_thread::{AgentConnection, StubAgentConnection};
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
     use editor::RowInfo;
     use fs::FakeFs;

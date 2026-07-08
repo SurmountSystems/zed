@@ -2,8 +2,9 @@ mod connection;
 mod diff;
 mod mention;
 mod terminal;
+pub use ::terminal::HeadlessTerminal;
 use action_log::{ActionLog, ActionLogTelemetry};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::{MaybeUndefined, v1 as acp};
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashSet;
 pub use connection::*;
@@ -39,12 +40,14 @@ use std::time::{Duration, Instant};
 use std::{fmt::Display, mem, path::PathBuf, sync::Arc};
 use task::{Shell, ShellBuilder};
 pub use terminal::*;
-
 use text::Bias;
 use ui::App;
 use util::markdown::MarkdownEscaped;
 use util::path_list::PathList;
-use util::{ResultExt, get_default_system_shell_preferring_bash, paths::PathStyle};
+use util::{
+    ResultExt, get_default_system_shell_preferring_bash,
+    paths::{PathStyle, is_absolute},
+};
 use uuid::Uuid;
 
 /// Returned when the model stops because it exhausted its output token budget.
@@ -63,10 +66,6 @@ impl std::error::Error for MaxOutputTokensError {}
 /// This is a workaround since ACP's ToolCall doesn't have a dedicated name field.
 pub const TOOL_NAME_META_KEY: &str = "tool_name";
 
-/// Tool name used by Grok Build (and similar agents) for the background/monitoring tool.
-/// Used to identify monitor-style long-running tasks for special UI treatment in the activity bar.
-pub const MONITOR_TOOL_NAME: &str = "monitor";
-
 /// Helper to extract tool name from ACP meta
 pub fn tool_name_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
     meta.as_ref()
@@ -80,12 +79,53 @@ pub fn meta_with_tool_name(tool_name: &str) -> acp::Meta {
     acp::Meta::from_iter([(TOOL_NAME_META_KEY.into(), tool_name.into())])
 }
 
-/// Key used in ACP ToolCall meta to store the session id and message indexes
-pub const SUBAGENT_SESSION_INFO_META_KEY: &str = "subagent_session_info";
+/// Key used in ACP `AvailableCommand` meta to record which source produced a
+/// slash command, so the completion popup can group commands by category.
+pub const COMMAND_CATEGORY_META_KEY: &str = "command_category";
+
+/// The source category of a slash command, used to group commands in the
+/// completion popup. Only the native Zed agent annotates its commands; commands
+/// from external ACP agents carry no category and are grouped on their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommandCategory {
+    /// Built-in Zed agent commands (e.g. `/compact`).
+    Native,
+    /// Commands sourced from MCP server prompts.
+    Mcp,
+}
+
+impl CommandCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Mcp => "mcp",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "native" => Some(Self::Native),
+            "mcp" => Some(Self::Mcp),
+            _ => None,
+        }
+    }
+}
+
+pub fn meta_with_command_category(category: CommandCategory) -> acp::Meta {
+    acp::Meta::from_iter([(COMMAND_CATEGORY_META_KEY.into(), category.as_str().into())])
+}
+
+pub fn command_category_from_meta(meta: &Option<acp::Meta>) -> Option<CommandCategory> {
+    meta.as_ref()
+        .and_then(|m| m.get(COMMAND_CATEGORY_META_KEY))
+        .and_then(|v| v.as_str())
+        .and_then(CommandCategory::from_str)
+}
+
+pub const MONITOR_TOOL_NAME: &str = "monitor";
 
 /// Tool names that, when they require confirmation (PotentiallyDestructive),
 /// indicate risk of changes *outside* the current project working directory.
-/// These get the yellow exclamation visual treatment.
 pub const EXTERNALLY_DESTRUCTIVE_TOOL_NAMES: &[&str] = &[
     "terminal",
     "delete_path",
@@ -94,8 +134,6 @@ pub const EXTERNALLY_DESTRUCTIVE_TOOL_NAMES: &[&str] = &[
     "spawn_agent",
 ];
 
-/// ACP progress watchdog timeouts (used for auto-notification when the agent
-/// appears stuck / in a doom loop). All values are conservative and named.
 pub const ACP_TURN_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(180);
 pub const ACP_STALLED_TOOL_OUTPUT_TIMEOUT: Duration = Duration::from_secs(90);
 pub const ACP_MONITOR_NO_OUTPUT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -119,9 +157,6 @@ impl ApprovalRisk {
         *self == Self::ReadOnly
     }
 
-    /// Returns true if this risk represents an action that can both mutate the
-    /// filesystem and affect locations outside the current project working directory.
-    /// Used to decide the yellow exclamation visual vs blue "RW".
     pub fn is_externally_destructive(&self, tool_name: Option<&SharedString>) -> bool {
         if *self != Self::PotentiallyDestructive {
             return false;
@@ -131,26 +166,10 @@ impl ApprovalRisk {
             .unwrap_or(true)
     }
 
-    /// Returns a user-facing label suitable for chips, buttons, and tooltips.
-    /// We deliberately avoid slapping the strong word "Destructive" on every action
-    /// that merely needs confirmation. "Destructive" is reserved for operations that
-    /// can realistically perform writes (or equivalent side-effects) that affect
-    /// locations outside the current project working directory or the user's system.
-    /// Planning/state tools like todo_write and enter_plan_mode still get the strong
-    /// permission gate, but are labeled "Plan Change" so the terminology matches
-    /// the actual risk the user cares about (per feedback that "Destructive" should
-    /// imply ability to change things on disk *and* outside the cwd).
     pub fn display_label(&self, tool_name: Option<&SharedString>) -> SharedString {
         if let Some(name) = tool_name {
             match name.as_ref() {
                 "todo_write" | "enter_plan_mode" => return "Plan Change".into(),
-                // Tools that are writes but are *not* inherently able to reach outside the
-                // current project working directory get the milder "Write" label. Only actions
-                // that can realistically perform disk changes *and* escape the cwd (terminal,
-                // raw delete/move with no path restriction, monitor that can run arbitrary
-                // commands, spawn of agents that can do anything, etc.) keep the strong
-                // "Destructive" word, exactly matching the user's requirement that *both*
-                // conditions must be true.
                 "edit_file" | "write_file" | "create_directory" | "rename_symbol" => {
                     return "Write".into();
                 }
@@ -181,12 +200,7 @@ pub fn approval_risk_for_tool_call(
             | "move_path" | "rename_symbol" | "spawn_agent" | "monitor" => {
                 return ApprovalRisk::PotentiallyDestructive;
             }
-            "todo_write" | "enter_plan_mode" => {
-                // These still require explicit user confirmation (the user wants to review/approve
-                // the agent's plan), but they are not general filesystem writes that can escape the
-                // project cwd. We keep them as high-risk for gating, but surface a clearer label.
-                return ApprovalRisk::PotentiallyDestructive;
-            }
+            "todo_write" | "enter_plan_mode" => return ApprovalRisk::PotentiallyDestructive,
             _ => {}
         }
     }
@@ -225,6 +239,146 @@ pub fn approval_risk_for_operation(operation_description: &str) -> ApprovalRisk 
     }
 }
 
+pub const SUBAGENT_SESSION_INFO_META_KEY: &str = "subagent_session_info";
+
+pub const SANDBOX_AUTHORIZATION_META_KEY: &str = "sandbox_authorization";
+
+/// Stable `PermissionOption` ids for the sandbox-escalation approval prompt.
+///
+/// These are shared across the option construction (in the agent), the outcome
+/// dispatch, and the UI so the distinct grant lifetimes stay in sync. Note
+/// that `AllowThread` and `AllowAlways` both use
+/// `PermissionOptionKind::AllowAlways`; the id is what distinguishes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxPermission {
+    AllowOnce,
+    AllowThread,
+    AllowAlways,
+    Deny,
+}
+
+impl SandboxPermission {
+    pub fn as_id(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow",
+            Self::AllowThread => "allow_thread",
+            Self::AllowAlways => "allow_always",
+            Self::Deny => "deny",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "allow" => Some(Self::AllowOnce),
+            "allow_thread" => Some(Self::AllowThread),
+            "allow_always" => Some(Self::AllowAlways),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SandboxAuthorizationDetails {
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Specific hosts the command requested network access to, in canonical
+    /// form (`github.com`, `*.npmjs.org`). Empty when no specific hosts were
+    /// requested (see `network_all_hosts`).
+    #[serde(default)]
+    pub network_hosts: Vec<String>,
+    /// Whether the command requested access to any host ("arbitrary network
+    /// access"). The `network` alias deserializes the field this replaced —
+    /// a plain bool meaning "network access" — so details persisted by older
+    /// builds still render the network request.
+    #[serde(default, alias = "network")]
+    pub network_all_hosts: bool,
+
+    #[serde(default)]
+    pub allow_fs_write_all: bool,
+    #[serde(default)]
+    pub unsandboxed: bool,
+    #[serde(default)]
+    pub write_paths: Vec<PathBuf>,
+    /// The agent-provided justification for requesting these permissions,
+    /// shown to the user (attributed to the agent) in the approval prompt.
+    #[serde(default)]
+    pub reason: String,
+}
+
+pub fn meta_with_sandbox_authorization(details: SandboxAuthorizationDetails) -> acp::Meta {
+    acp::Meta::from_iter([(
+        SANDBOX_AUTHORIZATION_META_KEY.into(),
+        serde_json::to_value(details).unwrap_or_default(),
+    )])
+}
+
+pub fn sandbox_authorization_details_from_meta(
+    meta: &Option<acp::Meta>,
+) -> Option<SandboxAuthorizationDetails> {
+    meta.as_ref()
+        .and_then(|m| m.get(SANDBOX_AUTHORIZATION_META_KEY))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+pub const SANDBOX_FALLBACK_AUTHORIZATION_META_KEY: &str = "sandbox_fallback_authorization";
+
+/// Stable `PermissionOption` id for the "Retry" choice in the sandbox
+/// *fallback* prompt (shown when the OS sandbox can't be created on this
+/// system). The remaining choices reuse the [`SandboxPermission`] ids.
+pub const SANDBOX_FALLBACK_RETRY_OPTION_ID: &str = "retry";
+
+/// Details shown when the OS sandbox could not be created for a command and
+/// the user is asked whether to run it without a sandbox. Distinct from
+/// [`SandboxAuthorizationDetails`] (a model-requested *escalation*): here the
+/// sandbox itself failed, so the prompt explains why and offers a retry.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SandboxFallbackAuthorizationDetails {
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Human-readable reason the OS sandbox could not be created (for example,
+    /// "bwrap not found on PATH"), shown to the user so they can decide
+    /// whether to run the command without a sandbox.
+    #[serde(default)]
+    pub reason: String,
+}
+
+pub fn meta_with_sandbox_fallback_authorization(
+    details: SandboxFallbackAuthorizationDetails,
+) -> acp::Meta {
+    acp::Meta::from_iter([(
+        SANDBOX_FALLBACK_AUTHORIZATION_META_KEY.into(),
+        serde_json::to_value(details).unwrap_or_default(),
+    )])
+}
+
+pub fn sandbox_fallback_authorization_details_from_meta(
+    meta: &Option<acp::Meta>,
+) -> Option<SandboxFallbackAuthorizationDetails> {
+    meta.as_ref()
+        .and_then(|m| m.get(SANDBOX_FALLBACK_AUTHORIZATION_META_KEY))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+/// Meta key recording why the OS sandbox was not applied to a terminal tool
+/// call, even though sandboxing was active for the thread. The value is a
+/// serialized [`SandboxNotAppliedReason`]. Surfaced as a warning in the UI and
+/// used to explain the situation to both the user and the agent.
+pub const SANDBOX_NOT_APPLIED_META_KEY: &str = "sandbox_not_applied";
+
+pub fn meta_with_sandbox_not_applied(reason: &SandboxNotAppliedReason) -> acp::Meta {
+    acp::Meta::from_iter([(
+        SANDBOX_NOT_APPLIED_META_KEY.into(),
+        serde_json::to_value(reason).unwrap_or_default(),
+    )])
+}
+
+pub fn sandbox_not_applied_from_meta(meta: &Option<acp::Meta>) -> Option<SandboxNotAppliedReason> {
+    meta.as_ref()
+        .and_then(|m| m.get(SANDBOX_NOT_APPLIED_META_KEY))
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubagentSessionInfo {
     /// The session id of the subagent sessiont that was spawned
@@ -248,8 +402,7 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
 }
 
 /// Extracts a stable identifier for a plan/todo entry from ACP meta when the
-/// upstream agent (e.g. the Grok binary) supplies one. This enables the
-/// T-<n>-task-<id> cross-turn referencing feature in the categorized todos surface.
+/// upstream agent supplies one.
 pub fn plan_entry_id_from_meta(meta: &Option<acp::Meta>) -> Option<String> {
     meta.as_ref()
         .and_then(|m| m.get("id"))
@@ -285,6 +438,7 @@ impl AgentPersona {
             _ => Self::General,
         }
     }
+
     pub fn display_name(&self) -> SharedString {
         match self {
             Self::General => "Subagent".into(),
@@ -314,12 +468,14 @@ impl AgentCapabilityMode {
             _ => Self::Full,
         }
     }
+
     pub fn display_name(&self) -> SharedString {
         match self {
             Self::Full => "Full".into(),
             Self::ReadOnly => "Read-Only".into(),
         }
     }
+
     pub fn is_read_only(&self) -> bool {
         *self == Self::ReadOnly
     }
@@ -342,21 +498,13 @@ impl PlanPhase {
     pub fn set_to_proposed(&mut self) {
         *self = Self::Proposed;
     }
-
-    pub fn approve(&mut self) {
-        if *self == Self::Proposed {
-            *self = Self::Active;
-        }
-    }
-
-    pub fn reset(&mut self) {
-        *self = Self::None;
-    }
 }
 
 #[derive(Debug)]
 pub struct UserMessage {
-    pub id: Option<UserMessageId>,
+    pub protocol_id: Option<acp::MessageId>,
+    pub client_id: Option<ClientUserMessageId>,
+    pub is_optimistic: bool,
     pub content: ContentBlock,
     pub chunks: Vec<acp::ContentBlock>,
     pub checkpoint: Option<Checkpoint>,
@@ -370,6 +518,10 @@ pub struct Checkpoint {
 }
 
 impl UserMessage {
+    pub fn id(&self) -> Option<UserMessageId> {
+        self.client_id.clone()
+    }
+
     fn to_markdown(&self, cx: &App) -> String {
         let mut markdown = String::new();
         if self
@@ -409,8 +561,14 @@ impl AssistantMessage {
 
 #[derive(Debug, PartialEq)]
 pub enum AssistantMessageChunk {
-    Message { block: ContentBlock },
-    Thought { block: ContentBlock },
+    Message {
+        id: Option<acp::MessageId>,
+        block: ContentBlock,
+    },
+    Thought {
+        id: Option<acp::MessageId>,
+        block: ContentBlock,
+    },
 }
 
 impl AssistantMessageChunk {
@@ -421,17 +579,28 @@ impl AssistantMessageChunk {
         cx: &mut App,
     ) -> Self {
         Self::Message {
+            id: None,
             block: ContentBlock::new(chunk.into(), language_registry, path_style, cx),
         }
     }
 
     fn to_markdown(&self, cx: &App) -> String {
         match self {
-            Self::Message { block } => block.to_markdown(cx).to_string(),
-            Self::Thought { block } => {
+            Self::Message { block, .. } => block.to_markdown(cx).to_string(),
+            Self::Thought { block, .. } => {
                 format!("<thinking>\n{}\n</thinking>", block.to_markdown(cx))
             }
         }
+    }
+}
+
+fn can_merge_message_chunks(
+    existing: Option<&acp::MessageId>,
+    incoming: Option<&acp::MessageId>,
+) -> bool {
+    match (existing, incoming) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        _ => true,
     }
 }
 
@@ -440,8 +609,399 @@ pub enum AgentThreadEntry {
     UserMessage(UserMessage),
     AssistantMessage(AssistantMessage),
     ToolCall(ToolCall),
+    Elicitation(ElicitationEntryId),
     CompletedPlan(Vec<PlanEntry>),
-    ContextCompaction,
+    ContextCompaction(ContextCompaction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ElicitationEntryId(pub Arc<str>);
+
+#[derive(Debug)]
+pub struct Elicitation {
+    pub id: ElicitationEntryId,
+    pub request: acp::CreateElicitationRequest,
+    pub status: ElicitationStatus,
+}
+
+#[derive(Debug)]
+pub enum ElicitationStatus {
+    Pending {
+        respond_tx: oneshot::Sender<acp::CreateElicitationResponse>,
+    },
+    Accepted,
+    Declined,
+    Canceled,
+    Completed,
+}
+
+#[derive(Clone, Debug)]
+pub enum ElicitationStoreEvent {
+    ElicitationRequested(ElicitationEntryId),
+    ElicitationResponded(ElicitationEntryId),
+    ElicitationUpdated(ElicitationEntryId),
+}
+
+#[derive(Default)]
+pub struct ElicitationStore {
+    elicitations: Vec<Elicitation>,
+}
+
+impl EventEmitter<ElicitationStoreEvent> for ElicitationStore {}
+
+impl ElicitationStore {
+    pub fn elicitations(&self) -> &[Elicitation] {
+        &self.elicitations
+    }
+
+    fn validate_request(
+        request: &acp::CreateElicitationRequest,
+        cx: &App,
+    ) -> Result<(), acp::Error> {
+        if !cx.has_flag::<AcpBetaFeatureFlag>() {
+            return Err(
+                acp::Error::invalid_params().data("elicitation support requires the ACP beta flag")
+            );
+        }
+
+        if let acp::ElicitationMode::Url(mode) = &request.mode {
+            url::Url::parse(&mode.url)
+                .map_err(|_| acp::Error::invalid_params().data("invalid elicitation URL"))?;
+        }
+
+        Ok(())
+    }
+
+    fn insert_pending_elicitation(
+        &mut self,
+        request: acp::CreateElicitationRequest,
+    ) -> (
+        ElicitationEntryId,
+        oneshot::Receiver<acp::CreateElicitationResponse>,
+    ) {
+        let (respond_tx, response_rx) = oneshot::channel();
+        let id = ElicitationEntryId(Uuid::new_v4().to_string().into());
+        self.elicitations.push(Elicitation {
+            id: id.clone(),
+            request,
+            status: ElicitationStatus::Pending { respond_tx },
+        });
+        (id, response_rx)
+    }
+
+    fn response_task<T>(
+        id: ElicitationEntryId,
+        response_rx: oneshot::Receiver<acp::CreateElicitationResponse>,
+        cx: &mut Context<T>,
+        emit_responded: impl FnOnce(&mut T, &mut Context<T>, ElicitationEntryId) + 'static,
+    ) -> Task<acp::CreateElicitationResponse>
+    where
+        T: 'static,
+    {
+        cx.spawn(async move |this, cx| {
+            let response = response_rx.await.unwrap_or_else(|oneshot::Canceled| {
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Cancel)
+            });
+            this.update(cx, |this, cx| emit_responded(this, cx, id))
+                .ok();
+            response
+        })
+    }
+
+    fn respond_to_elicitation_entry(
+        elicitation: &mut Elicitation,
+        response: acp::CreateElicitationResponse,
+    ) -> bool {
+        if !matches!(elicitation.status, ElicitationStatus::Pending { .. }) {
+            return false;
+        }
+        let ElicitationStatus::Pending { respond_tx } = mem::replace(
+            &mut elicitation.status,
+            elicitation_status_for_response(&response),
+        ) else {
+            return false;
+        };
+        respond_tx.send(response).ok();
+        true
+    }
+
+    fn complete_url_elicitation_entry(elicitation: &mut Elicitation) -> bool {
+        let previous_status = mem::replace(&mut elicitation.status, ElicitationStatus::Completed);
+        match previous_status {
+            ElicitationStatus::Pending { respond_tx } => {
+                respond_tx
+                    .send(acp::CreateElicitationResponse::new(
+                        acp::ElicitationAction::Accept(acp::ElicitationAcceptAction::new()),
+                    ))
+                    .ok();
+                true
+            }
+            ElicitationStatus::Accepted => true,
+            ElicitationStatus::Completed => false,
+            previous_status @ (ElicitationStatus::Declined | ElicitationStatus::Canceled) => {
+                elicitation.status = previous_status;
+                false
+            }
+        }
+    }
+
+    fn cancel_elicitation_entry(
+        elicitation: &mut Elicitation,
+        cancel_accepted_url_elicitations: bool,
+    ) -> bool {
+        match mem::replace(&mut elicitation.status, ElicitationStatus::Canceled) {
+            ElicitationStatus::Pending { respond_tx } => {
+                respond_tx
+                    .send(acp::CreateElicitationResponse::new(
+                        acp::ElicitationAction::Cancel,
+                    ))
+                    .ok();
+                true
+            }
+            ElicitationStatus::Accepted
+                if cancel_accepted_url_elicitations
+                    && matches!(&elicitation.request.mode, acp::ElicitationMode::Url(_)) =>
+            {
+                true
+            }
+            previous_status => {
+                elicitation.status = previous_status;
+                false
+            }
+        }
+    }
+
+    fn respond_to_elicitation_by_id(
+        &mut self,
+        id: &ElicitationEntryId,
+        response: acp::CreateElicitationResponse,
+    ) -> bool {
+        let Some((_, elicitation)) = self.elicitation_mut(id) else {
+            return false;
+        };
+        Self::respond_to_elicitation_entry(elicitation, response)
+    }
+
+    fn complete_url_elicitation_by_id(&mut self, id: &ElicitationEntryId) -> bool {
+        let Some((_, elicitation)) = self.elicitation_mut(id) else {
+            return false;
+        };
+        Self::complete_url_elicitation_entry(elicitation)
+    }
+
+    fn cancel_elicitation_by_id(
+        &mut self,
+        id: &ElicitationEntryId,
+        cancel_accepted_url_elicitations: bool,
+    ) -> bool {
+        let Some((_, elicitation)) = self.elicitation_mut(id) else {
+            return false;
+        };
+        Self::cancel_elicitation_entry(elicitation, cancel_accepted_url_elicitations)
+    }
+
+    pub fn request_elicitation(
+        &mut self,
+        request: acp::CreateElicitationRequest,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<acp::CreateElicitationResponse>, acp::Error> {
+        self.request_elicitation_with_id(request, cx)
+            .map(|(_, task)| task)
+    }
+
+    pub fn request_elicitation_with_id(
+        &mut self,
+        request: acp::CreateElicitationRequest,
+        cx: &mut Context<Self>,
+    ) -> Result<(ElicitationEntryId, Task<acp::CreateElicitationResponse>), acp::Error> {
+        Self::validate_request(&request, cx)?;
+        let (id, response_rx) = self.insert_pending_elicitation(request);
+        cx.emit(ElicitationStoreEvent::ElicitationRequested(id.clone()));
+        cx.notify();
+
+        let task = Self::response_task(id.clone(), response_rx, cx, |_store, cx, id| {
+            cx.emit(ElicitationStoreEvent::ElicitationResponded(id));
+            cx.notify();
+        });
+
+        Ok((id, task))
+    }
+
+    pub fn respond_to_elicitation(
+        &mut self,
+        id: &ElicitationEntryId,
+        response: acp::CreateElicitationResponse,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.respond_to_elicitation_by_id(id, response) {
+            return;
+        }
+
+        cx.emit(ElicitationStoreEvent::ElicitationUpdated(id.clone()));
+        cx.notify();
+    }
+
+    pub fn complete_url_elicitation(
+        &mut self,
+        elicitation_id: &acp::ElicitationId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry_id) = self.entry_id_for_url_elicitation(elicitation_id) else {
+            return;
+        };
+        if !self.complete_url_elicitation_by_id(&entry_id) {
+            return;
+        }
+
+        cx.emit(ElicitationStoreEvent::ElicitationUpdated(entry_id));
+        cx.notify();
+    }
+
+    pub fn cancel_elicitation(&mut self, id: &ElicitationEntryId, cx: &mut Context<Self>) {
+        if !self.cancel_elicitation_by_id(id, true) {
+            return;
+        }
+
+        cx.emit(ElicitationStoreEvent::ElicitationUpdated(id.clone()));
+        cx.notify();
+    }
+
+    pub fn cancel_all(&mut self, cx: &mut Context<Self>) {
+        let canceled_ids = self.cancel_pending(|_| true);
+        for id in canceled_ids {
+            cx.emit(ElicitationStoreEvent::ElicitationUpdated(id));
+        }
+        cx.notify();
+    }
+
+    pub fn clear(&mut self, cx: &mut Context<Self>) {
+        let canceled_ids = self.cancel_pending(|_| true);
+        self.elicitations.clear();
+        for id in canceled_ids {
+            cx.emit(ElicitationStoreEvent::ElicitationUpdated(id));
+        }
+        cx.notify();
+    }
+
+    pub fn clear_resolved(&mut self, cx: &mut Context<Self>) -> Vec<ElicitationEntryId> {
+        let mut cleared_ids = Vec::new();
+        self.elicitations.retain(|elicitation| {
+            let keep = matches!(
+                (&elicitation.status, &elicitation.request.mode),
+                (ElicitationStatus::Pending { .. }, _)
+                    | (ElicitationStatus::Accepted, acp::ElicitationMode::Url(_))
+            );
+            if !keep {
+                cleared_ids.push(elicitation.id.clone());
+            }
+            keep
+        });
+
+        if !cleared_ids.is_empty() {
+            for id in &cleared_ids {
+                cx.emit(ElicitationStoreEvent::ElicitationUpdated(id.clone()));
+            }
+            cx.notify();
+        }
+
+        cleared_ids
+    }
+
+    pub fn cancel_request(&mut self, request_id: &acp::RequestId, cx: &mut Context<Self>) {
+        let canceled_ids = self.cancel_pending(|elicitation| {
+            matches!(
+                elicitation.request.scope(),
+                acp::ElicitationScope::Request(scope) if &scope.request_id == request_id
+            )
+        });
+        for id in canceled_ids {
+            cx.emit(ElicitationStoreEvent::ElicitationUpdated(id));
+        }
+        cx.notify();
+    }
+
+    pub fn elicitation(&self, id: &ElicitationEntryId) -> Option<(usize, &Elicitation)> {
+        self.elicitations
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, elicitation)| {
+                (&elicitation.id == id).then_some((index, elicitation))
+            })
+    }
+
+    fn entry_id_for_url_elicitation(
+        &self,
+        elicitation_id: &acp::ElicitationId,
+    ) -> Option<ElicitationEntryId> {
+        self.elicitations.iter().rev().find_map(|elicitation| {
+            if let acp::ElicitationMode::Url(mode) = &elicitation.request.mode
+                && &mode.elicitation_id == elicitation_id
+            {
+                Some(elicitation.id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn elicitation_mut(&mut self, id: &ElicitationEntryId) -> Option<(usize, &mut Elicitation)> {
+        self.elicitations
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find_map(|(index, elicitation)| {
+                (&elicitation.id == id).then_some((index, elicitation))
+            })
+    }
+
+    fn cancel_pending(
+        &mut self,
+        mut should_cancel: impl FnMut(&Elicitation) -> bool,
+    ) -> Vec<ElicitationEntryId> {
+        let mut canceled_ids = Vec::new();
+        for elicitation in &mut self.elicitations {
+            if should_cancel(elicitation) && Self::cancel_elicitation_entry(elicitation, true) {
+                canceled_ids.push(elicitation.id.clone());
+            }
+        }
+        canceled_ids
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCompactionId(pub Arc<str>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextCompactionStatus {
+    InProgress,
+    Completed,
+    Canceled,
+}
+
+/// A point in the thread where the conversation history was compacted to free
+/// up room in the model's context window. The summary can be expanded to inspect
+/// what the model retained.
+#[derive(Debug)]
+pub struct ContextCompaction {
+    pub id: ContextCompactionId,
+    pub status: ContextCompactionStatus,
+    /// The compaction summary, streamed in as the model produces it. This is
+    /// `None` for provider-native compaction, which produces no summary to show.
+    pub summary: Option<Entity<Markdown>>,
+}
+
+impl ContextCompaction {
+    pub fn is_in_progress(&self) -> bool {
+        self.status == ContextCompactionStatus::InProgress
+    }
+}
+
+#[derive(Debug)]
+pub struct ContextCompactionUpdate {
+    pub id: ContextCompactionId,
+    pub summary_delta: String,
+    pub status: Option<ContextCompactionStatus>,
 }
 
 impl AgentThreadEntry {
@@ -450,8 +1010,9 @@ impl AgentThreadEntry {
             Self::UserMessage(message) => message.indented,
             Self::AssistantMessage(message) => message.indented,
             Self::ToolCall(_) => false,
+            Self::Elicitation(_) => false,
             Self::CompletedPlan(_) => false,
-            Self::ContextCompaction => false,
+            Self::ContextCompaction(_) => false,
         }
     }
 
@@ -460,6 +1021,7 @@ impl AgentThreadEntry {
             Self::UserMessage(message) => message.to_markdown(cx),
             Self::AssistantMessage(message) => message.to_markdown(cx),
             Self::ToolCall(tool_call) => tool_call.to_markdown(cx),
+            Self::Elicitation(_) => "## Input Requested\n\n".to_string(),
             Self::CompletedPlan(entries) => {
                 let mut md = String::from("## Plan\n\n");
                 for entry in entries {
@@ -468,7 +1030,7 @@ impl AgentThreadEntry {
                 }
                 md
             }
-            Self::ContextCompaction => "--- Context Compacted ---\n\n".to_string(),
+            Self::ContextCompaction(_) => "--- Context Compacted ---\n\n".to_string(),
         }
     }
 
@@ -527,15 +1089,15 @@ pub struct ToolCall {
     pub raw_output: Option<serde_json::Value>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
+    pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
+    pub sandbox_fallback_authorization_details: Option<SandboxFallbackAuthorizationDetails>,
+    /// Why this terminal command ran without the OS sandbox even though
+    /// sandboxing was active (see [`SANDBOX_NOT_APPLIED_META_KEY`]). `None` when
+    /// the command was sandboxed normally (or sandboxing was off).
+    pub sandbox_not_applied: Option<SandboxNotAppliedReason>,
 }
 
 impl ToolCall {
-    /// Returns true if this ToolCall represents a background/monitor-style long-running task
-    /// (e.g. Grok's `monitor` tool or background terminal execution).
-    ///
-    /// This is used by the UI (background task activity bar) to surface such tasks efficiently in the activity bar
-    /// with low overhead (collapsed by default, live updates only when expanded).
-    /// See AGENTS.md for the full background task activity bar design and TDD requirements.
     pub fn is_monitor(&self) -> bool {
         self.tool_name
             .as_ref()
@@ -584,6 +1146,11 @@ impl ToolCall {
         let tool_name = tool_name_from_meta(&tool_call.meta);
 
         let subagent_session_info = subagent_session_info_from_meta(&tool_call.meta);
+        let sandbox_authorization_details =
+            sandbox_authorization_details_from_meta(&tool_call.meta);
+        let sandbox_fallback_authorization_details =
+            sandbox_fallback_authorization_details_from_meta(&tool_call.meta);
+        let sandbox_not_applied = sandbox_not_applied_from_meta(&tool_call.meta);
 
         let label = if tool_call.kind == acp::ToolKind::Execute {
             cx.new(|cx| Markdown::new_text(title.into(), cx))
@@ -604,6 +1171,9 @@ impl ToolCall {
             raw_output: tool_call.raw_output,
             tool_name,
             subagent_session_info,
+            sandbox_authorization_details,
+            sandbox_fallback_authorization_details,
+            sandbox_not_applied,
         };
         Ok(result)
     }
@@ -633,11 +1203,24 @@ impl ToolCall {
         }
 
         if let Some(status) = status {
-            self.status = status.into();
+            self.update_acp_status(status);
         }
 
         if let Some(subagent_session_info) = subagent_session_info_from_meta(&meta) {
             self.subagent_session_info = Some(subagent_session_info);
+        }
+        if let Some(sandbox_authorization_details) = sandbox_authorization_details_from_meta(&meta)
+        {
+            self.sandbox_authorization_details = Some(sandbox_authorization_details);
+        }
+        if let Some(sandbox_fallback_authorization_details) =
+            sandbox_fallback_authorization_details_from_meta(&meta)
+        {
+            self.sandbox_fallback_authorization_details =
+                Some(sandbox_fallback_authorization_details);
+        }
+        if let Some(sandbox_not_applied) = sandbox_not_applied_from_meta(&meta) {
+            self.sandbox_not_applied = Some(sandbox_not_applied);
         }
 
         if let Some(title) = title {
@@ -712,6 +1295,31 @@ impl ToolCall {
         Ok(())
     }
 
+    fn update_status(&mut self, status: ToolCallStatus) {
+        match status {
+            ToolCallStatus::Pending => self.update_acp_status(acp::ToolCallStatus::Pending),
+            ToolCallStatus::InProgress => self.update_acp_status(acp::ToolCallStatus::InProgress),
+            ToolCallStatus::Completed => self.update_acp_status(acp::ToolCallStatus::Completed),
+            ToolCallStatus::Failed => self.update_acp_status(acp::ToolCallStatus::Failed),
+            status @ (ToolCallStatus::WaitingForConfirmation { .. }
+            | ToolCallStatus::Rejected
+            | ToolCallStatus::Canceled) => self.status = status,
+        }
+    }
+
+    fn update_acp_status(&mut self, status: acp::ToolCallStatus) {
+        if let ToolCallStatus::WaitingForConfirmation { current_status, .. } = &mut self.status
+            && matches!(
+                status,
+                acp::ToolCallStatus::Pending | acp::ToolCallStatus::InProgress
+            )
+        {
+            *current_status = status;
+        } else {
+            self.status = status.into();
+        }
+    }
+
     pub fn diffs(&self) -> impl Iterator<Item = &Entity<Diff>> {
         self.content.iter().filter_map(|content| match content {
             ToolCallContent::Diff(diff) => Some(diff),
@@ -753,9 +1361,16 @@ impl ToolCall {
     ) -> Option<ResolvedLocation> {
         let buffer = project
             .update(cx, |project, cx| {
-                project
-                    .project_path_for_absolute_path(&location.path, cx)
-                    .map(|path| project.open_buffer(path, cx))
+                if let Some(path) = project.project_path_for_absolute_path(&location.path, cx) {
+                    Some(project.open_buffer(path, cx))
+                } else if is_absolute(
+                    location.path.to_string_lossy().as_ref(),
+                    project.path_style(cx),
+                ) {
+                    Some(project.open_local_buffer(&location.path, cx))
+                } else {
+                    None
+                }
             })
             .ok()??;
         let buffer = buffer.await.log_err()?;
@@ -813,7 +1428,7 @@ pub enum SelectedPermissionParams {
     Terminal { patterns: Vec<String> },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SelectedPermissionOutcome {
     pub option_id: acp::PermissionOptionId,
     pub option_kind: acp::PermissionOptionKind,
@@ -879,6 +1494,7 @@ pub enum ToolCallStatus {
     Pending,
     /// The tool call is waiting for confirmation from the user.
     WaitingForConfirmation {
+        current_status: acp::ToolCallStatus,
         options: PermissionOptions,
         respond_tx: oneshot::Sender<SelectedPermissionOutcome>,
         kind: AuthorizationKind,
@@ -907,6 +1523,26 @@ impl From<acp::ToolCallStatus> for ToolCallStatus {
     }
 }
 
+impl ToolCallStatus {
+    fn as_acp_status(&self) -> Option<acp::ToolCallStatus> {
+        match self {
+            ToolCallStatus::Pending => Some(acp::ToolCallStatus::Pending),
+            ToolCallStatus::WaitingForConfirmation { current_status, .. } => Some(*current_status),
+            ToolCallStatus::InProgress => Some(acp::ToolCallStatus::InProgress),
+            ToolCallStatus::Completed => Some(acp::ToolCallStatus::Completed),
+            ToolCallStatus::Failed => Some(acp::ToolCallStatus::Failed),
+            ToolCallStatus::Rejected | ToolCallStatus::Canceled => None,
+        }
+    }
+
+    fn status_after_permission_grant(status: acp::ToolCallStatus) -> ToolCallStatus {
+        match ToolCallStatus::from(status) {
+            ToolCallStatus::Pending => ToolCallStatus::InProgress,
+            status => status,
+        }
+    }
+}
+
 impl Display for ToolCallStatus {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -925,11 +1561,24 @@ impl Display for ToolCallStatus {
     }
 }
 
+fn elicitation_status_for_response(response: &acp::CreateElicitationResponse) -> ElicitationStatus {
+    match &response.action {
+        acp::ElicitationAction::Accept(_) => ElicitationStatus::Accepted,
+        acp::ElicitationAction::Decline => ElicitationStatus::Declined,
+        acp::ElicitationAction::Cancel => ElicitationStatus::Canceled,
+        _ => ElicitationStatus::Canceled,
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum ContentBlock {
     Empty,
     Markdown {
         markdown: Entity<Markdown>,
+    },
+    EmbeddedResource {
+        resource: acp::EmbeddedResource,
+        markdown: Option<Entity<Markdown>>,
     },
     ResourceLink {
         resource_link: acp::ResourceLink,
@@ -963,6 +1612,26 @@ impl ContentBlock {
             this.append(block, &language_registry, path_style, cx);
         }
         this
+    }
+
+    pub fn new_tool_call_content(
+        block: acp::ContentBlock,
+        language_registry: &Arc<LanguageRegistry>,
+        path_style: PathStyle,
+        cx: &mut App,
+    ) -> Self {
+        match block {
+            acp::ContentBlock::Resource(resource) => {
+                if let Some((image, dimensions)) = Self::decode_embedded_resource_image(&resource) {
+                    Self::Image { image, dimensions }
+                } else {
+                    let markdown =
+                        Self::embedded_resource_markdown(&resource, language_registry, cx);
+                    Self::EmbeddedResource { resource, markdown }
+                }
+            }
+            block => Self::new(block, language_registry, path_style, cx),
+        }
     }
 
     pub fn append(
@@ -1000,6 +1669,13 @@ impl ContentBlock {
                 let combined = format!("{}\n{}", existing_content, new_content);
                 *self = Self::create_markdown_block(combined, language_registry, cx);
             }
+            (ContentBlock::EmbeddedResource { resource, .. }, _) => {
+                let existing_content =
+                    Self::embedded_resource_string_contents(resource, path_style);
+                let new_content = Self::block_string_contents(&block, path_style);
+                let combined = format!("{}\n{}", existing_content, new_content);
+                *self = Self::create_markdown_block(combined, language_registry, cx);
+            }
             (ContentBlock::Image { .. }, _) => {
                 let new_content = Self::block_string_contents(&block, path_style);
                 let combined = format!("`Image`\n{}", new_content);
@@ -1008,15 +1684,59 @@ impl ContentBlock {
         }
     }
 
+    /// Updates a Markdown block in place from a streaming text `block`, reusing
+    /// the existing `Markdown` entity rather than recreating it. Appends only the
+    /// new suffix when the update is a continuation (the common streaming case),
+    /// otherwise re-sets the source. Returns `false` when an in-place update isn't
+    /// applicable, so the caller can fall back to replacing the block wholesale.
+    ///
+    /// Recreating the entity on every streamed snapshot causes the rendered
+    /// element to tear down and rebuild, which flickers badly.
+    pub fn update_text_in_place(&mut self, block: &acp::ContentBlock, cx: &mut App) -> bool {
+        let ContentBlock::Markdown { markdown } = self else {
+            return false;
+        };
+        let acp::ContentBlock::Text(text_content) = block else {
+            return false;
+        };
+        let new_content = &text_content.text;
+        markdown.update(cx, |markdown, cx| {
+            let current = markdown.source().to_string();
+            match new_content.strip_prefix(&current) {
+                Some("") => {}
+                Some(suffix) => markdown.append(suffix, cx),
+                None => markdown.reset(new_content.clone().into(), cx),
+            }
+        });
+        true
+    }
+
     fn decode_image(
         image_content: &acp::ImageContent,
+    ) -> Option<(Arc<gpui::Image>, Option<gpui::Size<u32>>)> {
+        Self::decode_image_data(&image_content.data, &image_content.mime_type)
+    }
+
+    fn decode_embedded_resource_image(
+        resource: &acp::EmbeddedResource,
+    ) -> Option<(Arc<gpui::Image>, Option<gpui::Size<u32>>)> {
+        let acp::EmbeddedResourceResource::BlobResourceContents(blob) = &resource.resource else {
+            return None;
+        };
+        let mime_type = blob.mime_type.as_deref()?;
+        Self::decode_image_data(&blob.blob, mime_type)
+    }
+
+    fn decode_image_data(
+        data: &str,
+        mime_type: &str,
     ) -> Option<(Arc<gpui::Image>, Option<gpui::Size<u32>>)> {
         use base64::Engine as _;
 
         let bytes = base64::engine::general_purpose::STANDARD
-            .decode(image_content.data.as_bytes())
+            .decode(data.as_bytes())
             .ok()?;
-        let format = gpui::ImageFormat::from_mime_type(&image_content.mime_type)?;
+        let format = gpui::ImageFormat::from_mime_type(mime_type)?;
         let dimensions = Self::image_dimensions(&bytes, format);
         Some((Arc::new(gpui::Image::from_bytes(format, bytes)), dimensions))
     }
@@ -1046,19 +1766,141 @@ impl ContentBlock {
         cx: &mut App,
     ) -> ContentBlock {
         ContentBlock::Markdown {
-            markdown: cx.new(|cx| {
-                Markdown::new_with_options(
-                    content.into(),
-                    Some(language_registry.clone()),
-                    None,
-                    MarkdownOptions {
-                        render_mermaid_diagrams: true,
-                        render_metadata_blocks: true,
-                        ..Default::default()
-                    },
-                    cx,
-                )
-            }),
+            markdown: Self::create_markdown(content, language_registry, cx),
+        }
+    }
+
+    fn create_markdown(
+        content: String,
+        language_registry: &Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) -> Entity<Markdown> {
+        cx.new(|cx| {
+            Markdown::new_with_options(
+                content.into(),
+                Some(language_registry.clone()),
+                None,
+                MarkdownOptions {
+                    render_mermaid_diagrams: true,
+                    render_metadata_blocks: true,
+                    ..Default::default()
+                },
+                cx,
+            )
+        })
+    }
+
+    fn embedded_resource_markdown(
+        resource: &acp::EmbeddedResource,
+        language_registry: &Arc<LanguageRegistry>,
+        cx: &mut App,
+    ) -> Option<Entity<Markdown>> {
+        match &resource.resource {
+            acp::EmbeddedResourceResource::TextResourceContents(text) => Some(
+                Self::create_markdown(Self::text_resource_markdown(text), language_registry, cx),
+            ),
+            acp::EmbeddedResourceResource::BlobResourceContents(_) => None,
+            _ => None,
+        }
+    }
+
+    fn text_resource_markdown(resource: &acp::TextResourceContents) -> String {
+        match text_resource_render_mode(resource.mime_type.as_deref()) {
+            TextResourceRenderMode::Markdown => resource.text.clone(),
+            TextResourceRenderMode::CodeBlock(language) => {
+                Self::fenced_code_block(&resource.text, language)
+            }
+        }
+    }
+
+    pub fn text_content<'a>(&'a self, cx: &'a App) -> Option<&'a str> {
+        match self {
+            ContentBlock::Markdown { markdown } => Some(markdown.read(cx).source()),
+            ContentBlock::EmbeddedResource { resource, .. } => match &resource.resource {
+                acp::EmbeddedResourceResource::TextResourceContents(text) => Some(&text.text),
+                acp::EmbeddedResourceResource::BlobResourceContents(_) => None,
+                _ => None,
+            },
+            ContentBlock::Empty
+            | ContentBlock::ResourceLink { .. }
+            | ContentBlock::Image { .. } => None,
+        }
+    }
+
+    fn fenced_code_block(text: &str, language: Option<&str>) -> String {
+        let fence_len = text
+            .as_bytes()
+            .chunk_by(|left, right| left == right)
+            .filter(|chunk| chunk.first() == Some(&b'`'))
+            .map(|chunk| chunk.len() + 1)
+            .max()
+            .unwrap_or(3)
+            .max(3);
+        let fence = "`".repeat(fence_len);
+
+        let mut markdown = String::new();
+        markdown.push_str(&fence);
+        if let Some(language) = language {
+            markdown.push_str(language);
+        }
+        markdown.push('\n');
+        markdown.push_str(text);
+        if !text.ends_with('\n') {
+            markdown.push('\n');
+        }
+        markdown.push_str(&fence);
+        markdown
+    }
+
+    fn embedded_resource_string_contents(
+        resource: &acp::EmbeddedResource,
+        path_style: PathStyle,
+    ) -> String {
+        match &resource.resource {
+            acp::EmbeddedResourceResource::TextResourceContents(text) => {
+                Self::resource_link_md(&text.uri, path_style)
+            }
+            acp::EmbeddedResourceResource::BlobResourceContents(blob) => {
+                Self::resource_link_md(&blob.uri, path_style)
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn embedded_resource_text(resource: &acp::EmbeddedResource) -> &str {
+        match &resource.resource {
+            acp::EmbeddedResourceResource::TextResourceContents(text) => &text.text,
+            acp::EmbeddedResourceResource::BlobResourceContents(blob) => &blob.uri,
+            _ => "",
+        }
+    }
+
+    fn embedded_resource_label(resource: &acp::EmbeddedResource) -> &str {
+        match &resource.resource {
+            acp::EmbeddedResourceResource::TextResourceContents(text) => &text.uri,
+            acp::EmbeddedResourceResource::BlobResourceContents(blob) => &blob.uri,
+            _ => "",
+        }
+    }
+
+    pub fn embedded_resource(&self) -> Option<(&acp::EmbeddedResource, Option<&Entity<Markdown>>)> {
+        match self {
+            ContentBlock::EmbeddedResource { resource, markdown } => {
+                Some((resource, markdown.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn visible_content(&self, cx: &App) -> bool {
+        match self {
+            ContentBlock::Empty => false,
+            ContentBlock::Markdown { markdown } => !markdown.read(cx).source().trim().is_empty(),
+            ContentBlock::EmbeddedResource { resource, markdown } => match markdown {
+                Some(markdown) => !markdown.read(cx).source().trim().is_empty(),
+                None => !Self::embedded_resource_text(resource).trim().is_empty(),
+            },
+            ContentBlock::ResourceLink { .. } | ContentBlock::Image { .. } => true,
         }
     }
 
@@ -1097,6 +1939,13 @@ impl ContentBlock {
         match self {
             ContentBlock::Empty => "",
             ContentBlock::Markdown { markdown } => markdown.read(cx).source(),
+            ContentBlock::EmbeddedResource { resource, markdown } => {
+                if let Some(markdown) = markdown {
+                    markdown.read(cx).source()
+                } else {
+                    Self::embedded_resource_label(resource)
+                }
+            }
             ContentBlock::ResourceLink { resource_link } => &resource_link.uri,
             ContentBlock::Image { .. } => "`Image`",
         }
@@ -1106,6 +1955,7 @@ impl ContentBlock {
         match self {
             ContentBlock::Empty => None,
             ContentBlock::Markdown { markdown } => Some(markdown),
+            ContentBlock::EmbeddedResource { markdown, .. } => markdown.as_ref(),
             ContentBlock::ResourceLink { .. } => None,
             ContentBlock::Image { .. } => None,
         }
@@ -1126,6 +1976,61 @@ impl ContentBlock {
     }
 }
 
+enum TextResourceRenderMode {
+    Markdown,
+    CodeBlock(Option<&'static str>),
+}
+
+fn text_resource_render_mode(mime_type: Option<&str>) -> TextResourceRenderMode {
+    let Some(mime_type) = mime_type else {
+        return TextResourceRenderMode::CodeBlock(None);
+    };
+    let Ok(mime) = mime_type.parse::<mime::Mime>() else {
+        return TextResourceRenderMode::CodeBlock(None);
+    };
+
+    let type_ = mime.type_().as_str();
+    let subtype = mime.subtype().as_str();
+    let suffix = mime.suffix().map(|suffix| suffix.as_str());
+
+    if matches!(
+        (type_, subtype),
+        ("text", "markdown") | ("text", "x-markdown")
+    ) {
+        return TextResourceRenderMode::Markdown;
+    }
+
+    let language = match (type_, subtype, suffix) {
+        (_, "json", _) | (_, _, Some("json")) => Some("json"),
+        (_, "xml", _) | (_, _, Some("xml")) => Some("xml"),
+        ("text", "html", _) => Some("html"),
+        ("text", "css", _) => Some("css"),
+        ("text", "csv", _) => Some("csv"),
+        ("text", "tab-separated-values", _) => Some("tsv"),
+        ("text", "javascript", _) | ("application", "javascript", _) => Some("javascript"),
+        ("application", "x-javascript", _) => Some("javascript"),
+        ("text", "typescript", _) | ("application", "typescript", _) => Some("typescript"),
+        ("text", "x-shellscript", _) | ("application", "x-shellscript", _) => Some("sh"),
+        ("application", "x-sh", _) => Some("sh"),
+        ("text", "x-python", _) => Some("python"),
+        ("text", "x-rust", _) => Some("rust"),
+        ("text", "x-go", _) => Some("go"),
+        ("text", "x-ruby", _) => Some("ruby"),
+        ("text", "x-c", _) => Some("c"),
+        // `mime` parses `text/x-c++` as subtype `x-c+` with an empty suffix.
+        ("text", "x-c+", Some("")) => Some("cpp"),
+        ("text", "plain", _) => None,
+        ("text", _, _) => None,
+        ("application", "graphql", _) => Some("graphql"),
+        ("application", "toml", _) => Some("toml"),
+        ("application", "yaml", _) | ("application", "x-yaml", _) => Some("yaml"),
+        (_, _, Some("yaml" | "yml")) => Some("yaml"),
+        _ => return TextResourceRenderMode::CodeBlock(None),
+    };
+
+    TextResourceRenderMode::CodeBlock(language)
+}
+
 #[derive(Debug)]
 pub enum ToolCallContent {
     ContentBlock(ContentBlock),
@@ -1142,14 +2047,14 @@ impl ToolCallContent {
         cx: &mut App,
     ) -> Result<Option<Self>> {
         match content {
-            acp::ToolCallContent::Content(acp::Content { content, .. }) => {
-                Ok(Some(Self::ContentBlock(ContentBlock::new(
+            acp::ToolCallContent::Content(acp::Content { content, .. }) => Ok(Some(
+                Self::ContentBlock(ContentBlock::new_tool_call_content(
                     content,
                     &language_registry,
                     path_style,
                     cx,
-                ))))
-            }
+                )),
+            )),
             acp::ToolCallContent::Diff(diff) => Ok(Some(Self::Diff(cx.new(|cx| {
                 Diff::finalized(
                     diff.path.to_string_lossy().into_owned(),
@@ -1176,6 +2081,17 @@ impl ToolCallContent {
         terminals: &HashMap<acp::TerminalId, Entity<Terminal>>,
         cx: &mut App,
     ) -> Result<bool> {
+        // Update streaming text in place so the rendered markdown element is
+        // reused across snapshots instead of being recreated (which flickers).
+        if let (
+            Self::ContentBlock(block),
+            acp::ToolCallContent::Content(acp::Content { content, .. }),
+        ) = (&mut *self, &new)
+            && block.update_text_in_place(content, cx)
+        {
+            return Ok(true);
+        }
+
         let needs_update = match (&self, &new) {
             (Self::Diff(old_diff), acp::ToolCallContent::Diff(new_diff)) => {
                 old_diff.read(cx).needs_update(
@@ -1289,9 +2205,6 @@ impl Plan {
         !self.entries.is_empty() && stats.completed == 0 && stats.in_progress_entry.is_none()
     }
 
-    /// Returns true when the living plan still has work that the agent can and should
-    /// continue autonomously. Used by the Grok autonomous discipline enforcement
-    /// to prevent the model from stopping while tasks remain.
     pub fn has_pending_work(&self) -> bool {
         self.entries.iter().any(|entry| {
             matches!(
@@ -1301,29 +2214,6 @@ impl Plan {
         })
     }
 
-    /// Heuristic used by Grok runtime enforcement to detect when
-    /// the model is attempting to conclude the current turn while the plan still has
-    /// open work. Matches common "early stop" language the user has forbidden.
-    pub fn would_violate_autonomous_discipline(&self, text: &str) -> bool {
-        if !self.has_pending_work() {
-            return false;
-        }
-        let lower = text.to_ascii_lowercase();
-        lower.contains("no more work")
-            || lower.contains("all done")
-            || lower.contains("that's all")
-            || lower.contains("i'm finished")
-            || lower.contains("nothing left")
-            || lower.contains("no further tasks")
-            || lower.contains("i have completed everything")
-            || lower.contains("done for now")
-            || lower.contains("done with everything")
-            || (lower.contains("complete") && !lower.contains("plan"))
-    }
-
-    /// when the plan has just become empty (no more pending work)
-    /// after a Grok assistant turn, the model must have emitted the explicit
-    /// completion notification. Returns true if a notification is required but missing.
     pub fn requires_explicit_completion_notification(&self, text: &str) -> bool {
         if self.has_pending_work() {
             return false;
@@ -1331,6 +2221,16 @@ impl Plan {
         let lower = text.to_ascii_lowercase();
         !(lower.contains("all current independent work is complete")
             || lower.contains("no further autonomous actions are possible"))
+    }
+
+    pub fn progress_fraction(&self) -> f32 {
+        let total = self.entries.len();
+        if total == 0 {
+            0.0
+        } else {
+            let completed = self.stats().completed as usize;
+            completed as f32 / total as f32
+        }
     }
 
     pub fn stats(&self) -> PlanStats<'_> {
@@ -1358,20 +2258,6 @@ impl Plan {
 
         stats
     }
-
-    pub fn total_entries(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn progress_fraction(&self) -> f32 {
-        let total = self.entries.len();
-        if total == 0 {
-            0.0
-        } else {
-            let completed = self.stats().completed as usize;
-            completed as f32 / total as f32
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -1386,16 +2272,12 @@ impl PlanEntry {
     pub fn from_acp(entry: acp::PlanEntry, cx: &mut App) -> Self {
         Self {
             id: plan_entry_id_from_meta(&entry.meta).unwrap_or_else(|| {
-                // Synthesize a stable short slug from content when the ACP
-                // protocol message does not carry an explicit id. This keeps
-                // T-<n>-task-<id> references usable for long-running Grok sessions.
                 entry
                     .content
                     .chars()
                     .take(48)
                     .collect::<String>()
-                    .trim()
-                    .to_string()
+                    .replace(|c: char| !c.is_alphanumeric(), "_")
             }),
             content: cx.new(|cx| Markdown::new(entry.content.into(), None, None, cx)),
             priority: entry.priority,
@@ -1459,60 +2341,25 @@ pub struct RetryStatus {
     pub max_attempts: usize,
     pub started_at: Instant,
     pub duration: Duration,
+    pub meta: Option<acp::Meta>,
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct TurnId(u32);
+pub const REFUSAL_FALLBACK_MODEL_META_KEY: &str = "refusal_fallback_model";
 
-impl TurnId {
-    pub fn new(value: u32) -> Self {
-        Self(value)
-    }
+pub fn meta_with_refusal_fallback(model_name: &str) -> acp::Meta {
+    acp::Meta::from_iter([(REFUSAL_FALLBACK_MODEL_META_KEY.into(), model_name.into())])
 }
 
-impl From<u32> for TurnId {
-    fn from(value: u32) -> Self {
-        Self(value)
-    }
-}
-
-impl From<TurnId> for u32 {
-    fn from(turn_id: TurnId) -> Self {
-        turn_id.0
-    }
-}
-
-impl Display for TurnId {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "T-{}", self.0)
-    }
+pub fn refusal_fallback_model_from_meta(meta: &Option<acp::Meta>) -> Option<SharedString> {
+    meta.as_ref()
+        .and_then(|m| m.get(REFUSAL_FALLBACK_MODEL_META_KEY))
+        .and_then(|v| v.as_str())
+        .map(|s| SharedString::from(s.to_owned()))
 }
 
 struct RunningTurn {
-    id: TurnId,
+    id: u32,
     send_task: Task<()>,
-    last_progress: Instant,
-}
-
-impl RunningTurn {
-    fn new(id: TurnId, send_task: Task<()>) -> Self {
-        Self {
-            id,
-            send_task,
-            last_progress: Instant::now(),
-        }
-    }
-
-    fn record_progress(&mut self) {
-        self.last_progress = Instant::now();
-    }
-
-    fn stalled_duration(&self) -> Duration {
-        Instant::now().saturating_duration_since(self.last_progress)
-    }
 }
 
 pub struct AcpThread {
@@ -1524,13 +2371,14 @@ pub struct AcpThread {
     title: Option<SharedString>,
     provisional_title: Option<SharedString>,
     entries: Vec<AgentThreadEntry>,
+    elicitations: ElicitationStore,
     plan: Plan,
     project: Entity<Project>,
     action_log: Entity<ActionLog>,
     _git_store_subscription: Subscription,
     update_last_checkpoint_if_changed_task: Option<Task<Result<()>>>,
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
-    turn_id: TurnId,
+    turn_id: u32,
     running_turn: Option<RunningTurn>,
     connection: Rc<dyn AgentConnection>,
     token_usage: Option<TokenUsage>,
@@ -1551,8 +2399,6 @@ pub struct AcpThread {
     /// gradually to create a fluid typing effect instead of choppy chunk-at-a-time
     /// updates.
     streaming_text_buffer: Option<StreamingTextBuffer>,
-    /// Per assistant-message guard: discipline/formatting kickbacks fire at most once per streamed reply.
-    grok_output_discipline_kickback_sent: bool,
 }
 
 struct StreamingTextBuffer {
@@ -1585,6 +2431,7 @@ impl From<&AcpThread> for ActionLogTelemetry {
 
 #[derive(Debug)]
 pub enum AcpThreadEvent {
+    StatusChanged,
     PromptUpdated,
     NewEntry,
     TitleUpdated,
@@ -1593,6 +2440,8 @@ pub enum AcpThreadEvent {
     EntriesRemoved(Range<usize>),
     ToolAuthorizationRequested(acp::ToolCallId),
     ToolAuthorizationReceived(acp::ToolCallId),
+    ElicitationRequested(ElicitationEntryId),
+    ElicitationResponded(ElicitationEntryId),
     Retry(RetryStatus),
     SubagentSpawned(acp::SessionId),
     SubagentUpdated(acp::SessionId),
@@ -1694,7 +2543,6 @@ impl Error for LoadError {}
 impl AcpThread {
     pub fn new(
         parent_session_id: Option<acp::SessionId>,
-        persona: Option<AgentPersona>,
         title: Option<SharedString>,
         work_dirs: Option<PathList>,
         connection: Rc<dyn AgentConnection>,
@@ -1734,7 +2582,7 @@ impl AcpThread {
 
         Self {
             parent_session_id,
-            persona,
+            persona: None,
             is_grok,
             work_dirs,
             action_log,
@@ -1742,12 +2590,13 @@ impl AcpThread {
             update_last_checkpoint_if_changed_task: None,
             shared_buffers: Default::default(),
             entries: Default::default(),
+            elicitations: ElicitationStore::default(),
             plan: Default::default(),
             title,
             provisional_title: None,
             project,
             running_turn: None,
-            turn_id: TurnId(0),
+            turn_id: 0,
             connection,
             session_id,
             token_usage: None,
@@ -1762,7 +2611,6 @@ impl AcpThread {
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
-            grok_output_discipline_kickback_sent: false,
         }
     }
 
@@ -1774,173 +2622,63 @@ impl AcpThread {
         self.persona
     }
 
-    /// Returns whether this thread is connected to the bridged "grok" ACP agent.
-    /// Used by the diagnostic push logic (and tests) so that editor warnings/errors
-    /// from the current project are automatically included in the prompt sent to
-    /// the external grok binary on every turn — making them known to the agent
-    /// without manual checks.
     pub fn is_grok(&self) -> bool {
         self.is_grok
     }
 
-    /// Returns the current turn ID for this thread. Used to give Grok Build
-    /// threads a stable way to refer to specific turns and tasks (e.g. "T-17-task-xxx") when
-    /// tracking tasks across multiple turns in the categorized todos surface and behavioral
-    /// rule enforcement.
-    pub fn current_turn_id(&self) -> TurnId {
-        self.turn_id
-    }
-
-    /// Returns the number of tool calls currently awaiting user approval.
-    /// Exposed so that post-EndTurn diagnostic continuation messages and
-    /// categorized todos surfaces can report accurate pending approval counts using only
-    /// data already held by AcpThread.
-    pub fn pending_approval_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| {
-                if let AgentThreadEntry::ToolCall(tc) = e {
-                    matches!(tc.status, ToolCallStatus::WaitingForConfirmation { .. })
-                } else {
-                    false
-                }
-            })
-            .count()
-    }
-
-    /// Returns the number of active background monitor tasks (monitor tool
-    /// calls that have not yet completed or failed). Used by the automatic
-    /// live diagnostic continuation injection after EndTurn.
-    pub fn active_background_monitor_count(&self) -> usize {
-        self.entries
-            .iter()
-            .filter(|e| {
-                if let AgentThreadEntry::ToolCall(tc) = e {
-                    tc.is_monitor()
-                        && !matches!(
-                            tc.status,
-                            ToolCallStatus::Completed | ToolCallStatus::Failed
-                        )
-                } else {
-                    false
-                }
-            })
-            .count()
-    }
-
-    /// After a clean EndTurn (the point at which the "thinking" / stop button
-    /// resets in the UI), automatically query the *live* in-process LSP
-    /// diagnostic state via Project::diagnostic_summary (the real data rust-analyzer
-    /// has already pushed into this process) plus the current pending todos
-    /// (approvals, plan, monitors). If any remain, synthesize and append a user
-    /// content block containing the fresh counts + current turn ID.
-    ///
-    /// This is the mechanism that lets the agent "find that information" (the
-    /// diagnostics the editor already holds) without the user pasting the block,
-    /// directly addressing the requirement that the three behavioral rules
-    /// (never stop while work remains, mandatory exact completion notification,
-    /// CWD dual-condition labeling) must be self-enforcing for Grok threads.
-    pub fn inject_live_diagnostic_continuation_if_needed(&mut self, cx: &mut Context<Self>) {
-        if !self.is_grok() {
-            return;
-        }
-        if self.merge_review_file_turn_scoped() {
-            log::info!(
-                "acp_thread: skipping live diagnostic continuation for merge review file turn"
-            );
-            return;
-        }
-
-        let diag = self.project.read(cx).diagnostic_summary(false, cx);
-        let turn_id = self.turn_id;
-        let has_plan = self.plan.has_pending_work(); // Plan lives in a separate field
-        let approval_count = self.pending_approval_count();
-        let monitor_count = self.active_background_monitor_count();
-
-        if diag.error_count == 0
-            && diag.warning_count == 0
-            && !has_plan
-            && approval_count == 0
-            && monitor_count == 0
-        {
-            return;
-        }
-
-        let text = format!(
-            "\n\n## System Continuation (after EndTurn on {})\nThe previous assistant response returned StopReason::EndTurn, but the live state inside this Zed process shows work remains.\n\n## Current Zed Editor Diagnostics (live from rust-analyzer / LSP)\nProject currently has {} errors and {} warnings reported by Zed's language servers.\n\n## Pending Todos Work\n- Plan entries with work remaining: {}\n- Tool calls awaiting approval: {}\n- Active background monitors: {}\n\nPer the three behavioral rules (never stop while tasks remain, mandatory exact completion notification when truly done, and correct CWD-based RO vs Destructive labeling), you must continue autonomously. Reference tasks using the T-<n>-task-<id> syntax (e.g. {}-task-refactor-parser) for stable cross-turn task naming when using todo_write and plan tools.",
-            turn_id,
-            diag.error_count,
-            diag.warning_count,
-            if has_plan { "yes" } else { "no" },
-            approval_count,
-            monitor_count,
-            turn_id
-        );
-
-        let block = acp::ContentBlock::Text(acp::TextContent::new(text));
-        self.push_user_content_block_with_indent(None, block, false, cx);
-        cx.notify();
-    }
-
-    /// Validates Grok thread output against the strict alpha-numbered list formatting contract.
-    /// Rejects bullet/dash lists, numbered lists without alphabetical section headers (A., B.),
-    /// smart quotes, and em/en dashes. This ensures items are stably referenceable (A1, B3, ...)
-    /// in conjunction with T-<n>-task-<id> naming for plan/todo items. Used by ACP to automatically request revisions.
-    pub fn validate_grok_output_formatting(text: &str) -> Result<(), Vec<String>> {
-        let mut violations = vec![];
-
-        if text.contains('“') || text.contains('”') || text.contains('‘') || text.contains('’')
-        {
-            violations.push("smart quotes detected — use straight quotes only".to_string());
-        }
-        if text.contains('—') || text.contains('–') {
-            violations.push("em or en dash detected — use hyphen or rephrase".to_string());
-        }
-
-        for line in text.lines() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("- ")
-                || trimmed.starts_with("* ")
-                || trimmed.starts_with("• ")
-                || trimmed.starts_with("– ")
-                || trimmed.starts_with("— ")
-            {
-                violations.push("bullet or dash/hyphenated list detected (use numbered lists under alphabetical section headers A., B., etc.)".to_string());
-                break;
+    pub fn grok_memory(&self) -> GrokMemoryArtifacts {
+        if let Some(dirs) = self.work_dirs() {
+            if let Some(cwd) = dirs.ordered_paths().next() {
+                return grok_memory_artifacts_for_cwd(cwd);
             }
         }
+        GrokMemoryArtifacts::default()
+    }
 
-        let has_numbered = text.lines().any(|l| {
-            let t = l.trim_start();
-            t.chars().next().is_some_and(|c| c.is_ascii_digit()) && t.contains(". ")
-        });
-        let has_alpha_header = text.lines().any(|l| {
-            let t = l.trim_start();
-            // Safe check for "A." or "**A.**" style alphabetical headers (supports the exact contract
-            // the system prompt and native Grok fragments demand so items are referenceable as A1/B3).
-            (t.len() >= 2
-                && t.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                && t.chars().nth(1) == Some('.'))
-                || (t.starts_with("**")
-                    && t.get(2..)
-                        .and_then(|s| s.chars().next())
-                        .is_some_and(|c| c.is_ascii_uppercase()))
-                || (t.starts_with("**")
-                    && t.get(2..).is_some_and(|s| {
-                        s.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                            && s.chars().nth(1) == Some('.')
-                    }))
-        });
-
-        if has_numbered && !has_alpha_header {
-            violations.push("numbered list items present without alphabetical section header (A., B., **A.** etc. so items can be referenced as A1, B3, ...)".to_string());
+    pub fn active_subagent_count(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for entry in &self.entries {
+            if let AgentThreadEntry::ToolCall(tc) = entry {
+                if let Some(info) = &tc.subagent_session_info {
+                    seen.insert(&info.session_id);
+                }
+            }
         }
+        seen.len()
+    }
 
-        if violations.is_empty() {
-            Ok(())
-        } else {
-            Err(violations)
+    pub fn has_active_background_monitors(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            if let AgentThreadEntry::ToolCall(tool_call) = entry {
+                tool_call.is_monitor()
+                    && matches!(
+                        tool_call.status,
+                        ToolCallStatus::InProgress | ToolCallStatus::Pending
+                    )
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn current_turn_stalled(&self) -> Option<Duration> {
+        self.running_turn.as_ref().and_then(|_| {
+            // RunningTurn does not yet track per-turn stall timing; return None until wired.
+            None
+        })
+    }
+
+    pub fn has_outstanding_todos(&self) -> bool {
+        if !self.plan.is_empty() && self.plan.stats().pending > 0 {
+            return true;
         }
+        if self.is_waiting_for_confirmation() {
+            return true;
+        }
+        if self.has_active_background_monitors() {
+            return true;
+        }
+        false
     }
 
     pub fn prompt_capabilities(&self) -> acp::PromptCapabilities {
@@ -2002,6 +2740,15 @@ impl AcpThread {
         &self.entries
     }
 
+    pub fn is_compacting(&self) -> bool {
+        self.entries.last().is_some_and(|entry| {
+            matches!(
+                entry,
+                AgentThreadEntry::ContextCompaction(compaction) if compaction.is_in_progress()
+            )
+        })
+    }
+
     pub fn invalidate_mermaid_caches(&self, cx: &mut App) {
         for entry in &self.entries {
             let chunks = match entry {
@@ -2010,8 +2757,8 @@ impl AcpThread {
             };
             for chunk in chunks {
                 let block = match chunk {
-                    AssistantMessageChunk::Message { block } => block,
-                    AssistantMessageChunk::Thought { block } => block,
+                    AssistantMessageChunk::Message { block, .. } => block,
+                    AssistantMessageChunk::Thought { block, .. } => block,
                 };
                 if let Some(markdown) = block.markdown() {
                     markdown.update(cx, |markdown, cx| {
@@ -2059,10 +2806,20 @@ impl AcpThread {
                     status: ToolCallStatus::WaitingForConfirmation { .. },
                     ..
                 }) => return true,
+                AgentThreadEntry::Elicitation(elicitation_id)
+                    if self.elicitations.elicitation(elicitation_id).is_some_and(
+                        |(_, elicitation)| {
+                            matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                        },
+                    ) =>
+                {
+                    return true;
+                }
                 AgentThreadEntry::ToolCall(_)
+                | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction => {}
+                | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
         false
@@ -2074,21 +2831,6 @@ impl AcpThread {
 
     pub fn cost(&self) -> Option<&SessionCost> {
         self.cost.as_ref()
-    }
-
-    /// Returns the number of distinct active sub-agents (based on SubagentSessionInfo
-    /// attached to tool calls). Used for the Grok Build context ring + "nothing
-    /// happening" visuals in the categorized todos surface.
-    pub fn active_subagent_count(&self) -> usize {
-        let mut seen = std::collections::HashSet::new();
-        for entry in &self.entries {
-            if let AgentThreadEntry::ToolCall(tc) = entry {
-                if let Some(info) = &tc.subagent_session_info {
-                    seen.insert(&info.session_id);
-                }
-            }
-        }
-        seen.len()
     }
 
     pub fn has_pending_edit_tool_calls(&self) -> bool {
@@ -2104,9 +2846,10 @@ impl AcpThread {
                     return true;
                 }
                 AgentThreadEntry::ToolCall(_)
+                | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction => {}
+                | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
 
@@ -2124,52 +2867,13 @@ impl AcpThread {
                     return true;
                 }
                 AgentThreadEntry::ToolCall(_)
+                | AgentThreadEntry::Elicitation(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction => {}
+                | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
 
-        false
-    }
-
-    pub fn has_active_background_monitors(&self) -> bool {
-        self.entries.iter().any(|entry| {
-            if let AgentThreadEntry::ToolCall(tool_call) = entry {
-                tool_call.is_monitor()
-                    && matches!(
-                        tool_call.status,
-                        ToolCallStatus::InProgress | ToolCallStatus::Pending
-                    )
-            } else {
-                false
-            }
-        })
-    }
-
-    /// Returns how long the current turn has been without visible progress, if any.
-    /// This is the ACP-owned source of truth for "the agent forgot to notify me".
-    pub fn current_turn_stalled(&self) -> Option<Duration> {
-        self.running_turn.as_ref().and_then(|t| {
-            let duration = t.stalled_duration();
-            if duration > ACP_TURN_NO_PROGRESS_TIMEOUT {
-                Some(duration)
-            } else {
-                None
-            }
-        })
-    }
-
-    pub fn has_outstanding_todos(&self) -> bool {
-        if !self.plan.is_empty() && self.plan.stats().pending > 0 {
-            return true;
-        }
-        if self.is_waiting_for_confirmation() {
-            return true;
-        }
-        if self.has_active_background_monitors() {
-            return true;
-        }
         false
     }
 
@@ -2179,7 +2883,8 @@ impl AcpThread {
                 AgentThreadEntry::UserMessage(..) => return false,
                 AgentThreadEntry::AssistantMessage(..)
                 | AgentThreadEntry::CompletedPlan(..)
-                | AgentThreadEntry::ContextCompaction => continue,
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::Elicitation(_) => continue,
                 AgentThreadEntry::ToolCall(..) => return true,
             }
         }
@@ -2193,24 +2898,54 @@ impl AcpThread {
         cx: &mut Context<Self>,
     ) -> Result<(), acp::Error> {
         match update {
-            acp::SessionUpdate::UserMessageChunk(acp::ContentChunk { content, .. }) => {
+            acp::SessionUpdate::UserMessageChunk(acp::ContentChunk {
+                content,
+                message_id,
+                ..
+            }) => {
                 // We optimistically add the full user prompt before calling `prompt`.
-                // Some ACP servers echo user chunks back over updates. Skip the chunk if
-                // it's already present in the current user message to avoid duplicating content.
+                // Some ACP servers echo user chunks back over updates. Skip echoed
+                // chunks only when they match the local optimistic message.
                 let already_in_user_message = self
                     .entries
-                    .last()
-                    .and_then(|entry| entry.user_message())
-                    .is_some_and(|message| message.chunks.contains(&content));
+                    .last_mut()
+                    .and_then(|entry| match entry {
+                        AgentThreadEntry::UserMessage(message) => Some(message),
+                        _ => None,
+                    })
+                    .is_some_and(|message| {
+                        let already_in_user_message = message.is_optimistic
+                            && message.chunks.contains(&content)
+                            && can_merge_message_chunks(
+                                message.protocol_id.as_ref(),
+                                message_id.as_ref(),
+                            );
+                        if already_in_user_message && message.protocol_id.is_none() {
+                            message.protocol_id = message_id.clone();
+                        }
+                        already_in_user_message
+                    });
                 if !already_in_user_message {
-                    self.push_user_content_block(None, content, cx);
+                    self.push_user_content_block_from_agent(message_id, content, cx);
                 }
             }
-            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk { content, .. }) => {
-                self.push_assistant_content_block(content, false, cx);
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk {
+                content,
+                message_id,
+                ..
+            }) => {
+                self.push_assistant_content_block_with_message_id(
+                    message_id, content, false, false, cx,
+                );
             }
-            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk { content, .. }) => {
-                self.push_assistant_content_block(content, true, cx);
+            acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk {
+                content,
+                message_id,
+                ..
+            }) => {
+                self.push_assistant_content_block_with_message_id(
+                    message_id, content, true, false, cx,
+                );
             }
             acp::SessionUpdate::ToolCall(tool_call) => {
                 self.upsert_tool_call(tool_call, cx)?;
@@ -2222,7 +2957,7 @@ impl AcpThread {
                 self.update_plan(plan, cx);
             }
             acp::SessionUpdate::SessionInfoUpdate(info_update) => {
-                if let acp::MaybeUndefined::Value(title) = info_update.title {
+                if let MaybeUndefined::Value(title) = info_update.title {
                     let had_provisional = self.provisional_title.take().is_some();
                     let title: SharedString = title.into();
                     if self.title.as_ref() != Some(&title) {
@@ -2248,7 +2983,7 @@ impl AcpThread {
                 config_options,
                 ..
             }) => cx.emit(AcpThreadEvent::ConfigOptionsUpdated(config_options)),
-            acp::SessionUpdate::UsageUpdate(update) if cx.has_flag::<AcpBetaFeatureFlag>() => {
+            acp::SessionUpdate::UsageUpdate(update) => {
                 let usage = self.token_usage.get_or_insert_with(Default::default);
                 usage.max_tokens = update.size;
                 usage.used_tokens = update.used;
@@ -2267,16 +3002,44 @@ impl AcpThread {
 
     pub fn push_user_content_block(
         &mut self,
-        message_id: Option<UserMessageId>,
+        client_id: Option<ClientUserMessageId>,
         chunk: acp::ContentBlock,
         cx: &mut Context<Self>,
     ) {
-        self.push_user_content_block_with_indent(message_id, chunk, false, cx)
+        self.push_user_content_block_with_indent(client_id, chunk, false, cx)
     }
 
     pub fn push_user_content_block_with_indent(
         &mut self,
-        message_id: Option<UserMessageId>,
+        client_id: Option<ClientUserMessageId>,
+        chunk: acp::ContentBlock,
+        indented: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_user_content_block_with_protocol_id(
+            client_id.clone(),
+            client_id.is_some(),
+            None,
+            chunk,
+            indented,
+            cx,
+        )
+    }
+
+    fn push_user_content_block_from_agent(
+        &mut self,
+        id: Option<acp::MessageId>,
+        chunk: acp::ContentBlock,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_user_content_block_with_protocol_id(None, false, id, chunk, false, cx)
+    }
+
+    fn push_user_content_block_with_protocol_id(
+        &mut self,
+        incoming_client_id: Option<ClientUserMessageId>,
+        is_optimistic: bool,
+        protocol_id: Option<acp::MessageId>,
         chunk: acp::ContentBlock,
         indented: bool,
         cx: &mut Context<Self>,
@@ -2287,16 +3050,29 @@ impl AcpThread {
 
         if let Some(last_entry) = self.entries.last_mut()
             && let AgentThreadEntry::UserMessage(UserMessage {
-                id,
+                protocol_id: existing_protocol_id,
+                client_id: existing_client_id,
                 content,
                 chunks,
+                is_optimistic: existing_is_optimistic,
                 indented: existing_indented,
                 ..
             }) = last_entry
             && *existing_indented == indented
+            && can_merge_message_chunks(existing_protocol_id.as_ref(), protocol_id.as_ref())
+            && !(*existing_is_optimistic
+                && !is_optimistic
+                && existing_protocol_id.is_none()
+                && protocol_id.is_some())
         {
             Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
-            *id = message_id.or(id.take());
+            if let Some(incoming_client_id) = incoming_client_id {
+                *existing_client_id = Some(incoming_client_id);
+            }
+            *existing_is_optimistic |= is_optimistic;
+            if existing_protocol_id.is_none() {
+                *existing_protocol_id = protocol_id;
+            }
             content.append(chunk.clone(), &language_registry, path_style, cx);
             chunks.push(chunk);
             let idx = entries_len - 1;
@@ -2305,7 +3081,9 @@ impl AcpThread {
             let content = ContentBlock::new(chunk.clone(), &language_registry, path_style, cx);
             self.push_entry(
                 AgentThreadEntry::UserMessage(UserMessage {
-                    id: message_id,
+                    protocol_id,
+                    client_id: incoming_client_id,
+                    is_optimistic,
                     content,
                     chunks: vec![chunk],
                     checkpoint: None,
@@ -2325,69 +3103,6 @@ impl AcpThread {
         self.push_assistant_content_block_with_indent(chunk, is_thought, false, cx)
     }
 
-    /// Keep in sync with `agent_ui::merge_review::merge_review_file_prompt`.
-    const MERGE_REVIEW_PLAN_PROMPT_MARKER: &'static str = "Merge review session for upstream";
-    const MERGE_REVIEW_FILE_PROMPT_MARKER: &'static str =
-        "Summarize this file for merging upstream";
-    const MERGE_REVIEW_SCOPED_TURN_MARKER: &'static str = "This is a scoped single-file turn";
-    const MERGE_REVIEW_CONFLICT_TURN_MARKER: &'static str =
-        "This file has an active merge conflict";
-    const MERGE_REVIEW_FORMAT_RETRY_MARKER: &'static str =
-        "missing the required Summary: and Outcome: lines";
-    const DISCIPLINE_KICKBACK_MARKER: &'static str = "autonomous work discipline rules";
-    const FORMATTING_KICKBACK_MARKER: &'static str =
-        "violated the required output formatting rules";
-
-    pub(crate) fn user_message_plain_text(message: &UserMessage) -> String {
-        message
-            .chunks
-            .iter()
-            .filter_map(|block| match block {
-                acp::ContentBlock::Text(text_content) => Some(text_content.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn is_injected_grok_correction(text: &str) -> bool {
-        let lower = text.to_ascii_lowercase();
-        lower.contains(Self::DISCIPLINE_KICKBACK_MARKER)
-            || lower.contains(Self::FORMATTING_KICKBACK_MARKER)
-            || lower.contains("please revise your last response to comply")
-            || lower.contains("please revise your entire last answer")
-    }
-
-    fn is_merge_review_file_prompt(text: &str) -> bool {
-        text.contains(Self::MERGE_REVIEW_PLAN_PROMPT_MARKER)
-            || text.contains(Self::MERGE_REVIEW_FILE_PROMPT_MARKER)
-            || text.contains(Self::MERGE_REVIEW_SCOPED_TURN_MARKER)
-            || text.contains(Self::MERGE_REVIEW_CONFLICT_TURN_MARKER)
-    }
-
-    /// True while the thread is answering a per-file merge review prompt, including
-    /// follow-up turns after injected Grok discipline kickbacks.
-    fn merge_review_file_turn_scoped(&self) -> bool {
-        for entry in self.entries.iter().rev() {
-            let AgentThreadEntry::UserMessage(message) = entry else {
-                continue;
-            };
-            let text = Self::user_message_plain_text(message);
-            if Self::is_injected_grok_correction(&text)
-                || text.contains(Self::MERGE_REVIEW_FORMAT_RETRY_MARKER)
-            {
-                continue;
-            }
-            return Self::is_merge_review_file_prompt(&text);
-        }
-        false
-    }
-
-    #[cfg(test)]
-    pub(crate) fn merge_review_file_turn_scoped_for_tests(&self) -> bool {
-        self.merge_review_file_turn_scoped()
-    }
-
     pub fn push_assistant_content_block_with_indent(
         &mut self,
         chunk: acp::ContentBlock,
@@ -2395,70 +3110,25 @@ impl AcpThread {
         indented: bool,
         cx: &mut Context<Self>,
     ) {
+        self.push_assistant_content_block_with_message_id(None, chunk, is_thought, indented, cx)
+    }
+
+    fn push_assistant_content_block_with_message_id(
+        &mut self,
+        message_id: Option<acp::MessageId>,
+        chunk: acp::ContentBlock,
+        is_thought: bool,
+        indented: bool,
+        cx: &mut Context<Self>,
+    ) {
         let path_style = self.project.read(cx).path_style(cx);
-
-        let merge_review_scoped = self.merge_review_file_turn_scoped();
-        if self.is_grok() && !merge_review_scoped && !self.grok_output_discipline_kickback_sent {
-            if let acp::ContentBlock::Text(tc) = &chunk {
-                if let Err(violations) = Self::validate_grok_output_formatting(&tc.text) {
-                    let correction = format!(
-                        "Your previous response violated the required output formatting rules: {:?}. \
-                        Please revise your entire last answer. Use ONLY properly enumerated numbered lists \
-                        under alphabetical section headers (A. 1. 2. 3. B. 1. 2. etc.) so every item can be \
-                        referenced as A1, B3, etc. Never use dash lists (-, *, •, –, —), smart quotes, or em/en dashes. \
-                        Pair this with T-<n>-task-<id> naming for all plan/todo entries.",
-                        violations
-                    );
-                    let text_block = acp::ContentBlock::Text(acp::TextContent::new(correction));
-                    self.grok_output_discipline_kickback_sent = true;
-                    self.push_user_content_block(None, text_block, cx);
-                } else {
-                    // Combined enforcement for the autonomous discipline rules: produce one clear correction when the model
-                    // either stops while work remains or fails to emit the required completion notification.
-                    let stop_violation = self.plan.would_violate_autonomous_discipline(&tc.text);
-                    let notification_violation = self
-                        .plan
-                        .requires_explicit_completion_notification(&tc.text);
-
-                    if stop_violation || notification_violation {
-                        let mut correction = String::from(
-                            "Your previous response violated the Autonomous Work Discipline rules:\n\n",
-                        );
-
-                        if stop_violation {
-                            correction.push_str("A. You attempted to stop while the living plan (tracked via todo_write and visible in the categorized todos surface) still has pending items.\n");
-                            correction.push_str(
-                                "   1. Stopping when there are still tasks is not acceptable.\n",
-                            );
-                            correction.push_str("   2. Continue autonomously using the available tools until every pending entry is resolved or you explicitly hand control back.\n\n");
-                        }
-
-                        if notification_violation {
-                            correction.push_str("B. You concluded the turn without the required explicit completion notification.\n");
-                            correction.push_str("   1. When all work is genuinely finished you MUST state: 'All current independent work is complete. No further autonomous actions are possible without additional direction.'\n");
-                            correction.push_str("   2. This notification must be present so the categorized todos surface can record the correct state.\n\n");
-                        }
-
-                        correction.push_str("   When naming or referencing tasks (in todo_write, plan entries, categorized todos), always use the T-<n>-task-<id> syntax (e.g. T-17-task-refactor-parser) for stable cross-turn traceability.\n\n");
-                        correction.push_str("Please revise your last response to comply with all three rules (never stop while tasks remain, always emit the exact completion notification when done, and apply the CWD-based RO/Destructive classification using proper T-<n>-task-<id> references).");
-
-                        log::info!(
-                            "acp_thread: injecting Grok discipline kickback (stop={stop_violation}, notification={notification_violation})"
-                        );
-                        let text_block = acp::ContentBlock::Text(acp::TextContent::new(correction));
-                        self.grok_output_discipline_kickback_sent = true;
-                        self.push_user_content_block(None, text_block, cx);
-                    }
-                }
-            }
-        } else if self.is_grok() && merge_review_scoped {
-            log::debug!("acp_thread: skipping Grok output discipline for merge review scoped turn");
-        }
 
         // For text chunks going to an existing Markdown block, buffer for smooth
         // streaming instead of appending all at once which may feel more choppy.
         if let acp::ContentBlock::Text(text_content) = &chunk {
-            if let Some(markdown) = self.streaming_markdown_target(is_thought, indented) {
+            if let Some(markdown) =
+                self.streaming_markdown_target(message_id.as_ref(), is_thought, indented)
+            {
                 let entries_len = self.entries.len();
                 cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
                 self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
@@ -2480,28 +3150,54 @@ impl AcpThread {
             Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
             cx.emit(AcpThreadEvent::EntryUpdated(idx));
             match (chunks.last_mut(), is_thought) {
-                (Some(AssistantMessageChunk::Message { block }), false)
-                | (Some(AssistantMessageChunk::Thought { block }), true) => {
+                (
+                    Some(AssistantMessageChunk::Message {
+                        id: existing_id,
+                        block,
+                    }),
+                    false,
+                )
+                | (
+                    Some(AssistantMessageChunk::Thought {
+                        id: existing_id,
+                        block,
+                    }),
+                    true,
+                ) if can_merge_message_chunks(existing_id.as_ref(), message_id.as_ref()) => {
+                    if existing_id.is_none() {
+                        *existing_id = message_id;
+                    }
                     block.append(chunk, &language_registry, path_style, cx)
                 }
                 _ => {
                     let block = ContentBlock::new(chunk, &language_registry, path_style, cx);
                     if is_thought {
-                        chunks.push(AssistantMessageChunk::Thought { block })
+                        chunks.push(AssistantMessageChunk::Thought {
+                            id: message_id,
+                            block,
+                        })
                     } else {
-                        chunks.push(AssistantMessageChunk::Message { block })
+                        chunks.push(AssistantMessageChunk::Message {
+                            id: message_id,
+                            block,
+                        })
                     }
                 }
             }
         } else {
             let block = ContentBlock::new(chunk, &language_registry, path_style, cx);
             let chunk = if is_thought {
-                AssistantMessageChunk::Thought { block }
+                AssistantMessageChunk::Thought {
+                    id: message_id,
+                    block,
+                }
             } else {
-                AssistantMessageChunk::Message { block }
+                AssistantMessageChunk::Message {
+                    id: message_id,
+                    block,
+                }
             };
 
-            self.grok_output_discipline_kickback_sent = false;
             self.push_entry(
                 AgentThreadEntry::AssistantMessage(AssistantMessage {
                     chunks: vec![chunk],
@@ -2514,32 +3210,40 @@ impl AcpThread {
     }
 
     fn streaming_markdown_target(
-        &self,
+        &mut self,
+        message_id: Option<&acp::MessageId>,
         is_thought: bool,
         indented: bool,
     ) -> Option<Entity<Markdown>> {
-        let last_entry = self.entries.last()?;
+        let last_entry = self.entries.last_mut()?;
         if let AgentThreadEntry::AssistantMessage(AssistantMessage {
             chunks,
             indented: existing_indented,
             ..
         }) = last_entry
             && *existing_indented == indented
-            && let [.., chunk] = chunks.as_slice()
+            && let [.., chunk] = chunks.as_mut_slice()
         {
             match (chunk, is_thought) {
                 (
                     AssistantMessageChunk::Message {
+                        id: existing_id,
                         block: ContentBlock::Markdown { markdown },
                     },
                     false,
                 )
                 | (
                     AssistantMessageChunk::Thought {
+                        id: existing_id,
                         block: ContentBlock::Markdown { markdown },
                     },
                     true,
-                ) => Some(markdown.clone()),
+                ) if can_merge_message_chunks(existing_id.as_ref(), message_id) => {
+                    if existing_id.is_none() {
+                        *existing_id = message_id.cloned();
+                    }
+                    Some(markdown.clone())
+                }
                 _ => None,
             }
         } else {
@@ -2645,8 +3349,69 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::NewEntry);
     }
 
-    pub fn push_context_compaction(&mut self, cx: &mut Context<Self>) {
-        self.push_entry(AgentThreadEntry::ContextCompaction, cx);
+    pub fn push_context_compaction(
+        &mut self,
+        compaction: ContextCompaction,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) =
+            self.entries
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(ix, entry)| match entry {
+                    AgentThreadEntry::ContextCompaction(c) if &c.id == &compaction.id => Some(ix),
+                    _ => None,
+                })
+        {
+            self.entries[ix] = AgentThreadEntry::ContextCompaction(compaction);
+            cx.emit(AcpThreadEvent::EntryUpdated(ix));
+        } else {
+            self.push_entry(AgentThreadEntry::ContextCompaction(compaction), cx);
+        }
+    }
+
+    pub fn update_context_compaction(
+        &mut self,
+        update: ContextCompactionUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let language_registry = self.project.read(cx).languages().clone();
+        let Some((ix, compaction)) =
+            self.entries
+                .iter_mut()
+                .enumerate()
+                .rev()
+                .find_map(|(ix, entry)| match entry {
+                    AgentThreadEntry::ContextCompaction(c) if &c.id == &update.id => Some((ix, c)),
+                    _ => None,
+                })
+        else {
+            return;
+        };
+
+        if !update.summary_delta.is_empty() {
+            if compaction.summary.is_none() {
+                compaction.summary = Some(cx.new(|cx| {
+                    Markdown::new(
+                        update.summary_delta.into(),
+                        Some(language_registry),
+                        None,
+                        cx,
+                    )
+                }));
+            } else if let Some(summary) = compaction.summary.clone() {
+                summary.update(cx, |markdown, cx| {
+                    markdown.append(&update.summary_delta, cx)
+                });
+            }
+        }
+
+        if let Some(status) = update.status {
+            compaction.status = status;
+        }
+
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
     }
 
     pub fn can_set_title(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2678,17 +3443,7 @@ impl AcpThread {
     }
 
     pub fn subagent_spawned(&mut self, session_id: acp::SessionId, cx: &mut Context<Self>) {
-        if let Some(rt) = &mut self.running_turn {
-            rt.record_progress();
-        }
         cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
-    }
-
-    pub fn subagent_updated(&mut self, session_id: acp::SessionId, cx: &mut Context<Self>) {
-        if let Some(rt) = &mut self.running_turn {
-            rt.record_progress();
-        }
-        cx.emit(AcpThreadEvent::SubagentUpdated(session_id));
     }
 
     pub fn update_token_usage(&mut self, usage: Option<TokenUsage>, cx: &mut Context<Self>) {
@@ -2734,6 +3489,9 @@ impl AcpThread {
                     raw_output: None,
                     tool_name: None,
                     subagent_session_info: None,
+                    sandbox_authorization_details: None,
+                    sandbox_fallback_authorization_details: None,
+                    sandbox_not_applied: None,
                 };
                 self.push_entry(AgentThreadEntry::ToolCall(failed_tool_call), cx);
                 return Ok(());
@@ -2791,9 +3549,6 @@ impl AcpThread {
         status: ToolCallStatus,
         cx: &mut Context<Self>,
     ) -> Result<(), acp::Error> {
-        if let Some(rt) = &mut self.running_turn {
-            rt.record_progress();
-        }
         let language_registry = self.project.read(cx).languages().clone();
         let path_style = self.project.read(cx).path_style(cx);
         let id = update.tool_call_id.clone();
@@ -2829,7 +3584,7 @@ impl AcpThread {
                 &self.terminals,
                 cx,
             )?;
-            call.status = status;
+            call.update_status(status);
 
             cx.emit(AcpThreadEvent::EntryUpdated(ix));
         } else {
@@ -2980,7 +3735,13 @@ impl AcpThread {
     ) -> Result<Task<RequestPermissionOutcome>> {
         let (tx, rx) = oneshot::channel();
 
+        let current_status = self
+            .tool_call(&tool_call.tool_call_id)
+            .and_then(|(_, tool_call)| tool_call.status.as_acp_status())
+            .or(tool_call.fields.status)
+            .unwrap_or(acp::ToolCallStatus::Pending);
         let status = ToolCallStatus::WaitingForConfirmation {
+            current_status,
             options,
             respond_tx: tx,
             kind,
@@ -3005,6 +3766,19 @@ impl AcpThread {
         }))
     }
 
+    pub fn cancel_tool_call_authorization(&mut self, id: &acp::ToolCallId, cx: &mut Context<Self>) {
+        let Some((ix, call)) = self.tool_call_mut(id) else {
+            return;
+        };
+        if !matches!(call.status, ToolCallStatus::WaitingForConfirmation { .. }) {
+            return;
+        }
+
+        call.status = ToolCallStatus::Canceled;
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+        cx.emit(AcpThreadEvent::ToolAuthorizationReceived(id.clone()));
+    }
+
     pub fn authorize_tool_call(
         &mut self,
         id: acp::ToolCallId,
@@ -3015,24 +3789,30 @@ impl AcpThread {
             return;
         };
 
-        let is_action_choice = matches!(
-            call.status,
-            ToolCallStatus::WaitingForConfirmation {
-                kind: AuthorizationKind::ActionChoice,
-                ..
-            }
-        );
         let new_status =
-            if is_action_choice {
-                ToolCallStatus::InProgress
-            } else {
-                match outcome.option_kind {
+            match &call.status {
+                ToolCallStatus::WaitingForConfirmation {
+                    kind: AuthorizationKind::ActionChoice,
+                    ..
+                } => ToolCallStatus::InProgress,
+                ToolCallStatus::WaitingForConfirmation { current_status, .. } => {
+                    match outcome.option_kind {
+                        acp::PermissionOptionKind::RejectOnce
+                        | acp::PermissionOptionKind::RejectAlways => ToolCallStatus::Rejected,
+                        acp::PermissionOptionKind::AllowOnce
+                        | acp::PermissionOptionKind::AllowAlways => {
+                            ToolCallStatus::status_after_permission_grant(*current_status)
+                        }
+                        _ => ToolCallStatus::status_after_permission_grant(*current_status),
+                    }
+                }
+                _ => match outcome.option_kind {
                     acp::PermissionOptionKind::RejectOnce
                     | acp::PermissionOptionKind::RejectAlways => ToolCallStatus::Rejected,
                     acp::PermissionOptionKind::AllowOnce
                     | acp::PermissionOptionKind::AllowAlways => ToolCallStatus::InProgress,
                     _ => ToolCallStatus::InProgress,
-                }
+                },
             };
 
         let curr_status = mem::replace(&mut call.status, new_status);
@@ -3044,33 +3824,114 @@ impl AcpThread {
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
     }
 
+    pub fn request_elicitation(
+        &mut self,
+        request: acp::CreateElicitationRequest,
+        cx: &mut Context<Self>,
+    ) -> Result<Task<acp::CreateElicitationResponse>, acp::Error> {
+        self.request_elicitation_with_id(request, cx)
+            .map(|(_, task)| task)
+    }
+
+    pub fn request_elicitation_with_id(
+        &mut self,
+        request: acp::CreateElicitationRequest,
+        cx: &mut Context<Self>,
+    ) -> Result<(ElicitationEntryId, Task<acp::CreateElicitationResponse>), acp::Error> {
+        ElicitationStore::validate_request(&request, cx)?;
+
+        let (id, response_rx) = self.elicitations.insert_pending_elicitation(request);
+        self.push_entry(AgentThreadEntry::Elicitation(id.clone()), cx);
+        cx.emit(AcpThreadEvent::ElicitationRequested(id.clone()));
+
+        let task =
+            ElicitationStore::response_task(id.clone(), response_rx, cx, |_thread, cx, id| {
+                cx.emit(AcpThreadEvent::ElicitationResponded(id))
+            });
+
+        Ok((id, task))
+    }
+
+    pub fn respond_to_elicitation(
+        &mut self,
+        id: &ElicitationEntryId,
+        response: acp::CreateElicitationResponse,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.elicitation_entry_ix(id) else {
+            return;
+        };
+        if !self.elicitations.respond_to_elicitation_by_id(id, response) {
+            return;
+        }
+
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+    }
+
+    pub fn complete_url_elicitation(
+        &mut self,
+        elicitation_id: &acp::ElicitationId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry_id) = self
+            .elicitations
+            .entry_id_for_url_elicitation(elicitation_id)
+        else {
+            return;
+        };
+        let Some(ix) = self.elicitation_entry_ix(&entry_id) else {
+            return;
+        };
+        if !self.elicitations.complete_url_elicitation_by_id(&entry_id) {
+            return;
+        }
+
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+    }
+
+    pub fn cancel_elicitation(&mut self, id: &ElicitationEntryId, cx: &mut Context<Self>) {
+        let Some(ix) = self.elicitation_entry_ix(id) else {
+            return;
+        };
+        if !self.elicitations.cancel_elicitation_by_id(id, true) {
+            return;
+        }
+
+        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+    }
+
+    fn elicitation_entry_ix(&self, id: &ElicitationEntryId) -> Option<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, entry)| {
+                matches!(entry, AgentThreadEntry::Elicitation(elicitation_id) if elicitation_id == id)
+                    .then_some(index)
+            })
+    }
+
+    pub fn elicitation(&self, id: &ElicitationEntryId) -> Option<(usize, &Elicitation)> {
+        let index = self.elicitation_entry_ix(id)?;
+        let (_, elicitation) = self.elicitations.elicitation(id)?;
+        Some((index, elicitation))
+    }
+
     pub fn plan(&self) -> &Plan {
         &self.plan
     }
 
-    pub fn grok_memory(&self) -> GrokMemoryArtifacts {
-        if let Some(dirs) = self.work_dirs() {
-            if let Some(cwd) = dirs.ordered_paths().next() {
-                return grok_memory_artifacts_for_cwd(cwd);
-            }
-        }
-        GrokMemoryArtifacts::default()
-    }
-
     pub fn update_plan(&mut self, request: acp::Plan, cx: &mut Context<Self>) {
-        if let Some(rt) = &mut self.running_turn {
-            rt.record_progress();
-        }
         let new_entries_len = request.entries.len();
         let mut new_entries = request.entries.into_iter();
 
         // Reuse existing markdown to prevent flickering
         for (old, new) in self.plan.entries.iter_mut().zip(new_entries.by_ref()) {
             let PlanEntry {
-                id: _,
                 content,
                 priority,
                 status,
+                ..
             } = old;
             content.update(cx, |old, cx| {
                 old.replace(new.content, cx);
@@ -3082,16 +3943,6 @@ impl AcpThread {
             self.plan.entries.push(PlanEntry::from_acp(new, cx))
         }
         self.plan.entries.truncate(new_entries_len);
-
-        if self.plan.phase == PlanPhase::None {
-            if self.plan.is_proposed() {
-                self.plan.phase.set_to_proposed();
-            } else if !self.plan.entries.is_empty() {
-                self.plan.phase = PlanPhase::Active;
-            } else {
-                self.plan.phase.reset();
-            }
-        }
 
         cx.notify();
     }
@@ -3111,12 +3962,7 @@ impl AcpThread {
     }
 
     pub fn clear_plan(&mut self, cx: &mut Context<Self>) {
-        if self.plan.phase.is_proposed() {
-            self.plan.phase.approve();
-        } else {
-            self.plan.entries.clear();
-            self.plan.phase.reset();
-        }
+        self.plan.entries.clear();
         cx.notify();
     }
 
@@ -3134,62 +3980,81 @@ impl AcpThread {
         message: Vec<acp::ContentBlock>,
         cx: &mut Context<Self>,
     ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        self.send_inner(message, true, cx)
+    }
+
+    /// Sends a prompt without displaying a user-message bubble for it.
+    /// This is used for native slash commands (e.g. `/compact`) that run a turn
+    /// which produces its own thread entry (like the compaction summary). The
+    /// typed command isn't sent to the model as an ordinary user turn.
+    pub fn send_command(
+        &mut self,
+        message: Vec<acp::ContentBlock>,
+        cx: &mut Context<Self>,
+    ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
+        self.send_inner(message, false, cx)
+    }
+
+    fn send_inner(
+        &mut self,
+        message: Vec<acp::ContentBlock>,
+        push_user_message: bool,
+        cx: &mut Context<Self>,
+    ) -> BoxFuture<'static, Result<Option<acp::PromptResponse>>> {
         let block = ContentBlock::new_combined(
             message.clone(),
             self.project.read(cx).languages().clone(),
             self.project.read(cx).path_style(cx),
             cx,
         );
-
-        let prompt_content = if self.is_grok {
-            let diag_summary = self.project.read(cx).diagnostic_summary(false, cx);
-            let turn_id = self.turn_id; // internal turn counter, incremented at the start of each assistant response
-            let diagnostic_text = format!(
-                "\n\n## Current Zed Editor Diagnostics (from rust-analyzer / LSP)\nProject currently has {} errors and {} warnings reported by Zed's language servers.\n\n## Current Turn\nThis conversation turn is {}.\nUse the T-<n>-task-<id> syntax (e.g. {}-task-refactor) when referencing specific tasks across multiple turns so that task names and references (e.g. in todo_write) remain stable and unambiguous.",
-                diag_summary.error_count, diag_summary.warning_count, turn_id, turn_id
-            );
-            let mut p = message.clone();
-            p.push(acp::ContentBlock::Text(acp::TextContent::new(
-                diagnostic_text,
-            )));
-            p
-        } else {
-            message.clone()
-        };
-
-        let request = acp::PromptRequest::new(self.session_id.clone(), prompt_content);
+        let request = acp::PromptRequest::new(self.session_id.clone(), message.clone());
         let git_store = self.project.read(cx).git_store().clone();
 
-        let message_id = UserMessageId::new();
+        let client_user_message_ids = self.connection.client_user_message_ids(cx);
+        let client_id = client_user_message_ids
+            .as_ref()
+            .map(|client_user_message_ids| client_user_message_ids.new_id());
 
         self.run_turn(cx, async move |this, cx| {
-            this.update(cx, |this, cx| {
-                this.push_entry(
-                    AgentThreadEntry::UserMessage(UserMessage {
-                        id: Some(message_id.clone()),
-                        content: block,
-                        chunks: message,
-                        checkpoint: None,
-                        indented: false,
-                    }),
-                    cx,
-                );
-            })
-            .ok();
+            if push_user_message {
+                this.update(cx, |this, cx| {
+                    this.push_entry(
+                        AgentThreadEntry::UserMessage(UserMessage {
+                            protocol_id: None,
+                            client_id: client_id.clone(),
+                            is_optimistic: true,
+                            content: block,
+                            chunks: message,
+                            checkpoint: None,
+                            indented: false,
+                        }),
+                        cx,
+                    );
+                })
+                .ok();
 
-            let old_checkpoint = git_store
-                .update(cx, |git, cx| git.checkpoint(cx))
-                .await
-                .context("failed to get old checkpoint")
-                .log_err();
+                let old_checkpoint = git_store
+                    .update(cx, |git, cx| git.checkpoint(cx))
+                    .await
+                    .context("failed to get old checkpoint")
+                    .log_err();
+                this.update(cx, |this, _cx| {
+                    if let Some((_ix, message)) = this.last_user_message() {
+                        message.checkpoint = old_checkpoint.map(|git_checkpoint| Checkpoint {
+                            git_checkpoint,
+                            show: false,
+                        });
+                    }
+                })
+                .ok();
+            }
+
             this.update(cx, |this, cx| {
-                if let Some((_, user_message)) = this.last_user_message() {
-                    user_message.checkpoint = old_checkpoint.map(|git_checkpoint| Checkpoint {
-                        git_checkpoint,
-                        show: false,
-                    });
+                if let (Some(prompt), Some(client_id)) = (client_user_message_ids, client_id) {
+                    prompt.prompt(client_id, request, cx)
+                } else {
+                    this.connection.prompt(request, cx)
                 }
-                this.connection.prompt(message_id, request, cx)
             })?
             .await
         })
@@ -3225,15 +4090,16 @@ impl AcpThread {
         let (tx, rx) = oneshot::channel();
         let cancel_task = self.cancel(cx);
 
-        self.turn_id = TurnId(self.turn_id.0 + 1);
+        self.turn_id += 1;
         let turn_id = self.turn_id;
-        self.running_turn = Some(RunningTurn::new(
-            turn_id,
-            cx.spawn(async move |this, cx| {
+        self.running_turn = Some(RunningTurn {
+            id: turn_id,
+            send_task: cx.spawn(async move |this, cx| {
                 cancel_task.await;
                 tx.send(f(this, cx).await).ok();
             }),
-        ));
+        });
+        cx.emit(AcpThreadEvent::StatusChanged);
 
         cx.spawn(async move |this, cx| {
             let response = rx.await;
@@ -3262,6 +4128,9 @@ impl AcpThread {
                 }
 
                 let Ok(response) = response else {
+                    if is_same_turn {
+                        cx.emit(AcpThreadEvent::StatusChanged);
+                    }
                     // tx dropped, just return
                     return Ok(None);
                 };
@@ -3271,6 +4140,9 @@ impl AcpThread {
                         Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
 
                         if r.stop_reason == acp::StopReason::MaxTokens {
+                            if is_same_turn {
+                                cx.emit(AcpThreadEvent::StatusChanged);
+                            }
                             this.had_error = true;
                             cx.emit(AcpThreadEvent::Error);
                             log::error!("Max tokens reached. Usage: {:?}", this.token_usage);
@@ -3289,12 +4161,15 @@ impl AcpThread {
                             } else {
                                 log::error!("Max tokens reached. Usage: {:?}", this.token_usage);
                             }
+                            if is_same_turn {
+                                this.cancel_pending_turn_entries(cx);
+                            }
                             return Err(anyhow!(MaxOutputTokensError));
                         }
 
                         let canceled = matches!(r.stop_reason, acp::StopReason::Cancelled);
-                        if canceled {
-                            this.mark_pending_tools_as_canceled();
+                        if canceled && is_same_turn {
+                            this.cancel_pending_turn_entries(cx);
                         }
 
                         if !canceled {
@@ -3346,17 +4221,20 @@ impl AcpThread {
                             cx.emit(AcpThreadEvent::TokenUsageUpdated);
                         }
 
-                        cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
-
-                        if r.stop_reason == acp::StopReason::EndTurn {
-                            this.inject_live_diagnostic_continuation_if_needed(cx);
+                        if is_same_turn {
+                            cx.emit(AcpThreadEvent::StatusChanged);
                         }
-
+                        cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
                         Ok(Some(r))
                     }
                     Err(e) => {
+                        if is_same_turn {
+                            cx.emit(AcpThreadEvent::StatusChanged);
+                        }
                         Self::flush_streaming_text(&mut this.streaming_text_buffer, cx);
-
+                        if is_same_turn {
+                            this.cancel_pending_turn_entries(cx);
+                        }
                         this.had_error = true;
                         cx.emit(AcpThreadEvent::Error);
                         log::error!("Error in run turn: {:?}", e);
@@ -3369,31 +4247,61 @@ impl AcpThread {
     }
 
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
+        self.cancel_outstanding_elicitations(cx);
+
         let Some(turn) = self.running_turn.take() else {
             return Task::ready(());
         };
+        self.mark_pending_entries_as_canceled(cx);
         self.connection.cancel(&self.session_id, cx);
-
-        Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
-        self.mark_pending_tools_as_canceled();
+        cx.emit(AcpThreadEvent::StatusChanged);
 
         // Wait for the send task to complete
         cx.background_spawn(turn.send_task)
     }
 
-    fn mark_pending_tools_as_canceled(&mut self) {
-        for entry in self.entries.iter_mut() {
-            if let AgentThreadEntry::ToolCall(call) = entry {
-                let cancel = matches!(
-                    call.status,
-                    ToolCallStatus::Pending
-                        | ToolCallStatus::WaitingForConfirmation { .. }
-                        | ToolCallStatus::InProgress
-                );
+    fn cancel_pending_turn_entries(&mut self, cx: &mut Context<Self>) {
+        self.mark_pending_entries_as_canceled(cx);
+        self.cancel_outstanding_elicitations(cx);
+    }
 
-                if cancel {
-                    call.status = ToolCallStatus::Canceled;
+    fn mark_pending_entries_as_canceled(&mut self, cx: &mut Context<Self>) {
+        for (ix, entry) in self.entries.iter_mut().enumerate() {
+            match entry {
+                AgentThreadEntry::ToolCall(call) => {
+                    let cancel = matches!(
+                        call.status,
+                        ToolCallStatus::Pending
+                            | ToolCallStatus::WaitingForConfirmation { .. }
+                            | ToolCallStatus::InProgress
+                    );
+                    if cancel {
+                        call.status = ToolCallStatus::Canceled;
+                        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+                    }
                 }
+                AgentThreadEntry::ContextCompaction(compaction) => {
+                    if compaction.status == ContextCompactionStatus::InProgress {
+                        compaction.status = ContextCompactionStatus::Canceled;
+                        cx.emit(AcpThreadEvent::EntryUpdated(ix));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn cancel_outstanding_elicitations(&mut self, cx: &mut Context<Self>) {
+        for ix in 0..self.entries.len() {
+            let Some(AgentThreadEntry::Elicitation(elicitation_id)) = self.entries.get(ix) else {
+                continue;
+            };
+            if self
+                .elicitations
+                .cancel_elicitation_by_id(elicitation_id, true)
+            {
+                cx.emit(AcpThreadEvent::EntryUpdated(ix));
             }
         }
     }
@@ -3401,10 +4309,10 @@ impl AcpThread {
     /// Restores the git working tree to the state at the given checkpoint (if one exists)
     pub fn restore_checkpoint(
         &mut self,
-        id: UserMessageId,
+        client_id: ClientUserMessageId,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        let Some((_, message)) = self.user_message_mut(&id) else {
+        let Some((_, message)) = self.user_message_mut(&client_id) else {
             return Task::ready(Err(anyhow!("message not found")));
         };
 
@@ -3415,7 +4323,7 @@ impl AcpThread {
 
         // Cancel any in-progress generation before restoring
         let cancel_task = self.cancel(cx);
-        let rewind = self.rewind(id.clone(), cx);
+        let rewind = self.rewind(client_id.clone(), cx);
         let git_store = self.project.read(cx).git_store().clone();
 
         cx.spawn(async move |_, cx| {
@@ -3434,7 +4342,11 @@ impl AcpThread {
     /// Rewinds this thread to before the entry at `index`, removing it and all
     /// subsequent entries while rejecting any action_log changes made from that point.
     /// Unlike `restore_checkpoint`, this method does not restore from git.
-    pub fn rewind(&mut self, id: UserMessageId, cx: &mut Context<Self>) -> Task<Result<()>> {
+    pub fn rewind(
+        &mut self,
+        client_id: ClientUserMessageId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let Some(truncate) = self.connection.truncate(&self.session_id, cx) else {
             return Task::ready(Err(anyhow!("not supported")));
         };
@@ -3442,9 +4354,9 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         let telemetry = ActionLogTelemetry::from(&*self);
         cx.spawn(async move |this, cx| {
-            cx.update(|cx| truncate.run(id.clone(), cx)).await?;
+            cx.update(|cx| truncate.run(client_id.clone(), cx)).await?;
             this.update(cx, |this, cx| {
-                if let Some((ix, _)) = this.user_message_mut(&id) {
+                if let Some((ix, _)) = this.user_message_mut(&client_id) {
                     // Collect all terminals from entries that will be removed
                     let terminals_to_remove: Vec<acp::TerminalId> = this.entries[ix..]
                         .iter()
@@ -3481,13 +4393,11 @@ impl AcpThread {
 
         let git_store = self.project.read(cx).git_store().clone();
 
-        let Some((user_message_id, checkpoint)) =
-            self.last_user_message().and_then(|(_, message)| {
-                let id = message.id.clone()?;
-                let checkpoint = message.checkpoint.as_ref()?;
-                Some((id, checkpoint))
-            })
-        else {
+        let Some((client_id, checkpoint)) = self.last_user_message().and_then(|(_, message)| {
+            let id = message.client_id.clone()?;
+            let checkpoint = message.checkpoint.as_ref()?;
+            Some((id, checkpoint))
+        }) else {
             return Task::ready(Ok(()));
         };
         if checkpoint.show {
@@ -3532,7 +4442,7 @@ impl AcpThread {
                 let Some((ix, message)) = this.last_user_message() else {
                     return;
                 };
-                if message.id.as_ref() != Some(&user_message_id) {
+                if message.client_id.as_ref() != Some(&client_id) {
                     return;
                 }
                 if let Some(checkpoint) = message.checkpoint.as_mut()
@@ -3553,7 +4463,7 @@ impl AcpThread {
         let Some((_, message)) = self.last_user_message() else {
             return Task::ready(Ok(()));
         };
-        let Some(user_message_id) = message.id.clone() else {
+        let Some(client_id) = message.client_id.clone() else {
             return Task::ready(Ok(()));
         };
         let Some(checkpoint) = message.checkpoint.as_ref() else {
@@ -3579,7 +4489,7 @@ impl AcpThread {
                 .unwrap_or(true);
 
             this.update(cx, |this, cx| {
-                if let Some((ix, message)) = this.user_message_mut(&user_message_id) {
+                if let Some((ix, message)) = this.user_message_mut(&client_id) {
                     if let Some(checkpoint) = message.checkpoint.as_mut() {
                         checkpoint.show = !equal;
                         cx.emit(AcpThreadEvent::EntryUpdated(ix));
@@ -3605,10 +4515,13 @@ impl AcpThread {
             })
     }
 
-    fn user_message_mut(&mut self, id: &UserMessageId) -> Option<(usize, &mut UserMessage)> {
+    fn user_message_mut(
+        &mut self,
+        client_id: &ClientUserMessageId,
+    ) -> Option<(usize, &mut UserMessage)> {
         self.entries.iter_mut().enumerate().find_map(|(ix, entry)| {
             if let AgentThreadEntry::UserMessage(message) = entry {
-                if message.id.as_ref() == Some(id) {
+                if message.client_id.as_ref() == Some(client_id) {
                     Some((ix, message))
                 } else {
                     None
@@ -3825,6 +4738,10 @@ impl AcpThread {
         let project = self.project.clone();
         let language_registry = project.read(cx).languages().clone();
         let is_windows = project.read(cx).path_style(cx).is_windows();
+        // Headless hosts (e.g. the eval CLI) have no controlling TTY, so PTY
+        // setup fails with `ENOTTY`. Run the command non-interactively and
+        // without a PTY in that case.
+        let headless = HeadlessTerminal::is_enabled(cx);
 
         let terminal_id = acp::TerminalId::new(Uuid::new_v4().to_string());
         let terminal_task = cx.spawn({
@@ -3838,20 +4755,82 @@ impl AcpThread {
                             .and_then(|r| r.read(cx).default_system_shell())
                     })
                     .unwrap_or_else(|| get_default_system_shell_preferring_bash());
-                let (task_command, task_args) =
-                    ShellBuilder::new(&Shell::Program(shell), is_windows)
+
+                // The sandbox owns the network proxy (for restricted-network
+                // policies) and injects the child's proxy env vars, returning
+                // the env to spawn with. On Windows, restricted host access is
+                // rejected inside the sandbox before command preparation.
+                #[cfg(target_os = "windows")]
+                let (task_command, task_args, task_env, sandbox, spawn_cwd) =
+                    if sandbox_wrap.is_some() {
+                        let (task_command, task_args) = task::ShellBuilder::new(
+                            &Shell::Program("/bin/sh".to_string()),
+                            false,
+                        )
+                        .non_interactive()
                         .redirect_stdin_to_dev_null()
                         .build(Some(command.clone()), &args);
-                let (task_command, task_args, sandbox_config) =
-                    apply_sandbox_wrap(task_command, task_args, sandbox_wrap)?;
+                        let wrap = cx.background_spawn(prepare_sandbox_wrap(
+                            task_command,
+                            task_args,
+                            cwd.clone(),
+                            sandbox_wrap,
+                            env,
+                        ));
+                        let timeout = cx.background_executor().timer(WSL_SANDBOX_WRAP_TIMEOUT);
+                        let (task_command, task_args, task_env, sandbox) = futures::select_biased! {
+                            result = wrap.fuse() => result?,
+                            _ = timeout.fuse() => return Err(anyhow::Error::new(
+                                sandbox::SandboxError::WslUnavailable(format!(
+                                    "WSL did not respond within {} seconds while preparing the sandboxed command",
+                                    WSL_SANDBOX_WRAP_TIMEOUT.as_secs()
+                                )),
+                            )),
+                        };
+                        (task_command, task_args, task_env, sandbox, None)
+                    } else {
+                        // No sandbox wrap means we're running unsandboxed, and
+                        // on Windows that deliberately changes the shell: the
+                        // sandboxed path runs under WSL's Linux bash, but this
+                        // fallback uses the host's `shell` against the native cwd.
+                        let mut builder = ShellBuilder::new(&Shell::Program(shell), is_windows);
+                        if headless {
+                            builder = builder.non_interactive();
+                        }
+                        let (task_command, task_args) = builder
+                            .redirect_stdin_to_dev_null()
+                            .build(Some(command.clone()), &args);
+                        (task_command, task_args, env, None, cwd.clone())
+                    };
+
+                #[cfg(not(target_os = "windows"))]
+                let (task_command, task_args, task_env, sandbox, spawn_cwd) = {
+                    let mut builder = ShellBuilder::new(&Shell::Program(shell), is_windows);
+                    if headless {
+                        builder = builder.non_interactive();
+                    }
+                    let (task_command, task_args) = builder
+                        .redirect_stdin_to_dev_null()
+                        .build(Some(command.clone()), &args);
+                    let (task_command, task_args, task_env, sandbox) = cx
+                        .background_spawn(prepare_sandbox_wrap(
+                            task_command,
+                            task_args,
+                            cwd.clone(),
+                            sandbox_wrap,
+                            env,
+                        ))
+                        .await?;
+                    (task_command, task_args, task_env, sandbox, cwd.clone())
+                };
                 let terminal = project
                     .update(cx, |project, cx| {
                         project.create_terminal_task(
                             task::SpawnInTerminal {
                                 command: Some(task_command),
                                 args: task_args,
-                                cwd: cwd.clone(),
-                                env,
+                                cwd: spawn_cwd,
+                                env: task_env,
                                 ..Default::default()
                             },
                             cx,
@@ -3867,7 +4846,7 @@ impl AcpThread {
                         output_byte_limit.map(|l| l as usize),
                         terminal,
                         language_registry,
-                        sandbox_config,
+                        sandbox,
                         cx,
                     )
                 }))
@@ -3920,8 +4899,6 @@ impl AcpThread {
             .cloned()
     }
 
-    /// Returns the exit status for a terminal if it has completed.
-    /// Used by native monitor/get_command_or_subagent_output for capture harness fidelity.
     pub fn terminal_exit_status(
         &self,
         terminal_id: &acp::TerminalId,
@@ -3929,13 +4906,24 @@ impl AcpThread {
         self.pending_terminal_exit.get(terminal_id).cloned()
     }
 
-    /// Returns any pending output chunks for a terminal (for live streaming in monitors).
     pub fn pending_terminal_output(&self, terminal_id: &acp::TerminalId) -> Option<Vec<Vec<u8>>> {
         self.pending_terminal_output.get(terminal_id).cloned()
     }
 
     pub fn to_markdown(&self, cx: &App) -> String {
-        self.entries.iter().map(|e| e.to_markdown(cx)).collect()
+        self.entries
+            .iter()
+            .map(|entry| match entry {
+                AgentThreadEntry::Elicitation(elicitation_id) => self
+                    .elicitations
+                    .elicitation(elicitation_id)
+                    .map(|(_, elicitation)| {
+                        format!("## Input Requested\n\n{}\n\n", elicitation.request.message)
+                    })
+                    .unwrap_or_else(|| entry.to_markdown(cx)),
+                _ => entry.to_markdown(cx),
+            })
+            .collect()
     }
 
     pub fn emit_load_error(&mut self, error: LoadError, cx: &mut Context<Self>) {
@@ -3986,9 +4974,6 @@ impl AcpThread {
         event: TerminalProviderEvent,
         cx: &mut Context<Self>,
     ) {
-        if let Some(rt) = &mut self.running_turn {
-            rt.record_progress();
-        }
         match event {
             TerminalProviderEvent::Created {
                 terminal_id,
@@ -4017,7 +5002,8 @@ impl AcpThread {
                 }
 
                 if let Some(_status) = self.pending_terminal_exit.remove(&terminal_id) {
-                    entity.update(cx, |_term, cx| {
+                    entity.update(cx, |term, cx| {
+                        term.inner().update(cx, |inner, _| inner.shrink_to_used());
                         cx.notify();
                     });
                 }
@@ -4053,7 +5039,8 @@ impl AcpThread {
                 status,
             } => {
                 if let Some(entity) = self.terminals.get(&terminal_id) {
-                    entity.update(cx, |_term, cx| {
+                    entity.update(cx, |term, cx| {
+                        term.inner().update(cx, |inner, _| inner.shrink_to_used());
                         cx.notify();
                     });
                 } else {
@@ -4112,8 +5099,10 @@ fn markdown_for_raw_output(
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use feature_flags::FeatureFlag as _;
     use futures::stream::StreamExt as _;
     use futures::{channel::mpsc, future::LocalBoxFuture, select};
+    use gpui::UpdateGlobal as _;
     use gpui::{App, AsyncApp, TestAppContext, WeakEntity};
     use indoc::indoc;
     use project::{AgentId, FakeFs, Fs};
@@ -4131,192 +5120,284 @@ mod tests {
     use util::{path, path_list::PathList};
 
     #[test]
-    fn test_turn_id_display_formats_as_t_number() -> anyhow::Result<()> {
-        assert_eq!(format!("{}", TurnId::new(17)), "T-17");
-        assert_eq!(format!("{}", TurnId::new(99)), "T-99");
-        Ok(())
+    fn command_category_meta_round_trips() {
+        // Exhaustive list of variants. The match below has no wildcard arm, so
+        // adding a `CommandCategory` variant fails to compile here until it's
+        // covered, keeping the `as_str`/`from_str` wire contract in sync.
+        let all = [CommandCategory::Native, CommandCategory::Mcp];
+        for category in all {
+            match category {
+                CommandCategory::Native | CommandCategory::Mcp => {}
+            }
+            let meta = meta_with_command_category(category);
+            assert_eq!(command_category_from_meta(&Some(meta)), Some(category));
+        }
+
+        // Absent meta and unknown categories both decode to `None`.
+        assert_eq!(command_category_from_meta(&None), None);
+        let unknown =
+            acp::Meta::from_iter([(COMMAND_CATEGORY_META_KEY.into(), "future-category".into())]);
+        assert_eq!(command_category_from_meta(&Some(unknown)), None);
     }
 
     #[test]
-    fn test_turn_id_serde_roundtrip() -> anyhow::Result<()> {
-        let original = TurnId::new(42);
-        let json = serde_json::to_string(&original)?;
-        let deserialized: TurnId = serde_json::from_str(&json)?;
-        assert_eq!(original, deserialized);
-        assert_eq!(u32::from(original), 42);
-        Ok(())
+    fn client_user_message_id_serializes_as_string() {
+        let serialized =
+            serde_json::to_value(ClientUserMessageId::new()).expect("serialize client message id");
+        assert!(
+            serialized.is_string(),
+            "expected string, got {serialized:?}"
+        );
+
+        let deserialized: ClientUserMessageId =
+            serde_json::from_value(json!("client-id")).expect("deserialize client message id");
+        assert_eq!(
+            serde_json::to_value(deserialized).expect("serialize client message id"),
+            json!("client-id")
+        );
     }
 
     fn init_test(cx: &mut TestAppContext) {
         env_logger::try_init().ok();
         cx.update(|cx| {
-            let settings_store = SettingsStore::test(cx);
+            let mut settings_store = SettingsStore::test(cx);
+            settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
             cx.set_global(settings_store);
         });
     }
 
-    #[gpui::test]
-    fn test_tool_call_is_monitor(cx: &mut TestAppContext) {
-        init_test(cx);
+    fn enable_acp_beta(cx: &mut TestAppContext) {
         cx.update(|cx| {
-            let label_monitor = cx.new(|cx| Markdown::new("monitor".into(), None, None, cx));
-            let label_other = cx.new(|cx| Markdown::new("other".into(), None, None, cx));
-            let label_none = cx.new(|cx| Markdown::new("none".into(), None, None, cx));
+            cx.update_flags(false, vec![AcpBetaFeatureFlag::NAME.to_string()]);
+        });
+    }
 
-            let monitor_call = ToolCall {
-                id: acp::ToolCallId::new("monitor-1"),
-                label: label_monitor,
-                kind: acp::ToolKind::Execute,
-                content: vec![],
-                status: ToolCallStatus::Pending,
-                locations: vec![],
-                resolved_locations: vec![],
-                raw_input: None,
-                raw_input_markdown: None,
-                raw_output: None,
-                tool_name: Some(MONITOR_TOOL_NAME.into()),
-                subagent_session_info: None,
-            };
-            assert!(monitor_call.is_monitor());
-
-            let other_call = ToolCall {
-                id: acp::ToolCallId::new("other-1"),
-                label: label_other,
-                kind: acp::ToolKind::Execute,
-                content: vec![],
-                status: ToolCallStatus::Pending,
-                locations: vec![],
-                resolved_locations: vec![],
-                raw_input: None,
-                raw_input_markdown: None,
-                raw_output: None,
-                tool_name: Some("spawn_agent".into()),
-                subagent_session_info: None,
-            };
-            assert!(!other_call.is_monitor());
-
-            let none_call = ToolCall {
-                id: acp::ToolCallId::new("none-1"),
-                label: label_none,
-                kind: acp::ToolKind::Execute,
-                content: vec![],
-                status: ToolCallStatus::Pending,
-                locations: vec![],
-                resolved_locations: vec![],
-                raw_input: None,
-                raw_input_markdown: None,
-                raw_output: None,
-                tool_name: None,
-                subagent_session_info: None,
-            };
-            assert!(!none_call.is_monitor());
+    fn set_acp_beta_override(value: &str, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content
+                        .feature_flags
+                        .get_or_insert_default()
+                        .insert(AcpBetaFeatureFlag::NAME.to_string(), value.to_string());
+                });
+            });
         });
     }
 
     #[test]
-    fn test_agent_persona_serde_and_from_name() {
-        let p = AgentPersona::from_name("researcher");
-        assert_eq!(p, AgentPersona::Researcher);
-        assert_eq!(p.display_name(), "Researcher");
-        let info = SubagentSessionInfo {
-            session_id: acp::SessionId::new("s1"),
-            message_start_index: 0,
-            message_end_index: None,
-            persona: Some(p),
-            capability_mode: None,
-        };
-        let v = serde_json::to_value(&info).unwrap();
-        assert_eq!(v["persona"], "researcher");
-        assert_eq!(v["capability_mode"], serde_json::Value::Null);
-        let back: SubagentSessionInfo = serde_json::from_value(v).unwrap();
-        assert_eq!(back.persona, Some(AgentPersona::Researcher));
-        assert_eq!(back.capability_mode, None);
-        let unknown = AgentPersona::from_name("foo");
-        assert_eq!(unknown, AgentPersona::General);
-        assert_eq!(AgentPersona::from_name("plan"), AgentPersona::Plan);
+    fn text_resource_markdown_uses_mime_type_for_code_blocks() {
+        let shell = acp::TextResourceContents::new("echo 'hello from exec test'", "tool://preview")
+            .mime_type("text/x-shellscript".to_string());
         assert_eq!(
-            AgentPersona::from_name("general-purpose"),
-            AgentPersona::General
+            ContentBlock::text_resource_markdown(&shell),
+            "```sh\necho 'hello from exec test'\n```"
         );
-        assert_eq!(AgentPersona::from_name("explore"), AgentPersona::Explorer);
-        assert_eq!(AgentPersona::from_name("verifier"), AgentPersona::Verifier);
+
+        let markdown = acp::TextResourceContents::new("**approval** requested", "tool://preview")
+            .mime_type("text/markdown".to_string());
         assert_eq!(
-            AgentPersona::from_name("architect"),
-            AgentPersona::Architect
+            ContentBlock::text_resource_markdown(&markdown),
+            "**approval** requested"
         );
+
+        let plain = acp::TextResourceContents::new("plain preview", "tool://preview")
+            .mime_type("text/plain".to_string());
         assert_eq!(
-            AgentPersona::from_name("implement"),
-            AgentPersona::Implementer
+            ContentBlock::text_resource_markdown(&plain),
+            "```\nplain preview\n```"
         );
-        assert_eq!(AgentPersona::Plan.display_name(), "Plan");
-        assert_eq!(AgentPersona::Verifier.display_name(), "Verifier");
-        let m = AgentCapabilityMode::from_name("read-only");
-        assert_eq!(m, AgentCapabilityMode::ReadOnly);
-        assert_eq!(m.display_name(), "Read-Only");
-        assert!(m.is_read_only());
+
+        let cpp = acp::TextResourceContents::new("int main() {}", "tool://preview")
+            .mime_type("text/x-c++; charset=utf-8".to_string());
         assert_eq!(
-            AgentCapabilityMode::from_name("full"),
-            AgentCapabilityMode::Full
+            ContentBlock::text_resource_markdown(&cpp),
+            "```cpp\nint main() {}\n```"
         );
-        assert!(!AgentCapabilityMode::from_name("foo").is_read_only());
+
+        let untyped = acp::TextResourceContents::new("# plain preview", "tool://preview");
+        assert_eq!(
+            ContentBlock::text_resource_markdown(&untyped),
+            "```\n# plain preview\n```"
+        );
     }
 
     #[gpui::test]
-    fn test_plan_progress_fraction(cx: &mut TestAppContext) {
+    async fn test_tool_call_content_preserves_embedded_text_resource(
+        cx: &mut gpui::TestAppContext,
+    ) {
         init_test(cx);
+
         cx.update(|cx| {
-            let mut make_entry = |status: acp::PlanEntryStatus| PlanEntry {
-                id: "test-plan-slug".to_string(),
-                content: cx.new(|cx| Markdown::new("step".into(), None, None, cx)),
-                priority: acp::PlanEntryPriority::Medium,
-                status,
+            let language_registry =
+                Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+            let content = acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::TextResourceContents(
+                    acp::TextResourceContents::new("echo 'hello from exec test'", "tool://preview")
+                        .mime_type("text/x-shellscript".to_string()),
+                ),
+            ));
+
+            let block = ContentBlock::new_tool_call_content(
+                content,
+                &language_registry,
+                PathStyle::local(),
+                cx,
+            );
+
+            let ContentBlock::EmbeddedResource { resource, markdown } = &block else {
+                panic!("expected embedded resource block, got {block:?}");
             };
-            let empty = Plan {
-                entries: vec![],
-                phase: PlanPhase::None,
-            };
-            assert_eq!(empty.total_entries(), 0);
-            assert!((empty.progress_fraction() - 0.0).abs() < 0.001);
-            let p1 = Plan {
-                entries: vec![make_entry(acp::PlanEntryStatus::Completed)],
-                phase: PlanPhase::None,
-            };
-            assert_eq!(p1.total_entries(), 1);
-            assert!((p1.progress_fraction() - 1.0).abs() < 0.001);
-            let p2 = Plan {
-                entries: vec![
-                    make_entry(acp::PlanEntryStatus::Completed),
-                    make_entry(acp::PlanEntryStatus::Pending),
-                    make_entry(acp::PlanEntryStatus::InProgress),
-                ],
-                phase: PlanPhase::None,
-            };
-            assert_eq!(p2.total_entries(), 3);
-            assert!((p2.progress_fraction() - (1.0f32 / 3.0f32)).abs() < 0.001);
-            let proposed = Plan {
-                entries: vec![
-                    make_entry(acp::PlanEntryStatus::Pending),
-                    make_entry(acp::PlanEntryStatus::Pending),
-                ],
-                phase: PlanPhase::Proposed,
-            };
-            assert!(proposed.is_proposed());
-            let active = Plan {
-                entries: vec![
-                    make_entry(acp::PlanEntryStatus::InProgress),
-                    make_entry(acp::PlanEntryStatus::Pending),
-                ],
-                phase: PlanPhase::Active,
-            };
-            assert!(!active.is_proposed());
-            let done = Plan {
-                entries: vec![make_entry(acp::PlanEntryStatus::Completed)],
-                phase: PlanPhase::None,
-            };
-            assert!(!done.is_proposed());
-            let id_test_entry = make_entry(acp::PlanEntryStatus::Pending);
-            assert_eq!(id_test_entry.id, "test-plan-slug");
+            match &resource.resource {
+                acp::EmbeddedResourceResource::TextResourceContents(text) => {
+                    assert_eq!(text.text, "echo 'hello from exec test'");
+                    assert_eq!(text.uri, "tool://preview");
+                    assert_eq!(text.mime_type.as_deref(), Some("text/x-shellscript"));
+                }
+                other => panic!("expected text resource contents, got {other:?}"),
+            }
+
+            let markdown = markdown
+                .as_ref()
+                .expect("text resources should have renderable markdown")
+                .read(cx)
+                .source()
+                .to_string();
+            assert_eq!(markdown, "```sh\necho 'hello from exec test'\n```");
+            assert_eq!(
+                block.to_markdown(cx),
+                "```sh\necho 'hello from exec test'\n```"
+            );
+            assert_eq!(block.text_content(cx), Some("echo 'hello from exec test'"));
+
+            let untyped = ContentBlock::new_tool_call_content(
+                acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                    acp::EmbeddedResourceResource::TextResourceContents(
+                        acp::TextResourceContents::new("# plain preview", "tool://preview"),
+                    ),
+                )),
+                &language_registry,
+                PathStyle::local(),
+                cx,
+            );
+            assert_eq!(untyped.to_markdown(cx), "```\n# plain preview\n```");
+            assert_eq!(untyped.text_content(cx), Some("# plain preview"));
         });
+    }
+
+    #[gpui::test]
+    async fn test_tool_call_content_renders_embedded_image_blob_resource(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            let language_registry =
+                Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+            let image_blob = acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::BlobResourceContents(
+                    acp::BlobResourceContents::new(
+                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+                        "tool://preview.png",
+                    )
+                    .mime_type("image/png".to_string()),
+                ),
+            ));
+
+            let block = ContentBlock::new_tool_call_content(
+                image_blob,
+                &language_registry,
+                PathStyle::local(),
+                cx,
+            );
+
+            let ContentBlock::Image { image, dimensions } = &block else {
+                panic!("expected image block, got {block:?}");
+            };
+            assert_eq!(image.format(), gpui::ImageFormat::Png);
+            assert_eq!(
+                dimensions.as_ref().map(|size| (size.width, size.height)),
+                Some((1, 1))
+            );
+            assert_eq!(block.to_markdown(cx), "`Image`");
+            assert_eq!(block.text_content(cx), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_tool_call_content_falls_back_for_non_image_blob_resource(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            let language_registry =
+                Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+            let archive_blob = acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::BlobResourceContents(
+                    acp::BlobResourceContents::new("not an image", "tool://archive.bin")
+                        .mime_type("application/octet-stream".to_string()),
+                ),
+            ));
+
+            let block = ContentBlock::new_tool_call_content(
+                archive_blob,
+                &language_registry,
+                PathStyle::local(),
+                cx,
+            );
+
+            let ContentBlock::EmbeddedResource { resource, markdown } = &block else {
+                panic!("expected embedded resource block, got {block:?}");
+            };
+            assert!(markdown.is_none());
+            match &resource.resource {
+                acp::EmbeddedResourceResource::BlobResourceContents(blob) => {
+                    assert_eq!(blob.uri, "tool://archive.bin");
+                    assert_eq!(blob.mime_type.as_deref(), Some("application/octet-stream"));
+                }
+                other => panic!("expected blob resource contents, got {other:?}"),
+            }
+            assert_eq!(block.to_markdown(cx), "tool://archive.bin");
+            assert_eq!(block.text_content(cx), None);
+
+            let invalid_image_blob = acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                acp::EmbeddedResourceResource::BlobResourceContents(
+                    acp::BlobResourceContents::new("not-base64", "tool://preview.png")
+                        .mime_type("image/png".to_string()),
+                ),
+            ));
+            let invalid = ContentBlock::new_tool_call_content(
+                invalid_image_blob,
+                &language_registry,
+                PathStyle::local(),
+                cx,
+            );
+            let ContentBlock::EmbeddedResource { resource, markdown } = &invalid else {
+                panic!("expected embedded resource block, got {invalid:?}");
+            };
+            assert!(markdown.is_none());
+            assert_eq!(
+                ContentBlock::embedded_resource_label(resource),
+                "tool://preview.png"
+            );
+            assert_eq!(invalid.to_markdown(cx), "tool://preview.png");
+        });
+    }
+
+    #[test]
+    fn sandbox_authorization_details_deserialize_legacy_network_bool() {
+        // Older builds persisted `network: bool`; the `alias` on
+        // `network_all_hosts` must keep those details rendering as a
+        // network request rather than silently dropping it.
+        let details: SandboxAuthorizationDetails =
+            serde_json::from_value(json!({ "network": true })).unwrap();
+        assert!(details.network_all_hosts);
+        assert!(details.network_hosts.is_empty());
+
+        let details: SandboxAuthorizationDetails =
+            serde_json::from_value(json!({ "network": false })).unwrap();
+        assert!(!details.network_all_hosts);
     }
 
     #[gpui::test]
@@ -4385,6 +5466,83 @@ mod tests {
         assert!(
             content.contains("hello buffered"),
             "expected buffered output to render, got: {content}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_exit_preserves_visible_scrollback(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(
+                    project,
+                    PathList::new(&[std::path::Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        let terminal_id = acp::TerminalId::new(uuid::Uuid::new_v4().to_string());
+        let lower = cx.new(|cx| {
+            let builder = ::terminal::TerminalBuilder::new_display_only(
+                ::terminal::terminal_settings::CursorShape::default(),
+                ::terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            );
+            builder.subscribe(cx)
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Created {
+                    terminal_id: terminal_id.clone(),
+                    label: "Buffered Test".to_string(),
+                    cwd: None,
+                    output_byte_limit: None,
+                    terminal: lower.clone(),
+                },
+                cx,
+            );
+        });
+
+        let mut output = String::new();
+        for line in 0..15_000 {
+            output.push_str(&format!("line {line}\n"));
+        }
+
+        thread.update(cx, |thread, cx| {
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Output {
+                    terminal_id: terminal_id.clone(),
+                    data: output.into_bytes(),
+                },
+                cx,
+            );
+            thread.on_terminal_provider_event(
+                TerminalProviderEvent::Exit {
+                    terminal_id: terminal_id.clone(),
+                    status: acp::TerminalExitStatus::new().exit_code(0),
+                },
+                cx,
+            );
+        });
+
+        let content = thread.read_with(cx, |thread, cx| {
+            let term = thread.terminal(terminal_id.clone()).unwrap();
+            term.read_with(cx, |term, cx| term.inner().read(cx).get_content())
+        });
+
+        assert!(
+            content.contains("line 14999"),
+            "expected output to remain visible after terminal exit, got: {content}"
         );
     }
 
@@ -4638,7 +5796,8 @@ mod tests {
         thread.update(cx, |thread, cx| {
             assert_eq!(thread.entries.len(), 1);
             if let AgentThreadEntry::UserMessage(user_msg) = &thread.entries[0] {
-                assert_eq!(user_msg.id, None);
+                assert_eq!(user_msg.protocol_id, None);
+                assert_eq!(user_msg.client_id, None);
                 assert_eq!(user_msg.content.to_markdown(cx), "Hello, ");
             } else {
                 panic!("Expected UserMessage");
@@ -4646,7 +5805,7 @@ mod tests {
         });
 
         // Test appending to existing user message
-        let message_1_id = UserMessageId::new();
+        let message_1_id = ClientUserMessageId::new();
         thread.update(cx, |thread, cx| {
             thread.push_user_content_block(Some(message_1_id.clone()), "world!".into(), cx);
         });
@@ -4654,7 +5813,8 @@ mod tests {
         thread.update(cx, |thread, cx| {
             assert_eq!(thread.entries.len(), 1);
             if let AgentThreadEntry::UserMessage(user_msg) = &thread.entries[0] {
-                assert_eq!(user_msg.id, Some(message_1_id));
+                assert_eq!(user_msg.protocol_id, None);
+                assert_eq!(user_msg.client_id, Some(message_1_id));
                 assert_eq!(user_msg.content.to_markdown(cx), "Hello, world!");
             } else {
                 panic!("Expected UserMessage");
@@ -4666,7 +5826,7 @@ mod tests {
             thread.push_assistant_content_block("Assistant response".into(), false, cx);
         });
 
-        let message_2_id = UserMessageId::new();
+        let message_2_id = ClientUserMessageId::new();
         thread.update(cx, |thread, cx| {
             thread.push_user_content_block(
                 Some(message_2_id.clone()),
@@ -4678,11 +5838,291 @@ mod tests {
         thread.update(cx, |thread, cx| {
             assert_eq!(thread.entries.len(), 3);
             if let AgentThreadEntry::UserMessage(user_msg) = &thread.entries[2] {
-                assert_eq!(user_msg.id, Some(message_2_id));
+                assert_eq!(user_msg.protocol_id, None);
+                assert_eq!(user_msg.client_id, Some(message_2_id));
                 assert_eq!(user_msg.content.to_markdown(cx), "New user message");
             } else {
                 panic!("Expected UserMessage at index 2");
             }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_user_message_chunks_use_protocol_message_id_boundaries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("First ".into()).message_id("msg_user_1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("message".into()).message_id("msg_user_1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("Second message".into()).message_id("msg_user_2"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("Echo".into()).message_id("msg_user_3"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("Echo".into()).message_id("msg_user_3"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.update(cx, |thread, cx| {
+            assert_eq!(thread.entries.len(), 3);
+
+            let AgentThreadEntry::UserMessage(first_message) = &thread.entries[0] else {
+                panic!("expected first entry to be a user message")
+            };
+            assert_eq!(first_message.content.to_markdown(cx), "First message");
+            assert_eq!(
+                first_message
+                    .protocol_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("msg_user_1")
+            );
+
+            let AgentThreadEntry::UserMessage(second_message) = &thread.entries[1] else {
+                panic!("expected second entry to be a user message")
+            };
+            assert_eq!(second_message.content.to_markdown(cx), "Second message");
+            assert_eq!(
+                second_message
+                    .protocol_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("msg_user_2")
+            );
+
+            let AgentThreadEntry::UserMessage(third_message) = &thread.entries[2] else {
+                panic!("expected third entry to be a user message")
+            };
+            assert_eq!(third_message.content.to_markdown(cx), "EchoEcho");
+            assert_eq!(
+                third_message
+                    .protocol_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("msg_user_3")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_protocol_user_chunk_does_not_merge_into_optimistic_prompt(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread.push_user_content_block_with_protocol_id(
+                None,
+                true,
+                None,
+                "Typed prompt".into(),
+                false,
+                cx,
+            );
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UserMessageChunk(
+                        acp::ContentChunk::new("Agent user chunk".into())
+                            .message_id("agent_user_chunk"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.update(cx, |thread, cx| {
+            assert_eq!(thread.entries.len(), 2);
+
+            let AgentThreadEntry::UserMessage(optimistic_message) = &thread.entries[0] else {
+                panic!("expected first entry to be optimistic user message")
+            };
+            assert!(optimistic_message.is_optimistic);
+            assert_eq!(optimistic_message.content.to_markdown(cx), "Typed prompt");
+            assert!(optimistic_message.protocol_id.is_none());
+            assert!(optimistic_message.client_id.is_none());
+
+            let AgentThreadEntry::UserMessage(agent_message) = &thread.entries[1] else {
+                panic!("expected second entry to be protocol user chunk")
+            };
+            assert!(!agent_message.is_optimistic);
+            assert_eq!(agent_message.content.to_markdown(cx), "Agent user chunk");
+            assert_eq!(
+                agent_message
+                    .protocol_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .as_deref(),
+                Some("agent_user_chunk")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_assistant_chunks_use_protocol_message_id_boundaries(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentThoughtChunk(
+                        acp::ContentChunk::new("Thinking ".into()).message_id("msg_thought_1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentThoughtChunk(
+                        acp::ContentChunk::new("hard".into()).message_id("msg_thought_1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentThoughtChunk(
+                        acp::ContentChunk::new("A separate thought".into())
+                            .message_id("msg_thought_2"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Answer ".into()).message_id("msg_agent_1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("done".into()).message_id("msg_agent_1"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(
+                        acp::ContentChunk::new("Follow-up".into()).message_id("msg_agent_2"),
+                    ),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.update(cx, |thread, cx| {
+            assert_eq!(thread.entries.len(), 1);
+            let AgentThreadEntry::AssistantMessage(message) = &thread.entries[0] else {
+                panic!("expected assistant entry")
+            };
+            assert_eq!(message.chunks.len(), 4);
+
+            let AssistantMessageChunk::Thought { id, block } = &message.chunks[0] else {
+                panic!("expected first chunk to be a thought")
+            };
+            assert_eq!(block.to_markdown(cx), "Thinking hard");
+            assert_eq!(
+                id.as_ref().map(ToString::to_string).as_deref(),
+                Some("msg_thought_1")
+            );
+
+            let AssistantMessageChunk::Thought { id, block } = &message.chunks[1] else {
+                panic!("expected second chunk to be a thought")
+            };
+            assert_eq!(block.to_markdown(cx), "A separate thought");
+            assert_eq!(
+                id.as_ref().map(ToString::to_string).as_deref(),
+                Some("msg_thought_2")
+            );
+
+            let AssistantMessageChunk::Message { id, block } = &message.chunks[2] else {
+                panic!("expected third chunk to be a message")
+            };
+            assert_eq!(block.to_markdown(cx), "Answer done");
+            assert_eq!(
+                id.as_ref().map(ToString::to_string).as_deref(),
+                Some("msg_agent_1")
+            );
+
+            let AssistantMessageChunk::Message { id, block } = &message.chunks[3] else {
+                panic!("expected fourth chunk to be a message")
+            };
+            assert_eq!(block.to_markdown(cx), "Follow-up");
+            assert_eq!(
+                id.as_ref().map(ToString::to_string).as_deref(),
+                Some("msg_agent_2")
+            );
         });
     }
 
@@ -4749,6 +6189,80 @@ mod tests {
         );
     }
 
+    /// `send_command` runs the turn (the connection receives the typed command)
+    /// but never echoes a user-message bubble, so commands like `/compact` don't
+    /// show a fake user message implying the text was sent to the model.
+    #[gpui::test]
+    async fn test_send_command_does_not_echo_user_message(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        let received_prompt: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let received_prompt = received_prompt.clone();
+            move |request, thread, mut cx| {
+                let received_prompt = received_prompt.clone();
+                async move {
+                    if let Some(acp::ContentBlock::Text(text)) = request.prompt.first() {
+                        *received_prompt.borrow_mut() = Some(text.text.clone());
+                    }
+                    // Simulate a native command producing its own thread entry
+                    // (here a compaction) rather than echoing a user message.
+                    thread.update(&mut cx, |thread, cx| {
+                        thread.push_context_compaction(
+                            ContextCompaction {
+                                id: ContextCompactionId("c1".into()),
+                                status: ContextCompactionStatus::Completed,
+                                summary: None,
+                            },
+                            cx,
+                        );
+                    })?;
+                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                }
+                .boxed_local()
+            }
+        }));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.send_command(vec!["/compact".into()], cx)
+            })
+        })
+        .await
+        .unwrap();
+
+        // The command turn ran: the connection received the typed command.
+        assert_eq!(received_prompt.borrow().as_deref(), Some("/compact"));
+
+        thread.update(cx, |thread, _cx| {
+            assert!(
+                !thread
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, AgentThreadEntry::UserMessage(_))),
+                "send_command must not echo a user message"
+            );
+            // The command's own entry (here a compaction) is still shown.
+            assert!(
+                thread
+                    .entries
+                    .iter()
+                    .any(|entry| matches!(entry, AgentThreadEntry::ContextCompaction(_))),
+                "the command's own thread entry should still be present"
+            );
+        });
+    }
+
     #[gpui::test]
     async fn test_ignore_echoed_user_message_chunks_during_active_turn(
         cx: &mut gpui::TestAppContext,
@@ -4757,27 +6271,29 @@ mod tests {
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
-            |request, thread, mut cx| {
-                async move {
-                    let prompt = request.prompt.first().cloned().unwrap_or_else(|| "".into());
+        let connection = Rc::new(
+            FakeAgentConnection::new()
+                .without_truncate_support()
+                .on_user_message(|request, thread, mut cx| {
+                    async move {
+                        let prompt = request.prompt.first().cloned().unwrap_or_else(|| "".into());
 
-                    thread.update(&mut cx, |thread, cx| {
-                        thread
-                            .handle_session_update(
-                                acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
-                                    prompt,
-                                )),
-                                cx,
-                            )
-                            .unwrap();
-                    })?;
+                        thread.update(&mut cx, |thread, cx| {
+                            thread
+                                .handle_session_update(
+                                    acp::SessionUpdate::UserMessageChunk(acp::ContentChunk::new(
+                                        prompt,
+                                    )),
+                                    cx,
+                                )
+                                .unwrap();
+                        })?;
 
-                    Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
-                }
-                .boxed_local()
-            },
-        ));
+                        Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                    }
+                    .boxed_local()
+                }),
+        );
 
         let thread = cx
             .update(|cx| {
@@ -4793,6 +6309,14 @@ mod tests {
 
         let output = thread.read_with(cx, |thread, cx| thread.to_markdown(cx));
         assert_eq!(output.matches("Hello from Zed!").count(), 1);
+        thread.read_with(cx, |thread, _cx| {
+            let Some(AgentThreadEntry::UserMessage(message)) = thread.entries.first() else {
+                panic!("expected optimistic user message");
+            };
+            assert_eq!(message.protocol_id, None);
+            assert_eq!(message.client_id, None);
+            assert!(message.is_optimistic);
+        });
     }
 
     #[gpui::test]
@@ -5155,6 +6679,486 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_tool_call_location_resolves_external_file(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/tmp/skills/test-skill"),
+            json!({ "SKILL.md": "skill body" }),
+        )
+        .await;
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/project"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let skill_path = std::path::PathBuf::from(path!("/tmp/skills/test-skill/SKILL.md"));
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new("write_file", "Write SKILL.md")
+                            .kind(acp::ToolKind::Edit)
+                            .status(acp::ToolCallStatus::Completed)
+                            .locations(vec![acp::ToolCallLocation::new(skill_path.clone())]),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, cx| {
+            let (tool_call_location, agent_location) = thread.entries[0]
+                .location(0)
+                .expect("external tool-call location should resolve");
+            assert_eq!(tool_call_location.path, skill_path);
+
+            let buffer = agent_location
+                .buffer
+                .upgrade()
+                .expect("resolved location should keep an open buffer");
+            assert_eq!(buffer.read(cx).text(), "skill body");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_duplicate_tool_call_update_preserves_open_permission_request_until_authorized(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let tool_call_id = acp::ToolCallId::new("toolu_01duplicate");
+        let allow_option_id = acp::PermissionOptionId::new("allow");
+        let permission_task = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp::ToolCall::new(tool_call_id.clone(), "Original title")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Pending)
+                        .content(vec!["original content".into()])
+                        .into(),
+                    PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                        allow_option_id.clone(),
+                        "Allow",
+                        acp::PermissionOptionKind::AllowOnce,
+                    )]),
+                    AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id.clone(), "Updated title")
+                            .kind(acp::ToolKind::Execute)
+                            .status(acp::ToolCallStatus::Pending)
+                            .content(vec!["updated content".into()]),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.read_with(cx, |thread, cx| {
+            let (_, tool_call) = thread
+                .tool_call(&tool_call_id)
+                .expect("tool call should exist");
+            assert_eq!(tool_call.label.read(cx).source(), "Updated title");
+            assert!(matches!(
+                tool_call.status,
+                ToolCallStatus::WaitingForConfirmation { .. }
+            ));
+            assert_eq!(tool_call.content.len(), 1);
+            assert_eq!(tool_call.content[0].to_markdown(cx), "updated content");
+        });
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                        tool_call_id.clone(),
+                        acp::ToolCallUpdateFields::new()
+                            .status(acp::ToolCallStatus::InProgress)
+                            .title("Updated again")
+                            .content(vec!["updated again".into()]),
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.read_with(cx, |thread, cx| {
+            let (_, tool_call) = thread
+                .tool_call(&tool_call_id)
+                .expect("tool call should exist");
+            assert_eq!(tool_call.label.read(cx).source(), "Updated again");
+            assert!(matches!(
+                tool_call.status,
+                ToolCallStatus::WaitingForConfirmation { .. }
+            ));
+            assert_eq!(tool_call.content.len(), 1);
+            assert_eq!(tool_call.content[0].to_markdown(cx), "updated again");
+        });
+
+        let selected_outcome = SelectedPermissionOutcome::new(
+            allow_option_id.clone(),
+            acp::PermissionOptionKind::AllowOnce,
+        );
+        thread.update(cx, |thread, cx| {
+            thread.authorize_tool_call(tool_call_id.clone(), selected_outcome, cx);
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let (_, tool_call) = thread
+                .tool_call(&tool_call_id)
+                .expect("tool call should exist");
+            assert!(matches!(tool_call.status, ToolCallStatus::InProgress));
+        });
+
+        match permission_task.await {
+            RequestPermissionOutcome::Selected(outcome) => {
+                assert_eq!(outcome.option_id, allow_option_id);
+                assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
+            }
+            RequestPermissionOutcome::Cancelled => {
+                panic!("permission request should remain open after duplicate tool call update")
+            }
+        }
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                        tool_call_id.clone(),
+                        acp::ToolCallUpdateFields::new()
+                            .status(acp::ToolCallStatus::Completed)
+                            .title("Completed")
+                            .content(vec!["done".into()]),
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.read_with(cx, |thread, cx| {
+            let (_, tool_call) = thread
+                .tool_call(&tool_call_id)
+                .expect("tool call should exist");
+            assert_eq!(tool_call.label.read(cx).source(), "Completed");
+            assert!(matches!(tool_call.status, ToolCallStatus::Completed));
+            assert_eq!(tool_call.content.len(), 1);
+            assert_eq!(tool_call.content[0].to_markdown(cx), "done");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_permission_request_tracks_agent_status_until_resolved(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let tool_call_id = acp::ToolCallId::new("toolu_01auto_resolve");
+        let permission_task = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp::ToolCall::new(tool_call_id.clone(), "Original title")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Pending)
+                        .into(),
+                    PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                        acp::PermissionOptionId::new("allow"),
+                        "Allow",
+                        acp::PermissionOptionKind::AllowOnce,
+                    )]),
+                    AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                        tool_call_id.clone(),
+                        acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.read_with(cx, |thread, _cx| {
+            let (_, tool_call) = thread
+                .tool_call(&tool_call_id)
+                .expect("tool call should exist");
+            assert!(matches!(
+                tool_call.status,
+                ToolCallStatus::WaitingForConfirmation {
+                    current_status: acp::ToolCallStatus::InProgress,
+                    ..
+                }
+            ));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.authorize_tool_call(
+                tool_call_id.clone(),
+                SelectedPermissionOutcome::new(
+                    acp::PermissionOptionId::new("allow"),
+                    acp::PermissionOptionKind::AllowOnce,
+                ),
+                cx,
+            );
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let (_, tool_call) = thread
+                .tool_call(&tool_call_id)
+                .expect("tool call should exist");
+            assert!(matches!(tool_call.status, ToolCallStatus::InProgress));
+        });
+
+        match permission_task.await {
+            RequestPermissionOutcome::Selected(outcome) => {
+                assert_eq!(outcome.option_id, acp::PermissionOptionId::new("allow"));
+                assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
+            }
+            RequestPermissionOutcome::Cancelled => {
+                panic!("resolved permission request should select an outcome")
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_permission_request_sets_waiting_status_on_existing_tool_call(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let tool_call_id = acp::ToolCallId::new("toolu_01existing_permission");
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id.clone(), "Running title")
+                            .kind(acp::ToolKind::Execute)
+                            .status(acp::ToolCallStatus::InProgress),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        let permission_task = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp::ToolCall::new(tool_call_id.clone(), "Needs permission")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Pending)
+                        .into(),
+                    PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                        acp::PermissionOptionId::new("allow"),
+                        "Allow",
+                        acp::PermissionOptionKind::AllowOnce,
+                    )]),
+                    AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.read_with(cx, |thread, cx| {
+            let (_, tool_call) = thread
+                .tool_call(&tool_call_id)
+                .expect("tool call should exist");
+            assert_eq!(tool_call.label.read(cx).source(), "Needs permission");
+            assert!(matches!(
+                tool_call.status,
+                ToolCallStatus::WaitingForConfirmation {
+                    current_status: acp::ToolCallStatus::InProgress,
+                    ..
+                }
+            ));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.authorize_tool_call(
+                tool_call_id.clone(),
+                SelectedPermissionOutcome::new(
+                    acp::PermissionOptionId::new("allow"),
+                    acp::PermissionOptionKind::AllowOnce,
+                ),
+                cx,
+            );
+        });
+
+        match permission_task.await {
+            RequestPermissionOutcome::Selected(outcome) => {
+                assert_eq!(outcome.option_id, acp::PermissionOptionId::new("allow"));
+                assert_eq!(outcome.option_kind, acp::PermissionOptionKind::AllowOnce);
+            }
+            RequestPermissionOutcome::Cancelled => {
+                panic!("permission request should resolve after authorization")
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_cancel_tool_call_authorization_resolves_permission_request(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let tool_call_id = acp::ToolCallId::new("toolu_01cancelled_permission");
+        let permission_task = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp::ToolCall::new(tool_call_id.clone(), "Needs permission")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Pending)
+                        .into(),
+                    PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                        acp::PermissionOptionId::new("allow"),
+                        "Allow",
+                        acp::PermissionOptionKind::AllowOnce,
+                    )]),
+                    AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread.cancel_tool_call_authorization(&tool_call_id, cx);
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let (_, tool_call) = thread
+                .tool_call(&tool_call_id)
+                .expect("tool call should exist");
+            assert!(matches!(tool_call.status, ToolCallStatus::Canceled));
+        });
+
+        match permission_task.await {
+            RequestPermissionOutcome::Cancelled => {}
+            RequestPermissionOutcome::Selected(_) => {
+                panic!("cancelled permission request should not select an outcome")
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_terminal_tool_call_update_closes_open_permission_request(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let tool_call_id = acp::ToolCallId::new("toolu_01completed_while_waiting");
+        let permission_task = thread
+            .update(cx, |thread, cx| {
+                thread.request_tool_call_authorization(
+                    acp::ToolCall::new(tool_call_id.clone(), "Needs permission")
+                        .kind(acp::ToolKind::Execute)
+                        .status(acp::ToolCallStatus::Pending)
+                        .into(),
+                    PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                        acp::PermissionOptionId::new("allow"),
+                        "Allow",
+                        acp::PermissionOptionKind::AllowOnce,
+                    )]),
+                    AuthorizationKind::PermissionGrant,
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                        tool_call_id.clone(),
+                        acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.read_with(cx, |thread, _cx| {
+            let (_, tool_call) = thread
+                .tool_call(&tool_call_id)
+                .expect("tool call should exist");
+            assert!(matches!(tool_call.status, ToolCallStatus::Completed));
+        });
+
+        match permission_task.await {
+            RequestPermissionOutcome::Cancelled => {}
+            RequestPermissionOutcome::Selected(_) => {
+                panic!("terminal tool call update should close pending permission request")
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn test_no_pending_edits_if_tool_calls_are_completed(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.background_executor.clone());
@@ -5359,7 +7363,7 @@ mod tests {
                 let AgentThreadEntry::UserMessage(message) = &thread.entries[2] else {
                     panic!("unexpected entries {:?}", thread.entries)
                 };
-                thread.restore_checkpoint(message.id.clone().unwrap(), cx)
+                thread.restore_checkpoint(message.client_id.clone().unwrap(), cx)
             })
             .await
             .unwrap();
@@ -5738,6 +7742,1216 @@ mod tests {
         });
     }
 
+    async fn new_test_thread(cx: &mut TestAppContext) -> Entity<AcpThread> {
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        cx.update(|cx| {
+            connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+        })
+        .await
+        .unwrap()
+    }
+
+    fn only_thread_elicitation(thread: &AcpThread) -> (ElicitationEntryId, &Elicitation) {
+        let [entry] = thread.entries() else {
+            panic!("expected one elicitation entry, got {:?}", thread.entries());
+        };
+        let AgentThreadEntry::Elicitation(id) = entry else {
+            panic!("expected one elicitation entry, got {:?}", thread.entries());
+        };
+        let Some((_, elicitation)) = thread.elicitation(id) else {
+            panic!("missing elicitation entry");
+        };
+        (id.clone(), elicitation)
+    }
+
+    fn latest_thread_elicitation(thread: &AcpThread) -> (ElicitationEntryId, &Elicitation) {
+        let Some(AgentThreadEntry::Elicitation(id)) = thread.entries().last() else {
+            panic!("expected latest entry to be an elicitation");
+        };
+        let Some((_, elicitation)) = thread.elicitation(id) else {
+            panic!("missing elicitation entry");
+        };
+        (id.clone(), elicitation)
+    }
+
+    #[gpui::test]
+    async fn test_elicitation_requires_acp_beta_flag(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_flags(false, vec![]);
+        });
+        set_acp_beta_override("off", cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        let result = thread.update(cx, |thread, cx| {
+            thread.request_elicitation(
+                acp::CreateElicitationRequest::new(
+                    acp::ElicitationFormMode::new(
+                        acp::ElicitationSessionScope::new(session_id),
+                        acp::ElicitationSchema::new().string("name", true),
+                    ),
+                    "Provide a name",
+                ),
+                cx,
+            )
+        });
+
+        assert!(result.is_err());
+        thread.read_with(cx, |thread, _| assert!(thread.entries().is_empty()));
+    }
+
+    #[gpui::test]
+    async fn test_form_elicitation_accepts_response(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let tool_call_id = acp::ToolCallId::new("tool-1");
+
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id.clone())
+                                .tool_call_id(tool_call_id.clone()),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let elicitation_id = thread.read_with(cx, |thread, _| {
+            let (elicitation_id, elicitation) = only_thread_elicitation(thread);
+            let acp::ElicitationScope::Session(scope) = elicitation.request.scope() else {
+                panic!("expected session-scoped elicitation");
+            };
+            assert_eq!(scope.tool_call_id.as_ref(), Some(&tool_call_id));
+            elicitation_id
+        });
+
+        let expected_content = std::collections::BTreeMap::from([(
+            "name".to_string(),
+            acp::ElicitationContentValue::from("Ada"),
+        )]);
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new().content(expected_content.clone()),
+                )),
+                cx,
+            );
+        });
+
+        let response = response_task.await;
+        assert_eq!(
+            response.action,
+            acp::ElicitationAction::Accept(
+                acp::ElicitationAcceptAction::new().content(expected_content)
+            )
+        );
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&elicitation_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Accepted));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_url_elicitation_can_be_completed(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let url_elicitation_id = acp::ElicitationId::new("url-1");
+
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationUrlMode::new(
+                            acp::ElicitationSessionScope::new(session_id),
+                            url_elicitation_id.clone(),
+                            "https://example.com/complete",
+                        ),
+                        "Complete this in the browser",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let entry_id = thread.read_with(cx, |thread, _| {
+            let (entry_id, _) = only_thread_elicitation(thread);
+            entry_id
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.complete_url_elicitation(&url_elicitation_id, cx);
+        });
+        assert!(matches!(
+            response_task.await.action,
+            acp::ElicitationAction::Accept(_)
+        ));
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &entry_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
+                cx,
+            );
+        });
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Completed));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_idle_cancel_cancels_accepted_url_elicitation(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let url_elicitation_id = acp::ElicitationId::new("url-1");
+
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationUrlMode::new(
+                            acp::ElicitationSessionScope::new(session_id),
+                            url_elicitation_id.clone(),
+                            "https://example.com/complete",
+                        ),
+                        "Complete this in the browser",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let entry_id = thread.read_with(cx, |thread, _| {
+            let (entry_id, _) = only_thread_elicitation(thread);
+            entry_id
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &entry_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+        });
+        assert!(matches!(
+            response_task.await.action,
+            acp::ElicitationAction::Accept(_)
+        ));
+
+        thread.update(cx, |thread, cx| {
+            thread.cancel(cx).detach();
+        });
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.complete_url_elicitation(&url_elicitation_id, cx);
+        });
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cancel_accepted_url_elicitation_marks_canceled(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let url_elicitation_id = acp::ElicitationId::new("url-1");
+
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationUrlMode::new(
+                            acp::ElicitationSessionScope::new(session_id),
+                            url_elicitation_id.clone(),
+                            "https://example.com/complete",
+                        ),
+                        "Complete this in the browser",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let entry_id = thread.read_with(cx, |thread, _| {
+            let (entry_id, _) = only_thread_elicitation(thread);
+            entry_id
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &entry_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+        });
+        assert!(matches!(
+            response_task.await.action,
+            acp::ElicitationAction::Accept(_)
+        ));
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Accepted));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.cancel(cx).detach();
+        });
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.complete_url_elicitation(&url_elicitation_id, cx);
+        });
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_turn_cancel_cancels_accepted_url_elicitation_from_previous_turn(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let prompt_count = Rc::new(RefCell::new(0usize));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let prompt_count = prompt_count.clone();
+            move |_request, _thread, _cx| {
+                let stop_reason = {
+                    let mut prompt_count = prompt_count.borrow_mut();
+                    let stop_reason = if *prompt_count == 0 {
+                        acp::StopReason::EndTurn
+                    } else {
+                        acp::StopReason::Cancelled
+                    };
+                    *prompt_count += 1;
+                    stop_reason
+                };
+
+                async move { Ok(acp::PromptResponse::new(stop_reason)) }.boxed_local()
+            }
+        }));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("new session should succeed");
+
+        let response = thread
+            .update(cx, |thread, cx| thread.send(vec!["first turn".into()], cx))
+            .await
+            .expect("first turn should succeed")
+            .expect("first turn should return a response");
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let url_elicitation_id = acp::ElicitationId::new("url-1");
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationUrlMode::new(
+                            acp::ElicitationSessionScope::new(session_id),
+                            url_elicitation_id.clone(),
+                            "https://example.com/complete",
+                        ),
+                        "Complete this in the browser",
+                    ),
+                    cx,
+                )
+                .expect("url elicitation should be accepted")
+        });
+
+        let entry_id = thread.read_with(cx, |thread, _| {
+            let (entry_id, _) = latest_thread_elicitation(thread);
+            entry_id
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &entry_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+        });
+        assert!(matches!(
+            response_task.await.action,
+            acp::ElicitationAction::Accept(_)
+        ));
+
+        let response = thread
+            .update(cx, |thread, cx| thread.send(vec!["second turn".into()], cx))
+            .await
+            .expect("second turn should succeed")
+            .expect("second turn should return a response");
+        assert_eq!(response.stop_reason, acp::StopReason::Cancelled);
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.complete_url_elicitation(&url_elicitation_id, cx);
+        });
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_request_scoped_elicitation_store_accepts_response(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let store = cx.update(|cx| cx.new(|_| ElicitationStore::default()));
+
+        let response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(1)),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let elicitation_id = store.read_with(cx, |store, _| {
+            let [elicitation] = store.elicitations() else {
+                panic!(
+                    "expected one elicitation entry, got {:?}",
+                    store.elicitations()
+                );
+            };
+            let acp::ElicitationScope::Request(scope) = elicitation.request.scope() else {
+                panic!("expected request-scoped elicitation");
+            };
+            assert_eq!(scope.request_id, acp::RequestId::Number(1));
+            elicitation.id.clone()
+        });
+
+        store.update(cx, |store, cx| {
+            store.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
+                cx,
+            );
+        });
+
+        assert_eq!(response_task.await.action, acp::ElicitationAction::Decline);
+        store.read_with(cx, |store, _| {
+            let Some((_, elicitation)) = store.elicitation(&elicitation_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Declined));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_request_elicitation_store_ignores_duplicate_response(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let store = cx.update(|cx| cx.new(|_| ElicitationStore::default()));
+
+        let response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(1)),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let elicitation_id = store.read_with(cx, |store, _| {
+            let [elicitation] = store.elicitations() else {
+                panic!(
+                    "expected one elicitation entry, got {:?}",
+                    store.elicitations()
+                );
+            };
+            elicitation.id.clone()
+        });
+
+        store.update(cx, |store, cx| {
+            store.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
+                cx,
+            );
+            store.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+        });
+
+        assert_eq!(response_task.await.action, acp::ElicitationAction::Decline);
+        store.read_with(cx, |store, _| {
+            let Some((_, elicitation)) = store.elicitation(&elicitation_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Declined));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cancel_session_elicitation_by_id_resolves_cancel(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        let (elicitation_id, response_task) = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation_with_id(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.cancel_elicitation(&elicitation_id, cx);
+        });
+
+        assert_eq!(response_task.await.action, acp::ElicitationAction::Cancel);
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&elicitation_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cancel_pending_session_elicitation_resolves_cancel(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let elicitation_id = thread.read_with(cx, |thread, _| {
+            let (elicitation_id, _) = only_thread_elicitation(thread);
+            elicitation_id
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.cancel(cx).detach();
+        });
+
+        assert_eq!(response_task.await.action, acp::ElicitationAction::Cancel);
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&elicitation_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    fn request_test_session_elicitation(
+        thread: WeakEntity<AcpThread>,
+        session_id: acp::SessionId,
+        cx: &mut AsyncApp,
+    ) -> Result<Task<acp::CreateElicitationResponse>> {
+        thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .map_err(|error| anyhow!(error))
+        })?
+    }
+
+    #[gpui::test]
+    async fn test_prompt_error_cancels_pending_session_elicitation(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let elicitation_action = Rc::new(RefCell::new(None));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let elicitation_action = elicitation_action.clone();
+            move |request, thread, mut cx| {
+                let elicitation_action = elicitation_action.clone();
+                async move {
+                    let response_task =
+                        request_test_session_elicitation(thread, request.session_id, &mut cx)?;
+                    cx.spawn(async move |_cx| {
+                        let response = response_task.await;
+                        *elicitation_action.borrow_mut() = Some(response.action);
+                    })
+                    .detach();
+
+                    Err(anyhow!("prompt failed"))
+                }
+                .boxed_local()
+            }
+        }));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("new session should succeed");
+
+        let result = thread
+            .update(cx, |thread, cx| thread.send(vec!["hello".into()], cx))
+            .await;
+
+        assert!(result.is_err());
+        cx.run_until_parked();
+        assert_eq!(
+            *elicitation_action.borrow(),
+            Some(acp::ElicitationAction::Cancel)
+        );
+        thread.read_with(cx, |thread, _| {
+            let Some(elicitation) = thread.entries().iter().find_map(|entry| match entry {
+                AgentThreadEntry::Elicitation(id) => {
+                    thread.elicitation(id).map(|(_, elicitation)| elicitation)
+                }
+                _ => None,
+            }) else {
+                panic!("expected an elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_max_tokens_cancels_pending_session_elicitation(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let elicitation_action = Rc::new(RefCell::new(None));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let elicitation_action = elicitation_action.clone();
+            move |request, thread, mut cx| {
+                let elicitation_action = elicitation_action.clone();
+                async move {
+                    let response_task =
+                        request_test_session_elicitation(thread, request.session_id, &mut cx)?;
+                    cx.spawn(async move |_cx| {
+                        let response = response_task.await;
+                        *elicitation_action.borrow_mut() = Some(response.action);
+                    })
+                    .detach();
+
+                    Ok(acp::PromptResponse::new(acp::StopReason::MaxTokens))
+                }
+                .boxed_local()
+            }
+        }));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("new session should succeed");
+
+        let result = thread
+            .update(cx, |thread, cx| thread.send(vec!["hello".into()], cx))
+            .await;
+
+        assert!(result.is_err());
+        cx.run_until_parked();
+        assert_eq!(
+            *elicitation_action.borrow(),
+            Some(acp::ElicitationAction::Cancel)
+        );
+        thread.read_with(cx, |thread, _| {
+            let Some(elicitation) = thread.entries().iter().find_map(|entry| match entry {
+                AgentThreadEntry::Elicitation(id) => {
+                    thread.elicitation(id).map(|(_, elicitation)| elicitation)
+                }
+                _ => None,
+            }) else {
+                panic!("expected an elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cancel_request_scoped_elicitation_resolves_cancel(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let store = cx.update(|cx| cx.new(|_| ElicitationStore::default()));
+
+        let (elicitation_id, response_task) = store.update(cx, |store, cx| {
+            store
+                .request_elicitation_with_id(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(1)),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        store.update(cx, |store, cx| {
+            store.cancel_elicitation(&elicitation_id, cx);
+        });
+
+        assert_eq!(response_task.await.action, acp::ElicitationAction::Cancel);
+        store.read_with(cx, |store, _| {
+            let Some((_, elicitation)) = store.elicitation(&elicitation_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_request_elicitation_store_cancel_all_resolves_cancel(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let store = cx.update(|cx| cx.new(|_| ElicitationStore::default()));
+
+        let response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(1)),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        store.update(cx, |store, cx| {
+            store.cancel_all(cx);
+        });
+
+        assert_eq!(response_task.await.action, acp::ElicitationAction::Cancel);
+    }
+
+    #[gpui::test]
+    async fn test_request_elicitation_store_clear_removes_answered_and_cancels_pending(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let store = cx.update(|cx| cx.new(|_| ElicitationStore::default()));
+
+        let first_response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(1)),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+        let second_response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(2)),
+                            acp::ElicitationSchema::new().string("account", true),
+                        ),
+                        "Provide an account",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let first_elicitation_id = store.read_with(cx, |store, _| {
+            let [first, _second] = store.elicitations() else {
+                panic!("expected two elicitations, got {:?}", store.elicitations());
+            };
+            first.id.clone()
+        });
+
+        store.update(cx, |store, cx| {
+            store.respond_to_elicitation(
+                &first_elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
+                cx,
+            );
+            store.clear(cx);
+        });
+
+        assert_eq!(
+            first_response_task.await.action,
+            acp::ElicitationAction::Decline
+        );
+        assert_eq!(
+            second_response_task.await.action,
+            acp::ElicitationAction::Cancel
+        );
+        store.read_with(cx, |store, _| assert!(store.elicitations().is_empty()));
+    }
+
+    #[gpui::test]
+    async fn test_request_elicitation_store_clear_resolved_preserves_outstanding(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let store = cx.update(|cx| cx.new(|_| ElicitationStore::default()));
+        let url_elicitation_id = acp::ElicitationId::new("url-1");
+
+        let accepted_response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(1)),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+        let pending_response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(2)),
+                            acp::ElicitationSchema::new().string("account", true),
+                        ),
+                        "Provide an account",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+        let accepted_url_response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationUrlMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(3)),
+                            url_elicitation_id,
+                            "https://example.com/complete",
+                        ),
+                        "Complete this in the browser",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let (accepted_id, pending_id, accepted_url_id) = store.read_with(cx, |store, _| {
+            let [accepted, pending, accepted_url] = store.elicitations() else {
+                panic!(
+                    "expected three request-scoped elicitations, got {:?}",
+                    store.elicitations()
+                );
+            };
+            (
+                accepted.id.clone(),
+                pending.id.clone(),
+                accepted_url.id.clone(),
+            )
+        });
+
+        store.update(cx, |store, cx| {
+            store.respond_to_elicitation(
+                &accepted_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+            store.respond_to_elicitation(
+                &accepted_url_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+        });
+        assert!(matches!(
+            accepted_response_task.await.action,
+            acp::ElicitationAction::Accept(_)
+        ));
+        assert!(matches!(
+            accepted_url_response_task.await.action,
+            acp::ElicitationAction::Accept(_)
+        ));
+
+        let cleared_ids = store.update(cx, |store, cx| store.clear_resolved(cx));
+        assert_eq!(cleared_ids, vec![accepted_id]);
+        store.read_with(cx, |store, _| {
+            let [pending, accepted_url] = store.elicitations() else {
+                panic!(
+                    "expected pending and accepted url elicitations, got {:?}",
+                    store.elicitations()
+                );
+            };
+            assert_eq!(pending.id, pending_id);
+            assert!(matches!(pending.status, ElicitationStatus::Pending { .. }));
+            assert_eq!(accepted_url.id, accepted_url_id);
+            assert!(matches!(accepted_url.status, ElicitationStatus::Accepted));
+        });
+
+        store.update(cx, |store, cx| store.clear(cx));
+        assert_eq!(
+            pending_response_task.await.action,
+            acp::ElicitationAction::Cancel
+        );
+    }
+
+    #[gpui::test]
+    async fn test_request_url_elicitation_store_can_be_completed(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let store = cx.update(|cx| cx.new(|_| ElicitationStore::default()));
+        let url_elicitation_id = acp::ElicitationId::new("url-1");
+
+        let response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationUrlMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(1)),
+                            url_elicitation_id.clone(),
+                            "https://example.com/complete",
+                        ),
+                        "Complete this in the browser",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let entry_id = store.read_with(cx, |store, _| {
+            let [elicitation] = store.elicitations() else {
+                panic!(
+                    "expected one request-scoped elicitation, got {:?}",
+                    store.elicitations()
+                );
+            };
+            elicitation.id.clone()
+        });
+
+        store.update(cx, |store, cx| {
+            store.complete_url_elicitation(&url_elicitation_id, cx);
+        });
+
+        assert!(matches!(
+            response_task.await.action,
+            acp::ElicitationAction::Accept(_)
+        ));
+        store.update(cx, |store, cx| {
+            store.respond_to_elicitation(
+                &entry_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
+                cx,
+            );
+        });
+        store.read_with(cx, |store, _| {
+            let Some((_, elicitation)) = store.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Completed));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_request_url_elicitation_store_cancel_all_cancels_accepted_url(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let store = cx.update(|cx| cx.new(|_| ElicitationStore::default()));
+        let url_elicitation_id = acp::ElicitationId::new("url-1");
+
+        let response_task = store.update(cx, |store, cx| {
+            store
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationUrlMode::new(
+                            acp::ElicitationRequestScope::new(acp::RequestId::Number(1)),
+                            url_elicitation_id.clone(),
+                            "https://example.com/complete",
+                        ),
+                        "Complete this in the browser",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let entry_id = store.read_with(cx, |store, _| {
+            let [elicitation] = store.elicitations() else {
+                panic!(
+                    "expected one elicitation entry, got {:?}",
+                    store.elicitations()
+                );
+            };
+            elicitation.id.clone()
+        });
+
+        store.update(cx, |store, cx| {
+            store.respond_to_elicitation(
+                &entry_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+        });
+        assert!(matches!(
+            response_task.await.action,
+            acp::ElicitationAction::Accept(_)
+        ));
+        store.update(cx, |store, cx| {
+            store.cancel_all(cx);
+        });
+        store.read_with(cx, |store, _| {
+            let Some((_, elicitation)) = store.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+
+        store.update(cx, |store, cx| {
+            store.complete_url_elicitation(&url_elicitation_id, cx);
+        });
+        store.read_with(cx, |store, _| {
+            let Some((_, elicitation)) = store.elicitation(&entry_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cancel_pending_elicitations_preserves_responded_statuses(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let elicitation_id = thread.read_with(cx, |thread, _| {
+            let (elicitation_id, _) = only_thread_elicitation(thread);
+            elicitation_id
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
+                cx,
+            );
+            thread.cancel(cx).detach();
+        });
+
+        assert_eq!(response_task.await.action, acp::ElicitationAction::Decline);
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&elicitation_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Declined));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_session_elicitation_ignores_duplicate_response(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        let response_task = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .unwrap()
+        });
+
+        let elicitation_id = thread.read_with(cx, |thread, _| {
+            let (elicitation_id, _) = only_thread_elicitation(thread);
+            elicitation_id
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Decline),
+                cx,
+            );
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+        });
+
+        assert_eq!(response_task.await.action, acp::ElicitationAction::Decline);
+        thread.read_with(cx, |thread, _| {
+            let Some((_, elicitation)) = thread.elicitation(&elicitation_id) else {
+                panic!("missing elicitation entry");
+            };
+            assert!(matches!(elicitation.status, ElicitationStatus::Declined));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_url_elicitation_rejects_invalid_url(cx: &mut TestAppContext) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let thread = new_test_thread(cx).await;
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+
+        let result = thread.update(cx, |thread, cx| {
+            thread.request_elicitation(
+                acp::CreateElicitationRequest::new(
+                    acp::ElicitationUrlMode::new(
+                        acp::ElicitationSessionScope::new(session_id),
+                        "url-1",
+                        "not a url",
+                    ),
+                    "Complete this in the browser",
+                ),
+                cx,
+            )
+        });
+
+        assert!(result.is_err());
+        thread.read_with(cx, |thread, _| assert!(thread.entries().is_empty()));
+    }
+
     async fn run_until_first_tool_call(
         thread: &Entity<AcpThread>,
         cx: &mut TestAppContext,
@@ -5765,7 +8979,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     struct FakeAgentConnection {
         auth_methods: Vec<acp::AuthMethod>,
         supports_truncate: bool,
@@ -5781,7 +8995,6 @@ mod tests {
                     + 'static,
             >,
         >,
-        agent_id: AgentId,
     }
 
     impl FakeAgentConnection {
@@ -5792,7 +9005,6 @@ mod tests {
                 on_user_message: None,
                 sessions: Arc::default(),
                 set_title_calls: Default::default(),
-                agent_id: AgentId::new("fake"),
             }
         }
 
@@ -5819,16 +9031,11 @@ mod tests {
             self.on_user_message.replace(Rc::new(handler));
             self
         }
-
-        fn with_agent_id(mut self, id: &str) -> Self {
-            self.agent_id = AgentId::new(id);
-            self
-        }
     }
 
     impl AgentConnection for FakeAgentConnection {
         fn agent_id(&self) -> AgentId {
-            self.agent_id.clone()
+            AgentId::new("fake")
         }
 
         fn telemetry_id(&self) -> SharedString {
@@ -5855,7 +9062,6 @@ mod tests {
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             let thread = cx.new(|cx| {
                 AcpThread::new(
-                    None,
                     None,
                     None,
                     Some(work_dirs),
@@ -5886,7 +9092,6 @@ mod tests {
 
         fn prompt(
             &self,
-            _id: UserMessageId,
             params: acp::PromptRequest,
             cx: &mut App,
         ) -> Task<gpui::Result<acp::PromptResponse>> {
@@ -5899,6 +9104,17 @@ mod tests {
             } else {
                 Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::EndTurn)))
             }
+        }
+
+        fn client_user_message_ids(
+            &self,
+            _cx: &App,
+        ) -> Option<Rc<dyn AgentSessionClientUserMessageIds>> {
+            self.supports_truncate.then(|| {
+                Rc::new(FakeAgentSessionClientUserMessageIds {
+                    connection: self.clone(),
+                }) as Rc<dyn AgentSessionClientUserMessageIds>
+            })
         }
 
         fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
@@ -5946,8 +9162,27 @@ mod tests {
     }
 
     impl AgentSessionTruncate for FakeAgentSessionEditor {
-        fn run(&self, _message_id: UserMessageId, _cx: &mut App) -> Task<Result<()>> {
+        fn run(
+            &self,
+            _client_user_message_id: ClientUserMessageId,
+            _cx: &mut App,
+        ) -> Task<Result<()>> {
             Task::ready(Ok(()))
+        }
+    }
+
+    struct FakeAgentSessionClientUserMessageIds {
+        connection: FakeAgentConnection,
+    }
+
+    impl AgentSessionClientUserMessageIds for FakeAgentSessionClientUserMessageIds {
+        fn prompt(
+            &self,
+            _client_user_message_id: ClientUserMessageId,
+            params: acp::PromptRequest,
+            cx: &mut App,
+        ) -> Task<Result<acp::PromptResponse>> {
+            self.connection.prompt(params, cx)
         }
     }
 
@@ -5999,6 +9234,9 @@ mod tests {
                         ContentBlock::Empty => panic!("Expected markdown content, got empty"),
                         ContentBlock::ResourceLink { .. } => {
                             panic!("Expected markdown content, got resource link")
+                        }
+                        ContentBlock::EmbeddedResource { .. } => {
+                            panic!("Expected markdown content, got embedded resource")
                         }
                         ContentBlock::Image { .. } => {
                             panic!("Expected markdown content, got image")
@@ -6153,7 +9391,7 @@ mod tests {
             let AgentThreadEntry::UserMessage(message) = &thread.entries[1] else {
                 panic!("expected user message at index 1");
             };
-            message.id.clone().unwrap()
+            message.client_id.clone().unwrap()
         });
 
         // Create a terminal AFTER the checkpoint we'll restore to.
@@ -6359,7 +9597,9 @@ mod tests {
         thread.update(cx, |thread, cx| {
             thread.push_entry(
                 AgentThreadEntry::UserMessage(UserMessage {
-                    id: Some(UserMessageId::new()),
+                    protocol_id: None,
+                    client_id: Some(ClientUserMessageId::new()),
+                    is_optimistic: true,
                     content: ContentBlock::Empty,
                     chunks: vec!["Injected message (no checkpoint)".into()],
                     checkpoint: None,
@@ -6423,18 +9663,18 @@ mod tests {
 
         // Send first message (turn_id=1) - handler will block
         let first_request = thread.update(cx, |thread, cx| thread.send_raw("first", cx));
-        assert_eq!(thread.read_with(cx, |t, _| t.turn_id), TurnId::new(1));
+        assert_eq!(thread.read_with(cx, |t, _| t.turn_id), 1);
 
         // Send second message (turn_id=2) while first is still blocked
         // This calls cancel() which takes turn 1's running_turn and sets turn 2's
         let second_request = thread.update(cx, |thread, cx| thread.send_raw("second", cx));
-        assert_eq!(thread.read_with(cx, |t, _| t.turn_id), TurnId::new(2));
+        assert_eq!(thread.read_with(cx, |t, _| t.turn_id), 2);
 
         let running_turn_after_second_send =
             thread.read_with(cx, |thread, _| thread.running_turn.as_ref().map(|t| t.id));
         assert_eq!(
             running_turn_after_second_send,
-            Some(TurnId::new(2)),
+            Some(2),
             "running_turn should be set to turn 2 after sending second message"
         );
 
@@ -6449,7 +9689,7 @@ mod tests {
             thread.read_with(cx, |thread, _| thread.running_turn.as_ref().map(|t| t.id));
         assert_eq!(
             running_turn_after_first,
-            Some(TurnId::new(2)),
+            Some(2),
             "first turn completing should not clear running_turn (belongs to turn 2)"
         );
 
@@ -6465,7 +9705,105 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_send_assigns_message_id_without_truncate_support(cx: &mut TestAppContext) {
+    async fn test_stale_cancelled_response_does_not_cancel_current_compaction(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        let (first_complete_tx, first_complete_rx) = futures::channel::oneshot::channel::<()>();
+        let first_complete_rx = RefCell::new(Some(first_complete_rx));
+        let compaction_id = ContextCompactionId("test-compaction".into());
+
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let compaction_id = compaction_id.clone();
+            move |params, thread, mut cx| {
+                let first_complete_rx = first_complete_rx.borrow_mut().take();
+                let is_first = params.prompt.iter().any(|content| {
+                    matches!(content, acp::ContentBlock::Text(text) if text.text.contains("first"))
+                });
+                let compaction_id = compaction_id.clone();
+
+                async move {
+                    if is_first {
+                        if let Some(rx) = first_complete_rx {
+                            rx.await
+                                .expect("first completion sender should still be alive");
+                        }
+
+                        thread.update(&mut cx, |thread, cx| {
+                            thread.push_context_compaction(
+                                ContextCompaction {
+                                    id: compaction_id,
+                                    status: ContextCompactionStatus::InProgress,
+                                    summary: None,
+                                },
+                                cx,
+                            );
+                        })?;
+
+                        Ok(acp::PromptResponse::new(acp::StopReason::Cancelled))
+                    } else {
+                        Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+                    }
+                }
+                .boxed_local()
+            }
+        }));
+
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let first_request = thread.update(cx, |thread, cx| thread.send_raw("first", cx));
+        assert_eq!(thread.read_with(cx, |thread, _| thread.turn_id), 1);
+
+        let second_request = thread.update(cx, |thread, cx| thread.send_raw("second", cx));
+        assert_eq!(thread.read_with(cx, |thread, _| thread.turn_id), 2);
+
+        first_complete_tx
+            .send(())
+            .expect("first completion receiver should still be alive");
+
+        let response = first_request
+            .await
+            .expect("first request should complete")
+            .expect("first request should have response");
+        assert_eq!(response.stop_reason, acp::StopReason::Cancelled);
+
+        thread.read_with(cx, |thread, _| {
+            let compaction = thread
+                .entries
+                .iter()
+                .find_map(|entry| {
+                    let AgentThreadEntry::ContextCompaction(compaction) = entry else {
+                        return None;
+                    };
+                    (compaction.id == compaction_id).then_some(compaction)
+                })
+                .expect("compaction entry should exist");
+
+            assert_eq!(
+                compaction.status,
+                ContextCompactionStatus::InProgress,
+                "a stale cancelled response from an older turn should not cancel current compaction"
+            );
+        });
+
+        second_request
+            .await
+            .expect("second request should complete");
+    }
+
+    #[gpui::test]
+    async fn test_send_omits_message_id_without_client_user_message_id_support(
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
 
         let fs = FakeFs::new(cx.executor());
@@ -6488,10 +9826,9 @@ mod tests {
             let AgentThreadEntry::UserMessage(message) = &thread.entries[0] else {
                 panic!("expected first entry to be a user message")
             };
-            assert!(
-                message.id.is_some(),
-                "user message should always have an id"
-            );
+            assert_eq!(message.protocol_id, None);
+            assert_eq!(message.client_id, None);
+            assert!(message.is_optimistic);
         });
     }
 
@@ -6742,6 +10079,71 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_context_compaction_preserves_token_usage(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UsageUpdate(
+                        acp::UsageUpdate::new(5000, 10000).cost(acp::Cost::new(0.42, "USD")),
+                    ),
+                    cx,
+                )
+                .unwrap();
+
+            thread.push_context_compaction(
+                ContextCompaction {
+                    id: ContextCompactionId("compaction-1".into()),
+                    status: ContextCompactionStatus::InProgress,
+                    summary: None,
+                },
+                cx,
+            );
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let usage = thread
+                .token_usage()
+                .expect("context compaction should not clear token usage on its own");
+            assert_eq!(usage.used_tokens, 5000);
+            assert_eq!(usage.max_tokens, 10000);
+
+            let cost = thread
+                .cost()
+                .expect("context compaction should not clear cost on its own");
+            assert!((cost.amount - 0.42).abs() < f64::EPSILON);
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(1000, 10000)),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let usage = thread
+                .token_usage()
+                .expect("token_usage should be restored by the next usage update");
+            assert_eq!(usage.used_tokens, 1000);
+            assert_eq!(usage.max_tokens, 10000);
+        });
+    }
+
+    #[gpui::test]
     async fn test_usage_update_without_cost_preserves_existing_cost(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -6930,812 +10332,6 @@ mod tests {
             thread.read_with(cx, |t, _| t.status()),
             ThreadStatus::Idle,
             "running_turn must be cleared even when tx was dropped without send"
-        );
-    }
-
-    // TDD for background task activity bar: describes the desired collapsed-by-default low-overhead
-    // monitor identification (before heavy UI impl in ThreadView).
-    // Monitors (e.g. Grok `monitor` tool) must be detected via is_monitor()
-    // so activity bar can gate expensive rendering behind disclosure expand.
-    #[test]
-    fn test_monitor_tool_name_and_is_monitor_semantics() {
-        assert_eq!(MONITOR_TOOL_NAME, "monitor");
-        // tool_name_from_meta + equality is the detection mechanism used by
-        // ThreadView's filter + has_background_tasks check (O(n) skeleton).
-        let meta = meta_with_tool_name(MONITOR_TOOL_NAME);
-        let extracted = tool_name_from_meta(&Some(meta));
-        assert_eq!(extracted.as_deref(), Some("monitor"));
-        // Future: when ToolCall can be built in test, assert tc.is_monitor()
-    }
-
-    #[test]
-    fn test_approval_risk_classification_for_grok_native_tool_names() {
-        let monitor_risk = approval_risk_for_tool_call(
-            Some(&SharedString::from("monitor")),
-            acp::ToolKind::Execute,
-        );
-        assert_eq!(monitor_risk, ApprovalRisk::PotentiallyDestructive);
-        assert_eq!(monitor_risk.label(), "Destructive");
-        let todo_write_risk = approval_risk_for_tool_call(
-            Some(&SharedString::from("todo_write")),
-            acp::ToolKind::Think,
-        );
-        assert_eq!(todo_write_risk, ApprovalRisk::PotentiallyDestructive);
-        let enter_plan_mode_risk = approval_risk_for_tool_call(
-            Some(&SharedString::from("enter_plan_mode")),
-            acp::ToolKind::Think,
-        );
-        assert_eq!(enter_plan_mode_risk, ApprovalRisk::PotentiallyDestructive);
-        let read_fallback = approval_risk_for_tool_call(
-            Some(&SharedString::from("unknown_grok_tool")),
-            acp::ToolKind::Read,
-        );
-        assert_eq!(read_fallback, ApprovalRisk::ReadOnly);
-    }
-
-    #[test]
-    fn test_agent_persona_and_capability_mode_propagation_roundtrip() {
-        let persona = AgentPersona::from_name("implementer");
-        let capability = AgentCapabilityMode::from_name("read-only");
-        let session_info = SubagentSessionInfo {
-            session_id: acp::SessionId::new("sess-42"),
-            message_start_index: 5,
-            message_end_index: Some(12),
-            persona: Some(persona),
-            capability_mode: Some(capability),
-        };
-        let serialized =
-            serde_json::to_value(&session_info).expect("serialization for propagation test");
-        assert_eq!(serialized["persona"], "implementer");
-        assert_eq!(serialized["capability_mode"], "read_only");
-        let deserialized: SubagentSessionInfo =
-            serde_json::from_value(serialized).expect("deser for propagation");
-        assert_eq!(deserialized.persona, Some(AgentPersona::Implementer));
-        assert!(
-            deserialized
-                .capability_mode
-                .expect("mode present after roundtrip")
-                .is_read_only()
-        );
-    }
-
-    #[test]
-    fn test_approval_risk_classification_on_grok_plan_tools() {
-        let todo_risk = approval_risk_for_tool_call(
-            Some(&SharedString::from("todo_write")),
-            acp::ToolKind::Think,
-        );
-        assert_eq!(todo_risk, ApprovalRisk::PotentiallyDestructive);
-        let monitor_risk = approval_risk_for_tool_call(
-            Some(&SharedString::from("monitor")),
-            acp::ToolKind::Execute,
-        );
-        assert_eq!(monitor_risk, ApprovalRisk::PotentiallyDestructive);
-        let enter_risk = approval_risk_for_tool_call(
-            Some(&SharedString::from("enter_plan_mode")),
-            acp::ToolKind::Think,
-        );
-        assert_eq!(enter_risk, ApprovalRisk::PotentiallyDestructive);
-    }
-
-    #[test]
-    fn test_plan_phase_explicit_states_and_transitions() {
-        let mut p: Plan = Plan::default();
-        assert_eq!(p.phase, PlanPhase::None);
-        assert!(!p.is_proposed());
-
-        p.phase.set_to_proposed();
-        assert!(p.is_proposed());
-
-        p.phase.approve();
-        assert!(!p.is_proposed());
-
-        p.phase.reset();
-        assert!(!p.is_proposed());
-
-        let turn_id: TurnId = TurnId::new(17);
-        assert_eq!(format!("{}", turn_id), "T-17");
-    }
-
-    // Tests for strict Grok output formatting enforcement.
-    // Every Grok response (ACP or native is_grok_build_profile) must use only
-    // A. 1. 2. B. 3. style so items are referenceable (A1, B3, ...) alongside T-<n>-task-<id>.
-    // These tests cover all violation classes the validator and kickback are
-    // responsible for detecting and forcing revision on.
-
-    #[test]
-    fn test_validate_grok_output_formatting_accepts_clean_a_b_numbered() {
-        let clean = indoc! {"
-            A. First major section
-            1. Sub-item one
-            2. Sub-item two
-            B. Second major section
-            1. Another item
-            C. Third
-        "};
-        assert!(AcpThread::validate_grok_output_formatting(clean).is_ok());
-    }
-
-    #[test]
-    fn test_validate_grok_output_formatting_rejects_any_bullet_or_dash_list() {
-        for bad_line in [
-            "- bullet",
-            "* star",
-            "• bullet",
-            "– en-dash list",
-            "— em-dash list",
-        ] {
-            let text = format!("A. Good header\n1. ok\n{}", bad_line);
-            let res = AcpThread::validate_grok_output_formatting(&text);
-            assert!(res.is_err(), "should reject: {}", bad_line);
-            assert!(
-                res.unwrap_err()
-                    .iter()
-                    .any(|v| v.contains("bullet or dash"))
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_grok_output_formatting_rejects_smart_quotes_and_dashes() {
-        let smart = "A. “curly quotes” are bad";
-        assert!(AcpThread::validate_grok_output_formatting(smart).is_err());
-
-        let em = "A. real — dash here";
-        assert!(AcpThread::validate_grok_output_formatting(em).is_err());
-
-        let en = "A. real – dash here";
-        assert!(AcpThread::validate_grok_output_formatting(en).is_err());
-    }
-
-    #[test]
-    fn test_validate_grok_output_formatting_rejects_numbered_lists_without_alpha_header() {
-        let no_header = "1. First\n2. Second\n3. Third";
-        let res = AcpThread::validate_grok_output_formatting(no_header);
-        assert!(res.is_err());
-        assert!(
-            res.unwrap_err()
-                .iter()
-                .any(|v| v.contains("alphabetical section header"))
-        );
-
-        // Even with some text, if no A. / B. style header precedes numbered items
-        let almost = "Some intro text\n1. bad\n2. still bad";
-        assert!(AcpThread::validate_grok_output_formatting(almost).is_err());
-    }
-
-    #[test]
-    fn test_validate_grok_output_formatting_accepts_bold_alpha_headers() {
-        let bold = "**A.** Bold header\n1. item\n**B.** Next\n1. ok";
-        assert!(AcpThread::validate_grok_output_formatting(bold).is_ok());
-    }
-
-    // Tests for the autonomous work discipline rules.
-    // The living plan must drive continued work; the agent is not allowed to conclude
-    // while pending items remain.
-
-    #[gpui::test]
-    fn test_plan_has_pending_work_detects_incomplete_entries(cx: &mut gpui::TestAppContext) {
-        init_test(cx);
-        cx.update(|cx| {
-            let mut make_entry = |status: acp::PlanEntryStatus| PlanEntry {
-                id: "test-plan-slug".to_string(),
-                content: cx.new(|cx| Markdown::new("step".into(), None, None, cx)),
-                priority: acp::PlanEntryPriority::Medium,
-                status,
-            };
-
-            let empty = Plan {
-                entries: vec![],
-                phase: PlanPhase::None,
-            };
-            assert!(!empty.has_pending_work());
-
-            let p1 = Plan {
-                entries: vec![make_entry(acp::PlanEntryStatus::Pending)],
-                phase: PlanPhase::None,
-            };
-            assert!(p1.has_pending_work());
-
-            let p2 = Plan {
-                entries: vec![
-                    make_entry(acp::PlanEntryStatus::InProgress),
-                    make_entry(acp::PlanEntryStatus::Completed),
-                ],
-                phase: PlanPhase::None,
-            };
-            assert!(p2.has_pending_work());
-
-            let done = Plan {
-                entries: vec![make_entry(acp::PlanEntryStatus::Completed)],
-                phase: PlanPhase::None,
-            };
-            assert!(!done.has_pending_work());
-        });
-    }
-
-    #[gpui::test]
-    fn test_requires_explicit_completion_notification(cx: &mut gpui::TestAppContext) {
-        init_test(cx);
-        cx.update(|cx| {
-            let mut plan = Plan::default();
-            // Still has work -> never requires notification yet
-            plan.entries.push(PlanEntry {
-                id: "test-plan-slug".to_string(),
-                content: cx.new(|cx| Markdown::new("step".into(), None, None, cx)),
-                priority: acp::PlanEntryPriority::Medium,
-                status: acp::PlanEntryStatus::Pending,
-            });
-            assert!(!plan.requires_explicit_completion_notification("I am done now"));
-
-            // Plan just became empty, but text lacks the required phrase -> needs notification
-            plan.entries[0].status = acp::PlanEntryStatus::Completed;
-            assert!(plan.requires_explicit_completion_notification("All finished!"));
-
-            // Has the exact required phrasing -> does not require extra
-            assert!(!plan.requires_explicit_completion_notification(
-                "All current independent work is complete. No further autonomous actions are possible without additional direction."
-            ));
-        });
-    }
-
-    #[gpui::test]
-    fn test_autonomous_discipline_combined_violations(cx: &mut gpui::TestAppContext) {
-        init_test(cx);
-        cx.update(|cx| {
-            let mut plan = Plan::default();
-            plan.entries.push(PlanEntry {
-                id: "test-plan-slug".to_string(),
-                content: cx.new(|cx| Markdown::new("remaining step".into(), None, None, cx)),
-                priority: acp::PlanEntryPriority::Medium,
-                status: acp::PlanEntryStatus::Pending,
-            });
-
-            // Text that both stops while pending AND lacks the notification phrase
-            let bad_text = "I have no more work to do, everything is finished now.";
-            assert!(plan.would_violate_autonomous_discipline(bad_text));
-            // While work remains, this specific helper returns false (notification requirement
-            // only applies once the plan is actually empty). The text itself still lacks the
-            // required completion phrasing.
-            assert!(!plan.requires_explicit_completion_notification(bad_text));
-
-            // After marking complete, notification violation becomes active
-            plan.entries[0].status = acp::PlanEntryStatus::Completed;
-            assert!(!plan.would_violate_autonomous_discipline(bad_text));
-            assert!(plan.requires_explicit_completion_notification(bad_text));
-
-            // Good text with proper notification
-            let good_text = "All current independent work is complete. No further autonomous actions are possible without additional direction.";
-            assert!(!plan.requires_explicit_completion_notification(good_text));
-        });
-    }
-
-    #[gpui::test]
-    fn test_autonomous_discipline_phrase_coverage(cx: &mut gpui::TestAppContext) {
-        init_test(cx);
-        cx.update(|cx| {
-            let mut plan = Plan::default();
-            plan.entries.push(PlanEntry {
-                id: "test-plan-slug".to_string(),
-                content: cx.new(|cx| Markdown::new("task".into(), None, None, cx)),
-                priority: acp::PlanEntryPriority::Medium,
-                status: acp::PlanEntryStatus::Pending,
-            });
-
-            let stop_phrases = [
-                "no more work",
-                "all done",
-                "that's all",
-                "i'm finished",
-                "nothing left",
-                "i have completed everything",
-                "no further tasks",
-            ];
-
-            for phrase in stop_phrases {
-                let text = format!("I think {}", phrase);
-                assert!(
-                    plan.would_violate_autonomous_discipline(&text),
-                    "should detect stop phrase: {}",
-                    phrase
-                );
-            }
-
-            // Notification violation when plan is empty
-            plan.entries[0].status = acp::PlanEntryStatus::Completed;
-            let bad_notification = "Everything is wrapped up now.";
-            assert!(plan.requires_explicit_completion_notification(bad_notification));
-
-            let good_notification = "All current independent work is complete. No further autonomous actions are possible without additional direction.";
-            assert!(!plan.requires_explicit_completion_notification(good_notification));
-        });
-    }
-
-    #[gpui::test]
-    fn test_would_violate_autonomous_discipline_edge_cases(cx: &mut gpui::TestAppContext) {
-        init_test(cx);
-        cx.update(|cx| {
-            let mut plan = Plan::default();
-            plan.entries.push(PlanEntry {
-                id: "test-plan-slug".to_string(),
-                content: cx.new(|cx| Markdown::new("item".into(), None, None, cx)),
-                priority: acp::PlanEntryPriority::Medium,
-                status: acp::PlanEntryStatus::Pending,
-            });
-
-            // Should trigger on "I have no more work"
-            assert!(plan.would_violate_autonomous_discipline("I have no more work left on this."));
-
-            // Should trigger on "done for now" even if plan is pending
-            assert!(plan.would_violate_autonomous_discipline("This is done for now."));
-
-            // Should not trigger if the text is just describing work without claiming completion
-            assert!(!plan.would_violate_autonomous_discipline(
-                "I will continue working on the remaining items using the monitor tool."
-            ));
-
-            // When plan is empty, the stop-violation helper should return false even on bad phrasing
-            plan.entries[0].status = acp::PlanEntryStatus::Completed;
-            assert!(!plan.would_violate_autonomous_discipline("I have no more work."));
-        });
-    }
-
-    #[gpui::test]
-    async fn test_merge_review_file_prompt_skips_autonomous_discipline_kickback(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project,
-                    PathList::new(&[std::path::Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        thread.update(cx, |thread, cx| {
-            thread.plan.entries.clear();
-            let merge_review_prompt = "Summarize this file for merging upstream `origin/main` into the Surmount fork.\nFile: lib.rs\n";
-            thread.push_user_content_block(
-                None,
-                acp::ContentBlock::Text(acp::TextContent::new(merge_review_prompt)),
-                cx,
-            );
-            let summary_without_notification =
-                "Upstream tweaked the skill wording.\nSummary: Keep our fork additions.\n";
-            thread.push_assistant_content_block_with_indent(
-                acp::ContentBlock::Text(acp::TextContent::new(summary_without_notification)),
-                false,
-                false,
-                cx,
-            );
-        });
-        thread.read_with(cx, |thread, app| {
-            let correction_found = thread.entries.iter().any(|entry| {
-                if let AgentThreadEntry::UserMessage(user_message) = entry {
-                    user_message
-                        .content
-                        .to_markdown(app)
-                        .contains("Autonomous Work Discipline rules")
-                } else {
-                    false
-                }
-            });
-            assert!(
-                !correction_found,
-                "merge review file summaries must not trigger autonomous discipline kickback"
-            );
-            assert!(
-                thread.merge_review_file_turn_scoped_for_tests(),
-                "merge review file prompt must keep the turn scoped"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_merge_review_plan_prompt_skips_autonomous_discipline_kickback(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project,
-                    PathList::new(&[std::path::Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        thread.update(cx, |thread, cx| {
-            thread.plan.entries.clear();
-            let plan_prompt = "Merge review session for upstream `origin/main` into the Surmount fork.\n\
-                 202 files changed; propose review order by SURMOUNT section.\n";
-            thread.push_user_content_block(
-                None,
-                acp::ContentBlock::Text(acp::TextContent::new(plan_prompt)),
-                cx,
-            );
-            for chunk in ["A. Review ", "agent_ui ", "first.\n"] {
-                thread.push_assistant_content_block_with_indent(
-                    acp::ContentBlock::Text(acp::TextContent::new(chunk)),
-                    false,
-                    false,
-                    cx,
-                );
-            }
-        });
-        thread.read_with(cx, |thread, app| {
-            let correction_count = thread
-                .entries
-                .iter()
-                .filter(|entry| {
-                    if let AgentThreadEntry::UserMessage(user_message) = entry {
-                        user_message
-                            .content
-                            .to_markdown(app)
-                            .contains("Autonomous Work Discipline rules")
-                    } else {
-                        false
-                    }
-                })
-                .count();
-            assert_eq!(
-                correction_count, 0,
-                "merge review plan turn must not inject discipline kickback per chunk"
-            );
-            assert!(thread.merge_review_file_turn_scoped_for_tests());
-        });
-    }
-
-    #[gpui::test]
-    async fn test_merge_review_file_turn_stays_scoped_after_injected_kickback(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project,
-                    PathList::new(&[std::path::Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        thread.update(cx, |thread, cx| {
-            thread.push_user_content_block(
-                None,
-                acp::ContentBlock::Text(acp::TextContent::new(
-                    "Summarize this file for merging upstream `origin/main` into the Surmount fork.\nFile: lib.rs\n",
-                )),
-                cx,
-            );
-            thread.push_assistant_content_block_with_indent(
-                acp::ContentBlock::Text(acp::TextContent::new("Summary: keep ours.\n")),
-                false,
-                false,
-                cx,
-            );
-            thread.push_user_content_block(
-                None,
-                acp::ContentBlock::Text(acp::TextContent::new(
-                    "Your previous response violated the Autonomous Work Discipline rules:\n\nB. You concluded the turn...",
-                )),
-                cx,
-            );
-            assert!(
-                thread.merge_review_file_turn_scoped_for_tests(),
-                "injected kickback must not end merge review scoping"
-            );
-            thread.push_assistant_content_block_with_indent(
-                acp::ContentBlock::Text(acp::TextContent::new(
-                    "Summary: upstream doc tweak only.\n",
-                )),
-                false,
-                false,
-                cx,
-            );
-        });
-        thread.read_with(cx, |thread, app| {
-            let kickback_count = thread
-                .entries
-                .iter()
-                .filter(|entry| {
-                    matches!(entry, AgentThreadEntry::UserMessage(message)
-                        if AcpThread::user_message_plain_text(message)
-                            .contains("Autonomous Work Discipline rules"))
-                })
-                .count();
-            assert_eq!(
-                kickback_count, 1,
-                "simulated kickback must not multiply during merge review revisions"
-            );
-            assert!(
-                !thread.entries.iter().any(|entry| {
-                    matches!(entry, AgentThreadEntry::UserMessage(message) if {
-                        let text = AcpThread::user_message_plain_text(message);
-                        text.contains("Autonomous Work Discipline rules")
-                            && text.contains("Please revise your last response")
-                    })
-                }),
-                "second assistant revision must not inject another kickback (got {kickback_count})"
-            );
-            let _ = app;
-        });
-    }
-
-    #[gpui::test]
-    async fn test_merge_review_conflict_turn_stays_scoped_after_kickback(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project,
-                    PathList::new(&[std::path::Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        thread.update(cx, |thread, cx| {
-            thread.push_user_content_block(
-                None,
-                acp::ContentBlock::Text(acp::TextContent::new(
-                    "This file has an active merge conflict while merging upstream `origin/main` into the Surmount fork.\n\
-                     File: lib.rs\n\
-                     This is a scoped single-file turn — do not use todo_write or plan entries.\n",
-                )),
-                cx,
-            );
-            thread.push_assistant_content_block_with_indent(
-                acp::ContentBlock::Text(acp::TextContent::new(
-                    "Which side owns the zoom hook?\n",
-                )),
-                false,
-                false,
-                cx,
-            );
-            thread.push_user_content_block(
-                None,
-                acp::ContentBlock::Text(acp::TextContent::new(
-                    "Your response violated the Autonomous Work Discipline Rules.\n\
-                     Please revise your last response to comply with all three rules.",
-                )),
-                cx,
-            );
-            assert!(
-                thread.merge_review_file_turn_scoped_for_tests(),
-                "conflict workshop kickback must not end merge review scoping"
-            );
-        });
-    }
-
-    #[gpui::test]
-    async fn test_merge_review_file_turn_stays_scoped_after_capitalized_discipline_kickback(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project,
-                    PathList::new(&[std::path::Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        thread.update(cx, |thread, cx| {
-            thread.push_user_content_block(
-                None,
-                acp::ContentBlock::Text(acp::TextContent::new(
-                    "Summarize this file for merging upstream `origin/main` into the Surmount fork.\n\
-                     File: lib.rs\n\
-                     This is a scoped single-file turn — do not use todo_write or plan entries.\n",
-                )),
-                cx,
-            );
-            thread.push_assistant_content_block_with_indent(
-                acp::ContentBlock::Text(acp::TextContent::new("Summary: keep ours.\n")),
-                false,
-                false,
-                cx,
-            );
-            thread.push_user_content_block(
-                None,
-                acp::ContentBlock::Text(acp::TextContent::new(
-                    "Your response violated the Autonomous Work Discipline Rules:\n\n\
-                     B. You concluded the turn without the required explicit completion notification.\n\
-                     Please revise your last response to comply with all three rules.",
-                )),
-                cx,
-            );
-            assert!(
-                thread.merge_review_file_turn_scoped_for_tests(),
-                "capitalized discipline kickback must not end merge review scoping"
-            );
-            thread.push_assistant_content_block_with_indent(
-                acp::ContentBlock::Text(acp::TextContent::new(
-                    "Summary: upstream doc tweak only.\n",
-                )),
-                false,
-                false,
-                cx,
-            );
-        });
-        thread.read_with(cx, |thread, app| {
-            let kickback_count = thread
-                .entries
-                .iter()
-                .filter(|entry| {
-                    matches!(entry, AgentThreadEntry::UserMessage(message)
-                        if AcpThread::user_message_plain_text(message)
-                            .to_ascii_lowercase()
-                            .contains("autonomous work discipline rules"))
-                })
-                .count();
-            assert_eq!(
-                kickback_count, 1,
-                "capitalized kickback must not multiply during merge review revisions"
-            );
-            let _ = app;
-        });
-    }
-
-    #[gpui::test]
-    async fn test_grok_flagged_thread_open_plan_violating_done_text_injects_exact_correction_with_task_references(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-        let fs = FakeFs::new(cx.executor());
-        let project = Project::test(fs, [], cx).await;
-        let connection = Rc::new(FakeAgentConnection::new().with_agent_id("grok"));
-        let thread = cx
-            .update(|cx| {
-                connection.new_session(
-                    project,
-                    PathList::new(&[std::path::Path::new(path!("/test"))]),
-                    cx,
-                )
-            })
-            .await
-            .unwrap();
-        thread.update(cx, |thread, cx| {
-            thread.plan.entries.clear();
-            thread.plan.entries.push(PlanEntry {
-                id: "T-12-task-kickback-test".to_string(),
-                content: cx.new(|cx| {
-                    Markdown::new(
-                        "exercise the full E2E kickback injection path".into(),
-                        None,
-                        None,
-                        cx,
-                    )
-                }),
-                priority: acp::PlanEntryPriority::Medium,
-                status: acp::PlanEntryStatus::Pending,
-            });
-            thread.plan.phase = PlanPhase::Active;
-            let violating_text = "I'm done with everything now.";
-            let chunk = acp::ContentBlock::Text(acp::TextContent::new(violating_text));
-            thread.push_assistant_content_block_with_indent(chunk, false, false, cx);
-        });
-        thread.read_with(cx, |thread, app| {
-            let correction_found = thread.entries.iter().any(|entry| {
-                if let AgentThreadEntry::UserMessage(user_message) = entry {
-                    let markdown = user_message.content.to_markdown(app);
-                    markdown.contains("Autonomous Work Discipline rules")
-                        && markdown.contains("T-<n>-task-<id>")
-                        && markdown.contains("never stop while tasks remain")
-                } else {
-                    false
-                }
-            });
-            assert!(correction_found);
-        });
-    }
-
-    #[gpui::test]
-    fn test_plan_entry_identifier_resolution_via_from_acp_meta_path_and_content_fallback(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        init_test(cx);
-        cx.update(|cx| {
-            let meta_containing_identifier = Some(acp::Meta::from_iter([(
-                "id".into(),
-                "explicit-from-meta".into(),
-            )]));
-            let acp_plan_entry_containing_identifier = acp::PlanEntry::new(
-                "Login user with oauth provider",
-                acp::PlanEntryPriority::High,
-                acp::PlanEntryStatus::Pending,
-            )
-            .meta(meta_containing_identifier);
-            let resolved_entry_using_meta_identifier =
-                PlanEntry::from_acp(acp_plan_entry_containing_identifier, cx);
-            assert_eq!(
-                resolved_entry_using_meta_identifier.id,
-                "explicit-from-meta"
-            );
-
-            let meta_without_identifier = None::<acp::Meta>;
-            assert_eq!(plan_entry_id_from_meta(&meta_without_identifier), None);
-
-            let acp_plan_entry_for_fallback = acp::PlanEntry::new(
-                "Implement comprehensive error handling for all edge cases in parser",
-                acp::PlanEntryPriority::Medium,
-                acp::PlanEntryStatus::InProgress,
-            );
-            let resolved_entry_from_content_fallback =
-                PlanEntry::from_acp(acp_plan_entry_for_fallback, cx);
-            assert!(!resolved_entry_from_content_fallback.id.is_empty());
-            assert_ne!(
-                resolved_entry_using_meta_identifier.id,
-                resolved_entry_from_content_fallback.id
-            );
-        });
-    }
-
-    // native path performance validation sub-agent perf re-audit additions: TurnId and shared path validation for native vs ACP.
-    // TurnId is the canonical cross-turn reference (T-<n>) used in native profile prompt injection
-    // and E2E kickback. These tests + timing harness prove O(1) for the common substrate.
-    // All native paths (agent::Thread under is_grok_build_profile) and ACP paths share this without
-    // extra cost. External process still pays the full ACP wire + spawn on top.
-
-    #[test]
-    fn perf_validation_turnid_o1_properties_for_p4_native_and_acp() {
-        use std::time::Instant;
-        let start = Instant::now();
-        for i in 0..5000u32 {
-            let tid: TurnId = TurnId::new(i);
-            let _u: u32 = u32::from(tid);
-            let _d = format!("{}", tid); // "T-{}"
-            let ser = serde_json::to_string(&tid)
-                .expect("TurnId serde for native Grok TurnId refs in prompt and kickback");
-            let de: TurnId = serde_json::from_str(&ser)
-                .expect("roundtrip for E2E regression and the categorized todos surface");
-            assert_eq!(tid, de);
-            assert_eq!(u32::from(de), i);
-        }
-        let elapsed = start.elapsed();
-        // 5k full TurnId lifecycle < 100ms (loose bound for debug/profile variance) guards O(1) property for native Grok vs ACP
-        assert!(
-            elapsed < std::time::Duration::from_millis(100),
-            "TurnId must remain O(1) light for native Grok efficiency vs external ACP"
-        );
-        let _display_pin: TurnId = TurnId::new(1);
-    }
-
-    #[test]
-    fn perf_validation_acp_thread_turnid_in_grok_kickback_paths() {
-        // Exercises the paths used by both bridged ACP grok and native is_grok_build_profile for validation kickback.
-        // Confirms no hidden allocs or non-O(1) in the TurnId carrying types for native path performance validation re-audit.
-        let tid = TurnId::new(42);
-        assert_eq!(format!("{}", tid), "T-42");
-        // The autonomous discipline + formatting validators reference turns; cost is independent of external process.
-        assert!(
-            true,
-            "shared acp_thread substrate for native profile is efficient"
         );
     }
 }

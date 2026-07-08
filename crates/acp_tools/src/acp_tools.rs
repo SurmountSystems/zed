@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use agent_servers::{AcpDebugMessage, AcpDebugMessageContent, AcpDebugMessageDirection};
 use agent_ui::agent_connection_store::AgentConnectionStatus;
 use agent_ui::{Agent, AgentConnectionStore, AgentPanel};

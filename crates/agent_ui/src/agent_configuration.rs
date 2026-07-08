@@ -1,4 +1,3 @@
-mod add_llm_provider_modal;
 pub mod configure_context_server_modal;
 mod configure_context_server_tools_modal;
 mod manage_profiles_modal;
@@ -47,7 +46,6 @@ pub(crate) use manage_profiles_modal::ManageProfilesModal;
 
 use crate::{
     Agent,
-    agent_configuration::add_llm_provider_modal::{AddLlmProviderModal, LlmCompatibleProvider},
     agent_connection_store::{AgentConnectionStatus, AgentConnectionStore},
 };
 
@@ -66,6 +64,7 @@ pub struct AgentConfiguration {
     scroll_handle: ScrollHandle,
 }
 
+#[allow(dead_code)]
 impl AgentConfiguration {
     pub fn new(
         fs: Arc<dyn Fs>,
@@ -156,6 +155,7 @@ impl Focusable for AgentConfiguration {
 }
 
 pub enum AssistantConfigurationEvent {
+    #[allow(dead_code)]
     NewThread(Arc<dyn LanguageModelProvider>),
 }
 
@@ -430,52 +430,13 @@ impl AgentConfiguration {
     ) -> impl IntoElement {
         let providers = LanguageModelRegistry::read_global(cx).visible_providers();
 
-        let popover_menu = PopoverMenu::new("add-provider-popover")
-            .trigger(
-                Button::new("add-provider", "Add Provider")
-                    .style(ButtonStyle::Outlined)
-                    .start_icon(
-                        Icon::new(IconName::Plus)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .label_size(LabelSize::Small),
-            )
-            .menu({
-                let workspace = self.workspace.clone();
-                move |window, cx| {
-                    Some(ContextMenu::build(window, cx, |menu, _window, _cx| {
-                        menu.header("Compatible APIs").entry("OpenAI", None, {
-                            let workspace = workspace.clone();
-                            move |window, cx| {
-                                workspace
-                                    .update(cx, |workspace, cx| {
-                                        AddLlmProviderModal::toggle(
-                                            LlmCompatibleProvider::OpenAi,
-                                            workspace,
-                                            window,
-                                            cx,
-                                        );
-                                    })
-                                    .log_err();
-                            }
-                        })
-                    }))
-                }
-            })
-            .anchor(gpui::Anchor::TopRight)
-            .offset(gpui::Point {
-                x: px(0.0),
-                y: px(2.0),
-            });
-
         v_flex()
             .min_w_0()
             .w_full()
             .child(self.render_section_title(
                 "LLM Providers",
                 "Add at least one provider to use AI-powered features with Zed's native agent.",
-                popover_menu.into_any_element(),
+                gpui::Empty.into_any_element(),
             ))
             .child(
                 div()
@@ -512,6 +473,7 @@ impl AgentConfiguration {
                 Plan::ZedPro => ("Pro", Color::Accent, pro_chip_bg),
                 Plan::ZedBusiness => ("Business", Color::Accent, pro_chip_bg),
                 Plan::ZedStudent => ("Student", Color::Accent, pro_chip_bg),
+                Plan::ZedVip => ("VIP", Color::Accent, pro_chip_bg),
             };
 
             Chip::new(plan_name.to_string())
@@ -1455,8 +1417,6 @@ async fn open_new_agent_servers_entry_in_settings_editor(
                                 args: vec![],
                                 env: HashMap::default(),
                                 default_mode: None,
-                                default_model: None,
-                                favorite_models: vec![],
                                 default_config_options: Default::default(),
                                 favorite_config_option_values: Default::default(),
                             },

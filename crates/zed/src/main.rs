@@ -14,8 +14,6 @@ const _: () = assert!(
      Forks: update APP_NAME in crates/paths/src/paths.rs when renaming the binary.",
 );
 
-use agent::{SharedThread, ThreadStore};
-use agent_client_protocol::schema as acp;
 use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -32,8 +30,7 @@ use futures::{StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
-    App, AppContext, Application, AsyncApp, Focusable as _, QuitMode, Task, TaskExt,
-    UpdateGlobal as _, block_on,
+    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
 };
 use gpui_platform;
 
@@ -49,7 +46,6 @@ use assets::Assets;
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
 use project::{project_settings::ProjectSettings, trusted_worktrees};
-use proto;
 use recent_projects::{RemoteSettings, open_remote_project};
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
@@ -67,11 +63,13 @@ use std::{
 };
 use theme::{ActiveTheme, GlobalTheme, ThemeRegistry};
 use theme_settings::load_user_theme;
-use util::{ResultExt, TryFutureExt, maybe};
+use util::{ResultExt, maybe};
 use uuid::Uuid;
 use workspace::{
     AppState, MultiWorkspace, SerializedWorkspaceLocation, SessionWorkspace, Toast,
-    WorkspaceSettings, WorkspaceStore, notifications::NotificationId, restore_multiworkspace,
+    WorkspaceSettings, WorkspaceStore,
+    notifications::{NotificationId, NotifyResultExt},
+    restore_multiworkspace,
 };
 use zed::{
     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
@@ -86,7 +84,12 @@ use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn build_application() -> Application {
-    let platform = gpui_platform::current_platform(false);
+    #[cfg(feature = "agent-stdio")]
+    let headless = zed::agent_stdio::is_active();
+    #[cfg(not(feature = "agent-stdio"))]
+    let headless = false;
+
+    let platform = gpui_platform::current_platform(headless);
     if std::env::var("ZED_EXPERIMENTAL_A11Y").as_deref() == Ok("1") {
         Application::with_platform(platform)
     } else {
@@ -202,6 +205,12 @@ static STARTUP_TIME: OnceLock<Instant> = OnceLock::new();
 fn main() {
     STARTUP_TIME.get_or_init(|| Instant::now());
 
+    // If this process was re-executed as a Linux sandbox helper, run that mode
+    // without returning. Must run before argument parsing: the wrapped command's
+    // args are appended verbatim and would otherwise be misinterpreted as Zed's
+    // own arguments.
+    sandbox::run_sandbox_launcher_if_invoked();
+
     #[cfg(unix)]
     util::prevent_root_execution();
 
@@ -264,6 +273,19 @@ fn main() {
         return;
     }
 
+    #[cfg(feature = "agent-stdio")]
+    let agent_stdio_mode =
+        args.agent_stdio || std::env::var(zed::agent_stdio::ENV_VAR).ok().as_deref() == Some("1");
+    #[cfg(feature = "agent-stdio")]
+    let agent_stdio_user_data_dir = if agent_stdio_mode {
+        Some(
+            zed::agent_stdio::prepare_environment(args.user_data_dir.as_deref())
+                .expect("failed to prepare agent-stdio environment"),
+        )
+    } else {
+        None
+    };
+
     // Set custom data directory.
     if let Some(dir) = &args.user_data_dir {
         paths::set_custom_data_dir(dir);
@@ -288,6 +310,20 @@ fn main() {
 
     zlog::init();
 
+    #[cfg(feature = "agent-stdio")]
+    if agent_stdio_mode {
+        zlog::init_output_stderr();
+    } else if stdout_is_a_pty() {
+        zlog::init_output_stdout();
+    } else {
+        let result = zlog::init_output_file(paths::log_file(), Some(paths::old_log_file()));
+        if let Err(err) = result {
+            eprintln!("Could not open log file: {}... Defaulting to stdout", err);
+            zlog::init_output_stdout();
+        };
+    }
+
+    #[cfg(not(feature = "agent-stdio"))]
     if stdout_is_a_pty() {
         zlog::init_output_stdout();
     } else {
@@ -352,7 +388,11 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
+    #[cfg(not(feature = "agent-stdio"))]
+    let agent_stdio_mode = false;
+
+    let failed_single_instance_check = if agent_stdio_mode
+        || *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
     {
         false
@@ -767,7 +807,6 @@ fn main() {
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         collab_ui::init(&app_state, cx);
         git_ui::init(cx);
-        git_graph::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
         csv_preview::init(cx);
@@ -981,6 +1020,14 @@ fn main() {
             }
         })
         .detach();
+
+        #[cfg(feature = "agent-stdio")]
+        if agent_stdio_mode {
+            if let Some(user_data_dir) = agent_stdio_user_data_dir.as_ref() {
+                zed::agent_stdio::emit_ready(user_data_dir);
+            }
+            zed::agent_stdio::start(cx);
+        }
     });
 }
 
@@ -1053,124 +1100,17 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                 })
                 .detach_and_log_err(cx);
             }
-            OpenRequestKind::SharedAgentThread { session_id } => {
-                cx.spawn(async move |cx| {
-                    let multi_workspace =
-                        workspace::get_any_active_multi_workspace(app_state.clone(), cx.clone())
-                            .await?;
-
-                    let workspace =
-                        multi_workspace.read_with(cx, |mw, _| mw.workspace().clone())?;
-
-                    let import_state = multi_workspace.update(cx, |_, window, cx| {
-                        workspace.update(cx, |workspace, cx| {
-                            if workspace.root_paths(cx).is_empty() {
-                                workspace.focus_panel::<AgentPanel>(window, cx);
-
-                                struct OpenProjectForSharedThreadToast;
-                                workspace.show_toast(
-                                    Toast::new(
-                                        NotificationId::unique::<OpenProjectForSharedThreadToast>(),
-                                        "Open a project to import shared threads",
-                                    )
-                                    .autohide(),
-                                    cx,
-                                );
-
-                                return anyhow::Ok(None);
-                            }
-
-                            let client = workspace.project().read(cx).client();
-                            let thread_store: Option<gpui::Entity<ThreadStore>> = workspace
-                                .panel::<AgentPanel>(cx)
-                                .map(|panel| panel.read(cx).thread_store().clone());
-                            anyhow::Ok(Some((client, thread_store)))
-                        })
-                    })??;
-
-                    let Some((client, thread_store)) = import_state else {
-                        return Ok(());
-                    };
-
-                    let Some(thread_store): Option<gpui::Entity<ThreadStore>> = thread_store else {
-                        anyhow::bail!("Agent panel not available");
-                    };
-
-                    let response = client
-                        .request(proto::GetSharedAgentThread {
-                            session_id: session_id.clone(),
-                        })
-                        .await
-                        .context("Failed to fetch shared thread")?;
-
-                    let shared_thread = SharedThread::from_bytes(&response.thread_data)?;
-                    let db_thread = shared_thread.to_db_thread();
-                    let session_id = acp::SessionId::new(session_id);
-
-                    let save_session_id = session_id.clone();
-
-                    thread_store
-                        .update(&mut cx.clone(), |store, cx| {
-                            store.save_thread(
-                                save_session_id.clone(),
-                                db_thread,
-                                Default::default(),
-                                cx,
-                            )
-                        })
-                        .await?;
-
-                    let sharer_username = response.sharer_username.clone();
-
-                    multi_workspace.update(cx, |_, window, cx| {
-                        workspace.update(cx, |workspace, cx| {
-                            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                                panel.update(cx, |panel, cx| {
-                                    panel.open_thread(
-                                        session_id,
-                                        None,
-                                        Some(format!("🔗 {}", response.title).into()),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                                panel.focus_handle(cx).focus(window, cx);
-                            }
-
-                            struct ImportedThreadToast;
-                            workspace.show_toast(
-                                Toast::new(
-                                    NotificationId::unique::<ImportedThreadToast>(),
-                                    format!("Imported shared thread from {}", sharer_username),
-                                )
-                                .autohide(),
-                                cx,
-                            );
-                        });
-                    })?;
-
-                    anyhow::Ok(())
-                })
-                .detach_and_log_err(cx);
-            }
             OpenRequestKind::InstallSkill { content } => {
                 cx.spawn(async move |cx| {
                     let multi_workspace =
                         workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
 
-                    multi_workspace.update(cx, |multi_workspace, window, cx| {
-                        multi_workspace.workspace().update(cx, |workspace, cx| {
-                            if let Some(panel) = workspace.focus_panel::<AgentPanel>(window, cx) {
-                                panel.update(cx, |panel, cx| {
-                                    panel.install_shared_skill(content, cx);
-                                });
-                            } else {
-                                log::warn!(
-                                    "zed://skill received but the AgentPanel is not registered \
-                                     (is `disable_ai` enabled?)"
-                                );
-                            }
-                        });
+                    multi_workspace.update(cx, |_multi_workspace, _window, cx| {
+                        settings_ui::open_skill_creator(
+                            settings_ui::pages::SkillCreatorOpenMode::Install { content },
+                            Some(multi_workspace),
+                            cx,
+                        );
                     })
                 })
                 .detach_and_log_err(cx);
@@ -1248,7 +1188,10 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     workspace.update(cx, |_, window, cx| match setting_path {
                         None => window.dispatch_action(Box::new(zed_actions::OpenSettings), cx),
                         Some(setting_path) => window.dispatch_action(
-                            Box::new(zed_actions::OpenSettingsAt { path: setting_path }),
+                            Box::new(zed_actions::OpenSettingsAt {
+                                path: setting_path,
+                                target: None,
+                            }),
                             cx,
                         ),
                     })
@@ -1397,9 +1340,9 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     task.await?;
                 }
                 let client = app_state.client.clone();
-                // we continue even if authentication fails as join_channel/ open channel notes will
+                // we continue even if connection fails as join_channel/ open channel notes will
                 // show a visible error message.
-                authenticate(client, cx).await.log_err();
+                client.connect(true, cx).await.into_response().log_err();
 
                 if let Some(channel_id) = request.join_channel {
                     cx.update(|cx| {
@@ -1418,6 +1361,7 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                     workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
 
                 let workspace = workspace_window.read_with(cx, |mw, _| mw.workspace().clone())?;
+                let weak_workspace = workspace.downgrade();
 
                 let mut promises = Vec::new();
                 for (channel_id, heading) in request.open_channel_notes {
@@ -1429,10 +1373,11 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                             window,
                             cx,
                         )
-                        .log_err()
                     })?)
                 }
-                future::join_all(promises).await;
+                for result in future::join_all(promises).await {
+                    result.notify_workspace_async_err(weak_workspace.clone(), cx);
+                }
                 anyhow::Ok(())
             })
             .await;
@@ -1855,6 +1800,11 @@ struct Args {
 
     #[arg(long, hide = true)]
     dump_all_actions: bool,
+
+    /// Run Zed as an MCP-style stdio subagent (TOON protocol on stdin/stdout).
+    #[cfg(feature = "agent-stdio")]
+    #[arg(long, hide = true)]
+    agent_stdio: bool,
 
     /// Output current environment variables as JSON to stdout
     #[arg(long, hide = true)]

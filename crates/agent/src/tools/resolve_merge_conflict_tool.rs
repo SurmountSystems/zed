@@ -1,4 +1,4 @@
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
 use gpui::{App, Entity, SharedString, Task};
 use project::Project;

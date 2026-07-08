@@ -43,9 +43,13 @@ mod web_search_tool;
 mod write_file_tool;
 
 use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
+use feature_flags::{
+    CreateThreadToolFeatureFlag, FeatureFlagAppExt as _, LspToolFeatureFlag, RenameToolFeatureFlag,
+};
 use gpui::{App, Entity, SharedString, Task};
 use language_model::{LanguageModelRequestTool, LanguageModelToolSchemaFormat};
+use memory_palace::MemoryPalaceStore;
 use project::Project;
 use schemars::JsonSchema;
 use serde::{
@@ -236,21 +240,8 @@ impl AgentTool for MonitorTool {
             let input_val = input.recv().await.map_err(|e| e.to_string())?;
 
             let (working_dir, authorize) = cx.update(|cx| {
-                let working_dir = terminal_tool::working_dir(
-                    &TerminalToolInput {
-                        command: input_val.command.clone(),
-                        cd: input_val.cd.clone(),
-                        timeout_ms: input_val.timeout_ms,
-                        head_lines: None,
-                        tail_lines: None,
-                        allow_network: None,
-                        allow_fs_write: None,
-                        unsandboxed: None,
-                    },
-                    &project,
-                    cx,
-                )
-                .map_err(|err| err.to_string())?;
+                let working_dir = terminal_tool::working_dir(&input_val.cd, &project, cx)
+                    .map_err(|err| err.to_string())?;
 
                 let context =
                     crate::ToolPermissionContext::new(Self::NAME, vec![input_val.command.clone()]);
@@ -356,8 +347,8 @@ impl AgentTool for RememberTool {
                         .next()
                         .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
                         .ok_or_else(|| "no active worktree for memory_palace".to_string())?;
-                    let mut store = memory_palace::MemoryPalaceStore::open_for_cwd(&cwd)
-                        .map_err(|error| error.to_string())?;
+                    let mut store =
+                        MemoryPalaceStore::open_for_cwd(&cwd).map_err(|error| error.to_string())?;
                     if parsed.global {
                         store
                             .global
@@ -604,4 +595,20 @@ tools! {
     UpdateTitleTool,
     WebSearchTool,
     WriteFileTool,
+}
+
+/// Some built-in tools are gated behind a feature flag and only become usable
+/// once that flag is active. Tools without a flag are always available.
+pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
+    match tool_name {
+        RenameTool::NAME => cx.has_flag::<RenameToolFeatureFlag>(),
+        FindReferencesTool::NAME
+        | GetCodeActionsTool::NAME
+        | ApplyCodeActionTool::NAME
+        | GoToDefinitionTool::NAME => cx.has_flag::<LspToolFeatureFlag>(),
+        CreateThreadTool::NAME | ListAgentsAndModelsTool::NAME => {
+            cx.has_flag::<CreateThreadToolFeatureFlag>()
+        }
+        _ => true,
+    }
 }

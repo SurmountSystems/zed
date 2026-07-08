@@ -6,10 +6,8 @@ use acp_thread::{
     ToolCallContent, ToolCallStatus, UserMessageId,
 };
 use action_log::{ActionLog, ActionLogTelemetry, DiffStats};
-use agent::{
-    NativeAgentServer, NativeAgentSessionList, NoModelConfiguredError, SharedThread, ThreadStore,
-};
-use agent_client_protocol::schema as acp;
+use agent::{NativeAgentServer, NoModelConfiguredError, ThreadStore};
+use agent_client_protocol::schema::v1 as acp;
 #[cfg(test)]
 use agent_servers::AgentServerDelegate;
 use agent_servers::{AgentServer, GEMINI_TERMINAL_AUTH_METHOD_ID};
@@ -24,7 +22,7 @@ use editor::scroll::Autoscroll;
 use editor::{
     Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, SelectionEffects, SizingBehavior,
 };
-use feature_flags::{AgentSharingFeatureFlag, FeatureFlagAppExt as _};
+use feature_flags::FeatureFlagAppExt as _;
 use file_icons::FileIcons;
 use fs::Fs;
 use futures::FutureExt as _;
@@ -70,8 +68,7 @@ use util::{
     time::duration_alt_display,
 };
 use workspace::{
-    CollaboratorId, MultiWorkspace, NewTerminal, PathList, Toast, Workspace,
-    path_link::sanitize_path_text,
+    CollaboratorId, MultiWorkspace, NewTerminal, PathList, Workspace, path_link::sanitize_path_text,
 };
 use zed_actions::agent::{Chat, ToggleModelSelector};
 
@@ -106,7 +103,7 @@ const TOKEN_THRESHOLD: u64 = 250;
 
 pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
-mod thread_view;
+pub mod thread_view;
 pub use thread_view::{
     AcpThreadViewEvent, ThreadView, ZedTodos, ZedTodosComponent, ZedTodosDockPrototype,
     collect_background_monitor_tool_calls, collect_pending_approval_tool_calls,
@@ -130,6 +127,7 @@ enum ThreadFeedback {
 
 #[derive(Debug)]
 pub(crate) enum ThreadError {
+    #[allow(dead_code)]
     PaymentRequired,
     Refusal,
     AuthenticationRequired(SharedString),
@@ -170,8 +168,6 @@ impl From<anyhow::Error> for ThreadError {
             Self::MaxOutputTokens
         } else if error.is::<NoModelConfiguredError>() {
             Self::NoModelSelected
-        } else if error.is::<language_model::PaymentRequiredError>() {
-            Self::PaymentRequired
         } else if let Some(acp_error) = error.downcast_ref::<acp::Error>()
             && acp_error.code == acp::ErrorCode::AuthRequired
         {
@@ -303,7 +299,10 @@ impl Conversation {
                     | AcpThreadEvent::ModeUpdated(_)
                     | AcpThreadEvent::ConfigOptionsUpdated(_)
                     | AcpThreadEvent::WorkingDirectoriesUpdated
-                    | AcpThreadEvent::PromptUpdated => {}
+                    | AcpThreadEvent::PromptUpdated
+                    | AcpThreadEvent::StatusChanged
+                    | AcpThreadEvent::ElicitationRequested(_)
+                    | AcpThreadEvent::ElicitationResponded(_) => {}
                 }
             }
         });
@@ -463,6 +462,11 @@ pub(crate) struct RootThreadUpdated;
 
 impl EventEmitter<RootThreadUpdated> for ConversationView {}
 
+#[derive(Clone, Copy, Debug)]
+pub struct StateChange;
+
+impl EventEmitter<StateChange> for ConversationView {}
+
 fn resolve_outcome_from_selection(
     options: &PermissionOptions,
     selection: Option<&thread_view::PermissionSelection>,
@@ -522,7 +526,10 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ConfigOptionsUpdated(_)
         | AcpThreadEvent::SubagentSpawned(_)
         | AcpThreadEvent::SubagentUpdated(_)
-        | AcpThreadEvent::PromptUpdated => false,
+        | AcpThreadEvent::PromptUpdated
+        | AcpThreadEvent::StatusChanged
+        | AcpThreadEvent::ElicitationRequested(_)
+        | AcpThreadEvent::ElicitationResponded(_) => false,
     }
 }
 
@@ -531,6 +538,8 @@ pub enum AcpServerViewEvent {
 }
 
 impl EventEmitter<AcpServerViewEvent> for ConversationView {}
+
+pub use thread_view::open_markdown_in_workspace;
 
 pub struct ConversationView {
     agent: Rc<dyn AgentServer>,
@@ -929,6 +938,7 @@ impl ConversationView {
                         });
                     }
                 }
+                AgentConnectionEntryEvent::LoadingStatusChanged(_) => {}
             });
 
         let connect_result = connection_entry.read(cx).wait_for_connection();
@@ -1166,13 +1176,9 @@ impl ConversationView {
             // Fall back to legacy mode/model selectors
             config_options_view = None;
             model_selector = connection.model_selector(&session_id).map(|selector| {
-                let agent_server = self.agent.clone();
-                let fs = self.project.read(cx).fs().clone();
                 cx.new(|cx| {
                     ModelSelectorPopover::new(
                         selector,
-                        agent_server,
-                        fs,
                         PopoverMenuHandle::default(),
                         self.focus_handle(cx),
                         window,
@@ -2026,6 +2032,11 @@ impl ConversationView {
                 if !is_subagent && thread.read(cx).is_draft_thread() {
                     self.schedule_draft_prompt_persist(cx);
                 }
+                cx.notify();
+            }
+            AcpThreadEvent::StatusChanged
+            | AcpThreadEvent::ElicitationRequested(_)
+            | AcpThreadEvent::ElicitationResponded(_) => {
                 cx.notify();
             }
         }
@@ -4116,7 +4127,6 @@ pub(crate) mod tests {
 
         fn prompt(
             &self,
-            _id: acp_thread::UserMessageId,
             _params: acp::PromptRequest,
             _cx: &mut App,
         ) -> Task<gpui::Result<acp::PromptResponse>> {
@@ -5487,7 +5497,6 @@ pub(crate) mod tests {
         cx.new(|cx| {
             AcpThread::new(
                 None,
-                None,
                 Some(name.into()),
                 None,
                 connection,
@@ -5564,7 +5573,6 @@ pub(crate) mod tests {
 
         fn prompt(
             &self,
-            _id: acp_thread::UserMessageId,
             _params: acp::PromptRequest,
             _cx: &mut App,
         ) -> Task<gpui::Result<acp::PromptResponse>> {
@@ -5628,7 +5636,6 @@ pub(crate) mod tests {
                 AcpThread::new(
                     None,
                     None,
-                    None,
                     Some(work_dirs),
                     self,
                     project,
@@ -5673,7 +5680,6 @@ pub(crate) mod tests {
 
         fn prompt(
             &self,
-            _id: acp_thread::UserMessageId,
             _params: acp::PromptRequest,
             _cx: &mut App,
         ) -> Task<gpui::Result<acp::PromptResponse>> {
@@ -5713,7 +5719,6 @@ pub(crate) mod tests {
                 AcpThread::new(
                     None,
                     None,
-                    None,
                     Some(work_dirs),
                     self,
                     project,
@@ -5744,7 +5749,6 @@ pub(crate) mod tests {
 
         fn prompt(
             &self,
-            _id: acp_thread::UserMessageId,
             _params: acp::PromptRequest,
             _cx: &mut App,
         ) -> Task<gpui::Result<acp::PromptResponse>> {
@@ -5794,7 +5798,6 @@ pub(crate) mod tests {
                 AcpThread::new(
                     None,
                     None,
-                    None,
                     Some(work_dirs),
                     self.clone(),
                     project,
@@ -5830,7 +5833,6 @@ pub(crate) mod tests {
                 AcpThread::new(
                     None,
                     None,
-                    None,
                     Some(work_dirs),
                     self.clone(),
                     project,
@@ -5862,7 +5864,6 @@ pub(crate) mod tests {
 
         fn prompt(
             &self,
-            _id: acp_thread::UserMessageId,
             _params: acp::PromptRequest,
             _cx: &mut App,
         ) -> Task<gpui::Result<acp::PromptResponse>> {
@@ -6020,7 +6021,7 @@ pub(crate) mod tests {
             let AgentThreadEntry::UserMessage(user_message) = &thread.entries()[2] else {
                 panic!();
             };
-            user_message.id.clone().unwrap()
+            user_message.id().unwrap()
         });
 
         conversation_view.read_with(cx, |view, cx| {
@@ -8043,7 +8044,6 @@ pub(crate) mod tests {
                 parent_session_id,
                 None,
                 None,
-                None,
                 connection,
                 project,
                 action_log,
@@ -9063,7 +9063,6 @@ pub(crate) mod tests {
             let thread = cx.new(|cx| {
                 AcpThread::new(
                     None,
-                    None,
                     Some("CloseCapableConnection".into()),
                     Some(work_dirs),
                     self,
@@ -9109,7 +9108,6 @@ pub(crate) mod tests {
 
         fn prompt(
             &self,
-            _id: acp_thread::UserMessageId,
             _params: acp::PromptRequest,
             _cx: &mut App,
         ) -> Task<gpui::Result<acp::PromptResponse>> {

@@ -22,3 +22,20 @@ rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [env]
 MACOSX_DEPLOYMENT_TARGET = "10.15.7"
+
+# Menhera-cooldown pins (see root Cargo.toml): ~/.cargo redirects crates-io to menhera-cooldown
+# (sparse index …/10d/, 10-day crates.io lag). Upstream main merge (MERGE_HEAD) requires
+#   wgpu 29.0.4  (crates.io 2026-07-02) → menhera earliest 2026-07-12
+#   agent-client-protocol 1.0.1  (crates.io 2026-06-29) → menhera earliest 2026-07-09
+# We pin below those until menhera indexes the exact upstream versions:
+#   wgpu = "29.0.3"  (on menhera today; 29.0.4 not indexed yet as of 2026-07-07)
+#   agent-client-protocol = "=1.0.0"  (on menhera today; 1.0.1 not indexed yet)
+# Remove this block on or after 2026-07-12 (binding +10d from wgpu 29.0.4), then unpin to
+# upstream and verify:
+#   cargo info wgpu@29.0.4 --registry menhera-cooldown
+#   cargo info agent-client-protocol@1.0.1 --registry menhera-cooldown
+# No [source] override here — cargo cannot alias crates.io without a vendor tree.
+#
+# toon-format 0.5 (agent-stdio): not a menhera-lag issue — crates.io 2026-05-22, already on
+# menhera. Use `default-features = false` in crates/zed/Cargo.toml; default "cli" pulls
+# ratatui → unicode-width 0.2, which conflicts with workspace unicode-width 0.2 / merman-render.

@@ -2,9 +2,10 @@ use anyhow::{Context as _, Result};
 use const_format::{concatcp, formatcp};
 use fs::Fs;
 use futures::StreamExt;
-use gpui::{Global, SharedString};
+use gpui::{App, Global, SharedString};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use url::Url;
 use util::paths::component_matches_ignore_ascii_case;
@@ -90,6 +91,24 @@ pub const MAX_SKILL_DESCRIPTIONS_SIZE: usize = 50 * 1024;
 /// The name of the skill definition file
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SkillLoadWarning {
+    DescriptionTooLong { actual_len: usize, max_len: usize },
+}
+
+impl SkillLoadWarning {
+    pub fn message(&self) -> String {
+        match self {
+            Self::DescriptionTooLong {
+                actual_len,
+                max_len,
+            } => format!(
+                "Skill description is {actual_len} bytes, exceeding the {max_len}-byte limit. The skill was loaded, but long descriptions may consume more model-context tokens."
+            ),
+        }
+    }
+}
+
 /// Represents a loaded skill with all its metadata and content.
 #[derive(Debug, Clone)]
 pub struct Skill {
@@ -100,6 +119,8 @@ pub struct Skill {
     pub directory_path: PathBuf,
     /// Absolute path to the SKILL.md file
     pub skill_file_path: PathBuf,
+    /// Non-fatal issues found while loading this skill.
+    pub load_warnings: Vec<SkillLoadWarning>,
     /// When `true`, this skill is hidden from the model's catalog and the
     /// `skill` tool refuses to load it. The user can still invoke it as a
     /// slash command.
@@ -233,6 +254,11 @@ pub struct ProjectSkillGroup {
 
 impl Global for SkillIndex {}
 
+/// Rescan skill directories when skills are created or modified via UI.
+pub struct SkillsUpdatedHook(pub Rc<dyn Fn(&mut App)>);
+
+impl Global for SkillsUpdatedHook {}
+
 /// Just the frontmatter, used for parsing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillMetadata {
@@ -313,6 +339,7 @@ pub fn parse_skill_frontmatter(
         source,
         directory_path,
         skill_file_path: skill_file_path.to_path_buf(),
+        load_warnings: Vec::new(),
         disable_model_invocation: metadata.disable_model_invocation,
         embedded_body: None,
     })
@@ -721,6 +748,7 @@ fn parse_builtin_skill(name: &str, content: &'static str) -> Result<Skill> {
         source: SkillSource::BuiltIn,
         directory_path: synthetic_dir,
         skill_file_path: synthetic_path,
+        load_warnings: Vec::new(),
         disable_model_invocation: metadata.disable_model_invocation,
         embedded_body: Some(body.trim()),
     })
@@ -1831,6 +1859,7 @@ description: A skill with no body content
             source: SkillSource::Global,
             directory_path: PathBuf::from("/skills/test-skill"),
             skill_file_path: PathBuf::from("/skills/test-skill/SKILL.md"),
+            load_warnings: Vec::new(),
             disable_model_invocation: false,
             embedded_body: None,
         };

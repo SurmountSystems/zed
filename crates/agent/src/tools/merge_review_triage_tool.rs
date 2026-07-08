@@ -1,5 +1,5 @@
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
 use git::commit::parse_git_diff_name_status;
 use git::status::StatusCode;

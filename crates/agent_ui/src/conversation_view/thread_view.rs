@@ -4,7 +4,7 @@ use crate::{
     open_abs_path_at_point,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
-use agent_client_protocol::schema as acp;
+use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
 
 use acp_thread::{
@@ -12,13 +12,14 @@ use acp_thread::{
     SelectedPermissionOutcome, TokenUsage, ToolCall, ToolCallStatus, approval_risk_for_operation,
     approval_risk_for_tool_call,
 };
-use agent::{SkillLoadingError, SkillLoadingErrorsUpdated};
+use agent::{SkillLoadingIssue, SkillLoadingIssuesUpdated};
 use agent_settings::UserAgentsMd;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
 use feature_flags::AcpBetaFeatureFlag;
 use project::GrokMemoryArtifacts;
 
+use super::*;
 use crate::completion_provider::AvailableSkill;
 use crate::message_editor::SharedSessionCapabilities;
 use gpui::{InteractiveElement, List, MouseButton, TaskExt};
@@ -30,9 +31,6 @@ use language_model::{
 use settings::update_settings_file;
 use ui::{ButtonLike, Chip, SpinnerLabel, SpinnerVariant, SplitButton, SplitButtonStyle, Tab};
 use workspace::SERIALIZATION_THROTTLE_TIME;
-use workspace::notifications::NotificationId;
-
-use super::*;
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -1377,13 +1375,13 @@ pub struct ThreadView {
     /// are suppressed to avoid duplicate layout.
     pub embedded_in_zed_todos_dock: bool,
     pub generating_indicator_in_list: bool,
-    pub skill_loading_errors: Vec<SkillLoadingError>,
+    pub skill_loading_errors: Vec<SkillLoadingIssue>,
     /// Errors the user has explicitly dismissed. Each entry is matched against
     /// emitted errors by full equality; when an error no longer appears in the
     /// emitted list (i.e. the underlying file was fixed or removed), it's
     /// dropped from this set so a future regression of the same kind would
     /// re-show.
-    dismissed_skill_loading_errors: HashSet<SkillLoadingError>,
+    dismissed_skill_loading_errors: HashSet<SkillLoadingIssue>,
 }
 impl Focusable for ThreadView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -1423,6 +1421,55 @@ fn full_path_for_empty_project_path(file: &dyn language::File, cx: &App) -> Opti
 
     let full_path = file.full_path(cx).display().to_string();
     (!full_path.is_empty()).then_some(full_path)
+}
+
+pub fn open_markdown_in_workspace(
+    title: String,
+    markdown: String,
+    workspace: Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<()>> {
+    let markdown_language_task = workspace
+        .read(cx)
+        .app_state()
+        .languages
+        .language_for_name("Markdown");
+    let project = workspace.read(cx).project().clone();
+
+    window.spawn(cx, async move |cx| {
+        let markdown_language = markdown_language_task.await?;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.create_buffer(Some(markdown_language), false, cx)
+            })
+            .await?;
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_text(markdown, cx);
+            buffer.set_capability(language::Capability::ReadWrite, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(title.clone()));
+
+            workspace.add_item_to_active_pane(
+                Box::new(cx.new(|cx| {
+                    let mut editor =
+                        Editor::for_multibuffer(buffer, Some(project.clone()), window, cx);
+                    editor.set_breadcrumb_header(title);
+                    editor.disable_mouse_wheel_zoom();
+                    editor
+                })),
+                None,
+                true,
+                window,
+                cx,
+            );
+        })?;
+        anyhow::Ok(())
+    })
 }
 
 impl ThreadView {
@@ -1591,7 +1638,7 @@ impl ThreadView {
             let project_id = thread.read(cx).project().entity_id();
             subscriptions.push(cx.subscribe(
                 &native_connection.0,
-                move |this: &mut Self, _agent, event: &SkillLoadingErrorsUpdated, cx| {
+                move |this: &mut Self, _agent, event: &SkillLoadingIssuesUpdated, cx| {
                     if event.project_id != project_id {
                         return;
                     }
@@ -1599,11 +1646,11 @@ impl ThreadView {
                     // list — the underlying file must have been fixed or removed, so a
                     // future regression should re-show.
                     this.dismissed_skill_loading_errors
-                        .retain(|dismissed| event.errors.contains(dismissed));
+                        .retain(|dismissed| event.issues.contains(dismissed));
 
                     // Show only errors that haven't been dismissed.
                     this.skill_loading_errors = event
-                        .errors
+                        .issues
                         .iter()
                         .filter(|e| !this.dismissed_skill_loading_errors.contains(e))
                         .cloned()
@@ -2259,7 +2306,7 @@ impl ThreadView {
                 if let Some(AgentThreadEntry::UserMessage(user_message)) =
                     self.thread.read(cx).entries().get(event.entry_index)
                     && self.thread.read(cx).supports_truncate(cx)
-                    && user_message.id.is_some()
+                    && user_message.id().is_some()
                     && !self.is_subagent()
                 {
                     self.editing_message = Some(event.entry_index);
@@ -2270,7 +2317,7 @@ impl ThreadView {
                 if let Some(AgentThreadEntry::UserMessage(user_message)) =
                     self.thread.read(cx).entries().get(event.entry_index)
                     && self.thread.read(cx).supports_truncate(cx)
-                    && user_message.id.is_some()
+                    && user_message.id().is_some()
                     && !self.is_subagent()
                 {
                     if editor.read(cx).text(cx).as_str() == user_message.content.to_markdown(cx) {
@@ -2916,7 +2963,7 @@ impl ThreadView {
         let thread = self.thread.clone();
 
         let Some(user_message_id) = thread.update(cx, |thread, _| {
-            thread.entries().get(entry_ix)?.user_message()?.id.clone()
+            thread.entries().get(entry_ix)?.user_message()?.id()
         }) else {
             return;
         };
@@ -3534,122 +3581,18 @@ impl ThreadView {
 
     // thread stuff
 
-    fn share_thread(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some((thread, project)) = self.as_native_thread(cx).zip(self.project.upgrade()) else {
-            return;
-        };
-
-        let client = project.read(cx).client();
-        let workspace = self.workspace.clone();
-        let session_id = thread.read(cx).id().to_string();
-
-        let load_task = thread.read(cx).to_db(cx);
-
-        cx.spawn(async move |_this, cx| {
-            let db_thread = load_task.await;
-
-            let shared_thread = SharedThread::from_db_thread(&db_thread);
-            let thread_data = shared_thread.to_bytes()?;
-            let title = shared_thread.title.to_string();
-
-            client
-                .request(proto::ShareAgentThread {
-                    session_id: session_id.clone(),
-                    title,
-                    thread_data,
-                })
-                .await?;
-
-            let share_url = client::zed_urls::shared_agent_thread_url(&session_id);
-
-            cx.update(|cx| {
-                if let Some(workspace) = workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        struct ThreadSharedToast;
-                        workspace.show_toast(
-                            Toast::new(
-                                NotificationId::unique::<ThreadSharedToast>(),
-                                "Thread shared!",
-                            )
-                            .on_click(
-                                "Copy URL",
-                                move |_window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        share_url.clone(),
-                                    ));
-                                },
-                            ),
-                            cx,
-                        );
-                    });
-                }
-            });
-
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+    fn share_thread(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        // Thread sharing RPC is not available in this build.
     }
 
     pub fn sync_thread(
         &mut self,
-        project: Entity<Project>,
-        server_view: Entity<ConversationView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
+        _project: Entity<Project>,
+        _server_view: Entity<ConversationView>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) {
-        if !self.is_imported_thread(cx) {
-            return;
-        }
-
-        let Some(session_list) = self
-            .as_native_connection(cx)
-            .and_then(|connection| connection.session_list(cx))
-            .and_then(|list| list.downcast::<NativeAgentSessionList>())
-        else {
-            return;
-        };
-        let thread_store = session_list.thread_store().clone();
-
-        let client = project.read(cx).client();
-        let session_id = self.thread.read(cx).session_id().clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let response = client
-                .request(proto::GetSharedAgentThread {
-                    session_id: session_id.to_string(),
-                })
-                .await?;
-
-            let shared_thread = SharedThread::from_bytes(&response.thread_data)?;
-
-            let db_thread = shared_thread.to_db_thread();
-
-            thread_store
-                .update(&mut cx.clone(), |store, cx| {
-                    store.save_thread(session_id.clone(), db_thread, Default::default(), cx)
-                })
-                .await?;
-
-            server_view.update_in(cx, |server_view, window, cx| server_view.reset(window, cx))?;
-
-            this.update_in(cx, |this, _window, cx| {
-                if let Some(workspace) = this.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        struct ThreadSyncedToast;
-                        workspace.show_toast(
-                            Toast::new(
-                                NotificationId::unique::<ThreadSyncedToast>(),
-                                "Thread synced with latest version",
-                            )
-                            .autohide(),
-                            cx,
-                        );
-                    });
-                }
-            })?;
-
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+        // Thread sync RPC is not available in this build.
     }
 
     pub fn restore_checkpoint(&mut self, message_id: &UserMessageId, cx: &mut Context<Self>) {
@@ -7051,7 +6994,7 @@ impl ThreadView {
 
                 let is_subagent = self.is_subagent();
                 let can_rewind = self.thread.read(cx).supports_truncate(cx);
-                let is_editable = can_rewind && message.id.is_some() && !is_subagent;
+                let is_editable = can_rewind && message.id().is_some() && !is_subagent;
                 let agent_name = if is_subagent {
                     "subagents".into()
                 } else {
@@ -7072,7 +7015,7 @@ impl ThreadView {
                     .gap_1p5()
                     .w_full()
                     .when(is_editable && has_checkpoint_button, |this| {
-                        this.children(message.id.clone().map(|message_id| {
+                        this.children(message.id().map(|message_id| {
                             h_flex()
                                 .px_3()
                                 .gap_2()
@@ -7219,7 +7162,7 @@ impl ThreadView {
                     .gap_3()
                     .children(chunks.iter().enumerate().filter_map(
                         |(chunk_ix, chunk)| match chunk {
-                            AssistantMessageChunk::Message { block } => {
+                            AssistantMessageChunk::Message { block, .. } => {
                                 block.markdown().and_then(|md| {
                                     let this_is_blank = md.read(cx).source().trim().is_empty();
                                     is_blank = is_blank && this_is_blank;
@@ -7233,7 +7176,7 @@ impl ThreadView {
                                     )
                                 })
                             }
-                            AssistantMessageChunk::Thought { block } => {
+                            AssistantMessageChunk::Thought { block, .. } => {
                                 block.markdown().and_then(|md| {
                                     let this_is_blank = md.read(cx).source().trim().is_empty();
                                     is_blank = is_blank && this_is_blank;
@@ -7301,7 +7244,7 @@ impl ThreadView {
             AgentThreadEntry::CompletedPlan(entries) => {
                 self.render_completed_plan(entries, window, cx)
             }
-            AgentThreadEntry::ContextCompaction => h_flex()
+            AgentThreadEntry::ContextCompaction(_) => h_flex()
                 .id(("context_compaction", entry_ix))
                 .px_5()
                 .py_1()
@@ -7314,6 +7257,7 @@ impl ThreadView {
                 )
                 .child(Divider::horizontal())
                 .into_any(),
+            AgentThreadEntry::Elicitation(_) => Empty.into_any(),
         };
 
         let is_subagent_output = self.is_subagent()
@@ -7631,7 +7575,6 @@ impl ThreadView {
 
         if let Some(project) = self.project.upgrade()
             && let Some(server_view) = self.server_view.upgrade()
-            && cx.has_flag::<AgentSharingFeatureFlag>()
             && project.read(cx).client().status().borrow().is_connected()
         {
             let button = if self.is_imported_thread(cx) {
@@ -8256,8 +8199,12 @@ impl ThreadView {
                         .map(|chunks| {
                             chunks.iter().any(|chunk| {
                                 let md = match chunk {
-                                    AssistantMessageChunk::Message { block } => block.markdown(),
-                                    AssistantMessageChunk::Thought { block } => block.markdown(),
+                                    AssistantMessageChunk::Message { block, .. } => {
+                                        block.markdown()
+                                    }
+                                    AssistantMessageChunk::Thought { block, .. } => {
+                                        block.markdown()
+                                    }
                                 };
                                 md.map_or(false, |m| m.read(cx).selected_text().is_some())
                             })
@@ -8267,8 +8214,8 @@ impl ThreadView {
                     let context_menu_link = chunks.and_then(|chunks| {
                         chunks.iter().find_map(|chunk| {
                             let md = match chunk {
-                                AssistantMessageChunk::Message { block } => block.markdown(),
-                                AssistantMessageChunk::Thought { block } => block.markdown(),
+                                AssistantMessageChunk::Message { block, .. } => block.markdown(),
+                                AssistantMessageChunk::Thought { block, .. } => block.markdown(),
                             };
                             md.and_then(|m| m.read(cx).context_menu_link().cloned())
                         })
@@ -8374,7 +8321,7 @@ impl ThreadView {
                         .chunks
                         .iter()
                         .filter_map(|chunk| match chunk {
-                            AssistantMessageChunk::Message { block } => {
+                            AssistantMessageChunk::Message { block, .. } => {
                                 let markdown = block.to_markdown(cx);
                                 if markdown.trim().is_empty() {
                                     None
@@ -8424,7 +8371,8 @@ impl ThreadView {
                 AgentThreadEntry::ToolCall(_)
                 | AgentThreadEntry::AssistantMessage(_)
                 | AgentThreadEntry::CompletedPlan(_)
-                | AgentThreadEntry::ContextCompaction => {}
+                | AgentThreadEntry::ContextCompaction(_)
+                | AgentThreadEntry::Elicitation(_) => {}
             }
         }
 
@@ -11284,7 +11232,7 @@ impl ThreadView {
         let description = "This agent does not support viewing previous messages. However, your session will still continue from where you last left off.";
 
         Callout::new()
-            .border_position(ui::BorderPosition::Bottom)
+            .border_position(ui::CalloutBorderPosition::Bottom)
             .severity(Severity::Info)
             .icon(IconName::Info)
             .title("Resumed Session")
@@ -11448,7 +11396,7 @@ impl ThreadView {
                     "It currently only operates by default on \"{}\".",
                     active_dir
                 ))
-                .border_position(ui::BorderPosition::Bottom)
+                .border_position(ui::CalloutBorderPosition::Bottom)
                 .dismiss_action(
                     IconButton::new("dismiss-multi-root-callout", IconName::Close)
                         .icon_size(IconSize::Small)
@@ -12039,6 +11987,7 @@ pub(crate) fn open_link(
                     )
                     .detach_and_log_err(cx);
             }
+            MentionUri::Rule { .. } => {}
         })
     } else {
         cx.open_url(&url);

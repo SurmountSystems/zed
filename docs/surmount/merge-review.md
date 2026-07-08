@@ -1,5 +1,7 @@
 # Upstream merge review
 
+> **Status (2026-07-08):** Branch Diff workflow, heed3 session persistence (queue cursor, branch-diff selection, git SHA sync, UI state), and toast placement are implemented in `agent_ui` but **not fully dogfooded**. Treat merge-review UX and persistence as **unfinished** until a clean `cargo build --release -p zed` and an end-to-end merge session pass. `agent_ui` still has widespread upstream-merge compile damage (~200 errors: removed `AgentConfiguration`, ACP schema paths, queue/sandbox types); `git_ui` and `settings_ui` compile fixes landed separately.
+
 How we merge `origin/main` into `surmount`: understand each change in context, build up an explanation as we go, and only bother a human when the machine is genuinely stuck.
 
 ## The problem
@@ -181,8 +183,8 @@ If prose is drafted but a doc gap remains, a `TODO:` in that paragraph is fine �
 | All complete | **Draft commit message** + **End merge review** (red) | commit message modal |
 
 - **Start:** palette **Start Merge Review** or Branch Diff **Merge review** (accent; hidden while a session is already active).
-- **Summary toast:** `Saved path (N/M).` with embedded click action (**Review Diff**, **Next file →**, conflict button, or **End**).
-- **Per file:** **Review Diff** → agent ends with `Summary: …` + `Outcome: …` → session updates; toast offers the next primary action.
+- **Summary toast:** `File N/M · path summarized.` — brief confirmation, auto-dismisses; use the green workflow rail for the next action.
+- **Per file:** **Review Diff** → agent ends with `Summary: …` + `Outcome: …` → session updates; rail shows the next primary action.
 
 ## Build order
 
