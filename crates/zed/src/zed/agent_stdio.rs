@@ -308,19 +308,27 @@ fn handle_request(request: AgentRequest, cx: &mut App) -> Result<()> {
 fn capture_snapshot(cx: &mut App) -> String {
     let mut outline = String::new();
 
+    // Prefer active window, then others. Headless often has no active_window.
+    let mut handles = Vec::new();
     if let Some(active) = cx.active_window() {
-        let _ = cx.update_window(active, |_, window, _| {
-            outline = window.a11y_interactive_outline();
-        });
+        handles.push(active);
+    }
+    for window in cx.windows() {
+        if !handles.contains(&window) {
+            handles.push(window);
+        }
     }
 
-    if outline.is_empty() {
-        for window in cx.windows() {
-            let _ = cx.update_window(window, |_, window, _| {
-                if outline.is_empty() {
-                    outline = window.a11y_interactive_outline();
-                }
-            });
+    for handle in handles {
+        let _ = cx.update_window(handle, |_, window, cx| {
+            // Always paint before reading outline. Headless has no compositor
+            // frame loop; reusing a non-empty last outline after wait/action
+            // would return stale UI.
+            window.draw(cx).clear();
+            outline = window.a11y_interactive_outline();
+        });
+        if !outline.is_empty() {
+            break;
         }
     }
 

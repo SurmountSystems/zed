@@ -5512,10 +5512,18 @@ impl Window {
         self.a11y.is_active()
     }
 
-    /// Returns a compact text outline of interactive accessibility nodes in the current frame.
+    /// Returns a compact text outline of interactive accessibility nodes.
+    ///
+    /// Mid-frame: builds from the in-progress tree. After paint: returns the
+    /// outline retained at the last successful `finalize` (empty if a11y was
+    /// never active or was deactivated).
     pub fn a11y_interactive_outline(&self) -> String {
-        let nodes = self.a11y.nodes.collect_snapshot_nodes();
-        a11y::interactive_a11y_outline(&nodes)
+        if self.a11y.nodes.has_in_progress_frame() {
+            let nodes = self.a11y.nodes.collect_snapshot_nodes();
+            a11y::interactive_a11y_outline(&nodes)
+        } else {
+            self.a11y.nodes.last_interactive_outline().to_string()
+        }
     }
 
     /// Register a listener for an accessibility action on a specific node.

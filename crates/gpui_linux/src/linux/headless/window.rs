@@ -215,6 +215,13 @@ impl PlatformWindow for HeadlessWindow {
 
     fn draw(&self, _scene: &Scene) {}
 
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        // Headless has no AT-SPI / AccessKit adapter to activate when a screen
+        // reader connects. Invoke activation immediately so GPUI builds
+        // interactive trees for agent-stdio `method:snapshot`.
+        let _ = (callbacks.activation)();
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         Arc::new(HeadlessAtlas::default())
     }

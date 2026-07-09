@@ -3,40 +3,67 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acp_thread::{
-    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, ContentBlock,
-    ToolCallContent,
+    AcpThread, AcpThreadEvent, AgentThreadEntry, AssistantMessageChunk, ContentBlock, ToolCall,
+    ToolCallContent, ToolCallStatus,
 };
-use collections::HashMap;
+use agent_client_protocol::schema::v1 as acp;
+use agent_settings::AgentSettings;
+use collections::{HashMap, HashSet};
 use editor::{
     Editor, EditorElement, EditorEvent, EditorStyle, HighlightKey, SelectionEffects,
     scroll::Autoscroll,
 };
 use gpui::{
     Action, Entity, EntityId, EventEmitter, FocusHandle, Focusable, KeyContext, Subscription, Task,
-    TextStyle, WeakEntity, actions, prelude::*,
+    TextStyle, WeakEntity, prelude::*,
 };
 use markdown::Markdown;
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot};
 use project::search::SearchQuery;
 use search::{SearchOption, SearchOptions, SearchSource};
-use settings::Settings as _;
+use settings::{Settings as _, ThinkingBlockDisplay};
 use theme_settings::ThemeSettings;
 use ui::{IconButtonShape, Tooltip, prelude::*};
 use util::paths::PathMatcher;
 
 use crate::entry_view_state::EntryViewState;
+use crate::{DismissThreadSearch, SelectNextThreadMatch, SelectPreviousThreadMatch};
 
-actions!(
-    agent,
-    [
-        /// Closes the thread search bar.
-        DismissThreadSearch,
-        /// Selects the next thread search match.
-        SelectNextThreadMatch,
-        /// Selects the previous thread search match.
-        SelectPreviousThreadMatch,
-    ]
-);
+/// Live expansion snapshot from `ThreadView` so search only hits visible content.
+#[derive(Clone, Default)]
+pub(super) struct ThreadSearchExpansion {
+    pub expanded_tool_calls: HashSet<acp::ToolCallId>,
+    pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
+    pub expanded_thinking_blocks: HashSet<(usize, usize)>,
+    pub user_toggled_thinking_blocks: HashSet<(usize, usize)>,
+}
+
+impl ThreadSearchExpansion {
+    fn thinking_block_is_open(&self, key: (usize, usize), cx: &App) -> bool {
+        let is_user_toggled = self.user_toggled_thinking_blocks.contains(&key);
+        let is_in_expanded_set = self.expanded_thinking_blocks.contains(&key);
+        match AgentSettings::get_global(cx).thinking_display {
+            ThinkingBlockDisplay::Auto | ThinkingBlockDisplay::Preview => {
+                is_user_toggled || is_in_expanded_set
+            }
+            ThinkingBlockDisplay::AlwaysExpanded => !is_user_toggled,
+            ThinkingBlockDisplay::AlwaysCollapsed => is_user_toggled,
+        }
+    }
+
+    /// Matches render: body is open when user-expanded or forced open for confirmation.
+    fn is_tool_call_content_visible(&self, tool_call: &ToolCall) -> bool {
+        self.expanded_tool_calls.contains(&tool_call.id)
+            || matches!(
+                tool_call.status,
+                ToolCallStatus::WaitingForConfirmation { .. }
+            )
+    }
+
+    fn is_raw_input_expanded(&self, tool_call_id: &acp::ToolCallId) -> bool {
+        self.expanded_tool_call_raw_inputs.contains(tool_call_id)
+    }
+}
 
 /// Debounce for streaming thread updates, which can fire once per streamed
 /// chunk. Query edits are handled immediately instead (see the query editor
@@ -141,6 +168,8 @@ pub struct ThreadSearchBar {
     thread: Entity<AcpThread>,
     entry_view_state: Entity<EntryViewState>,
     on_activate_match: Arc<dyn Fn(usize, &mut Window, &mut App)>,
+    /// Reads ThreadView expansion so match counts track visible content only.
+    expansion: Arc<dyn Fn(&App) -> ThreadSearchExpansion>,
     is_active: bool,
     _update_matches_task: Option<Task<()>>,
     _search_task: Option<Task<()>>,
@@ -164,6 +193,7 @@ impl ThreadSearchBar {
         thread: Entity<AcpThread>,
         entry_view_state: Entity<EntryViewState>,
         on_activate_match: Arc<dyn Fn(usize, &mut Window, &mut App)>,
+        expansion: Arc<dyn Fn(&App) -> ThreadSearchExpansion>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -218,6 +248,7 @@ impl ThreadSearchBar {
             thread,
             entry_view_state,
             on_activate_match,
+            expansion,
             is_active: false,
             _update_matches_task: None,
             _search_task: None,
@@ -327,6 +358,7 @@ impl ThreadSearchBar {
         let mut targets: Vec<SearchTarget> = Vec::new();
         let thread = self.thread.read(cx);
         let entry_view_state = self.entry_view_state.read(cx);
+        let expansion = (self.expansion)(cx);
         for (entry_ix, entry) in thread.entries().iter().enumerate() {
             match entry {
                 // Past user messages render through `MessageEditor`, not markdown.
@@ -346,7 +378,7 @@ impl ThreadSearchBar {
                     });
                 }
                 _ => {
-                    for markdown in collect_markdowns(entry) {
+                    for markdown in collect_markdowns(entry_ix, entry, &expansion, cx) {
                         let source = markdown.read(cx).source().clone();
                         targets.push(SearchTarget::Markdown {
                             entry_ix,
@@ -879,55 +911,82 @@ fn nav_button(
         .tooltip(move |_window, cx| Tooltip::for_action_in(tooltip, action, &focus_handle, cx))
 }
 
-fn collect_markdowns(entry: &AgentThreadEntry) -> Vec<Entity<Markdown>> {
+fn collect_markdowns(
+    entry_ix: usize,
+    entry: &AgentThreadEntry,
+    expansion: &ThreadSearchExpansion,
+    cx: &App,
+) -> Vec<Entity<Markdown>> {
     let mut out = Vec::new();
     match entry {
         AgentThreadEntry::UserMessage(_) => {}
         AgentThreadEntry::AssistantMessage(message) => {
-            for chunk in &message.chunks {
+            for (chunk_ix, chunk) in message.chunks.iter().enumerate() {
                 match chunk {
-                    AssistantMessageChunk::Message { block, .. }
-                    | AssistantMessageChunk::Thought { block, .. } => {
+                    AssistantMessageChunk::Message { block, .. } => {
                         if let Some(md) = block.markdown() {
                             out.push(md.clone());
                         }
                     }
+                    AssistantMessageChunk::Thought { block, .. }
+                        if expansion.thinking_block_is_open((entry_ix, chunk_ix), cx) =>
+                    {
+                        if let Some(md) = block.markdown() {
+                            out.push(md.clone());
+                        }
+                    }
+                    AssistantMessageChunk::Thought { .. } => {}
                 }
             }
         }
         AgentThreadEntry::ToolCall(tool_call) => {
+            // Labels are always visible; body/raw input only when the card shows them.
             out.push(tool_call.label.clone());
-            out.extend(
-                tool_call
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }) => {
-                            Some(markdown.clone())
-                        }
-                        ToolCallContent::ContentBlock(ContentBlock::EmbeddedResource {
-                            markdown: Some(markdown),
-                            ..
-                        }) => Some(markdown.clone()),
-                        ToolCallContent::ContentBlock(
-                            ContentBlock::Empty
-                            | ContentBlock::EmbeddedResource { markdown: None, .. }
-                            | ContentBlock::ResourceLink { .. }
-                            | ContentBlock::Image { .. },
-                        )
-                        | ToolCallContent::Diff(_)
-                        | ToolCallContent::Terminal(_) => None,
-                    }),
-            );
+            let content_visible = expansion.is_tool_call_content_visible(tool_call);
+            if content_visible {
+                out.extend(
+                    tool_call
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }) => {
+                                Some(markdown.clone())
+                            }
+                            ToolCallContent::ContentBlock(ContentBlock::EmbeddedResource {
+                                markdown: Some(markdown),
+                                ..
+                            }) => Some(markdown.clone()),
+                            ToolCallContent::ContentBlock(
+                                ContentBlock::Empty
+                                | ContentBlock::EmbeddedResource { markdown: None, .. }
+                                | ContentBlock::ResourceLink { .. }
+                                | ContentBlock::Image { .. },
+                            )
+                            | ToolCallContent::Diff(_)
+                            | ToolCallContent::Terminal(_) => None,
+                        }),
+                );
+            }
+            if content_visible
+                && let Some(raw_input) = &tool_call.raw_input_markdown
+            {
+                // Confirmation cards toggle raw input; other open cards always show it.
+                let raw_visible = match &tool_call.status {
+                    ToolCallStatus::WaitingForConfirmation { .. } => {
+                        expansion.is_raw_input_expanded(&tool_call.id)
+                    }
+                    _ => true,
+                };
+                if raw_visible {
+                    out.push(raw_input.clone());
+                }
+            }
         }
         AgentThreadEntry::CompletedPlan(entries) => {
             out.extend(entries.iter().map(|e| e.content.clone()))
         }
-        AgentThreadEntry::ContextCompaction(compaction) => {
-            if let Some(summary) = &compaction.summary {
-                out.push(summary.clone());
-            }
-        }
+        // Surmount renders compaction as a non-expandable divider label only.
+        AgentThreadEntry::ContextCompaction(_) => {}
         AgentThreadEntry::Elicitation(_) => {}
     }
     out

@@ -179,7 +179,12 @@ impl A11y {
     /// See the docs for [`Self::active_flag`] and [`Self::active_this_frame`]
     /// for more commentary.
     pub(crate) fn sync_active_flag(&mut self) {
-        self.active_this_frame = !self.force_disabled && self.active_flag.load(Ordering::SeqCst);
+        let active = !self.force_disabled && self.active_flag.load(Ordering::SeqCst);
+        // Drop stale post-frame outline when AT / experimental activation ends.
+        if self.active_this_frame && !active {
+            self.nodes.clear_last_interactive_outline();
+        }
+        self.active_this_frame = active;
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -288,6 +293,9 @@ pub(crate) struct A11yNodeBuilder {
     /// This is the exact type required by accesskit, so we can't just make it a
     /// `HashMap<NodeId, Node>` to remove the need for `seen_ids`
     all_nodes: Vec<(NodeId, accesskit::Node)>,
+    /// Compact interactive outline from the last `finalize`. Prefer this over
+    /// retaining the full AccessKit node list (avoids per-frame full-tree clone).
+    last_interactive_outline: String,
     seen_ids: FxHashSet<NodeId>,
     /// The node that GPUI considers focused. Note that this may be different to
     /// what is reported to accesskit - see [`Self::active_descendant`]
@@ -305,10 +313,24 @@ impl A11yNodeBuilder {
             ids_stack: SmallVec::new(),
             nodes_stack: SmallVec::new(),
             all_nodes: Vec::new(),
+            last_interactive_outline: String::new(),
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
         }
+    }
+
+    pub(crate) fn clear_last_interactive_outline(&mut self) {
+        self.last_interactive_outline.clear();
+    }
+
+    pub(crate) fn last_interactive_outline(&self) -> &str {
+        &self.last_interactive_outline
+    }
+
+    /// True while a frame is being built (root still on the stack or leaves pending).
+    pub(crate) fn has_in_progress_frame(&self) -> bool {
+        !self.ids_stack.is_empty() || !self.all_nodes.is_empty()
     }
 
     #[must_use]
@@ -478,6 +500,9 @@ impl A11yNodeBuilder {
         };
 
         let nodes = std::mem::take(&mut self.all_nodes);
+        // Store interactive outline only (not a full-tree clone) for post-frame
+        // dogfood snapshots after `mem::take` moves nodes into TreeUpdate.
+        self.last_interactive_outline = interactive_a11y_outline(&nodes);
         let update = TreeUpdate {
             nodes,
             tree: Some(accesskit::Tree::new(ROOT_NODE_ID)),
@@ -534,7 +559,8 @@ impl A11yNodeBuilder {
         update
     }
 
-    /// Collects the nodes currently in the builder without finalizing the frame.
+    /// Collects nodes for mid-frame outline (stack + finalized leaves this frame).
+    /// After `finalize`, returns empty — use [`Self::last_interactive_outline`].
     pub(crate) fn collect_snapshot_nodes(&self) -> Vec<(NodeId, accesskit::Node)> {
         let mut nodes = self.all_nodes.clone();
         for (index, &id) in self.ids_stack.iter().enumerate() {
@@ -678,6 +704,76 @@ mod tests {
         assert!(outline.contains("Button"));
         assert!(outline.contains("Save"));
         assert!(!outline.contains("GenericContainer"));
+    }
+
+    #[test]
+    fn interactive_outline_available_after_finalize() {
+        let mut builder = new_builder();
+        let button = NodeId(1);
+
+        let mut button_node = accesskit::Node::new(Role::Button);
+        button_node.set_label("Open".to_string());
+        button_node.add_action(accesskit::Action::Click);
+        assert!(builder.push(button, button_node));
+        builder.pop();
+
+        let update = builder.finalize();
+        // Regression: finalize takes all_nodes for TreeUpdate; mid-frame collect is empty.
+        assert!(
+            builder.collect_snapshot_nodes().is_empty(),
+            "post-finalize mid-frame node list must be empty"
+        );
+        assert!(!update.nodes.is_empty());
+
+        let outline = builder.last_interactive_outline();
+        assert!(!outline.is_empty());
+        assert!(
+            outline.contains("[Button]"),
+            "outline should include role: {outline:?}"
+        );
+        assert!(
+            outline.contains("Open"),
+            "post-frame snapshot must retain interactive label: {outline:?}"
+        );
+        assert!(
+            outline.contains("#NodeId(1)") || outline.contains("NodeId(1)"),
+            "outline should include node id: {outline:?}"
+        );
+    }
+
+    #[test]
+    fn post_finalize_outline_empty_when_no_interactive_nodes() {
+        let mut builder = new_builder();
+        let container = NodeId(1);
+        let container_node = accesskit::Node::new(Role::GenericContainer);
+        assert!(builder.push(container, container_node));
+        builder.pop();
+
+        let _update = builder.finalize();
+        assert!(
+            builder.last_interactive_outline().is_empty(),
+            "non-interactive-only trees yield empty interactive outline"
+        );
+    }
+
+    #[test]
+    fn begin_frame_does_not_clear_last_outline_until_next_finalize() {
+        let mut builder = new_builder();
+        let button = NodeId(1);
+        let mut button_node = accesskit::Node::new(Role::Button);
+        button_node.set_label("Keep".to_string());
+        button_node.add_action(accesskit::Action::Click);
+        assert!(builder.push(button, button_node));
+        builder.pop();
+        let _ = builder.finalize();
+        assert!(builder.last_interactive_outline().contains("Keep"));
+
+        builder.begin_frame(None);
+        assert!(
+            builder.last_interactive_outline().contains("Keep"),
+            "last outline survives begin_frame until the next finalize replaces it"
+        );
+        assert!(builder.has_in_progress_frame());
     }
 
     fn new_a11y() -> A11y {

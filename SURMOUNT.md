@@ -20,6 +20,9 @@ Living table of contents for fork-specific design docs (not published to zed.dev
 |-----|---------|
 | [docs/surmount/README.md](docs/surmount/README.md) | Index for this folder |
 | [docs/surmount/merge-review.md](docs/surmount/merge-review.md) | Merging upstream main: summarize each diff, cumulative review memory, SURMOUNT.md from that |
+| This file § [Menhera dependency pins](#menhera-dependency-pins-fork-maintenance) | Menhera-cooldown pin/verify/unpin (fork maintenance) |
+| This file § [Upstream services stripped](#upstream-services-stripped-merge-policy) | Zed Cloud / telemetry merge resolution table |
+| [`.agents/skills/surmount-merge-review/SKILL.md`](.agents/skills/surmount-merge-review/SKILL.md) | Operator skill for real upstream sync (`/surmount-merge-review`) |
 
 ### Merge review visibility (Linux grok-first cold start)
 
@@ -47,6 +50,12 @@ CARGO_TERM_QUIET=true cargo nextest run -p agent_ui -p git_ui -p project -p git 
 
 `agent-stdio` is a **default** feature on the `zed` crate (`crates/zed/Cargo.toml`). A plain `cargo build --release -p zed` includes `--agent-stdio` / `ZED_AGENT_STDIO=1` and the TOON stdio control plane. On upstream merges, keep `default = ["agent-stdio"]` unless deliberately dropping dogfood support.
 
+Operator contract: [`.agents/skills/zed-dogfood/SKILL.md`](.agents/skills/zed-dogfood/SKILL.md). **Mandatory preflight** before golden/long dogfood: `.agents/skills/zed-dogfood/scripts/preflight.sh` (asserts first stdout is `event: ready`; fails on panic/timeout). Then golden: `.agents/skills/zed-dogfood/scripts/golden-session.sh`. Call order: `cargo build --release -p zed` → preflight → golden. Handlers live in `crates/zed/src/zed/agent_stdio.rs` (`snapshot`, `actions`, `open`, `wait`, `action`, `keys`, `shutdown`). Agent search keymap actions stay registered in `agent_ui` (registration ≠ UI feature); orphan `conversation_view/thread_search_bar.rs` stays uncompiled until search wiring.
+
+**Linux headless (AccessKit activate + outline retain):** `event: ready` then all v1 methods respond `ok: true`. `method:actions` lists ~1.4k names. Prefer `method:open` on a **file**. Settle: `method:wait` **ms:3000** after open. **`method:snapshot`:** on the Linux **headless** window only, `a11y_init` calls AccessKit activation (GUI platforms still wait for AT), retains last-frame **interactive outline string** after `end_frame`, and `capture_snapshot` reuses that outline or force-draws if empty. Before headless AccessKit activation, snapshots were always empty even when chrome existed. After rebuild (`cargo build --release -p zed`) + golden session, expect non-empty interactive chrome when the frame has buttons/inputs/etc.; empty only if that frame has no interactive roles. Outline is interactive-only, not full DOM.
+
+**Known non-fatal dogfood stderr (do not treat as session failure):** in-memory DB WARN; `thread_metadata_store` remote-connection migration (`WorkspaceDb::recent_project_workspaces_ungrouped` → `recent_workspaces_query`) can ERROR with `database table is locked` under concurrent SQLite access in agent-stdio (dogfood skill known-noise table); migration uses `detach_and_log_err` and only writes the migration key after success, so leave production code alone rather than soft-failing empty + mark-complete; provider auth noise.
+
 ## Upstream services stripped (merge policy)
 
 Surmount is a local-first fork. It does **not** phone home to Zed Cloud for sign-in, metrics, crash upload, or usage telemetry. When merging upstream `main`, **keep Surmount stubs** — do not re-enable upstream paths without an explicit maintainer decision.
@@ -67,7 +76,50 @@ Stripping Zed Cloud sign-in is **not** a rejection of agent authentication. Surm
 
 **Today:** users configure local agents and provider API keys (see `docs/src/ai/use-api-access.md`); `client::zed_cloud_ui_enabled()` stays false in release.
 
-**Goal (document only for now):** first-class Grok Build auth UX and credential plumbing in Zed — discover/login state from the Grok CLI layout, surface status in agent settings, and keep it separate from the disabled Zed Cloud `SignIn` path. Do not restore RSA/`authenticate_with_browser` when implementing this; add a Surmount-specific path (likely `agent_servers`, `agent_settings`, native Grok profile).
+**Goal (document only for now):** first-class Grok Build auth UX and credential plumbing in Zed — discover/login state from the Grok CLI layout, surface status in agent settings, and keep it separate from the disabled Zed Cloud `SignIn` path. Do not restore RSA/`authenticate_with_browser` when implementing this; add a Surmount-specific path (likely `agent_servers`, `agent_settings`, native Grok profile). Do not implement OAuth or re-enable Zed Cloud `SignIn` under this goal.
+
+## Menhera dependency pins (fork maintenance)
+
+Maintainer `~/.cargo/config.toml` redirects crates-io to **menhera-cooldown** (`sparse+https://index.crates.menhera.org/10d/`, ~10 calendar days behind crates.io). Upstream bumps can land versions menhera has not indexed yet; cargo then fails even when search shows a newer crate (search returns latest indexed, not the exact pin).
+
+**Authoritative pin notes:** [`.cargo/config.toml`](.cargo/config.toml) (comments) and workspace pins in root [`Cargo.toml`](Cargo.toml). AGENTS.md § Menhera-cooldown dependency pins is binding for agents.
+
+### Current pins (as of 2026-07-08)
+
+| Crate | Upstream target | Surmount pin | crates.io publish | Menhera earliest (~+10d) |
+|-------|-----------------|--------------|-------------------|--------------------------|
+| `wgpu` | `29.0.4` | `29.0.3` | 2026-07-02 | **2026-07-12** (binding) |
+| `agent-client-protocol` | `1.0.1` | `=1.0.0` | 2026-06-29 | 2026-07-09 |
+
+**Binding unpin date** = latest of the per-crate +10d dates → **2026-07-12** (wgpu). Do **not** unpin before that date, and never change pin versions without human verify evidence below.
+
+### Verify then unpin (human-only)
+
+1. Confirm calendar is on/after the binding date (2026-07-12 for the current set).
+2. Exact-version checks (not `cargo search`):
+   ```bash
+   cargo info wgpu@29.0.4 --registry menhera-cooldown
+   cargo info agent-client-protocol@1.0.1 --registry menhera-cooldown
+   ```
+3. Only if both resolve: set root `Cargo.toml` to the upstream targets, remove or rewrite the pin block in `.cargo/config.toml`, and re-check with a normal workspace build.
+4. **Feature/default-feature conflicts are not menhera lag** — e.g. `toon-format` `default-features = false` in `crates/zed/Cargo.toml` avoids `ratatui` → `unicode-width` clash. Do not invent unpin dates for those; fix features/edges directly.
+
+Optional post-unpin sanity (client strip still correct after dep churn):
+
+```bash
+cargo clippy -p client -p rpc -p telemetry -- -D warnings
+```
+
+## Upstream merge process (pointer)
+
+Actual upstream sync is **not** ad-hoc merge docs. Use:
+
+- Skill: [`.agents/skills/surmount-merge-review/SKILL.md`](.agents/skills/surmount-merge-review/SKILL.md) (`/surmount-merge-review`)
+- Design/workflow: [docs/surmount/merge-review.md](docs/surmount/merge-review.md)
+- On `client` / `rpc` / `telemetry` / `assets/settings/default.json` conflicts: [Upstream services stripped](#upstream-services-stripped-merge-policy) above
+- On registry lag after merge: [Menhera dependency pins](#menhera-dependency-pins-fork-maintenance)
+
+Do not invent a parallel merge process. This fork-maintenance section documents policy only; it does not run `git merge` or unpin crates.
 
 ## Documentation map
 
