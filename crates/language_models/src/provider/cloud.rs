@@ -519,13 +519,11 @@ impl RenderOnce for ZedAiConfiguration {
 
         if !self.is_connected {
             if !client::zed_cloud_ui_enabled() {
-                return v_flex()
-                    .gap_2()
-                    .when(!self.compact, |this| {
-                        this.child(Label::new(
-                            "Configure a local model provider in Agent settings.",
-                        ))
-                    });
+                return v_flex().gap_2().when(!self.compact, |this| {
+                    this.child(Label::new(
+                        "Configure a local model provider in Agent settings.",
+                    ))
+                });
             }
 
             return v_flex()

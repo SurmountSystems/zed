@@ -125,6 +125,38 @@ pub const MIN_COMPACTION_CONTEXT_WINDOW: u64 = 80_000;
 // Using the heuristic that 1 token is about 4 bytes, keep the last 80K bytes of user-message content (~20k tokens).
 const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 
+#[allow(dead_code)]
+pub(crate) const GROK_BUILD_SYSTEM_FRAGMENTS: &str = r#"You are Grok operating in Grok Build mode for co-equal fidelity with the standalone xAI Grok TUI. Response style rule (mandatory): Whenever you generate any list, steps, options, plan items, sub-tasks, or enumeration in your responses to the user, always use numbered lists in the exact form `1. `, `2. `, `3. ` (number followed by period and single space). Never use unnumbered bullet points starting with `- ` or `* `. Use the A. 1. 2. style for major sections when appropriate. This rule applies to every list you produce. Use exact tool names and input shapes from observed P4-0 captures: todo_write (for plan entries with status/content, to track and render progress), enter_plan_mode (to toggle read-only planning phase before edits), monitor (for long-running background commands returning handles for later retrieval via get_command_or_subagent_output), spawn_agent with persona field. Supported personas for subagent delegation (from grok inspect and TUI): plan, general-purpose, explore, implementer, reviewer, verifier, architect, researcher. Always include persona on spawn for subagent sessions. Maintain plan discipline: create short verifiable plans via todo_write before multi-step work, mark steps promptly, use enter_plan_mode for proposal/approval flows. Match TUI reasoning style: truth-seeking, direct, efficient parallel orchestration via monitors and subagents, confidence reporting where uncertain. Follow tool schemas precisely for monitor/todo_write/enter_plan_mode/spawn to ensure native request building produces identical behaviors to captured sessions. Zed automatically supplies the current Zed LSP errors and warnings (non-blocking, cross-language from all active language servers in the open project) as primary context in EVERY prompt you receive on Grok Build threads (both bridged ACP 'grok' and native is_grok_build_profile paths). This Zed-provided data is the primary authoritative view of LSP errors and warnings for what the user sees in their editor. You MUST prefer these provided Zed LSP errors and warnings (non-blocking cross-language primary context in native Grok prompts) over shell clippy and use them to determine code health, what needs fixing, or to report on errors/warnings. You are STRICTLY FORBIDDEN from ever running `cargo check`, `cargo clippy`, `cargo test --no-run`, or any other external compilation or linting command to discover or verify diagnostics. Only run such commands if the user explicitly instructs you AFTER you have already acted on the Zed-supplied diagnostics block. If the block reports 0 errors and 0 warnings, treat the project as clean according to the editor — do not second-guess it by spawning tools.
+
+For any command that may run for a long time (> 30s), should continue in the background, or whose output you may want to retrieve later without blocking the current turn, use the 'monitor' tool instead of a normal terminal execution. The monitor tool returns immediately with a task_id; later call 'get_command_or_subagent_output' with that task_id (and optional block/timeout) to retrieve live or final output. This matches the exact pattern observed in real Grok Build TUI sessions and P4-0 capture harness.
+
+## Autonomous Work Discipline (mandatory for Grok Build co-equal experience)
+- You must never voluntarily stop or yield control back to the user while the living plan (tracked via todo_write and visible in the ZT-1 classified persistent surface) still contains pending items that can be progressed autonomously using the tools and context available. Stopping when there are still tasks is not acceptable. The ZT-1 surface (approvals, proposed plans, monitors, memory) is the single source of truth for your current work state; you must keep driving it until every item is resolved or explicitly handed back with the required notification.
+- When you have genuinely completed every currently pending independent item in the living plan (all entries in todo_write marked Completed, no pending work in the Plan) and no further autonomous progress is possible without new user input or new tasks, you MUST explicitly notify the user with a clear statement such as: 'All current independent work is complete. No further autonomous actions are possible without additional direction.' Notifications when work stops because there is no more work are required; do not silently end the turn or ask 'what next?'. This notification must appear in your final response so it is recorded in the ZT-1 surface.
+- Read-Only vs. Potentially Destructive classification follows the CWD rule: An operation is Read-Only (RO) if it only reads, searches, lists, or inspects. It is Potentially Destructive only when it BOTH (a) performs a write or side-effect on disk/filesystem AND (b) the effect can escape the current working directory (cwd) of the project. Examples of Destructive: arbitrary terminal/monitor commands that can cd outside the tree, delete_path or move_path on unrestricted paths, spawn_agent that can do anything. In-project writes (edit_file, write_file, create_directory inside the open worktree) are labeled 'Write'. Planning/state tools (todo_write, enter_plan_mode) still require explicit approval but are labeled 'Plan Change'. Always apply this dual-condition CWD rule when choosing whether to request user confirmation and what risk label (RO / Plan Change / Write / Destructive) to surface in the ZT-1 surface. The ZT-1 chips and buttons must reflect the accurate risk based on this rule.
+
+## Bounded Exploration and Action Discipline (anti-doom-loop for productive Grok Build work)
+- When investigating the project or codebase, you must not enter long unbounded chains of pure discovery tool calls (repeated read_file, grep, list_directory, terminal `find`/`ls`, etc.) without making concrete forward progress on the user's task.
+- After a small, reasonable number of targeted exploratory calls to understand the relevant area, you are expected to synthesize what you have learned and take action: update the living plan via todo_write, enter plan mode with a proposal, make edits, spawn a scoped subagent with a clear persona and task, start a monitor for long work, or surface a question to the user.
+- Endless "let me check one more file... and another... and another..." exploration loops that do not advance any item in the ZT-1 surface (plan, approvals, monitors) are not acceptable. They waste turns and violate the autonomous work discipline.
+- Prefer making progress with the information you already have over achieving perfect information. Use todo_write to explicitly track investigation steps when they are part of a larger task, and mark them as you go.
+- The ZT-1 classified persistent surface is the source of truth for real work. Pure exploration without corresponding plan updates or output is a violation of the productivity expectations for Grok Build mode.
+
+## Automatic Live Diagnostic Feedback After Turn Completion
+When you return StopReason::EndTurn, the system will automatically query the live in-process LSP diagnostic state (via Project::diagnostic_summary and diagnostic_summaries, the real data already held by rust-analyzer and other servers inside this Zed process) plus current ZT-1 pending work (approvals, plan items, active monitors) and append a system-generated user message containing the fresh diagnostics context (LSP errors/warnings) tied to your current TurnId (T-<n>) if any work remains. You will see this fresh state in your next prompt context. This mechanism exists so the three behavioral rules can be enforced without the user manually pasting diagnostic blocks.
+
+Zed automatically supplies the current editor diagnostics (errors and warnings from rust-analyzer and other language servers) as first-class context on every turn for native Grok Build threads (is_grok_build_profile). You MUST use ONLY these provided counts and details as your primary source of truth for code issues. You are STRICTLY FORBIDDEN from ever running `cargo check`, `cargo clippy`, or similar external linters to discover errors while the editor data is available. Do not second-guess the pushed diagnostics by spawning tools.
+
+## Turn Identification and Cross-Turn Task References (mandatory for reliable long-running Grok Build work)
+Zed supplies the Current Turn ID (as "T-<n>") plus a recent prior-turn summary in the prompt for every Grok Build thread (bridged and native is_grok_build_profile). Always reference work by turn ID + stable task slug (e.g. T-17-task-3f2a1b) when using todo_write, enter_plan_mode, or describing cross-turn progress so that the ZT-1 surface and future prompts can track unambiguously.
+
+Example:
+- "Continuing T-17-task-3f2a1b from prior turn summary."
+- Include the current turn ID prefix on new plan entries.
+
+The prior-turn summary and full history appear before these fragments; never use bare step numbers without the turn/task anchor."#;
+
+
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
 pub struct NoModelConfiguredError;
@@ -152,6 +184,67 @@ pub struct SubagentContext {
     #[serde(default)]
     pub plan_phase: Option<PlanPhase>,
 }
+
+/// Minimal skeleton entry point (NativeTurnDriver) for driving a pure native
+/// Grok `Thread` turn directly. Returns / subscribes to the same `ThreadEvent`
+/// values that power the shared ZT-1 collectors, `ZedTodosComponent`, plan
+/// rendering, and persona badges.
+///
+/// This is the thinnest direct native path per the authoritative orchestration
+/// design: callers operating under `is_grok_build_profile` obtain the canonical
+/// event stream without going through `NativeAgentConnection` or the full ACP
+/// translation layer in `handle_thread_events`.
+///
+/// Construction is explicitly gated on the profile flag. All usage follows
+/// CLAUDE.md (existing files, no panics on fallible paths, full words).
+pub struct NativeTurnDriver {
+    thread: Entity<Thread>,
+}
+
+impl NativeTurnDriver {
+    /// Returns a driver only for Threads where `is_grok_build_profile` is true.
+    /// This is the mandatory gate for the direct native path.
+    pub fn new_if_grok_native(thread: Entity<Thread>, cx: &App) -> Option<Self> {
+        if thread.read(cx).is_grok_build_profile(cx) {
+            Some(Self { thread })
+        } else {
+            None
+        }
+    }
+
+    /// Drives a turn using the existing `send` path and returns the direct
+    /// `ThreadEvent` subscription receiver. Identical events to the ACP path.
+    pub fn send_and_drive<T>(
+        &self,
+        id: ClientUserMessageId,
+        content: impl IntoIterator<Item = T>,
+        cx: &mut App,
+    ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>>
+    where
+        T: Into<UserMessageContent>,
+    {
+        self.thread
+            .update(cx, |thread, cx| thread.send(id, content, cx))
+    }
+
+    /// Drives a resume turn, returning the direct native event receiver.
+    pub fn resume_and_drive(
+        &self,
+        cx: &mut App,
+    ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        self.thread.update(cx, |thread, cx| thread.resume(cx))
+    }
+
+    /// Low-level drive of an already-prepared turn (after `send_existing` style prep).
+    pub fn drive_existing_turn(
+        &self,
+        cx: &mut App,
+    ) -> Result<mpsc::UnboundedReceiver<Result<ThreadEvent>>> {
+        self.thread
+            .update(cx, |thread, cx| thread.send_existing(cx))
+    }
+}
+
 
 /// The ID of the user prompt that initiated a request.
 ///
@@ -1243,7 +1336,7 @@ pub struct Thread {
     title_generation_failed: bool,
     pending_summary_generation: Option<Shared<Task<Option<SharedString>>>>,
     summary: Option<SharedString>,
-    messages: Vec<Arc<Message>>,
+    pub(crate) messages: Vec<Arc<Message>>,
     user_store: Entity<UserStore>,
     /// Holds the task that handles agent interaction until the end of the turn.
     /// Survives across multiple requests as the model performs tool calls and
@@ -1294,6 +1387,8 @@ pub struct Thread {
     /// already-granted permissions skip the approval prompt.
     /// Never persisted — lives and dies with this thread.
     sandbox_grants: Rc<RefCell<ThreadSandboxGrants>>,
+    /// Opaque JSON bag for native Grok Build session artifacts.
+    pub native_grok_artifacts: Option<serde_json::Value>,
     grok_build_profile: bool,
     plan_phase: PlanPhase,
     imported: bool,
@@ -1435,6 +1530,7 @@ impl Thread {
             inherits_parent_model_settings: true,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::default())),
+            native_grok_artifacts: None,
             grok_build_profile,
             plan_phase: PlanPhase::default(),
             imported: false,
@@ -1825,6 +1921,7 @@ impl Thread {
             sandbox_grants: Rc::new(RefCell::new(ThreadSandboxGrants::from_db(
                 &db_thread.sandbox_grants,
             ))),
+            native_grok_artifacts: db_thread.native_grok_artifacts,
             grok_build_profile,
             plan_phase: PlanPhase::default(),
             imported: false,
@@ -1926,6 +2023,7 @@ impl Thread {
             }),
             sandboxed_terminal_temp_dir: self.sandboxed_terminal_temp_dir.clone(),
             sandbox_grants: self.sandbox_grants.borrow().to_db(),
+            native_grok_artifacts: self.native_grok_artifacts.clone(),
         };
 
         cx.background_spawn(async move {
@@ -4202,6 +4300,18 @@ impl Thread {
         self.subagent_context = Some(ctx);
     }
 
+    pub fn capability_mode(&self) -> Option<AgentCapabilityMode> {
+        self.subagent_context
+            .as_ref()
+            .and_then(|ctx| ctx.capability_mode)
+    }
+
+    pub fn persona(&self) -> Option<AgentPersona> {
+        self.subagent_context
+            .as_ref()
+            .and_then(|ctx| ctx.persona)
+    }
+
     pub fn plan_phase(&self) -> PlanPhase {
         self.plan_phase
     }
@@ -4268,6 +4378,11 @@ impl Thread {
             ),
             is_linux: cfg!(target_os = "linux"),
             is_windows: cfg!(target_os = "windows"),
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         }
         .render(&self.templates)
         .context("failed to build system prompt")

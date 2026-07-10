@@ -2648,8 +2648,7 @@ impl CollabPanel {
                 .text_center()
                 .justify_center()
                 .child(
-                    Label::new("Collaboration is not available in Surmount.")
-                        .color(Color::Muted),
+                    Label::new("Collaboration is not available in Surmount.").color(Color::Muted),
                 );
         }
 

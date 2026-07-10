@@ -231,14 +231,14 @@ impl TerminalToolTest {
                 model_name: None,
                 date: chrono::Local::now().format("%Y-%m-%d").to_string(),
                 user_agents_md: None,
+                sandboxing: false,
+                is_linux: cfg!(target_os = "linux"),
+                is_windows: cfg!(target_os = "windows"),
                 subagent_persona: None,
                 subagent_capability_mode: None,
                 is_grok_build_profile: false,
                 current_turn_id: None,
                 prior_turn_summary: None,
-                sandboxing: false,
-                is_linux: cfg!(target_os = "linux"),
-                is_windows: cfg!(target_os = "windows"),
             };
             template.render(&Templates::new())?
         };

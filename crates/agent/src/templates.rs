@@ -57,6 +57,16 @@ pub struct SystemPromptTemplate<'a> {
     pub is_linux: bool,
     /// Whether sandboxed terminal commands run through WSL on Windows.
     pub is_windows: bool,
+    /// Subagent persona label when rendering a nested agent prompt (native Grok).
+    pub subagent_persona: Option<String>,
+    /// Subagent capability mode label when rendering a nested agent prompt.
+    pub subagent_capability_mode: Option<String>,
+    /// Whether this thread uses the native Grok Build profile.
+    pub is_grok_build_profile: bool,
+    /// Current turn id (e.g. `T-42`) for native multi-turn fidelity.
+    pub current_turn_id: Option<String>,
+    /// Optional summary of the prior turn for continuity in native Grok sessions.
+    pub prior_turn_summary: Option<String>,
 }
 
 impl Template for SystemPromptTemplate<'_> {
@@ -104,6 +114,11 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -137,6 +152,11 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -166,6 +186,11 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -199,6 +224,11 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -237,6 +267,11 @@ mod tests {
             sandboxing: true,
             is_linux: true,
             is_windows: false,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -267,6 +302,11 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: true,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -291,6 +331,11 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -311,6 +356,11 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -329,6 +379,11 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            subagent_persona: None,
+            subagent_capability_mode: None,
+            is_grok_build_profile: false,
+            current_turn_id: None,
+            prior_turn_summary: None,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();

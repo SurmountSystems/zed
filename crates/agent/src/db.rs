@@ -86,6 +86,10 @@ pub struct DbThread {
     /// [`crate::sandboxing::ThreadSandboxGrants`].
     #[serde(default)]
     pub sandbox_grants: DbSandboxGrants,
+    /// Opaque JSON bag for native Grok Build session artifacts (turn ids, plans, etc.).
+    /// Defaults to `None` for legacy threads.
+    #[serde(default)]
+    pub native_grok_artifacts: Option<serde_json::Value>,
 }
 
 /// Serialized form of the sandbox permissions the user granted "for the rest of
@@ -165,6 +169,7 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+        native_grok_artifacts: None,
         }
     }
 
@@ -349,6 +354,7 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+        native_grok_artifacts: None,
         })
     }
 }
@@ -800,6 +806,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
+        native_grok_artifacts: None,
         }
     }
 
@@ -1044,6 +1051,9 @@ mod tests {
         child_thread.subagent_context = Some(crate::SubagentContext {
             parent_thread_id: parent_id.clone(),
             depth: 1,
+            persona: None,
+            capability_mode: None,
+            plan_phase: None,
         });
 
         let mut grandchild_thread = make_thread(
@@ -1053,6 +1063,9 @@ mod tests {
         grandchild_thread.subagent_context = Some(crate::SubagentContext {
             parent_thread_id: child_id.clone(),
             depth: 2,
+            persona: None,
+            capability_mode: None,
+            plan_phase: None,
         });
 
         let unrelated_thread = make_thread(
@@ -1093,6 +1106,9 @@ mod tests {
         child_thread.subagent_context = Some(crate::SubagentContext {
             parent_thread_id: parent_id.clone(),
             depth: 2,
+            persona: None,
+            capability_mode: None,
+            plan_phase: None,
         });
 
         database

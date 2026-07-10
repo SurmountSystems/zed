@@ -62,7 +62,10 @@ use uuid::Uuid;
 pub(crate) mod a11y;
 mod prompts;
 
-pub use a11y::A11ySubtreeBuilder;
+pub use a11y::{
+    A11ySubtreeBuilder, OutlineDetail, OutlineOptions, format_a11y_outline,
+    interactive_a11y_outline,
+};
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -1442,7 +1445,7 @@ impl Window {
                     while let Ok(request) = action_receiver.recv().await {
                         handle
                             .update(&mut async_cx, |_, window, cx| {
-                                window.handle_a11y_action(request, cx);
+                                let _ = window.handle_a11y_action(request, cx);
                             })
                             .log_err();
                     }
@@ -5512,17 +5515,27 @@ impl Window {
         self.a11y.is_active()
     }
 
-    /// Returns a compact text outline of interactive accessibility nodes.
+    /// Returns a text outline of interactive accessibility nodes (rich detail).
     ///
     /// Mid-frame: builds from the in-progress tree. After paint: returns the
     /// outline retained at the last successful `finalize` (empty if a11y was
     /// never active or was deactivated).
     pub fn a11y_interactive_outline(&self) -> String {
+        self.a11y_outline(a11y::OutlineDetail::Rich)
+    }
+
+    /// Accessibility outline at the requested [`a11y::OutlineDetail`] tier.
+    ///
+    /// Mid-frame: formats from the in-progress tree. After paint: uses the
+    /// outline retained at the last `finalize` for that detail tier.
+    pub fn a11y_outline(&self, detail: a11y::OutlineDetail) -> String {
         if self.a11y.nodes.has_in_progress_frame() {
             let nodes = self.a11y.nodes.collect_snapshot_nodes();
-            a11y::interactive_a11y_outline(&nodes)
+            // Match finalize: active descendant wins when present.
+            let focus = self.a11y.nodes.active_descendant.or(self.a11y.nodes.focus);
+            a11y::format_a11y_outline(&nodes, a11y::OutlineOptions { focus, detail })
         } else {
-            self.a11y.nodes.last_interactive_outline().to_string()
+            self.a11y.nodes.last_outline(detail).to_string()
         }
     }
 
@@ -5544,8 +5557,62 @@ impl Window {
             .push((action, Box::new(listener)));
     }
 
+    /// Dispatch an AccessKit action to a node (dogfood / agent-stdio click-by-id).
+    ///
+    /// Uses the same path as platform assistive tech: registered listeners first,
+    /// then built-in Click (mouse at node center) / Focus fallbacks.
+    ///
+    /// Returns `Err` when the node is not in the last painted a11y tree (call after
+    /// `draw` / look so ids match the current frame), or when the node is present
+    /// but no listener/fallback actually applied the action.
+    pub fn dispatch_a11y_action(
+        &mut self,
+        target_node: accesskit::NodeId,
+        action: accesskit::Action,
+        data: Option<accesskit::ActionData>,
+        cx: &mut App,
+    ) -> std::result::Result<(), String> {
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = (target_node, action, data, cx);
+            return Err("a11y click is unsupported on wasm".into());
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            if !self.a11y.nodes.has_node(target_node) {
+                return Err(format!(
+                    "no a11y node #NodeId({}) in this window (look first, then click that id)",
+                    u64::from(target_node)
+                ));
+            }
+            let applied = self.handle_a11y_action(
+                accesskit::ActionRequest {
+                    action,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node,
+                    data,
+                },
+                cx,
+            );
+            if applied {
+                Ok(())
+            } else {
+                Err(format!(
+                    "a11y action not applicable on #NodeId({}) (no listener and no click bounds / focus handle for this action)",
+                    u64::from(target_node)
+                ))
+            }
+        }
+    }
+
+    /// Handle an AccessKit action request. Returns `true` if a listener matched
+    /// or a built-in fallback actually ran (click-at-center, focus, blur).
     #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn handle_a11y_action(&mut self, request: accesskit::ActionRequest, cx: &mut App) {
+    pub(crate) fn handle_a11y_action(
+        &mut self,
+        request: accesskit::ActionRequest,
+        cx: &mut App,
+    ) -> bool {
         // Take listeners out temporarily so the closures can borrow Window
         // mutably, then restore them afterward.
         if let Some(mut listeners) = self.a11y.action_listeners.remove(&request.target_node) {
@@ -5561,7 +5628,7 @@ impl Window {
                 .action_listeners
                 .insert(request.target_node, listeners);
             if matched {
-                return;
+                return true;
             }
         }
 
@@ -5585,6 +5652,9 @@ impl Window {
                     });
                     self.dispatch_event(mouse_down, cx);
                     self.dispatch_event(mouse_up, cx);
+                    true
+                } else {
+                    false
                 }
             }
             accesskit::Action::Focus => {
@@ -5592,10 +5662,14 @@ impl Window {
                     && let Some(handle) = FocusHandle::for_id(focus_id, &cx.focus_handles)
                 {
                     self.focus(&handle, cx);
+                    true
+                } else {
+                    false
                 }
             }
             accesskit::Action::Blur => {
                 self.blur();
+                true
             }
             _ => {
                 log::debug!(
@@ -5603,6 +5677,7 @@ impl Window {
                     request.action,
                     request.target_node
                 );
+                false
             }
         }
     }

@@ -19,8 +19,8 @@
 //! Patterns: injectable closures for hermetic FS/SQLite, GPUI `TestAppContext`, explicit error propagation.
 
 use super::*;
-use acp_thread::TurnId;
-use agent_client_protocol::schema as acp;
+use acp_thread::{ClientUserMessageId, TurnId};
+use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
 use core::assert_eq;
 use futures::channel::mpsc;
@@ -905,7 +905,7 @@ async fn test_native_grok_run_turn_e2e_fidelity_to_p4_artifacts_with_cwd_and_pro
     let _the_events = the_thread_entity
         .update(cx, |the_thread, cx| {
             the_thread.send(
-                UserMessageId::new(),
+                ClientUserMessageId::new(),
                 ["Native orchestration E2E under profile for ACP capture harness fidelity and CWD"],
                 cx,
             )

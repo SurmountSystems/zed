@@ -232,8 +232,6 @@ impl crate::ThreadEnvironment for FakeThreadEnvironment {
     fn create_subagent(
         &self,
         _label: String,
-        _persona: Option<acp_thread::AgentPersona>,
-        _capability_mode: Option<acp_thread::AgentCapabilityMode>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         Ok(self
@@ -292,8 +290,6 @@ impl crate::ThreadEnvironment for MultiTerminalEnvironment {
     fn create_subagent(
         &self,
         _label: String,
-        _persona: Option<acp_thread::AgentPersona>,
-        _capability_mode: Option<acp_thread::AgentCapabilityMode>,
         _cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
         unimplemented!()
@@ -5846,7 +5842,7 @@ async fn test_subagent_thread_inherits_parent_thread_properties(cx: &mut TestApp
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, cx));
     subagent_thread.read_with(cx, |subagent_thread, cx| {
         assert!(subagent_thread.is_subagent());
         assert_eq!(subagent_thread.depth(), 1);
@@ -5921,7 +5917,7 @@ async fn test_subagent_thread_uses_configured_subagent_model(cx: &mut TestAppCon
         )
     });
 
-    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, None, None, cx));
+    let subagent_thread = cx.new(|cx| Thread::new_subagent(&parent_thread, cx));
     subagent_thread.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
             subagent_thread.model().map(|model| model.id()),
@@ -5989,7 +5985,7 @@ async fn test_max_subagent_depth_prevents_tool_registration(cx: &mut TestAppCont
         thread
     });
     let deep_subagent_thread = cx.new(|cx| {
-        let mut thread = Thread::new_subagent(&deep_parent_thread, None, None, cx);
+        let mut thread = Thread::new_subagent(&deep_parent_thread, cx);
         thread.add_default_tools(environment, cx);
         thread
     });
@@ -6260,7 +6256,7 @@ async fn test_parent_cancel_stops_subagent(cx: &mut TestAppContext) {
         )
     });
 
-    let subagent = cx.new(|cx| Thread::new_subagent(&parent, None, None, cx));
+    let subagent = cx.new(|cx| Thread::new_subagent(&parent, cx));
 
     parent.update(cx, |thread, _cx| {
         thread.register_running_subagent(subagent.downgrade());
@@ -8410,6 +8406,8 @@ fn test_capability_mode_read_only_restriction_in_system_prompt_via_template() {
         is_grok_build_profile: false,
         current_turn_id: None,
         prior_turn_summary: None,
+        is_linux: false,
+        is_windows: false,
         sandboxing: false,
     };
     let rendered_prompt = read_only_template
@@ -8436,6 +8434,8 @@ fn test_capability_mode_read_only_restriction_in_system_prompt_via_template() {
         is_grok_build_profile: false,
         current_turn_id: None,
         prior_turn_summary: None,
+        is_linux: false,
+        is_windows: false,
         sandboxing: false,
     };
     let rendered_full = full_template
@@ -8462,6 +8462,8 @@ fn test_native_grok_build_profile_injects_three_behavioral_rules_and_turn_id() {
         is_grok_build_profile: true,
         current_turn_id: Some("T-42".to_string()),
         prior_turn_summary: Some("Prior assistant response: previous".to_string()),
+        is_linux: false,
+        is_windows: false,
         sandboxing: false,
     };
     let rendered_system_prompt = native_grok_profile_template
@@ -8688,12 +8690,10 @@ async fn test_persona_and_capability_mode_propagation_via_native_subagent_spawn(
     let persona_value = acp_thread::AgentPersona::from_name("researcher");
     let capability_value = acp_thread::AgentCapabilityMode::from_name("read-only");
     let subagent_entity = cx.new(|cx| {
-        Thread::new_subagent(
-            &parent_entity,
-            Some(persona_value),
-            Some(capability_value),
-            cx,
-        )
+        let mut thread = Thread::new_subagent(&parent_entity, cx);
+        thread.set_persona(Some(persona_value));
+        thread.set_capability_mode(Some(capability_value));
+        thread
     });
     subagent_entity.read_with(cx, |subagent_thread, _cx| {
         assert_eq!(
@@ -8826,7 +8826,7 @@ async fn test_native_grok_profile_triggers_system_notification_on_exact_completi
 mod native_grok_surface_tdd {
     // The glob is intentionally broad for the many one-line lock tests below; individual symbols are also used explicitly.
     use acp_thread::{ApprovalRisk, Plan, TurnId};
-    use agent_client_protocol::schema as acp;
+    use agent_client_protocol::schema::v1 as acp;
     // Disambiguate after the glob from super::* (which pulls conflicting names in this large test file).
     use std::assert_eq;
 

@@ -2340,6 +2340,7 @@ mod tests {
             // no conflict with surmount charter or categorized todos surface work).
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: Default::default(),
+            native_grok_artifacts: None,
         }
     }
 

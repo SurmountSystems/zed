@@ -44,6 +44,12 @@ pub struct SpawnAgentToolInput {
     /// Session ID of an existing agent session to continue instead of creating a new one.
     #[serde(default)]
     pub session_id: Option<acp::SessionId>,
+    /// Optional persona for native Grok / Surmount subagent spawn (e.g. implementer, explore).
+    #[serde(default)]
+    pub persona: Option<String>,
+    /// Optional capability mode for the spawned subagent (e.g. read-only).
+    #[serde(default)]
+    pub capability_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

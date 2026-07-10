@@ -31,7 +31,7 @@ use crate::{DismissThreadSearch, SelectNextThreadMatch, SelectPreviousThreadMatc
 
 /// Live expansion snapshot from `ThreadView` so search only hits visible content.
 #[derive(Clone, Default)]
-pub(super) struct ThreadSearchExpansion {
+pub(crate) struct ThreadSearchExpansion {
     pub expanded_tool_calls: HashSet<acp::ToolCallId>,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
     pub expanded_thinking_blocks: HashSet<(usize, usize)>,
@@ -284,6 +284,7 @@ impl ThreadSearchBar {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn active_match_index(&self) -> Option<usize> {
         self.active_match
     }
@@ -661,7 +662,12 @@ impl ThreadSearchBar {
         self.activate_match(prev, true, window, cx);
     }
 
-    fn dismiss(&mut self, _: &DismissThreadSearch, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn dismiss(
+        &mut self,
+        _: &DismissThreadSearch,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.clear_highlights(cx);
         cx.emit(ThreadSearchBarEvent::Dismissed);
     }
@@ -967,9 +973,7 @@ fn collect_markdowns(
                         }),
                 );
             }
-            if content_visible
-                && let Some(raw_input) = &tool_call.raw_input_markdown
-            {
+            if content_visible && let Some(raw_input) = &tool_call.raw_input_markdown {
                 // Confirmation cards toggle raw input; other open cards always show it.
                 let raw_visible = match &tool_call.status {
                     ToolCallStatus::WaitingForConfirmation { .. } => {

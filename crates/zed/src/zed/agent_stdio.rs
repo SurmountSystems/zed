@@ -5,19 +5,34 @@
 //! - **stdout**: TOON responses and events only
 //! - **stderr**: all Zed logs
 //!
-//! Startup emits a ready event:
+//! Startup emits a ready event (`toon-format`; spaces after `:`):
 //! ```text
-//! event:ready
-//! user_data_dir:/tmp/...
-//! pid:12345
+//! event: ready
+//! user_data_dir: "/tmp/..."
+//! pid: 12345
 //! ```
 //!
-//! Methods (v1): `snapshot`, `action`, `keys`, `open`, `actions`, `wait`, `shutdown`.
+//! ## Methods (v1)
+//!
+//! | Method | One-line |
+//! |--------|----------|
+//! | `snapshot` / `look` | Capture a11y outline (`detail`: compact\|rich\|room; look is a pure alias) |
+//! | `inventory` | Best-effort session bag (windows, titles, focus) |
+//! | `click` | Dispatch AccessKit action on a node id from look (default `click`) |
+//! | `theme` / `feel` | Global theme ambience (name + a few tokens — not per-control paint) |
+//! | `actions` | List registered GPUI action names (double-colon form) |
+//! | `open` | Open a file path or URL in the workspace |
+//! | `wait` | Sleep `ms` milliseconds on the GPUI executor |
+//! | `action` | Dispatch a registered GPUI action by name |
+//! | `keys` | Dispatch a keystroke string (e.g. `ctrl-p`) |
+//! | `shutdown` | Emit ok and quit the process |
 
 use crate::{OpenListener, RawOpenRequest};
 use anyhow::{Context as _, Result};
 use futures::{StreamExt, channel::mpsc};
-use gpui::{AnyWindowHandle, App, AppContext as _, Keystroke, ReadGlobal as _};
+use gpui::{
+    AnyWindowHandle, App, AppContext as _, Keystroke, OutlineDetail, ReadGlobal as _, accesskit,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
@@ -25,6 +40,7 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
+use theme::ActiveTheme;
 use toon_format::{decode_default, encode_default};
 /// Environment variable that enables agent-stdio mode (same effect as `--agent-stdio`).
 pub const ENV_VAR: &str = "ZED_AGENT_STDIO";
@@ -165,6 +181,18 @@ pub struct AgentRequest {
     pub path: Option<String>,
     #[serde(default)]
     pub ms: Option<u64>,
+    /// Snapshot/look detail: `compact`, `rich` (default), or `room`.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// AccessKit node id for `click` (`42`, `NodeId(42)`, or `#NodeId(42)`).
+    #[serde(default)]
+    pub node: Option<String>,
+    /// A11y action name for `click` (default `click`): click, focus, set_value, expand, collapse.
+    #[serde(default)]
+    pub a11y_action: Option<String>,
+    /// String payload for `a11y_action:set_value` (preferred over JSON `data`).
+    #[serde(default)]
+    pub value: Option<String>,
 }
 
 /// Encodes a value as a TOON document (no trailing newline).
@@ -181,20 +209,22 @@ pub fn decode_toon(document: &str) -> Result<Value> {
 pub fn decode_request(line: &str) -> Result<AgentRequest> {
     let mut value = decode_toon(line)?;
     if let Some(obj) = value.as_object_mut() {
-        normalize_request_id_field(obj);
+        // TOON bare numbers become JSON numbers; string fields need text.
+        normalize_stringish_field(obj, "id");
+        normalize_stringish_field(obj, "node");
     }
     serde_json::from_value(value).context("invalid agent-stdio request shape")
 }
 
-fn normalize_request_id_field(obj: &mut Map<String, Value>) {
-    let Some(id) = obj.get("id") else {
+fn normalize_stringish_field(obj: &mut Map<String, Value>, key: &str) {
+    let Some(value) = obj.get(key) else {
         return;
     };
-    if id.is_string() {
+    if value.is_string() {
         return;
     }
-    if let Some(number) = id.as_u64().or_else(|| id.as_i64().map(|n| n as u64)) {
-        obj.insert("id".into(), Value::String(number.to_string()));
+    if let Some(number) = value.as_u64().or_else(|| value.as_i64().map(|n| n as u64)) {
+        obj.insert(key.into(), Value::String(number.to_string()));
     }
 }
 
@@ -237,29 +267,151 @@ fn emit_response(id: Option<&str>, fields: Map<String, Value>) {
     }
 }
 
+fn parse_outline_detail(raw: Option<&str>) -> Result<OutlineDetail, String> {
+    match raw.map(str::trim).unwrap_or("rich") {
+        "" | "rich" => Ok(OutlineDetail::Rich),
+        "compact" => Ok(OutlineDetail::Compact),
+        "room" => Ok(OutlineDetail::Room),
+        other => Err(format!(
+            "unknown snapshot detail `{other}` (expected compact|rich|room)"
+        )),
+    }
+}
+
+fn parse_node_id(raw: &str) -> Result<accesskit::NodeId, String> {
+    // Accept decimal `42`, `NodeId(42)`, and outline token `#NodeId(42)`.
+    let trimmed = raw.trim();
+    let without_hash = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    let number = without_hash
+        .strip_prefix("NodeId(")
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or(without_hash);
+    number
+        .parse::<u64>()
+        .map(accesskit::NodeId)
+        .map_err(|_| format!("invalid node id `{raw}` (use decimal, NodeId(N), or #NodeId(N))"))
+}
+
+fn parse_a11y_action(raw: Option<&str>) -> Result<accesskit::Action, String> {
+    match raw.map(str::trim).unwrap_or("click") {
+        "" | "click" => Ok(accesskit::Action::Click),
+        "focus" => Ok(accesskit::Action::Focus),
+        "set_value" => Ok(accesskit::Action::SetValue),
+        "expand" => Ok(accesskit::Action::Expand),
+        "collapse" => Ok(accesskit::Action::Collapse),
+        other => Err(format!(
+            "unknown a11y_action `{other}` (click|focus|set_value|expand|collapse)"
+        )),
+    }
+}
+
+/// Map optional request payload into AccessKit action data.
+///
+/// `set_value` requires a string or number (`value:` field preferred; JSON
+/// string/number `data:` also accepted). Other actions leave data empty.
+fn a11y_action_data(
+    action: accesskit::Action,
+    value: Option<&str>,
+    data: Option<&Value>,
+) -> Result<Option<accesskit::ActionData>, String> {
+    if action != accesskit::Action::SetValue {
+        return Ok(None);
+    }
+    if let Some(text) = value.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(Some(accesskit::ActionData::Value(text.into())));
+    }
+    match data {
+        Some(Value::String(text)) if !text.is_empty() => {
+            Ok(Some(accesskit::ActionData::Value(text.clone().into_boxed_str())))
+        }
+        Some(Value::Number(n)) => {
+            if let Some(f) = n.as_f64() {
+                Ok(Some(accesskit::ActionData::NumericValue(f)))
+            } else {
+                Err("set_value data number is not finite".into())
+            }
+        }
+        Some(_) => Err(
+            "set_value requires string `value:` or string/number `data:` (ActionData::Value / NumericValue)"
+                .into(),
+        ),
+        None => Err(
+            "set_value requires `value:` (string) or `data:` (string|number); expand/collapse need a registered listener on the node"
+                .into(),
+        ),
+    }
+}
+
 fn handle_request(request: AgentRequest, cx: &mut App) -> Result<()> {
     let id = request.id.as_deref();
     match request.method.as_str() {
-        "snapshot" => {
-            let snapshot = capture_snapshot(cx);
+        "snapshot" | "look" => match parse_outline_detail(request.detail.as_deref()) {
+            Ok(detail) => match capture_snapshot(cx, detail) {
+                Ok(snapshot) => {
+                    let mut fields = Map::new();
+                    fields.insert("snapshot@text".into(), Value::String(snapshot));
+                    emit_response(id, fields);
+                }
+                Err(error) => emit_error(id, &error),
+            },
+            Err(error) => emit_error(id, &error),
+        },
+        "inventory" => match capture_inventory(cx) {
+            Ok(inventory) => {
+                let mut fields = Map::new();
+                fields.insert("inventory@text".into(), Value::String(inventory));
+                emit_response(id, fields);
+            }
+            Err(error) => emit_error(id, &error),
+        },
+        "theme" | "feel" => {
             let mut fields = Map::new();
-            fields.insert("snapshot@text".into(), Value::String(snapshot));
+            fields.insert("theme@text".into(), Value::String(capture_theme(cx)));
             emit_response(id, fields);
         }
+        "click" => match request.node.as_deref() {
+            Some(node_raw) => match parse_node_id(node_raw) {
+                Ok(node_id) => match parse_a11y_action(request.a11y_action.as_deref()) {
+                    Ok(action) => {
+                        match a11y_action_data(action, request.value.as_deref(), request.data.as_ref())
+                        {
+                            Ok(data) => {
+                                if let Err(error) = dispatch_a11y_click(cx, node_id, action, data) {
+                                    emit_error(id, &error);
+                                } else {
+                                    emit_response(id, Map::new());
+                                }
+                            }
+                            Err(error) => emit_error(id, &error),
+                        }
+                    }
+                    Err(error) => emit_error(id, &error),
+                },
+                Err(error) => emit_error(id, &error),
+            },
+            None => emit_error(
+                id,
+                &"click requests require `node` (AccessKit NodeId from look)",
+            ),
+        },
         "action" => match request.name.as_deref() {
             Some(name) => {
                 if let Err(error) = dispatch_action(cx, name, request.data) {
-                    emit_error(id, &error);
+                    // `{:#}` includes the full anyhow chain (build + dispatch context).
+                    emit_error(id, &format!("{error:#}"));
                 } else {
                     emit_response(id, Map::new());
                 }
             }
-            None => emit_error(id, &"action requests require `name`"),
+            None => emit_error(
+                id,
+                &"action requests require `name` (use method:actions for registered double-colon names, e.g. crate::Action)",
+            ),
         },
         "keys" => match request.keys.as_deref() {
             Some(keys) => {
                 if let Err(error) = dispatch_keys(cx, keys) {
-                    emit_error(id, &error);
+                    emit_error(id, &format!("{error:#}"));
                 } else {
                     emit_response(id, Map::new());
                 }
@@ -305,10 +457,123 @@ fn handle_request(request: AgentRequest, cx: &mut App) -> Result<()> {
     Ok(())
 }
 
-fn capture_snapshot(cx: &mut App) -> String {
-    let mut outline = String::new();
-
+/// Capture a11y outlines across windows at the given detail tier.
+///
+/// - Success (`Ok`): merged outlines (possibly empty string when windows painted
+///   with no interactive content for compact/rich, or when there are no windows).
+///   Room detail may still emit a header-only body when no controls exist.
+/// - Failure (`Err`): at least one `update_window` failed **and** no outline
+///   was produced — callers should emit `ok: false` so dogfood gates do not
+///   treat diagnostic text as a successful non-empty snapshot.
+fn capture_snapshot(cx: &mut App, detail: OutlineDetail) -> Result<String, String> {
     // Prefer active window, then others. Headless often has no active_window.
+    let handles = ordered_window_handles(cx);
+
+    let mut sections: Vec<(usize, String)> = Vec::new();
+    let mut update_errors: Vec<String> = Vec::new();
+    for (index, handle) in handles.into_iter().enumerate() {
+        match cx.update_window(handle, |_, window, cx| {
+            // Always paint before reading outline. Headless has no compositor
+            // frame loop; reusing a non-empty last outline after wait/action
+            // would return stale UI.
+            window.draw(cx).clear();
+            window.a11y_outline(detail)
+        }) {
+            Ok(outline) if !outline.is_empty() => sections.push((index, outline)),
+            Ok(_) => {}
+            Err(error) => {
+                // Full chain; never merge diagnostics into snapshot@text.
+                update_errors.push(format!("window {index}: {error:#}"));
+            }
+        }
+    }
+
+    if sections.is_empty() && !update_errors.is_empty() {
+        return Err(format!(
+            "snapshot update_window failed (no interactive outline): {}",
+            update_errors.join("; ")
+        ));
+    }
+    Ok(merge_window_outlines(&sections))
+}
+
+/// Active theme ambience for dogfood: name + a few named tokens, not per-control paint.
+///
+/// AccessKit does not expose fill/border/radius. This samples the global
+/// [`ActiveTheme`] only so agents can feel room atmosphere without inventing
+/// "1px solid white" from the outline.
+fn capture_theme(cx: &App) -> String {
+    let theme = cx.theme();
+    let colors = theme.colors();
+    let appearance = if theme.appearance.is_light() {
+        "light"
+    } else {
+        "dark"
+    };
+    format_theme_ambience(
+        theme.name.as_ref(),
+        appearance,
+        &colors.background.to_string(),
+        &colors.border.to_string(),
+        &colors.text_accent.to_string(),
+    )
+}
+
+/// Pure theme ambience text (unit-testable; no App required).
+fn format_theme_ambience(
+    name: &str,
+    appearance: &str,
+    background: &str,
+    border: &str,
+    text_accent: &str,
+) -> String {
+    format!(
+        "# theme: {name}\n# appearance: {appearance}\n# background: {background}\n# border: {border}\n# text_accent: {text_accent}\n"
+    )
+}
+
+/// Best-effort retained-session inventory for dogfood (agent_stdio only).
+fn capture_inventory(cx: &mut App) -> Result<String, String> {
+    let mut lines = Vec::new();
+    let window_count = cx.windows().len();
+    lines.push(format!("windows: {window_count}"));
+    if cx.active_window().is_some() {
+        lines.push("active_window: yes".into());
+    } else {
+        lines.push("active_window: (none)".into());
+    }
+
+    // Open paths when workspace APIs are available on the app; keep best-effort.
+    // Title from force-drawn outline focus line is enough for tactile inventory.
+    for (index, handle) in cx.windows().into_iter().enumerate() {
+        match cx.update_window(handle, |_, window, cx| {
+            window.draw(cx).clear();
+            let room = window.a11y_outline(OutlineDetail::Room);
+            let title = room
+                .lines()
+                .find_map(|line| line.strip_prefix("# window: "))
+                .unwrap_or("(unknown)")
+                .to_string();
+            let focus = room
+                .lines()
+                .find_map(|line| line.strip_prefix("# focus: "))
+                .unwrap_or("(unknown)")
+                .to_string();
+            (title, focus)
+        }) {
+            Ok((title, focus)) => {
+                lines.push(format!("window[{index}].title: {title}"));
+                lines.push(format!("window[{index}].focus: {focus}"));
+            }
+            Err(error) => lines.push(format!("window[{index}].error: {error:#}")),
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
+/// Ordered window handles: active first, then remaining (same as snapshot/look).
+fn ordered_window_handles(cx: &App) -> Vec<AnyWindowHandle> {
     let mut handles = Vec::new();
     if let Some(active) = cx.active_window() {
         handles.push(active);
@@ -318,31 +583,81 @@ fn capture_snapshot(cx: &mut App) -> String {
             handles.push(window);
         }
     }
+    handles
+}
 
-    for handle in handles {
-        let _ = cx.update_window(handle, |_, window, cx| {
-            // Always paint before reading outline. Headless has no compositor
-            // frame loop; reusing a non-empty last outline after wait/action
-            // would return stale UI.
+fn dispatch_a11y_click(
+    cx: &mut App,
+    node_id: accesskit::NodeId,
+    action: accesskit::Action,
+    data: Option<accesskit::ActionData>,
+) -> Result<(), String> {
+    let handles = ordered_window_handles(cx);
+    if handles.is_empty() {
+        return Err("no windows available for click".to_string());
+    }
+
+    let mut saw_missing = false;
+    let mut last_update_error: Option<String> = None;
+    for (index, handle) in handles.into_iter().enumerate() {
+        // Clone data for each window attempt (SetValue payload is cheap).
+        let data = data.clone();
+        match cx.update_window(handle, |_, window, cx| {
+            // Paint so node ids match the tree the agent saw in look/snapshot.
             window.draw(cx).clear();
-            outline = window.a11y_interactive_outline();
-        });
-        if !outline.is_empty() {
-            break;
+            window.dispatch_a11y_action(node_id, action, data, cx)
+        }) {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) if error.starts_with("no a11y node ") => {
+                saw_missing = true;
+            }
+            // Node present in this window but action did not apply — definitive.
+            Ok(Err(error)) => return Err(error),
+            Err(error) => {
+                last_update_error = Some(format!("window {index}: {error:#}"));
+            }
         }
     }
 
-    outline
+    if saw_missing {
+        return Err(format!(
+            "no a11y node #NodeId({}) in any window (look first, then click that id)",
+            u64::from(node_id)
+        ));
+    }
+    Err(last_update_error.unwrap_or_else(|| {
+        format!(
+            "click failed for #NodeId({}) (no window accepted the action)",
+            u64::from(node_id)
+        )
+    }))
+}
+
+/// Merge per-window interactive outlines. Single non-empty window is returned as-is;
+/// multiple get `--- window N ---` separators (`N` is 0-based walk order: active first).
+fn merge_window_outlines(sections: &[(usize, String)]) -> String {
+    match sections {
+        [] => String::new(),
+        [(_, only)] => only.clone(),
+        many => many
+            .iter()
+            .map(|(index, outline)| format!("--- window {index} ---\n{outline}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 fn dispatch_action(cx: &mut App, name: &str, data: Option<Value>) -> Result<()> {
-    let action = cx.build_action(name, data)?;
+    // Outer context omits `{name}` — GPUI `ActionBuildError` Display already includes it.
+    let action = cx.build_action(name, data).context(
+        "build action failed; names come from method:actions (double-colon form, e.g. crate::Action)",
+    )?;
     if let Some(handle) = active_window_handle(cx) {
         handle
             .update(cx, |_, window, cx| {
                 window.dispatch_action(action, cx);
             })
-            .context("failed to dispatch action on active window")?;
+            .with_context(|| format!("failed to dispatch action `{name}` on active window"))?;
     } else {
         cx.dispatch_action(action.as_ref());
     }
@@ -408,6 +723,10 @@ mod tests {
             url: None,
             path: None,
             ms: None,
+            detail: None,
+            node: None,
+            a11y_action: None,
+            value: None,
         };
         let encoded = encode_toon(&serde_json::to_value(&original).unwrap()).unwrap();
         let decoded = decode_request(&encoded).unwrap();
@@ -436,6 +755,182 @@ mod tests {
         let request = decode_request("method:snapshot\nid:7").unwrap();
         assert_eq!(request.method, "snapshot");
         assert_eq!(request.id.as_deref(), Some("7"));
+        assert_eq!(request.detail, None);
+        assert_eq!(
+            parse_outline_detail(request.detail.as_deref()).unwrap(),
+            OutlineDetail::Rich,
+            "snapshot without detail defaults to rich"
+        );
+    }
+
+    #[test]
+    fn test_parse_outline_detail_table() {
+        let cases: &[(&str, Result<OutlineDetail, ()>)] = &[
+            ("", Ok(OutlineDetail::Rich)),
+            ("rich", Ok(OutlineDetail::Rich)),
+            ("  rich  ", Ok(OutlineDetail::Rich)),
+            ("compact", Ok(OutlineDetail::Compact)),
+            ("room", Ok(OutlineDetail::Room)),
+            ("ROOM", Err(())),
+            ("full", Err(())),
+            ("richroom", Err(())),
+        ];
+        for (raw, expected) in cases {
+            let got = parse_outline_detail(Some(raw));
+            match expected {
+                Ok(detail) => assert_eq!(got.as_ref().ok(), Some(detail), "input {raw:?}"),
+                Err(()) => {
+                    assert!(got.is_err(), "expected error for {raw:?}, got {got:?}");
+                    let err = got.unwrap_err();
+                    assert!(
+                        err.contains("expected compact|rich|room"),
+                        "error shape: {err}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            parse_outline_detail(None).unwrap(),
+            OutlineDetail::Rich,
+            "missing detail defaults to rich"
+        );
+    }
+
+    #[test]
+    fn test_decode_look_room_and_click() {
+        let look = decode_request("method:look\nid:1\ndetail:room").unwrap();
+        assert_eq!(look.method, "look");
+        assert_eq!(look.detail.as_deref(), Some("room"));
+        assert_eq!(
+            parse_outline_detail(look.detail.as_deref()).unwrap(),
+            OutlineDetail::Room
+        );
+        // look without detail still decodes; default is rich (same as snapshot).
+        let look_default = decode_request("method:look\nid:1b").unwrap();
+        assert_eq!(look_default.method, "look");
+        assert_eq!(look_default.detail, None);
+        assert_eq!(
+            parse_outline_detail(look_default.detail.as_deref()).unwrap(),
+            OutlineDetail::Rich
+        );
+
+        let inventory = decode_request("method:inventory\nid:inv1").unwrap();
+        assert_eq!(inventory.method, "inventory");
+        assert_eq!(inventory.id.as_deref(), Some("inv1"));
+
+        let theme = decode_request("method:theme\nid:t1").unwrap();
+        assert_eq!(theme.method, "theme");
+        assert_eq!(theme.id.as_deref(), Some("t1"));
+        let feel = decode_request("method:feel\nid:t2").unwrap();
+        assert_eq!(feel.method, "feel");
+
+        let click = decode_request("method:click\nid:2\nnode:42\na11y_action:focus").unwrap();
+        assert_eq!(click.method, "click");
+        assert_eq!(click.node.as_deref(), Some("42"));
+        assert_eq!(parse_node_id("42").unwrap(), accesskit::NodeId(42));
+        assert_eq!(parse_node_id("NodeId(7)").unwrap(), accesskit::NodeId(7));
+        assert_eq!(parse_node_id("#NodeId(42)").unwrap(), accesskit::NodeId(42));
+        assert_eq!(parse_node_id("#99").unwrap(), accesskit::NodeId(99));
+        assert_eq!(
+            parse_a11y_action(click.a11y_action.as_deref()).unwrap(),
+            accesskit::Action::Focus
+        );
+        // Bare decimal preferred; TOON number for node normalizes to string.
+        let click_num = decode_request("method:click\nid:3\nnode:99").unwrap();
+        assert_eq!(click_num.node.as_deref(), Some("99"));
+        assert_eq!(
+            parse_a11y_action(None).unwrap(),
+            accesskit::Action::Click,
+            "missing a11y_action defaults to click"
+        );
+        assert_eq!(
+            parse_a11y_action(Some("set_value")).unwrap(),
+            accesskit::Action::SetValue
+        );
+        assert_eq!(
+            parse_a11y_action(Some("expand")).unwrap(),
+            accesskit::Action::Expand
+        );
+        assert_eq!(
+            parse_a11y_action(Some("collapse")).unwrap(),
+            accesskit::Action::Collapse
+        );
+        let bad_action = parse_a11y_action(Some("hover"));
+        assert!(bad_action.is_err(), "{bad_action:?}");
+        assert!(
+            bad_action.unwrap_err().contains("click|focus|set_value"),
+            "error should list allowed verbs"
+        );
+        assert!(parse_node_id("").is_err());
+        assert!(parse_node_id("NodeId").is_err());
+        assert!(parse_node_id("#NodeId()").is_err());
+        assert!(parse_node_id("not-a-node").is_err());
+        let missing_node = decode_request("method:click\nid:4").unwrap();
+        assert_eq!(missing_node.method, "click");
+        assert_eq!(missing_node.node, None);
+
+        // set_value requires value/data; other actions do not.
+        assert!(a11y_action_data(accesskit::Action::SetValue, None, None).is_err());
+        assert!(matches!(
+            a11y_action_data(accesskit::Action::SetValue, Some("hi"), None).unwrap(),
+            Some(accesskit::ActionData::Value(text)) if text.as_ref() == "hi"
+        ));
+        assert!(matches!(
+            a11y_action_data(
+                accesskit::Action::SetValue,
+                None,
+                Some(&Value::String("via-data".into()))
+            )
+            .unwrap(),
+            Some(accesskit::ActionData::Value(text)) if text.as_ref() == "via-data"
+        ));
+        assert!(matches!(
+            a11y_action_data(
+                accesskit::Action::SetValue,
+                None,
+                Some(&json!(1.5))
+            )
+            .unwrap(),
+            Some(accesskit::ActionData::NumericValue(n)) if (n - 1.5).abs() < f64::EPSILON
+        ));
+        assert_eq!(
+            a11y_action_data(accesskit::Action::Click, None, None).unwrap(),
+            None
+        );
+        assert_eq!(
+            a11y_action_data(accesskit::Action::Expand, None, None).unwrap(),
+            None
+        );
+        let set_value_req =
+            decode_request("method:click\nid:5\nnode:9\na11y_action:set_value\nvalue:hello")
+                .unwrap();
+        assert_eq!(set_value_req.value.as_deref(), Some("hello"));
+        assert_eq!(
+            a11y_action_data(
+                accesskit::Action::SetValue,
+                set_value_req.value.as_deref(),
+                set_value_req.data.as_ref()
+            )
+            .unwrap(),
+            Some(accesskit::ActionData::Value("hello".into()))
+        );
+    }
+
+    #[test]
+    fn test_merge_window_outlines_empty_single_and_multi() {
+        assert_eq!(merge_window_outlines(&[]), "");
+        assert_eq!(
+            merge_window_outlines(&[(0, "[Button] \"A\"".into())]),
+            "[Button] \"A\""
+        );
+        let merged = merge_window_outlines(&[
+            (0, "[Button] \"A\"".into()),
+            (2, "[TextInput] value=\"x\"".into()),
+        ]);
+        assert_eq!(
+            merged,
+            "--- window 0 ---\n[Button] \"A\"\n--- window 2 ---\n[TextInput] value=\"x\""
+        );
     }
 
     #[test]
@@ -463,5 +958,67 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn test_format_theme_ambience_named_tokens_only() {
+        let text = format_theme_ambience(
+            "One Dark",
+            "dark",
+            "hsla(210.00, 13.00%, 13.00%, 1.00)",
+            "hsla(210.00, 10.00%, 40.00%, 1.00)",
+            "hsla(207.00, 82.00%, 66.00%, 1.00)",
+        );
+        assert_eq!(
+            text,
+            "# theme: One Dark\n\
+             # appearance: dark\n\
+             # background: hsla(210.00, 13.00%, 13.00%, 1.00)\n\
+             # border: hsla(210.00, 10.00%, 40.00%, 1.00)\n\
+             # text_accent: hsla(207.00, 82.00%, 66.00%, 1.00)\n"
+        );
+        // Honest ambience only — no per-control CSS dump fields.
+        assert!(!text.contains("border-radius"), "{text}");
+        assert!(!text.contains("1px solid"), "{text}");
+    }
+
+    #[test]
+    fn test_decode_open_keys_actions_shutdown_and_compact() {
+        let open = decode_request("method:open\nid:o1\npath:/tmp/readme.md").unwrap();
+        assert_eq!(open.method, "open");
+        assert_eq!(open.path.as_deref(), Some("/tmp/readme.md"));
+        assert_eq!(open.url, None);
+
+        let open_url = decode_request("method:open\nid:o2\nurl:https://example.com").unwrap();
+        assert_eq!(open_url.url.as_deref(), Some("https://example.com"));
+        assert_eq!(open_url.path, None);
+
+        let keys = decode_request("method:keys\nid:k1\nkeys:ctrl-p").unwrap();
+        assert_eq!(keys.method, "keys");
+        assert_eq!(keys.keys.as_deref(), Some("ctrl-p"));
+
+        let actions = decode_request("method:actions\nid:a1").unwrap();
+        assert_eq!(actions.method, "actions");
+        assert_eq!(actions.id.as_deref(), Some("a1"));
+
+        let shutdown = decode_request("method:shutdown\nid:s1").unwrap();
+        assert_eq!(shutdown.method, "shutdown");
+
+        let action = decode_request("method:action\nid:act1\nname:agent::ToggleFocus").unwrap();
+        assert_eq!(action.method, "action");
+        assert_eq!(action.name.as_deref(), Some("agent::ToggleFocus"));
+
+        let compact = decode_request("method:snapshot\nid:c1\ndetail:compact").unwrap();
+        assert_eq!(compact.detail.as_deref(), Some("compact"));
+        assert_eq!(
+            parse_outline_detail(compact.detail.as_deref()).unwrap(),
+            OutlineDetail::Compact
+        );
+        let look_compact = decode_request("method:look\nid:c2\ndetail:compact").unwrap();
+        assert_eq!(look_compact.method, "look");
+        assert_eq!(
+            parse_outline_detail(look_compact.detail.as_deref()).unwrap(),
+            OutlineDetail::Compact
+        );
     }
 }

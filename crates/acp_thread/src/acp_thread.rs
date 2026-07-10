@@ -2176,6 +2176,35 @@ pub struct ToolCallUpdateTerminal {
     pub terminal: Entity<Terminal>,
 }
 
+/// Stable identifier for a native agent turn (Surmount / Grok Build fidelity).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnId(u32);
+
+impl TurnId {
+    pub fn new(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl From<u32> for TurnId {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl From<TurnId> for u32 {
+    fn from(turn_id: TurnId) -> Self {
+        turn_id.0
+    }
+}
+
+impl Display for TurnId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "T-{}", self.0)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Plan {
     pub entries: Vec<PlanEntry>,

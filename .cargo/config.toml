@@ -31,10 +31,12 @@ MACOSX_DEPLOYMENT_TARGET = "10.15.7"
 # Workspace pins until human verifies exact versions on menhera:
 #   wgpu = "29.0.3"
 #   agent-client-protocol = "=1.0.0"
-# As of 2026-07-08: still BEFORE binding date — do not unpin. On/after 2026-07-12, human runs:
+# As of 2026-07-08: still BEFORE binding date — do not unpin.
+# On/after 2026-07-12: calendar alone is insufficient — human must still run both
+# cargo info checks and only then bump Cargo.toml + drop this comment block:
 #   cargo info wgpu@29.0.4 --registry menhera-cooldown
 #   cargo info agent-client-protocol@1.0.1 --registry menhera-cooldown
-# Only then bump Cargo.toml to upstream targets and drop this comment block.
+# Full checklist: SURMOUNT.md § Menhera dependency pins (verify → unpin → rebuild → dogfood).
 # No [source] override here — cargo cannot alias crates.io without a vendor tree.
 #
 # toon-format 0.5 (agent-stdio): NOT menhera lag (already on menhera). Keep

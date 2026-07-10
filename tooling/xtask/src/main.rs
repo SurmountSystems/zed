@@ -15,6 +15,8 @@ struct Args {
 enum CliCommand {
     /// Runs `cargo clippy`.
     Clippy(tasks::clippy::ClippyArgs),
+    /// Headless agent-stdio dogfood (preflight / golden / smoke).
+    Dogfood(tasks::dogfood::DogfoodArgs),
     Compliance(tasks::compliance::ComplianceArgs),
     Licenses(tasks::licenses::LicensesArgs),
     /// Checks that packages conform to a set of standards.
@@ -38,6 +40,7 @@ fn main() -> Result<()> {
 
     match args.command {
         CliCommand::Clippy(args) => tasks::clippy::run_clippy(args),
+        CliCommand::Dogfood(args) => tasks::dogfood::run_dogfood(args),
         CliCommand::Compliance(args) => tasks::compliance::check_compliance(args),
         CliCommand::Licenses(args) => tasks::licenses::run_licenses(args),
         CliCommand::PackageConformity(args) => {

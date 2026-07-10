@@ -14,7 +14,7 @@ use project::{AgentId, Project, agent_server_store::AgentServerStore};
 use acp_thread::AgentConnection;
 use agent_client_protocol::schema::v1 as acp_schema;
 use anyhow::Result;
-use gpui::{App, AppContext, Entity, Task};
+use gpui::{App, AppContext, Entity, SharedString, Task};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use std::{any::Any, rc::Rc, sync::Arc};
 
@@ -132,4 +132,134 @@ pub fn load_proxy_env(cx: &mut App) -> HashMap<String, String> {
     }
 
     env
+}
+
+
+/// Surmount in-process native Grok server skeleton (contract conformance for tests).
+pub struct GrokNativeServer;
+
+impl GrokNativeServer {
+    pub fn new() -> Self {
+        GrokNativeServer
+    }
+}
+
+impl AgentServer for GrokNativeServer {
+    fn logo(&self) -> ui::IconName {
+        ui::IconName::AiXAi
+    }
+
+    fn agent_id(&self) -> AgentId {
+        AgentId::from("grok-native")
+    }
+
+    fn connect(
+        &self,
+        delegate: AgentServerDelegate,
+        project: Entity<Project>,
+        cx: &mut App,
+    ) -> Task<Result<Rc<dyn AgentConnection>>> {
+        let _ = (delegate, project, cx);
+        Task::ready(Ok(
+            Rc::new(GrokNativeConnection::new()) as Rc<dyn AgentConnection>
+        ))
+    }
+
+    fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+        self
+    }
+}
+
+/// Surmount in-process native Grok connection skeleton.
+#[derive(Clone)]
+pub struct GrokNativeConnection {
+    #[allow(dead_code)]
+    session_store: Option<()>,
+}
+
+impl GrokNativeConnection {
+    pub fn new() -> Self {
+        GrokNativeConnection {
+            session_store: None,
+        }
+    }
+
+    pub fn new_with_injectable_session_store(injected_store: ()) -> Self {
+        GrokNativeConnection {
+            session_store: Some(injected_store),
+        }
+    }
+}
+
+impl AgentConnection for GrokNativeConnection {
+    fn agent_id(&self) -> AgentId {
+        AgentId::from("grok-native")
+    }
+
+    fn telemetry_id(&self) -> SharedString {
+        SharedString::from("grok-native")
+    }
+
+    fn new_session(
+        self: Rc<Self>,
+        project: Entity<Project>,
+        work_dirs: util::path_list::PathList,
+        cx: &mut App,
+    ) -> Task<Result<Entity<acp_thread::AcpThread>>> {
+        let _ = (self, project, work_dirs, cx);
+        Task::ready(Err(anyhow::anyhow!(
+            "Grok-native launches via routed NativeAgentServer in agent_ui; skeleton for contract tests only"
+        )))
+    }
+
+    fn auth_methods(&self) -> &[acp_schema::AuthMethod] {
+        &[]
+    }
+
+    fn authenticate(&self, method: acp_schema::AuthMethodId, cx: &mut App) -> Task<Result<()>> {
+        let _ = (self, method, cx);
+        Task::ready(Ok(()))
+    }
+
+    fn prompt(
+        &self,
+        params: acp_schema::PromptRequest,
+        cx: &mut App,
+    ) -> Task<Result<acp_schema::PromptResponse>> {
+        let _ = (self, params, cx);
+        Task::ready(Err(anyhow::anyhow!(
+            "Grok-native prompt via routed NativeAgentServer path; skeleton for tests only"
+        )))
+    }
+
+    fn cancel(&self, session_id: &acp_schema::SessionId, cx: &mut App) {
+        let _ = (self, session_id, cx);
+    }
+
+    fn session_list(&self, cx: &mut App) -> Option<Rc<dyn acp_thread::AgentSessionList>> {
+        let _ = cx;
+        Some(Rc::new(GrokNativeSessionList) as Rc<dyn acp_thread::AgentSessionList>)
+    }
+
+    fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+        self
+    }
+}
+
+#[derive(Clone)]
+struct GrokNativeSessionList;
+
+impl acp_thread::AgentSessionList for GrokNativeSessionList {
+    fn list_sessions(
+        &self,
+        request: acp_thread::AgentSessionListRequest,
+        cx: &mut App,
+    ) -> Task<Result<acp_thread::AgentSessionListResponse>> {
+        let _ = (self, request, cx);
+        Task::ready(Ok(acp_thread::AgentSessionListResponse::new(Vec::new())))
+    }
+
+    fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+        self
+    }
 }

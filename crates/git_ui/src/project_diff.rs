@@ -3435,8 +3435,11 @@ mod tests {
         // tie between them is broken by the full path (`lib/` before `src/`).
         // A plain path sort would instead order them `lib/foo.rs`, `m.rs`,
         // `src/foo.rs`.
-        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
-        assert_eq!(paths, vec!["lib/foo.rs", "src/foo.rs", "m.rs"]);
+        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
+        assert_eq!(paths.len(), 3);
+        assert_eq!(*paths[0], *"lib/foo.rs");
+        assert_eq!(*paths[1], *"src/foo.rs");
+        assert_eq!(*paths[2], *"m.rs");
     }
 
     #[gpui::test]
@@ -3488,8 +3491,11 @@ mod tests {
         // In tree view the `src/sub/` directory sorts before the files directly
         // in `src/`. A plain path sort would interleave them as `src/a.rs`,
         // `src/m.rs`, `src/sub/b.rs`.
-        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
-        assert_eq!(paths, vec!["src/sub/b.rs", "src/a.rs", "src/m.rs"]);
+        let paths = diff.read_with(cx, |diff, cx| diff.excerpt_paths(cx));
+        assert_eq!(paths.len(), 3);
+        assert_eq!(*paths[0], *"src/sub/b.rs");
+        assert_eq!(*paths[1], *"src/a.rs");
+        assert_eq!(*paths[2], *"src/m.rs");
     }
 
     #[gpui::test]

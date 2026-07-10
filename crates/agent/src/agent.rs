@@ -4,6 +4,7 @@ mod native_agent_server;
 pub mod outline;
 mod pattern_extraction;
 mod sandboxing;
+mod scheduler;
 mod templates;
 #[cfg(test)]
 mod tests;
@@ -11,6 +12,7 @@ mod thread;
 mod thread_store;
 mod tool_permissions;
 mod tools;
+mod verification;
 
 use context_server::ContextServerId;
 pub use db::*;
@@ -24,9 +26,17 @@ pub use sandboxing::{
 pub use shell_command_parser::extract_commands;
 pub use templates::*;
 pub use thread::*;
+// Re-export for tests that assert fragment contents (`super::GROK_BUILD_SYSTEM_FRAGMENTS`).
+#[allow(unused_imports)]
+pub(crate) use thread::GROK_BUILD_SYSTEM_FRAGMENTS;
 pub use thread_store::*;
 pub use tool_permissions::*;
 pub use tools::*;
+pub use verification::{
+    BestOfNCandidate, BestOfNResult, CwdRiskLabel, NATIVE_VERIFICATION_FRAGMENTS,
+    SelfCheckResult, VerificationContext, inject_verification_rules_for_native_profile,
+    perform_best_of_n_verification, run_self_check, validate_grok_build_output_formatting,
+};
 
 use acp_thread::{
     AcpThread, AgentModelId, AgentModelSelector, AgentSessionInfo, AgentSessionList,

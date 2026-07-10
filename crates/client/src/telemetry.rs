@@ -21,14 +21,14 @@ use std::collections::HashSet;
 use std::fs::File;
 #[cfg(any(test, feature = "test-support"))]
 use std::io::Write;
+#[cfg(any(test, feature = "test-support"))]
+use std::mem;
 use std::sync::LazyLock;
 use std::time::Instant;
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 #[cfg(any(test, feature = "test-support"))]
-use std::mem;
-use telemetry_events::{AssistantEventData, AssistantPhase, Event, EventWrapper};
-#[cfg(any(test, feature = "test-support"))]
 use telemetry_events::EventRequestBody;
+use telemetry_events::{AssistantEventData, AssistantPhase, Event, EventWrapper};
 
 pub struct TelemetrySubscription {
     pub historical_events: Result<HistoricalEvents>,
@@ -652,8 +652,7 @@ impl Telemetry {
 
             state.events_queue.push(event_wrapper);
 
-            if state.installation_id.is_some() && state.events_queue.len() >= state.max_queue_size
-            {
+            if state.installation_id.is_some() && state.events_queue.len() >= state.max_queue_size {
                 drop(state);
                 self.flush_events().detach();
             }

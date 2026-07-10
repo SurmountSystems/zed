@@ -50,11 +50,24 @@ CARGO_TERM_QUIET=true cargo nextest run -p agent_ui -p git_ui -p project -p git 
 
 `agent-stdio` is a **default** feature on the `zed` crate (`crates/zed/Cargo.toml`). A plain `cargo build --release -p zed` includes `--agent-stdio` / `ZED_AGENT_STDIO=1` and the TOON stdio control plane. On upstream merges, keep `default = ["agent-stdio"]` unless deliberately dropping dogfood support.
 
-Operator contract: [`.agents/skills/zed-dogfood/SKILL.md`](.agents/skills/zed-dogfood/SKILL.md). **Mandatory preflight** before golden/long dogfood: `.agents/skills/zed-dogfood/scripts/preflight.sh` (asserts first stdout is `event: ready`; fails on panic/timeout). Then golden: `.agents/skills/zed-dogfood/scripts/golden-session.sh`. Call order: `cargo build --release -p zed` → preflight → golden. Handlers live in `crates/zed/src/zed/agent_stdio.rs` (`snapshot`, `actions`, `open`, `wait`, `action`, `keys`, `shutdown`). Agent search keymap actions stay registered in `agent_ui` (registration ≠ UI feature); orphan `conversation_view/thread_search_bar.rs` stays uncompiled until search wiring.
+Operator contract: [`.agents/skills/zed-dogfood/SKILL.md`](.agents/skills/zed-dogfood/SKILL.md) (Experience doctrine + **detail tiers** compact/rich/room; methods table: `snapshot`/`look`, `inventory`, `click`, `theme`/`feel`, `actions`, `open`, `wait`, `action`, `keys`, `shutdown`; no fake per-control style). **Rust gates only** — `cargo xtask dogfood preflight` (ready event) then `cargo xtask dogfood golden` / `smoke` (`tooling/xtask/src/tasks/dogfood.rs`; optional `--snapshot-detail`). Smoke: open fixture, poll snapshot until non-empty body (interactive or landmark lines; not room `#` headers alone; + optional `--expect`), optional action/keys. Call order: `cargo build --release -p zed` → preflight → golden/smoke. Handlers: `crates/zed/src/zed/agent_stdio.rs`. Outline formatting: `gpui` `format_a11y_outline` / `OutlineDetail`.
 
-**Linux headless (AccessKit activate + outline retain):** `event: ready` then all v1 methods respond `ok: true`. `method:actions` lists ~1.4k names. Prefer `method:open` on a **file**. Settle: `method:wait` **ms:3000** after open. **`method:snapshot`:** on the Linux **headless** window only, `a11y_init` calls AccessKit activation (GUI platforms still wait for AT), retains last-frame **interactive outline string** after `end_frame`, and `capture_snapshot` reuses that outline or force-draws if empty. Before headless AccessKit activation, snapshots were always empty even when chrome existed. After rebuild (`cargo build --release -p zed`) + golden session, expect non-empty interactive chrome when the frame has buttons/inputs/etc.; empty only if that frame has no interactive roles. Outline is interactive-only, not full DOM.
+**Residual risks:** bounds = scaled/physical px (not CSS logical); `click` manual/optional (not default golden); `theme`/`feel` = global `ActiveTheme` only (not per-control paint); no server wait-until (runner polls); macOS/Windows non-empty snapshot unsupported until headless force-activate exists.
+
+**Optional CI gate:** [`.github/workflows/dogfood_preflight.yml`](.github/workflows/dogfood_preflight.yml) (Surmount-maintained hand-written workflow — **not** produced by `cargo xtask workflows`). Runs on **schedule (nightly UTC)** and **workflow_dispatch** only (not PR critical path: full `cargo build --release -p zed` is ~15+ min). Linux `ubuntu-latest` with `CC`/`CXX=clang`, disk free-up before build, and `--timeout-secs 90` on dogfood steps: build release zed → `cargo xtask dogfood preflight` via `ZED_BIN` → optional `cargo xtask dogfood golden` (nightly always; dispatch when `run_golden` input is true). Snapshot dogfood is **Linux-primary**; do not require macOS/Windows for non-empty snapshot. **Fork ops:** GitHub disables scheduled workflows on forks until Actions is enabled on the Surmount remote (and often until the workflow has run once on the default branch); enable Actions / allow schedules or nightly will never fire. Local equivalent of the CI gate:
+
+```bash
+cargo build --release -p zed
+ZED_BIN=target/release/zed cargo xtask dogfood preflight --timeout-secs 90
+ZED_BIN=target/release/zed cargo xtask dogfood golden --timeout-secs 90   # optional
+# equivalent: cargo xtask dogfood preflight --bin target/release/zed --timeout-secs 90
+```
+
+**Linux headless (AccessKit activate + outline retain):** `event: ready` then methods respond `ok: true` (except snapshot when every `update_window` fails with no outline → `ok: false`). Prefer `method:open` on a **file**. Settle: `method:wait` **ms:3000** after open. **`method:snapshot` / `look`:** optional `detail` compact|rich|room (default rich). Linux headless `a11y_init` activates immediately; finalize retains **three** outline strings (compact/rich/room) in one tree walk; force-draw before read; multi-window merge with `--- window N ---`. Rich lines include focus `*`, bounds (`@x,y w×h` = **scaled/physical px**: layout × `scale_factor`, rounded — not CSS logical px), states, action verbs; room adds header + landmarks. **`compact`** is a lean role/label/value/id path (viable for minimal tokens; not required bit-identical to pre-R1). Default smoke/golden stay non-empty + optional **role/label** expects — not bounds digits or theme HSLA. **`inventory` / `click`:** session summary and a11y node actions (NodeId from look); click is manual/optional, not default golden. **`method:theme` / `feel` (R4 decision b):** global theme ambience only (name, appearance, background/border/text_accent via `ActiveTheme`) — not per-control paint, not a CSS dump; look/room stay structure-only. **`method:action`:** build errors include action name + `method:actions` hint. Poll-until-snapshot in **xtask dogfood**. **Non-goals:** full AccessKit JSON dump, force-a11y on all GPUI tests, macOS/Windows non-empty golden requirement, shell dogfood drivers. **Cross-platform snapshot matrix:** Linux headless yes; macOS/Windows unsupported for non-empty golden — see skill. No OS–agent coupling on methods.
 
 **Known non-fatal dogfood stderr (do not treat as session failure):** in-memory DB WARN; `thread_metadata_store` remote-connection migration (`WorkspaceDb::recent_project_workspaces_ungrouped` → `recent_workspaces_query`) can ERROR with `database table is locked` under concurrent SQLite access in agent-stdio (dogfood skill known-noise table); migration uses `detach_and_log_err` and only writes the migration key after success, so leave production code alone rather than soft-failing empty + mark-complete; provider auth noise.
+
+**Thread search:** Wired on `ThreadView` (`ThreadSearchBar`); action `agent::ToggleSearch` (Ctrl/Cmd+F in `AcpThread` keymaps). Match visibility tracks expanded thinking/tool/raw-input/confirmation. Dogfood: manual checklist or optional `--action agent::ToggleSearch` — see zed-dogfood skill (not in default smoke).
 
 ## Upstream services stripped (merge policy)
 
@@ -91,24 +104,38 @@ Maintainer `~/.cargo/config.toml` redirects crates-io to **menhera-cooldown** (`
 | `wgpu` | `29.0.4` | `29.0.3` | 2026-07-02 | **2026-07-12** (binding) |
 | `agent-client-protocol` | `1.0.1` | `=1.0.0` | 2026-06-29 | 2026-07-09 |
 
-**Binding unpin date** = latest of the per-crate +10d dates → **2026-07-12** (wgpu). Do **not** unpin before that date, and never change pin versions without human verify evidence below.
+**Binding unpin date** = latest of the per-crate +10d dates → **2026-07-12** (wgpu).
 
-### Verify then unpin (human-only)
+- **Before 2026-07-12:** do **not** unpin; leave workspace pins as listed above.
+- **On/after 2026-07-12:** calendar alone is **not** enough — still require human `cargo info` evidence that each upstream target resolves on menhera-cooldown before any version change.
+- Agents must **not** bump or unpin these versions. Never change pin versions without pasted human verify output.
 
-1. Confirm calendar is on/after the binding date (2026-07-12 for the current set).
-2. Exact-version checks (not `cargo search`):
+### Verify → unpin → rebuild → dogfood (human-only checklist)
+
+1. **Calendar:** on/after **2026-07-12**.
+2. **Verify** (exact-version checks; not `cargo search`):
    ```bash
    cargo info wgpu@29.0.4 --registry menhera-cooldown
    cargo info agent-client-protocol@1.0.1 --registry menhera-cooldown
    ```
-3. Only if both resolve: set root `Cargo.toml` to the upstream targets, remove or rewrite the pin block in `.cargo/config.toml`, and re-check with a normal workspace build.
-4. **Feature/default-feature conflicts are not menhera lag** — e.g. `toon-format` `default-features = false` in `crates/zed/Cargo.toml` avoids `ratatui` → `unicode-width` clash. Do not invent unpin dates for those; fix features/edges directly.
+3. **Unpin only if both resolve:** bump versions in root `Cargo.toml` only — keep table form and features. Target lines:
+   ```toml
+   agent-client-protocol = { version = "1.0.1", features = ["unstable"] }
+   wgpu = "29.0.4"
+   ```
+   Do **not** drop `features = ["unstable"]` (required by ACP-using crates). Then remove or rewrite the pin comment block in [`.cargo/config.toml`](.cargo/config.toml) and the pin pointer comments on those lines in root `Cargo.toml`.
+4. **Rebuild:** normal workspace / release build that exercises the bumped crates.
+5. **Dogfood preflight** (agent-stdio still healthy after dep churn):
+   ```bash
+   cargo build --release -p zed
+   cargo xtask dogfood preflight
+   ```
+6. **Optional strip sanity** after dep churn:
+   ```bash
+   cargo clippy -p client -p rpc -p telemetry -- -D warnings
+   ```
 
-Optional post-unpin sanity (client strip still correct after dep churn):
-
-```bash
-cargo clippy -p client -p rpc -p telemetry -- -D warnings
-```
+**Feature/default-feature conflicts are not menhera lag** — e.g. `toon-format` `default-features = false` in `crates/zed/Cargo.toml` avoids `ratatui` → `unicode-width` clash. Do not invent unpin dates for those; fix features/edges directly.
 
 ## Upstream merge process (pointer)
 

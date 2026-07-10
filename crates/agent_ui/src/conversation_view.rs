@@ -9109,8 +9109,69 @@ pub(crate) mod tests {
         let active_text_3 = bar.read_with(cx, |bar, cx| bar.active_match_text(cx));
         assert_eq!(active_text_3.as_deref(), Some("1/4"));
 
+        // Toggle-close when the bar owns focus (same helper as Esc / Dismissed).
+        bar.update_in(cx, |bar, window, cx| {
+            bar.focus_and_refresh(window, cx);
+        });
+        cx.run_until_parked();
         thread_view.update_in(cx, |view, window, cx| {
-            assert!(view.close_thread_search(window, cx));
+            assert!(
+                view.thread_search_bar
+                    .as_ref()
+                    .is_some_and(|search_bar| search_bar
+                        .focus_handle(cx)
+                        .contains_focused(window, cx)),
+                "search bar should own focus before toggle-close"
+            );
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+            assert!(!view.thread_search_visible);
+            assert!(
+                view.message_editor.focus_handle(cx).is_focused(window),
+                "toggle-close should restore message editor focus"
+            );
+        });
+        assert_eq!(
+            bar.read_with(cx, |bar, _| bar.match_count()),
+            0,
+            "toggle-close should clear match highlights/results",
+        );
+
+        // Dismissed subscription path: bar.dismiss → ThreadSearchBarEvent::Dismissed.
+        thread_view.update_in(cx, |view, window, cx| {
+            view.toggle_search(&crate::ToggleSearch, window, cx);
+        });
+        cx.run_until_parked();
+        bar.update_in(cx, |bar, window, cx| {
+            bar.query_editor.update(cx, |editor, cx| {
+                editor.set_text("banana", window, cx);
+            });
+            bar.update_matches(window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            bar.read_with(cx, |bar, _| bar.match_count()) > 0,
+            "re-opened search should find matches before dismiss"
+        );
+        bar.update_in(cx, |bar, window, cx| {
+            bar.dismiss(&crate::DismissThreadSearch, window, cx);
+        });
+        cx.run_until_parked();
+        thread_view.update_in(cx, |view, window, cx| {
+            assert!(!view.thread_search_visible);
+            assert!(
+                view.message_editor.focus_handle(cx).is_focused(window),
+                "Dismissed path should restore message editor focus"
+            );
+        });
+        assert_eq!(
+            bar.read_with(cx, |bar, _| bar.match_count()),
+            0,
+            "Dismissed path should clear match highlights/results",
+        );
+
+        // Direct helper: second close is a no-op once hidden.
+        thread_view.update_in(cx, |view, window, cx| {
+            assert!(!view.close_thread_search(window, cx));
             assert!(!view.thread_search_visible);
         });
     }

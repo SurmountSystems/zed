@@ -1,12 +1,10 @@
+use super::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent, ThreadSearchExpansion};
 use crate::{
     DEFAULT_THREAD_TITLE, DismissThreadSearch, SelectNextThreadMatch, SelectPermissionGranularity,
     SelectPreviousThreadMatch, ToggleSearch,
     agent_configuration::configure_context_server_modal::default_markdown_style,
     open_abs_path_at_point,
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
-};
-use super::thread_search_bar::{
-    ThreadSearchBar, ThreadSearchBarEvent, ThreadSearchExpansion,
 };
 use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
@@ -7852,14 +7850,11 @@ impl ThreadView {
                 window,
                 |this, _bar, event, window, cx| {
                     if matches!(event, ThreadSearchBarEvent::Dismissed) {
-                        // Idempotent with bar.dismiss clearing — keeps highlights from
-                        // leaking if a future emit path skips clear_highlights.
-                        if let Some(bar) = this.thread_search_bar.clone() {
-                            bar.update(cx, |bar, cx| bar.clear_highlights(cx));
+                        // Prefer the shared close helper. If already hidden (late/duplicate
+                        // Dismissed), still restore editor focus — user left the search bar.
+                        if !this.close_thread_search(window, cx) {
+                            this.message_editor.focus_handle(cx).focus(window, cx);
                         }
-                        this.thread_search_visible = false;
-                        this.message_editor.focus_handle(cx).focus(window, cx);
-                        cx.notify();
                     }
                 },
             ));
@@ -7873,12 +7868,8 @@ impl ThreadView {
             .is_some_and(|bar| bar.focus_handle(cx).contains_focused(window, cx));
 
         if self.thread_search_visible && search_bar_focused {
-            if let Some(bar) = &self.thread_search_bar {
-                bar.update(cx, |bar, cx| bar.clear_highlights(cx));
-            }
-            self.thread_search_visible = false;
-            self.message_editor.focus_handle(cx).focus(window, cx);
-            cx.notify();
+            // Same cleanup as Esc / message-editor Cancel / Dismissed.
+            self.close_thread_search(window, cx);
         } else {
             self.thread_search_visible = true;
             if let Some(bar) = self.thread_search_bar.clone() {
@@ -8265,11 +8256,9 @@ impl ThreadView {
                             .opened_icon(IconName::ChevronUp)
                             .closed_icon(IconName::ChevronDown)
                             .visible_on_hover(&card_header_id)
-                            .on_click(cx.listener(
-                                move |this, _event: &ClickEvent, window, cx| {
-                                    this.toggle_thinking_block_expansion(key, window, cx);
-                                },
-                            )),
+                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                                this.toggle_thinking_block_expansion(key, window, cx);
+                            })),
                     )
                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                         this.toggle_thinking_block_expansion(key, window, cx);
@@ -11843,8 +11832,8 @@ impl Render for ThreadView {
                     }
                 }),
             )
-            .on_action(cx.listener(
-                |this, action: &SelectNextThreadMatch, window, cx| {
+            .on_action(
+                cx.listener(|this, action: &SelectNextThreadMatch, window, cx| {
                     if !this.thread_search_visible {
                         cx.propagate();
                         return;
@@ -11852,10 +11841,10 @@ impl Render for ThreadView {
                     if let Some(bar) = this.thread_search_bar.clone() {
                         bar.update(cx, |bar, cx| bar.select_next_match(action, window, cx));
                     }
-                },
-            ))
-            .on_action(cx.listener(
-                |this, action: &SelectPreviousThreadMatch, window, cx| {
+                }),
+            )
+            .on_action(
+                cx.listener(|this, action: &SelectPreviousThreadMatch, window, cx| {
                     if !this.thread_search_visible {
                         cx.propagate();
                         return;
@@ -11863,8 +11852,8 @@ impl Render for ThreadView {
                     if let Some(bar) = this.thread_search_bar.clone() {
                         bar.update(cx, |bar, cx| bar.select_prev_match(action, window, cx));
                     }
-                },
-            ))
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &search::ToggleCaseSensitive, window, cx| {
                     if !this.thread_search_visible {

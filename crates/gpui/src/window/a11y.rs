@@ -293,18 +293,22 @@ pub(crate) struct A11yNodeBuilder {
     /// This is the exact type required by accesskit, so we can't just make it a
     /// `HashMap<NodeId, Node>` to remove the need for `seen_ids`
     all_nodes: Vec<(NodeId, accesskit::Node)>,
-    /// Compact interactive outline from the last `finalize`. Prefer this over
-    /// retaining the full AccessKit node list (avoids per-frame full-tree clone).
+    /// Interactive outline from the last `finalize` (rich detail by default).
+    /// Prefer this over retaining the full AccessKit node list.
     last_interactive_outline: String,
+    /// Compact interactive outline (role/label/value/id, optional focus `*`).
+    last_compact_outline: String,
+    /// Room narrative: header + landmarks + rich interactive lines.
+    last_room_outline: String,
     seen_ids: FxHashSet<NodeId>,
     /// The node that GPUI considers focused. Note that this may be different to
     /// what is reported to accesskit - see [`Self::active_descendant`]
-    focus: Option<NodeId>,
+    pub(crate) focus: Option<NodeId>,
     /// If a node calls `.aria_active_descendant()`, AND an ancestor is focused,
     /// override it as the focused node. This supports the "active descendant"
     /// pattern, which allows a focused container to act as if a descendant is
     /// focused.
-    active_descendant: Option<NodeId>,
+    pub(crate) active_descendant: Option<NodeId>,
 }
 
 impl A11yNodeBuilder {
@@ -314,6 +318,8 @@ impl A11yNodeBuilder {
             nodes_stack: SmallVec::new(),
             all_nodes: Vec::new(),
             last_interactive_outline: String::new(),
+            last_compact_outline: String::new(),
+            last_room_outline: String::new(),
             seen_ids: FxHashSet::default(),
             focus: None,
             active_descendant: None,
@@ -322,10 +328,20 @@ impl A11yNodeBuilder {
 
     pub(crate) fn clear_last_interactive_outline(&mut self) {
         self.last_interactive_outline.clear();
+        self.last_compact_outline.clear();
+        self.last_room_outline.clear();
     }
 
     pub(crate) fn last_interactive_outline(&self) -> &str {
         &self.last_interactive_outline
+    }
+
+    pub(crate) fn last_outline(&self, detail: OutlineDetail) -> &str {
+        match detail {
+            OutlineDetail::Compact => &self.last_compact_outline,
+            OutlineDetail::Rich => self.last_interactive_outline(),
+            OutlineDetail::Room => &self.last_room_outline,
+        }
     }
 
     /// True while a frame is being built (root still on the stack or leaves pending).
@@ -500,9 +516,13 @@ impl A11yNodeBuilder {
         };
 
         let nodes = std::mem::take(&mut self.all_nodes);
-        // Store interactive outline only (not a full-tree clone) for post-frame
+        // Store outline strings only (not a full-tree clone) for post-frame
         // dogfood snapshots after `mem::take` moves nodes into TreeUpdate.
-        self.last_interactive_outline = interactive_a11y_outline(&nodes);
+        // One tree walk builds compact/rich/room so finalize is not 3× O(n).
+        let tiers = format_a11y_outline_all_tiers(&nodes, Some(focus));
+        self.last_compact_outline = tiers.compact;
+        self.last_interactive_outline = tiers.rich;
+        self.last_room_outline = tiers.room;
         let update = TreeUpdate {
             nodes,
             tree: Some(accesskit::Tree::new(ROOT_NODE_ID)),
@@ -574,6 +594,43 @@ impl A11yNodeBuilder {
     }
 }
 
+/// How much tactile detail to put in an a11y outline for dogfood / agent-stdio.
+///
+/// Additive **fields**: compact ⊆ rich interactive fields; room = rich interactive
+/// lines + landmarks + room header. Focus `*` placement may differ when focus is a
+/// room-only landmark (room stars the landmark; rich/compact star the interactive
+/// ancestor). `compact` is a lean path for smoke/tokens — not required bit-identical
+/// to pre-enrichment lines. Bounds on rich/room lines are **scaled/physical px**
+/// (layout × window scale factor at prepaint); not CSS logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutlineDetail {
+    /// Role, label, value, id; focus marked with `*`.
+    Compact,
+    /// Interactive nodes with bounds, states, descriptions, and actions.
+    #[default]
+    Rich,
+    /// Room narrative: window/focus header, landmarks, then rich interactive lines.
+    Room,
+}
+
+/// Options for [`format_a11y_outline`].
+#[derive(Clone, Copy, Debug)]
+pub struct OutlineOptions {
+    /// AccessKit focus (or active descendant) for this frame.
+    pub focus: Option<NodeId>,
+    /// How much tactile detail to emit (compact / rich / room).
+    pub detail: OutlineDetail,
+}
+
+impl Default for OutlineOptions {
+    fn default() -> Self {
+        Self {
+            focus: None,
+            detail: OutlineDetail::Rich,
+        }
+    }
+}
+
 /// Returns whether an AccessKit node should appear in agent-stdio UI snapshots.
 pub fn is_interactive_a11y_node(node: &accesskit::Node) -> bool {
     use accesskit::Action;
@@ -618,50 +675,485 @@ pub fn is_interactive_a11y_node(node: &accesskit::Node) -> bool {
     )
 }
 
-/// Formats interactive nodes from an in-progress or finalized tree as a compact text outline.
-pub fn interactive_a11y_outline(nodes: &[(NodeId, accesskit::Node)]) -> String {
-    use accesskit::NodeId;
-    use collections::FxHashMap;
+/// Spatial / structural landmarks for `OutlineDetail::Room` (not pure chrome).
+///
+/// Structural roles (Heading, Dialog, AlertDialog, Toolbar, MenuBar, Menu, TabList)
+/// count even when unlabeled — plan R2 treats them as spatial anchors. Label/List/
+/// ListItem require non-empty label or value. If live `detail:room` looks fill with
+/// unlabeled Toolbar/Menu chrome, tighten those roles to require text before widening
+/// the always-on set again.
+pub fn is_landmark_a11y_node(node: &accesskit::Node) -> bool {
+    if node.is_hidden() || is_interactive_a11y_node(node) {
+        return false;
+    }
+
+    match node.role() {
+        accesskit::Role::Heading
+        | accesskit::Role::Dialog
+        | accesskit::Role::AlertDialog
+        | accesskit::Role::Toolbar
+        | accesskit::Role::MenuBar
+        | accesskit::Role::Menu
+        | accesskit::Role::TabList => true,
+        accesskit::Role::Label | accesskit::Role::List | accesskit::Role::ListItem => {
+            let label = node.label().unwrap_or_default();
+            let value = node.value().unwrap_or_default();
+            !label.is_empty() || !value.is_empty()
+        }
+        _ => false,
+    }
+}
+
+const OUTLINE_STRING_MAX: usize = 80;
+
+fn truncate_outline_str(s: &str) -> String {
+    if s.chars().count() <= OUTLINE_STRING_MAX {
+        return s.to_string();
+    }
+    let mut out: String = s
+        .chars()
+        .take(OUTLINE_STRING_MAX.saturating_sub(1))
+        .collect();
+    out.push('…');
+    out
+}
+
+fn format_node_outline_line(
+    id: NodeId,
+    node: &accesskit::Node,
+    depth: usize,
+    focused: bool,
+    detail: OutlineDetail,
+) -> String {
+    use accesskit::Action;
     use std::fmt::Write as _;
+
+    let indent = "  ".repeat(depth);
+    let role = format!("{:?}", node.role());
+    let label = node.label().unwrap_or_default();
+    let value = node.value().unwrap_or_default();
+    let mut line = String::new();
+    // Indent first so nested focus is `  *[Button]`, not `*  [Button]`.
+    let _ = write!(line, "{indent}");
+    if focused {
+        line.push('*');
+    }
+    let _ = write!(line, "[{role}]");
+    if !label.is_empty() {
+        let _ = write!(line, " \"{}\"", truncate_outline_str(&label));
+    }
+    if !value.is_empty() {
+        let _ = write!(line, " value=\"{}\"", truncate_outline_str(&value));
+    }
+
+    // Bounds are AccessKit rects written at prepaint as layout × scale_factor
+    // (scaled/physical px). Compact omits them to keep the lean token path.
+    if detail != OutlineDetail::Compact {
+        if let Some(bounds) = node.bounds() {
+            let x = bounds.x0.round() as i64;
+            let y = bounds.y0.round() as i64;
+            let w = (bounds.x1 - bounds.x0).round().max(0.0) as i64;
+            let h = (bounds.y1 - bounds.y0).round().max(0.0) as i64;
+            let _ = write!(line, " @{x},{y} {w}x{h}");
+        }
+        if node.is_disabled() {
+            line.push_str(" [disabled]");
+        }
+        if let Some(true) = node.is_selected() {
+            line.push_str(" [selected]");
+        }
+        if let Some(expanded) = node.is_expanded() {
+            if expanded {
+                line.push_str(" [expanded]");
+            } else {
+                line.push_str(" [collapsed]");
+            }
+        }
+        if let Some(toggled) = node.toggled() {
+            let toggled = match toggled {
+                accesskit::Toggled::True => "true",
+                accesskit::Toggled::False => "false",
+                accesskit::Toggled::Mixed => "mixed",
+            };
+            let _ = write!(line, " [toggled={toggled}]");
+        }
+        if let Some(description) = node.description() {
+            if !description.is_empty() {
+                let _ = write!(line, " desc=\"{}\"", truncate_outline_str(&description));
+            }
+        }
+        if let Some(placeholder) = node.placeholder() {
+            if !placeholder.is_empty() {
+                let _ = write!(
+                    line,
+                    " placeholder=\"{}\"",
+                    truncate_outline_str(&placeholder)
+                );
+            }
+        }
+
+        let mut actions = Vec::new();
+        for (action, name) in [
+            (Action::Click, "click"),
+            (Action::Focus, "focus"),
+            (Action::SetValue, "set_value"),
+            (Action::Expand, "expand"),
+            (Action::Collapse, "collapse"),
+        ] {
+            if node.supports_action(action) {
+                actions.push(name);
+            }
+        }
+        if !actions.is_empty() {
+            let _ = write!(line, " [{}]", actions.join(","));
+        }
+    }
+
+    // AccessKit's Debug is `#N`; avoid `##N` in dogfood outlines.
+    let _ = write!(line, " #NodeId({})", u64::from(id));
+    line
+}
+
+fn format_focus_summary_line(
+    focus: NodeId,
+    node_map: &collections::FxHashMap<NodeId, &accesskit::Node>,
+) -> String {
+    if let Some(node) = node_map.get(&focus) {
+        let role = format!("{:?}", node.role());
+        let label = node.label().unwrap_or_default();
+        let value = node.value().unwrap_or_default();
+        let mut line = format!("# focus: [{role}]");
+        if !label.is_empty() {
+            line.push_str(&format!(" \"{}\"", truncate_outline_str(&label)));
+        } else if !value.is_empty() {
+            line.push_str(&format!(" value=\"{}\"", truncate_outline_str(&value)));
+        }
+        line.push_str(&format!(" #NodeId({})", u64::from(focus)));
+        line
+    } else {
+        format!("# focus: #NodeId({})", u64::from(focus))
+    }
+}
+
+/// When focus lands on a non-interactive container, walk to the nearest
+/// interactive ancestor so `*` still appears on a control line (R1).
+fn resolve_interactive_focus_mark(
+    focus: Option<NodeId>,
+    node_map: &collections::FxHashMap<NodeId, &accesskit::Node>,
+    parent_of: &collections::FxHashMap<NodeId, NodeId>,
+) -> Option<NodeId> {
+    let mut current = focus?;
+    for _ in 0..10_000 {
+        let node = node_map.get(&current)?;
+        if is_interactive_a11y_node(node) {
+            return Some(current);
+        }
+        current = *parent_of.get(&current)?;
+    }
+    None
+}
+
+/// True when `focus` is itself a printed body line for this outline tier.
+/// If so, do not also star the nearest interactive ancestor (avoids Room dual-`*`).
+fn focus_is_printed_body_line(
+    focus: Option<NodeId>,
+    node_map: &collections::FxHashMap<NodeId, &accesskit::Node>,
+    include_landmarks: bool,
+) -> bool {
+    focus
+        .and_then(|id| node_map.get(&id).copied())
+        .is_some_and(|node| {
+            is_interactive_a11y_node(node) || (include_landmarks && is_landmark_a11y_node(node))
+        })
+}
+
+fn node_is_focused(
+    id: NodeId,
+    focus: Option<NodeId>,
+    interactive_focus_mark: Option<NodeId>,
+    focus_on_body: bool,
+) -> bool {
+    if focus == Some(id) {
+        return true;
+    }
+    // Bubble `*` only when the exact focus node is not printed in this tier.
+    !focus_on_body && interactive_focus_mark == Some(id)
+}
+
+fn build_parent_map(nodes: &[(NodeId, accesskit::Node)]) -> collections::FxHashMap<NodeId, NodeId> {
+    use collections::FxHashMap;
+    let mut parent_of: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+    for (id, node) in nodes {
+        for child_id in node.children() {
+            parent_of.insert(*child_id, *id);
+        }
+    }
+    parent_of
+}
+
+fn room_header_lines(
+    focus: Option<NodeId>,
+    node_map: &collections::FxHashMap<NodeId, &accesskit::Node>,
+    interactive_count: usize,
+    landmark_count: usize,
+) -> Vec<String> {
+    let mut header = Vec::new();
+    let window_title = node_map
+        .get(&ROOT_NODE_ID)
+        .and_then(|n| n.label())
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_outline_str(&s))
+        .unwrap_or_else(|| "(untitled)".into());
+    header.push(format!("# window: \"{window_title}\""));
+    // Finalize always passes Some(focus) (root fallback), so post-paint dogfood
+    // rarely sees `(none)` — unfocused frames show Window/root instead. Mid-frame
+    // outline paths may still pass None.
+    if let Some(focus) = focus {
+        header.push(format_focus_summary_line(focus, node_map));
+    } else {
+        header.push("# focus: (none)".into());
+    }
+    header.push(format!(
+        "# interactive: {interactive_count}  landmarks: {landmark_count}"
+    ));
+    header
+}
+
+/// Compact + rich + room outlines from a **single** tree walk (finalize path).
+pub(crate) struct OutlineTierStrings {
+    pub compact: String,
+    pub rich: String,
+    pub room: String,
+}
+
+pub(crate) fn format_a11y_outline_all_tiers(
+    nodes: &[(NodeId, accesskit::Node)],
+    focus: Option<NodeId>,
+) -> OutlineTierStrings {
+    use collections::FxHashMap;
 
     let node_map: FxHashMap<NodeId, &accesskit::Node> =
         nodes.iter().map(|(id, node)| (*id, node)).collect();
+    let parent_of = build_parent_map(nodes);
+    let interactive_focus_mark = resolve_interactive_focus_mark(focus, &node_map, &parent_of);
 
-    let mut lines = Vec::new();
+    // Compact/rich print only interactive nodes; room also prints landmarks.
+    let focus_on_interactive_body = focus_is_printed_body_line(focus, &node_map, false);
+    let focus_on_room_body = focus_is_printed_body_line(focus, &node_map, true);
+
+    let mut compact_lines = Vec::new();
+    let mut rich_lines = Vec::new();
+    let mut room_lines = Vec::new();
+    let mut interactive_count = 0usize;
+    let mut landmark_count = 0usize;
 
     fn visit(
         id: NodeId,
         depth: usize,
         node_map: &FxHashMap<NodeId, &accesskit::Node>,
-        lines: &mut Vec<String>,
+        focus: Option<NodeId>,
+        interactive_focus_mark: Option<NodeId>,
+        focus_on_interactive_body: bool,
+        focus_on_room_body: bool,
+        compact_lines: &mut Vec<String>,
+        rich_lines: &mut Vec<String>,
+        room_lines: &mut Vec<String>,
+        interactive_count: &mut usize,
+        landmark_count: &mut usize,
     ) {
         let Some(node) = node_map.get(&id) else {
             return;
         };
 
         if is_interactive_a11y_node(node) {
-            let indent = "  ".repeat(depth);
-            let role = format!("{:?}", node.role());
-            let label = node.label().unwrap_or_default();
-            let value = node.value().unwrap_or_default();
-            let mut line = format!("{indent}[{role}]");
-            if !label.is_empty() {
-                let _ = write!(line, " \"{label}\"");
+            *interactive_count += 1;
+            let rich_focused =
+                node_is_focused(id, focus, interactive_focus_mark, focus_on_interactive_body);
+            let room_focused =
+                node_is_focused(id, focus, interactive_focus_mark, focus_on_room_body);
+            compact_lines.push(format_node_outline_line(
+                id,
+                node,
+                depth,
+                rich_focused,
+                OutlineDetail::Compact,
+            ));
+            let rich_line =
+                format_node_outline_line(id, node, depth, rich_focused, OutlineDetail::Rich);
+            rich_lines.push(rich_line.clone());
+            // Room interactive lines match rich, but focus mark may differ when
+            // focus sits on a landmark that room prints and rich does not.
+            if room_focused == rich_focused {
+                room_lines.push(rich_line);
+            } else {
+                room_lines.push(format_node_outline_line(
+                    id,
+                    node,
+                    depth,
+                    room_focused,
+                    OutlineDetail::Rich,
+                ));
             }
-            if !value.is_empty() {
-                let _ = write!(line, " value=\"{value}\"");
-            }
-            let _ = write!(line, " #{id:?}");
-            lines.push(line);
+        } else if is_landmark_a11y_node(node) {
+            *landmark_count += 1;
+            // Landmarks: exact focus only (no ancestor bubble onto landmarks).
+            let focused = focus == Some(id);
+            room_lines.push(format_node_outline_line(
+                id,
+                node,
+                depth,
+                focused,
+                OutlineDetail::Rich,
+            ));
         }
 
         for child_id in node.children() {
-            visit(*child_id, depth + 1, node_map, lines);
+            visit(
+                *child_id,
+                depth + 1,
+                node_map,
+                focus,
+                interactive_focus_mark,
+                focus_on_interactive_body,
+                focus_on_room_body,
+                compact_lines,
+                rich_lines,
+                room_lines,
+                interactive_count,
+                landmark_count,
+            );
         }
     }
 
-    visit(ROOT_NODE_ID, 0, &node_map, &mut lines);
-    lines.join("\n")
+    visit(
+        ROOT_NODE_ID,
+        0,
+        &node_map,
+        focus,
+        interactive_focus_mark,
+        focus_on_interactive_body,
+        focus_on_room_body,
+        &mut compact_lines,
+        &mut rich_lines,
+        &mut room_lines,
+        &mut interactive_count,
+        &mut landmark_count,
+    );
+
+    let header = room_header_lines(focus, &node_map, interactive_count, landmark_count);
+    let room = if room_lines.is_empty() {
+        header.join("\n")
+    } else {
+        format!("{}\n{}", header.join("\n"), room_lines.join("\n"))
+    };
+
+    OutlineTierStrings {
+        compact: compact_lines.join("\n"),
+        rich: rich_lines.join("\n"),
+        room,
+    }
+}
+
+/// Formats an accessibility tree as a tactile text outline for dogfood.
+pub fn format_a11y_outline(nodes: &[(NodeId, accesskit::Node)], options: OutlineOptions) -> String {
+    use collections::FxHashMap;
+
+    let node_map: FxHashMap<NodeId, &accesskit::Node> =
+        nodes.iter().map(|(id, node)| (*id, node)).collect();
+    let parent_of = build_parent_map(nodes);
+    let interactive_focus_mark =
+        resolve_interactive_focus_mark(options.focus, &node_map, &parent_of);
+
+    let include_landmarks = options.detail == OutlineDetail::Room;
+    let focus_on_body = focus_is_printed_body_line(options.focus, &node_map, include_landmarks);
+    let mut body_lines = Vec::new();
+    let mut interactive_count = 0usize;
+    let mut landmark_count = 0usize;
+
+    fn visit(
+        id: NodeId,
+        depth: usize,
+        node_map: &FxHashMap<NodeId, &accesskit::Node>,
+        options: OutlineOptions,
+        interactive_focus_mark: Option<NodeId>,
+        focus_on_body: bool,
+        include_landmarks: bool,
+        body_lines: &mut Vec<String>,
+        interactive_count: &mut usize,
+        landmark_count: &mut usize,
+    ) {
+        let Some(node) = node_map.get(&id) else {
+            return;
+        };
+
+        if is_interactive_a11y_node(node) {
+            *interactive_count += 1;
+            let focused = node_is_focused(id, options.focus, interactive_focus_mark, focus_on_body);
+            body_lines.push(format_node_outline_line(
+                id,
+                node,
+                depth,
+                focused,
+                options.detail,
+            ));
+        } else if include_landmarks && is_landmark_a11y_node(node) {
+            *landmark_count += 1;
+            // Landmarks: exact focus only.
+            let focused = options.focus == Some(id);
+            body_lines.push(format_node_outline_line(
+                id,
+                node,
+                depth,
+                focused,
+                options.detail,
+            ));
+        }
+
+        for child_id in node.children() {
+            visit(
+                *child_id,
+                depth + 1,
+                node_map,
+                options,
+                interactive_focus_mark,
+                focus_on_body,
+                include_landmarks,
+                body_lines,
+                interactive_count,
+                landmark_count,
+            );
+        }
+    }
+
+    visit(
+        ROOT_NODE_ID,
+        0,
+        &node_map,
+        options,
+        interactive_focus_mark,
+        focus_on_body,
+        include_landmarks,
+        &mut body_lines,
+        &mut interactive_count,
+        &mut landmark_count,
+    );
+
+    if options.detail != OutlineDetail::Room {
+        return body_lines.join("\n");
+    }
+
+    let header = room_header_lines(options.focus, &node_map, interactive_count, landmark_count);
+    if body_lines.is_empty() {
+        header.join("\n")
+    } else {
+        format!("{}\n{}", header.join("\n"), body_lines.join("\n"))
+    }
+}
+
+/// Formats interactive nodes (rich detail, no focus marker unless provided via
+/// [`format_a11y_outline`]). Kept for call sites and tests.
+pub fn interactive_a11y_outline(nodes: &[(NodeId, accesskit::Node)]) -> String {
+    format_a11y_outline(nodes, OutlineOptions::default())
 }
 
 #[cfg(test)]
@@ -707,6 +1199,592 @@ mod tests {
     }
 
     #[test]
+    fn rich_outline_includes_focus_bounds_states_and_actions() {
+        use super::{OutlineDetail, OutlineOptions, format_a11y_outline};
+
+        let button = NodeId(1);
+        let container = NodeId(2);
+        let mut button_node = accesskit::Node::new(Role::Button);
+        button_node.set_label("Save".to_string());
+        button_node.set_disabled();
+        button_node.set_toggled(accesskit::Toggled::True);
+        button_node.set_selected(true);
+        button_node.set_expanded(false);
+        button_node.set_description("Commits the draft".to_string());
+        button_node.set_placeholder("unused-on-button".to_string());
+        button_node.set_bounds(accesskit::Rect {
+            x0: 10.0,
+            y0: 20.0,
+            x1: 98.0,
+            y1: 48.0,
+        });
+        button_node.add_action(accesskit::Action::Click);
+        button_node.add_action(accesskit::Action::Focus);
+        let container_node = accesskit::Node::new(Role::GenericContainer);
+
+        let nodes = vec![
+            (super::ROOT_NODE_ID, {
+                let mut root = accesskit::Node::new(Role::Window);
+                root.set_children(vec![button, container]);
+                root
+            }),
+            (button, button_node),
+            (container, container_node),
+        ];
+
+        let outline = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(button),
+                detail: OutlineDetail::Rich,
+            },
+        );
+        assert!(
+            outline
+                .lines()
+                .any(|line| line.trim_start().starts_with("*[Button]") && line.contains("Save")),
+            "focus marker after indent: {outline}"
+        );
+        assert!(outline.contains("@10,20 88x28"), "bounds: {outline}");
+        assert!(outline.contains("[disabled]"), "disabled: {outline}");
+        assert!(outline.contains("[toggled=true]"), "toggled: {outline}");
+        assert!(outline.contains("[selected]"), "selected: {outline}");
+        assert!(outline.contains("[collapsed]"), "expanded=false: {outline}");
+        assert!(
+            outline.contains("desc=\"Commits the draft\""),
+            "description: {outline}"
+        );
+        assert!(
+            outline.contains("placeholder=\"unused-on-button\""),
+            "placeholder: {outline}"
+        );
+        assert!(outline.contains("[click,focus]"), "actions: {outline}");
+        assert!(outline.contains("Save"), "label: {outline}");
+        assert!(
+            !outline.contains("GenericContainer"),
+            "skip non-interactive sibling: {outline}"
+        );
+    }
+
+    #[test]
+    fn rich_outline_marks_nearest_interactive_ancestor_when_focus_is_container() {
+        use super::{OutlineDetail, OutlineOptions, format_a11y_outline};
+
+        let button = NodeId(1);
+        let inner = NodeId(2);
+        let mut button_node = accesskit::Node::new(Role::Button);
+        button_node.set_label("Save".to_string());
+        button_node.add_action(accesskit::Action::Click);
+        button_node.set_children(vec![inner]);
+        let inner_node = accesskit::Node::new(Role::GenericContainer);
+
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_children(vec![button]);
+        let nodes = vec![
+            (super::ROOT_NODE_ID, root),
+            (button, button_node),
+            (inner, inner_node),
+        ];
+
+        let outline = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(inner),
+                detail: OutlineDetail::Rich,
+            },
+        );
+        assert!(
+            outline.lines().any(|line| {
+                line.trim_start().starts_with("*[Button]") && line.contains("Save")
+            }),
+            "focus on non-interactive child marks button ancestor: {outline}"
+        );
+        assert!(
+            !outline.contains("GenericContainer"),
+            "container still skipped"
+        );
+    }
+
+    #[test]
+    fn outline_truncates_long_description_and_placeholder() {
+        use super::{OUTLINE_STRING_MAX, OutlineDetail, OutlineOptions, format_a11y_outline};
+
+        let input = NodeId(1);
+        let long: String = "x".repeat(OUTLINE_STRING_MAX + 20);
+        let mut input_node = accesskit::Node::new(Role::TextInput);
+        input_node.set_description(long.clone());
+        input_node.set_placeholder(long);
+        input_node.add_action(accesskit::Action::SetValue);
+        input_node.add_action(accesskit::Action::Focus);
+
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_children(vec![input]);
+        let nodes = vec![(super::ROOT_NODE_ID, root), (input, input_node)];
+        let outline = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: None,
+                detail: OutlineDetail::Rich,
+            },
+        );
+        assert!(outline.contains('…'), "truncated ellipsis: {outline}");
+        assert!(
+            !outline.contains(&"x".repeat(OUTLINE_STRING_MAX + 1)),
+            "long strings must not appear full-length: {outline}"
+        );
+        assert!(
+            outline.contains("[set_value,focus]") || outline.contains("set_value"),
+            "{outline}"
+        );
+    }
+
+    #[test]
+    fn room_outline_has_header_and_landmarks() {
+        use super::{OutlineDetail, OutlineOptions, format_a11y_outline};
+
+        let heading = NodeId(1);
+        let button = NodeId(2);
+        let mut heading_node = accesskit::Node::new(Role::Heading);
+        heading_node.set_label("Welcome".to_string());
+        let mut button_node = accesskit::Node::new(Role::Button);
+        button_node.set_label("Go".to_string());
+        button_node.add_action(accesskit::Action::Click);
+
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_label("Zed".to_string());
+        root.set_children(vec![heading, button]);
+
+        let nodes = vec![
+            (super::ROOT_NODE_ID, root),
+            (heading, heading_node),
+            (button, button_node),
+        ];
+        let outline = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(button),
+                detail: OutlineDetail::Room,
+            },
+        );
+        let lines: Vec<_> = outline.lines().collect();
+        assert_eq!(lines[0], "# window: \"Zed\"", "{outline}");
+        assert_eq!(lines[1], "# focus: [Button] \"Go\" #NodeId(2)", "{outline}");
+        assert_eq!(lines[2], "# interactive: 1  landmarks: 1", "{outline}");
+        assert!(
+            outline.contains("  [Heading] \"Welcome\""),
+            "landmark keeps depth indent: {outline}"
+        );
+        assert!(
+            outline
+                .lines()
+                .any(|line| line.trim_start().starts_with("*[Button]") && line.contains("Go")),
+            "room stars focused interactive button: {outline}"
+        );
+        assert!(
+            !outline.contains("GenericContainer"),
+            "chrome not printed: {outline}"
+        );
+    }
+
+    #[test]
+    fn all_tiers_match_per_detail_formatters() {
+        use super::{
+            OutlineDetail, OutlineOptions, format_a11y_outline, format_a11y_outline_all_tiers,
+        };
+
+        let heading = NodeId(1);
+        let button = NodeId(2);
+        let mut heading_node = accesskit::Node::new(Role::Heading);
+        heading_node.set_label("Welcome".to_string());
+        let mut button_node = accesskit::Node::new(Role::Button);
+        button_node.set_label("Go".to_string());
+        button_node.add_action(accesskit::Action::Click);
+
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_label("Zed".to_string());
+        root.set_children(vec![heading, button]);
+        let nodes = vec![
+            (super::ROOT_NODE_ID, root),
+            (heading, heading_node),
+            (button, button_node),
+        ];
+        let focus = Some(button);
+        let tiers = format_a11y_outline_all_tiers(&nodes, focus);
+
+        assert_eq!(
+            tiers.room,
+            format_a11y_outline(
+                &nodes,
+                OutlineOptions {
+                    focus,
+                    detail: OutlineDetail::Room,
+                },
+            ),
+            "finalize room path must match format_a11y_outline(Room)"
+        );
+        assert_eq!(
+            tiers.rich,
+            format_a11y_outline(
+                &nodes,
+                OutlineOptions {
+                    focus,
+                    detail: OutlineDetail::Rich,
+                },
+            ),
+        );
+        assert_eq!(
+            tiers.compact,
+            format_a11y_outline(
+                &nodes,
+                OutlineOptions {
+                    focus,
+                    detail: OutlineDetail::Compact,
+                },
+            ),
+        );
+        assert!(!tiers.rich.contains("[Heading]"), "{}", tiers.rich);
+        assert!(!tiers.compact.contains("[Heading]"), "{}", tiers.compact);
+        assert!(!tiers.rich.starts_with("# window:"), "{}", tiers.rich);
+        assert!(tiers.room.contains("[Heading]"), "{}", tiers.room);
+        assert!(tiers.room.starts_with("# window:"), "{}", tiers.room);
+
+        // Landmark-under-interactive focus: room stars Heading, rich/compact star Button.
+        // Both walkers (all_tiers vs format_a11y_outline) must stay in lockstep.
+        let nested_button = NodeId(1);
+        let nested_heading = NodeId(2);
+        let mut nested_button_node = accesskit::Node::new(Role::Button);
+        nested_button_node.set_label("Go".to_string());
+        nested_button_node.add_action(accesskit::Action::Click);
+        nested_button_node.set_children(vec![nested_heading]);
+        let mut nested_heading_node = accesskit::Node::new(Role::Heading);
+        nested_heading_node.set_label("Welcome".to_string());
+        let mut nested_root = accesskit::Node::new(Role::Window);
+        nested_root.set_label("Zed".to_string());
+        nested_root.set_children(vec![nested_button]);
+        let nested = vec![
+            (super::ROOT_NODE_ID, nested_root),
+            (nested_button, nested_button_node),
+            (nested_heading, nested_heading_node),
+        ];
+        let landmark_focus = Some(nested_heading);
+        let nested_tiers = format_a11y_outline_all_tiers(&nested, landmark_focus);
+        for (detail, got) in [
+            (OutlineDetail::Room, nested_tiers.room.as_str()),
+            (OutlineDetail::Rich, nested_tiers.rich.as_str()),
+            (OutlineDetail::Compact, nested_tiers.compact.as_str()),
+        ] {
+            let expected = format_a11y_outline(
+                &nested,
+                OutlineOptions {
+                    focus: landmark_focus,
+                    detail,
+                },
+            );
+            assert_eq!(
+                got, expected,
+                "all_tiers must match format_a11y_outline({detail:?}) when focus is a landmark"
+            );
+        }
+        assert!(
+            nested_tiers
+                .room
+                .lines()
+                .any(|line| line.trim_start().starts_with("*[Heading]")),
+            "room stars landmark: {}",
+            nested_tiers.room
+        );
+        assert!(
+            nested_tiers
+                .rich
+                .lines()
+                .any(|line| line.trim_start().starts_with("*[Button]")),
+            "rich stars interactive ancestor: {}",
+            nested_tiers.rich
+        );
+        assert!(
+            !nested_tiers.rich.contains("[Heading]"),
+            "rich omits landmark: {}",
+            nested_tiers.rich
+        );
+    }
+
+    #[test]
+    fn room_landmarks_omitted_from_rich_and_compact() {
+        use super::{OutlineDetail, OutlineOptions, format_a11y_outline};
+
+        let heading = NodeId(1);
+        let dialog = NodeId(2);
+        let button = NodeId(3);
+        let mut heading_node = accesskit::Node::new(Role::Heading);
+        heading_node.set_label("Title".to_string());
+        let mut dialog_node = accesskit::Node::new(Role::Dialog);
+        dialog_node.set_label("Confirm".to_string());
+        let mut button_node = accesskit::Node::new(Role::Button);
+        button_node.set_label("Ok".to_string());
+        button_node.add_action(accesskit::Action::Click);
+
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_label("App".to_string());
+        root.set_children(vec![heading, dialog, button]);
+        let nodes = vec![
+            (super::ROOT_NODE_ID, root),
+            (heading, heading_node),
+            (dialog, dialog_node),
+            (button, button_node),
+        ];
+
+        let room = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(button),
+                detail: OutlineDetail::Room,
+            },
+        );
+        assert!(room.contains("[Heading]"), "{room}");
+        assert!(room.contains("[Dialog]"), "{room}");
+        assert!(room.contains("landmarks: 2"), "{room}");
+
+        for detail in [OutlineDetail::Rich, OutlineDetail::Compact] {
+            let outline = format_a11y_outline(
+                &nodes,
+                OutlineOptions {
+                    focus: Some(button),
+                    detail,
+                },
+            );
+            assert!(
+                !outline.starts_with("# window:"),
+                "header is room-only ({detail:?}): {outline}"
+            );
+            assert!(
+                !outline.contains("[Heading]") && !outline.contains("[Dialog]"),
+                "landmarks are room-only ({detail:?}): {outline}"
+            );
+            assert!(outline.contains("[Button]"), "{outline}");
+        }
+    }
+
+    #[test]
+    fn is_landmark_skips_chrome_and_unlabeled_lists() {
+        use super::{is_interactive_a11y_node, is_landmark_a11y_node};
+
+        assert!(is_landmark_a11y_node(&accesskit::Node::new(Role::Heading)));
+        assert!(is_landmark_a11y_node(&accesskit::Node::new(Role::Dialog)));
+        assert!(is_landmark_a11y_node(&accesskit::Node::new(
+            Role::AlertDialog
+        )));
+        assert!(is_landmark_a11y_node(&accesskit::Node::new(Role::Toolbar)));
+        assert!(is_landmark_a11y_node(&accesskit::Node::new(Role::MenuBar)));
+        assert!(is_landmark_a11y_node(&accesskit::Node::new(Role::Menu)));
+        assert!(is_landmark_a11y_node(&accesskit::Node::new(Role::TabList)));
+
+        let mut labeled = accesskit::Node::new(Role::Label);
+        labeled.set_label("Name".to_string());
+        assert!(is_landmark_a11y_node(&labeled));
+        assert!(!is_landmark_a11y_node(&accesskit::Node::new(Role::Label)));
+
+        let mut valued_list = accesskit::Node::new(Role::List);
+        valued_list.set_value("3 items".to_string());
+        assert!(is_landmark_a11y_node(&valued_list));
+        assert!(!is_landmark_a11y_node(&accesskit::Node::new(Role::List)));
+        assert!(!is_landmark_a11y_node(&accesskit::Node::new(
+            Role::ListItem
+        )));
+
+        assert!(!is_landmark_a11y_node(&accesskit::Node::new(
+            Role::GenericContainer
+        )));
+
+        // Interactive filter must stay strict: buttons are never landmarks.
+        let mut button = accesskit::Node::new(Role::Button);
+        button.add_action(accesskit::Action::Click);
+        assert!(is_interactive_a11y_node(&button));
+        assert!(!is_landmark_a11y_node(&button));
+    }
+
+    #[test]
+    fn room_outline_does_not_dual_star_landmark_and_interactive_ancestor() {
+        use super::{OutlineDetail, OutlineOptions, format_a11y_outline};
+
+        // Nest landmark under interactive control so resolve_interactive_focus_mark
+        // would return the button (pre-fix dual-star path). Room must star only
+        // the printed landmark, not the interactive ancestor.
+        //
+        //   Window
+        //     Button
+        //       Heading  (focus)
+        let button = NodeId(1);
+        let heading = NodeId(2);
+        let mut button_node = accesskit::Node::new(Role::Button);
+        button_node.set_label("Go".to_string());
+        button_node.add_action(accesskit::Action::Click);
+        button_node.set_children(vec![heading]);
+        let mut heading_node = accesskit::Node::new(Role::Heading);
+        heading_node.set_label("Welcome".to_string());
+
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_children(vec![button]);
+        let nodes = vec![
+            (super::ROOT_NODE_ID, root),
+            (button, button_node),
+            (heading, heading_node),
+        ];
+
+        let outline = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(heading),
+                detail: OutlineDetail::Room,
+            },
+        );
+        let starred: Vec<_> = outline
+            .lines()
+            .filter(|line| !line.starts_with('#') && line.contains('*'))
+            .collect();
+        assert_eq!(
+            starred.len(),
+            1,
+            "exactly one body focus mark expected: {outline}"
+        );
+        assert!(
+            starred[0].contains("[Heading]"),
+            "landmark keeps exact focus: {outline}"
+        );
+        assert!(
+            !outline
+                .lines()
+                .any(|line| line.contains('*') && line.contains("[Button]")),
+            "no dual-star on interactive ancestor: {outline}"
+        );
+
+        // Rich omits landmarks: same focus should bubble `*` onto the button.
+        let rich = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(heading),
+                detail: OutlineDetail::Rich,
+            },
+        );
+        assert!(
+            rich.lines()
+                .any(|line| line.trim_start().starts_with("*[Button]") && line.contains("Go")),
+            "rich bubbles focus to interactive ancestor: {rich}"
+        );
+        assert!(
+            !rich.contains("[Heading]"),
+            "rich still skips landmark: {rich}"
+        );
+    }
+
+    #[test]
+    fn compact_outline_omits_bounds_and_action_list() {
+        use super::{OutlineDetail, OutlineOptions, format_a11y_outline};
+
+        let button = NodeId(1);
+        let mut button_node = accesskit::Node::new(Role::Button);
+        button_node.set_label("Save".to_string());
+        button_node.set_bounds(accesskit::Rect {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 10.0,
+            y1: 10.0,
+        });
+        button_node.add_action(accesskit::Action::Click);
+
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_children(vec![button]);
+        let nodes = vec![(super::ROOT_NODE_ID, root), (button, button_node)];
+        let outline = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(button),
+                detail: OutlineDetail::Compact,
+            },
+        );
+        assert!(outline.contains("[Button]"), "{outline}");
+        assert!(outline.contains("Save"), "{outline}");
+        assert!(!outline.contains('@'), "compact has no bounds: {outline}");
+        assert!(
+            !outline.contains("[click]"),
+            "compact has no actions: {outline}"
+        );
+        assert!(
+            outline.contains('*'),
+            "compact still marks focus: {outline}"
+        );
+    }
+
+    #[test]
+    fn outline_includes_value_on_text_input_and_room_focus() {
+        use super::{OutlineDetail, OutlineOptions, format_a11y_outline};
+
+        let input = NodeId(1);
+        let mut input_node = accesskit::Node::new(Role::TextInput);
+        input_node.set_value("fn main".to_string());
+        input_node.add_action(accesskit::Action::SetValue);
+        input_node.add_action(accesskit::Action::Focus);
+
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_label("Zed".to_string());
+        root.set_children(vec![input]);
+        let nodes = vec![(super::ROOT_NODE_ID, root), (input, input_node)];
+
+        let rich = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(input),
+                detail: OutlineDetail::Rich,
+            },
+        );
+        assert!(
+            rich.contains("value=\"fn main\""),
+            "rich body carries value: {rich}"
+        );
+        assert!(
+            rich.lines()
+                .any(|line| line.trim_start().starts_with("*[TextInput]")),
+            "focus mark on text input: {rich}"
+        );
+
+        let compact = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(input),
+                detail: OutlineDetail::Compact,
+            },
+        );
+        assert!(
+            compact.contains("value=\"fn main\""),
+            "compact also carries value (lean path is role/label/value/id): {compact}"
+        );
+        assert!(
+            compact.lines()
+                .any(|line| line.trim_start().starts_with("*[TextInput]")),
+            "compact still marks focus: {compact}"
+        );
+        assert!(
+            !compact.contains('@'),
+            "compact omits bounds even when value present: {compact}"
+        );
+
+        let room = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(input),
+                detail: OutlineDetail::Room,
+            },
+        );
+        assert!(
+            room.contains("# focus: [TextInput] value=\"fn main\" #NodeId(1)"),
+            "room focus summary prefers value when label empty: {room}"
+        );
+        assert!(
+            room.contains("value=\"fn main\""),
+            "room body also has value: {room}"
+        );
+    }
+
+    #[test]
     fn interactive_outline_available_after_finalize() {
         let mut builder = new_builder();
         let button = NodeId(1);
@@ -736,8 +1814,8 @@ mod tests {
             "post-frame snapshot must retain interactive label: {outline:?}"
         );
         assert!(
-            outline.contains("#NodeId(1)") || outline.contains("NodeId(1)"),
-            "outline should include node id: {outline:?}"
+            outline.contains("#NodeId(1)"),
+            "outline should include exact #NodeId(1): {outline:?}"
         );
     }
 

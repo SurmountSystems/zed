@@ -19,15 +19,13 @@ use cloud_api_client::websocket_protocol::MessageToClient;
 use cloud_api_client::{ClientApiError, CloudApiClient};
 use cloud_api_types::OrganizationId;
 use credentials_provider::CredentialsProvider;
-use futures::{
-    FutureExt, SinkExt, Stream, StreamExt, TryFutureExt as _, TryStreamExt,
-    channel::mpsc,
-    future::BoxFuture,
-    stream::BoxStream,
-};
-use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt, WeakEntity, actions};
 #[cfg(any(test, feature = "test-support"))]
 use futures::channel::oneshot;
+use futures::{
+    FutureExt, SinkExt, Stream, StreamExt, TryFutureExt as _, TryStreamExt, channel::mpsc,
+    future::BoxFuture, stream::BoxStream,
+};
+use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt, WeakEntity, actions};
 use http_client::{HttpClient, HttpClientWithUrl, http, read_proxy_from_env};
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
@@ -1082,6 +1080,8 @@ impl Client {
 
         #[cfg(any(test, feature = "test-support"))]
         {
+            use feature_flags::FeatureFlagAppExt as _;
+
             // Don't try to sign in again if we're already connected to Collab, as it will temporarily disconnect us.
             if self.status().borrow().is_connected() {
                 return Ok(());
@@ -1110,7 +1110,9 @@ impl Client {
                         if is_staff {
                             match client.connect_with_credentials(credentials, cx).await {
                                 ConnectionResult::Timeout => Err(anyhow!("connection timed out")),
-                                ConnectionResult::ConnectionReset => Err(anyhow!("connection reset")),
+                                ConnectionResult::ConnectionReset => {
+                                    Err(anyhow!("connection reset"))
+                                }
                                 ConnectionResult::Result(result) => {
                                     result.context("client auth and connect")
                                 }
