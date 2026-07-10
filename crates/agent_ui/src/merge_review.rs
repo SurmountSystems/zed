@@ -1705,8 +1705,36 @@ fn parse_disposition(value: &str) -> Result<ReviewDisposition> {
     })
 }
 
+/// True when `worktree_root` is (or lives under) a Surmount fork root with `SURMOUNT.md`.
+///
+/// Accepts either a directory containing `SURMOUNT.md`, or a **single-file worktree**
+/// whose work directory is a file under such a root (common when agent-stdio / open-file
+/// opens `SURMOUNT.md` and GPUI sets work_directory to the file path itself).
 pub fn is_surmount_workspace(worktree_root: &Path) -> bool {
-    worktree_root.join("SURMOUNT.md").is_file()
+    if worktree_root.join("SURMOUNT.md").is_file() {
+        return true;
+    }
+    if worktree_root.is_file() {
+        if worktree_root.file_name().and_then(|name| name.to_str()) == Some("SURMOUNT.md") {
+            return true;
+        }
+        if let Some(parent) = worktree_root.parent() {
+            return parent.join("SURMOUNT.md").is_file();
+        }
+    }
+    false
+}
+
+/// Directory used for git + manifest I/O when `work_directory` may be a single file.
+pub fn normalize_surmount_worktree_root(work_directory: &Path) -> PathBuf {
+    if work_directory.is_file() {
+        work_directory
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| work_directory.to_path_buf())
+    } else {
+        work_directory.to_path_buf()
+    }
 }
 
 fn is_reviewable_changed_path(worktree_root: &Path, path: &str) -> bool {
@@ -2852,7 +2880,10 @@ pub fn worktree_root_for_merge_review(project: &Entity<Project>, cx: &App) -> Op
         .snapshot()
         .work_directory_abs_path
         .to_path_buf();
-    is_surmount_workspace(root.as_ref()).then_some(root)
+    if !is_surmount_workspace(root.as_ref()) {
+        return None;
+    }
+    Some(normalize_surmount_worktree_root(root.as_ref()))
 }
 
 async fn path_is_unmerged(worktree_root: &Path, path: &str) -> Result<bool> {
@@ -4142,12 +4173,34 @@ impl MergeReviewView {
 
     fn start_review(
         workspace: &mut Workspace,
-        _: &StartMergeReview,
+        action: &StartMergeReview,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
         let project = workspace.project().clone();
         let Some(repo) = surmount_repository(&project, cx) else {
+            // Multi-window headless: cold-start "empty project" may receive the action
+            // while SURMOUNT.md is open in another workspace. Prefer that window.
+            let candidates: Vec<_> = workspace
+                .app_state()
+                .workspace_store
+                .read(cx)
+                .workspaces()
+                .filter_map(|weak| weak.upgrade())
+                .filter(|other| other.entity_id() != cx.entity().entity_id())
+                .collect();
+            for other in candidates {
+                let other_project = other.read(cx).project().clone();
+                if surmount_repository(&other_project, cx).is_some() {
+                    log::info!(
+                        "surmount merge review: redirecting StartMergeReview to Surmount workspace"
+                    );
+                    other.update(cx, |other_workspace, cx| {
+                        Self::start_review(other_workspace, action, window, cx);
+                    });
+                    return;
+                }
+            }
             log::warn!("surmount merge review: no repository with SURMOUNT.md at root");
             workspace.show_toast(
                 merge_review_toast(
@@ -4157,11 +4210,9 @@ impl MergeReviewView {
             );
             return;
         };
-        let worktree_root = repo
-            .read(cx)
-            .snapshot()
-            .work_directory_abs_path
-            .to_path_buf();
+        let worktree_root = normalize_surmount_worktree_root(
+            repo.read(cx).snapshot().work_directory_abs_path.as_ref(),
+        );
         log::info!(
             "surmount merge review: start requested (worktree={})",
             worktree_root.display()
@@ -7023,6 +7074,30 @@ paths = ["Cargo.toml"]
     }
 
     #[test]
+    fn test_is_surmount_workspace_accepts_single_file_worktree_path() {
+        let root = std::env::temp_dir().join(format!(
+            "merge-review-surmount-file-wt-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let surmount = root.join("SURMOUNT.md");
+        std::fs::write(&surmount, "# fork").unwrap();
+        // Dogfood / open-file can set work_directory to the file path itself.
+        assert!(
+            is_surmount_workspace(&surmount),
+            "file worktree path must count as Surmount"
+        );
+        assert_eq!(normalize_surmount_worktree_root(&surmount), root);
+        // Another file under the same root still detects via parent SURMOUNT.md.
+        let other = root.join("README.md");
+        std::fs::write(&other, "hi").unwrap();
+        assert!(is_surmount_workspace(&other));
+        assert_eq!(normalize_surmount_worktree_root(&other), root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_is_reviewable_changed_path_skips_directories() {
         let root =
             std::env::temp_dir().join(format!("merge-review-path-filter-{}", std::process::id()));
@@ -7532,7 +7607,8 @@ paths = ["Cargo.toml"]
             save_session(cx, &session).expect("save session");
             let toast = merge_review_summary_saved_toast("lib.rs", true, cx);
             assert!(toast.contains("lib.rs"), "{toast}");
-            assert!(toast.contains("Advanced"), "{toast}");
+            // Production uses lowercase after the em-dash: "summarized — advanced. Click green…"
+            assert!(toast.contains("advanced"), "{toast}");
             assert!(toast.contains("Review Diff"), "{toast}");
         });
     }

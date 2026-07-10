@@ -34,6 +34,8 @@ enum DogfoodCommand {
     Golden(GoldenArgs),
     /// Automation smoke: open fixture, poll until non-empty snapshot (+ optional expects / action / keys).
     Smoke(SmokeArgs),
+    /// Headless merge-review start adventure: open Surmount fixture → StartMergeReview → wait → look → stderr tail.
+    MergeReview(MergeReviewArgs),
 }
 
 #[derive(Parser)]
@@ -100,6 +102,28 @@ struct SmokeArgs {
     require_action: bool,
     /// Snapshot detail: compact | rich (default) | room.
     #[arg(long, default_value = "rich", value_parser = ["compact", "rich", "room"])]
+    snapshot_detail: String,
+}
+
+#[derive(Parser)]
+struct MergeReviewArgs {
+    #[arg(long, env = "ZED_BIN")]
+    bin: Option<PathBuf>,
+    /// Prefer SURMOUNT.md so the worktree root is a Surmount workspace when git is wired.
+    #[arg(long, env = "ZED_DOGFOOD_FIXTURE")]
+    fixture: Option<PathBuf>,
+    /// Settle after open (ms) before StartMergeReview.
+    #[arg(long, default_value_t = 4000)]
+    wait_ms: u64,
+    /// Extra settle after StartMergeReview for git populate / Branch Diff (ms).
+    #[arg(long, default_value_t = 8000)]
+    post_start_wait_ms: u64,
+    #[arg(long, default_value_t = 180)]
+    timeout_secs: u64,
+    /// GPUI action that starts the workflow (default Surmount StartMergeReview).
+    #[arg(long, default_value = "surmount::StartMergeReview")]
+    action: String,
+    #[arg(long, default_value = "room", value_parser = ["compact", "rich", "room"])]
     snapshot_detail: String,
 }
 
@@ -739,6 +763,20 @@ fn resolve_fixture(explicit: Option<PathBuf>) -> Result<PathBuf> {
     bail!("no --fixture and README.md missing at workspace root");
 }
 
+/// Prefer SURMOUNT.md at the cargo workspace root (Surmount merge-review detector).
+fn resolve_surmount_fixture(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return resolve_fixture(Some(path));
+    }
+    let meta = workspace::load_workspace()?;
+    let root = PathBuf::from(meta.workspace_root);
+    let surmount = root.join("SURMOUNT.md");
+    if surmount.is_file() {
+        return Ok(surmount.canonicalize().unwrap_or(surmount));
+    }
+    resolve_fixture(None)
+}
+
 // ── Commands ─────────────────────────────────────────────────────────────────
 
 fn run_preflight(args: PreflightArgs) -> Result<()> {
@@ -1087,6 +1125,182 @@ pub fn run_dogfood(args: DogfoodArgs) -> Result<()> {
         DogfoodCommand::Preflight(a) => run_preflight(a),
         DogfoodCommand::Golden(a) => run_golden(a),
         DogfoodCommand::Smoke(a) => run_smoke(a),
+        DogfoodCommand::MergeReview(a) => run_merge_review(a),
+    }
+}
+
+/// Headless Start Merge Review adventure for debugging the Surmount workflow.
+///
+/// Always records action ok/error and snapshot preview honestly. Dumps stderr
+/// lines that mention merge review / surmount so product toasts and populate
+/// logs are visible without inventing UI that did not paint.
+fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
+    let bin = args.bin.map(Ok).unwrap_or_else(default_bin)?;
+    let fixture = resolve_surmount_fixture(args.fixture)?;
+    let timeout = Duration::from_secs(args.timeout_secs);
+    let fixture_str = fixture.display().to_string();
+    let detail = args.snapshot_detail.as_str();
+    let action_name = args.action.as_str();
+
+    println!(
+        "dogfood merge-review: bin={} fixture={} action={} detail={} wait_ms={} post_start_wait_ms={}",
+        bin.display(),
+        fixture.display(),
+        action_name,
+        detail,
+        args.wait_ms,
+        args.post_start_wait_ms,
+    );
+
+    let mut session = DogfoodSession::spawn(&bin, timeout)?;
+    session.wait_until(
+        0,
+        |lines| lines.iter().any(|l| is_ready_line(l)),
+        Duration::from_secs(45),
+    )?;
+    println!("[event:ready] ok");
+
+    session.request_ok(
+        "open1",
+        &[("method", "open"), ("path", fixture_str.as_str())],
+        Duration::from_secs(20),
+    )?;
+    println!("[method:open] ok path={fixture_str}");
+
+    if args.wait_ms > 0 {
+        let wait_ms = args.wait_ms.to_string();
+        session.request_ok(
+            "wait1",
+            &[("method", "wait"), ("ms", wait_ms.as_str())],
+            Duration::from_millis(args.wait_ms + 10_000),
+        )?;
+        println!("[method:wait pre-start] ok ms={}", args.wait_ms);
+    }
+
+    // Pre-start room look (baseline).
+    let look1 = session.request_ok(
+        "look1",
+        &snapshot_method_fields(detail),
+        Duration::from_secs(20),
+    )?;
+    let look1_blob = look1.join("\n");
+    println!(
+        "[method:look pre-start] empty={} preview={}",
+        classify_snapshot(&look1_blob),
+        extract_snapshot_preview(&look1_blob, 220)
+    );
+
+    match session.request_ok(
+        "start1",
+        &[("method", "action"), ("name", action_name)],
+        Duration::from_secs(20),
+    ) {
+        Ok(lines) => {
+            println!("[method:action {action_name}] ok");
+            let blob = lines.join("\n");
+            if blob_has_ok_false(&blob) {
+                println!("  warn: response contains ok:false in broader buffer");
+            }
+        }
+        Err(error) => {
+            // Still dump stderr for product diagnosis before failing.
+            session.pump();
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            session.shutdown_best_effort();
+            bail!("merge-review adventure: action {action_name:?} failed: {error:#}");
+        }
+    }
+
+    if args.post_start_wait_ms > 0 {
+        let wait_ms = args.post_start_wait_ms.to_string();
+        session.request_ok(
+            "wait2",
+            &[("method", "wait"), ("ms", wait_ms.as_str())],
+            Duration::from_millis(args.post_start_wait_ms + 15_000),
+        )?;
+        println!(
+            "[method:wait post-start] ok ms={}",
+            args.post_start_wait_ms
+        );
+    }
+
+    let look2 = session.request_ok(
+        "look2",
+        &snapshot_method_fields(detail),
+        Duration::from_secs(30),
+    )?;
+    let look2_blob = look2.join("\n");
+    println!(
+        "[method:look post-start] empty={} preview={}",
+        classify_snapshot(&look2_blob),
+        extract_snapshot_preview(&look2_blob, 400)
+    );
+    if let Some(text) = extract_snapshot_text(&look2_blob) {
+        let decoded = text.replace("\\n", "\n");
+        println!("--- post-start outline (first 40 lines) ---");
+        for (i, line) in decoded.lines().take(40).enumerate() {
+            println!("{:02}|{}", i + 1, line);
+        }
+    }
+
+    // inventory / theme are optional protocol toys — best-effort, non-fatal.
+    match session.request_ok("inv1", &[("method", "inventory")], Duration::from_secs(15)) {
+        Ok(lines) => {
+            let blob = lines.join("\n");
+            println!("[method:inventory] ok");
+            if let Some(caps) = Regex::new(r#""inventory@text":\s*"(.*)""#)
+                .ok()
+                .and_then(|re| re.captures(&blob))
+            {
+                let inv = caps
+                    .get(1)
+                    .map(|m| m.as_str().replace("\\n", "\n"))
+                    .unwrap_or_default();
+                println!("--- inventory ---");
+                for line in inv.lines().take(20) {
+                    println!("{line}");
+                }
+            }
+        }
+        Err(error) => println!("[method:inventory] warn: {error:#}"),
+    }
+
+    session.pump();
+    print_merge_review_stderr_tail(&session.stderr_buf);
+
+    session.shutdown_best_effort();
+    println!("[method:shutdown] requested");
+    println!("merge-review adventure finished (see stderr tail for populate / toast logs)");
+    Ok(())
+}
+
+fn print_merge_review_stderr_tail(stderr: &[String]) {
+    let interesting: Vec<&String> = stderr
+        .iter()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("merge review")
+                || lower.contains("surmount")
+                || lower.contains("branch diff")
+                || lower.contains("start requested")
+                || lower.contains("populated")
+                || lower.contains("empty queue")
+        })
+        .collect();
+    println!(
+        "--- stderr merge-review related ({} of {} lines) ---",
+        interesting.len(),
+        stderr.len()
+    );
+    if interesting.is_empty() {
+        println!("(none matched; last 25 stderr lines follow)");
+        for line in stderr.iter().rev().take(25).collect::<Vec<_>>().into_iter().rev() {
+            println!("{line}");
+        }
+    } else {
+        for line in interesting.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
+            println!("{line}");
+        }
     }
 }
 
