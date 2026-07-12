@@ -301,6 +301,12 @@ impl PlatformWindow for TestWindow {
         }
     }
 
+    fn a11y_init(&self, callbacks: crate::A11yCallbacks) {
+        // Mirror headless: no AT adapter, activate immediately so tests can
+        // paint AccessKit trees and assert room/rich outlines.
+        let _ = (callbacks.activation)();
+    }
+
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
         self.0.lock().sprite_atlas.clone()
     }

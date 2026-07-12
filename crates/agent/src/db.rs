@@ -169,7 +169,7 @@ impl SharedThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
-        native_grok_artifacts: None,
+            native_grok_artifacts: None,
         }
     }
 
@@ -354,7 +354,7 @@ impl DbThread {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
-        native_grok_artifacts: None,
+            native_grok_artifacts: None,
         })
     }
 }
@@ -806,7 +806,7 @@ mod tests {
             ui_scroll_position: None,
             sandboxed_terminal_temp_dir: None,
             sandbox_grants: DbSandboxGrants::default(),
-        native_grok_artifacts: None,
+            native_grok_artifacts: None,
         }
     }
 

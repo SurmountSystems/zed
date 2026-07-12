@@ -2176,6 +2176,19 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        // Merge-review focus layout owns dock zoom when a session is engaged; do not race it.
+        // Cold start: initialize_agent_panel may call this while restore is also applying
+        // focus layout. Never nest workspace.update (entity_map double-lease panic).
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            if let Some(panel) = workspace.panel::<Self>(cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.prepare_for_merge_review(window, cx);
+                });
+            }
+            // Safe unzoom (no PanelEvent::ZoomOut) if immersive startup already zoomed the dock.
+            workspace.unzoom_dock_panel::<Self>(window, cx);
+            return;
+        }
         let Some(panel) = workspace.panel::<Self>(cx) else {
             return;
         };

@@ -4345,6 +4345,30 @@ impl Workspace {
         self.serialize_workspace(window, cx);
     }
 
+    /// Unzoom a dock panel and clear workspace zoom state without nested workspace updates.
+    ///
+    /// Prefer this over emitting `PanelEvent::ZoomOut` while already inside
+    /// `workspace.update` / `update_in`. The dock subscriber for ZoomOut calls
+    /// `workspace.update` (via `Dock::set_panel_zoomed`), which panics with a
+    /// double-lease if Workspace is already leased.
+    pub fn unzoom_dock_panel<T: Panel>(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.panel::<T>(cx) else {
+            return;
+        };
+        let position = panel.read(cx).position(window, cx);
+        let dock = self.dock_at_position(position).clone();
+        dock.update(cx, |dock, cx| {
+            dock.set_panel_zoomed_no_serialize(&panel.to_any(), false, window, cx);
+        });
+        if self.zoomed_position == Some(position) || self.zoomed.is_some() {
+            self.zoomed = None;
+            self.zoomed_position = None;
+            cx.emit(Event::ZoomChanged);
+        }
+        self.serialize_workspace(window, cx);
+        cx.notify();
+    }
+
     /// Focus the panel of the given type if it isn't already focused. If it is
     /// already focused, then transfer focus back to the workspace center.
     /// When the `close_panel_on_toggle` setting is enabled, also closes the

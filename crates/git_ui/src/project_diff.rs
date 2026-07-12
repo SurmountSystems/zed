@@ -22,7 +22,7 @@ use git::{
 };
 use gpui::{
     Action, AnyElement, App, AppContext as _, AsyncApp, AsyncWindowContext, Entity, EventEmitter,
-    FocusHandle, Focusable, Render, Subscription, Task, WeakEntity, actions,
+    FocusHandle, Focusable, Render, Role, Subscription, Task, WeakEntity, actions,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
 use multi_buffer::{MultiBuffer, PathKey};
@@ -73,6 +73,22 @@ actions!(
         CompareWithBranch,
     ]
 );
+
+/// AccessKit / room-outline landmark label for merge-base Branch Diff.
+pub const BRANCH_DIFF_A11Y_LABEL: &str = "Branch Diff";
+
+/// Non-interactive item-level landmark for merge-base Branch Diff.
+///
+/// Focus-tracked ProjectDiff roots are interactive (`Action::Focus`), so the
+/// landmark must be a separate child. Used by render and paint tests.
+pub fn branch_diff_landmark_element() -> impl IntoElement {
+    div()
+        .id("branch-diff-landmark")
+        .role(Role::Heading)
+        .aria_label(BRANCH_DIFF_A11Y_LABEL)
+        .size_0()
+        .overflow_hidden()
+}
 
 struct BufferSubscriptions {
     _diff: Entity<BufferDiff>,
@@ -1452,7 +1468,7 @@ impl Item for ProjectDiff {
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
         match self.diff_base(cx) {
             DiffBase::Head => Some("Project Diff".into()),
-            DiffBase::Merge { .. } => Some("Branch Diff".into()),
+            DiffBase::Merge { .. } => Some(BRANCH_DIFF_A11Y_LABEL.into()),
         }
     }
 
@@ -1623,6 +1639,9 @@ impl Render for ProjectDiff {
             .items_center()
             .justify_center()
             .size_full()
+            .when(is_branch_diff_view, |this| {
+                this.child(branch_diff_landmark_element())
+            })
             .when(is_empty && is_loading, |el| {
                 let rems = TextSize::Large.rems(cx);
                 el.child(
@@ -2217,6 +2236,9 @@ impl Render for BranchDiffToolbar {
                 .is_file()
         });
 
+        // Toolbar is chrome only — the durable "Branch Diff" landmark is the
+        // ProjectDiff Heading (`branch_diff_landmark_element`), not a second
+        // identically labeled Toolbar.
         h_group_xl()
             .my_neg_1()
             .py_1()
@@ -3863,5 +3885,100 @@ mod tests {
         });
         assert!(!blocked, "guard should block navigation to bar");
         clear_merge_review_file_navigation_guard_test_override();
+    }
+
+    /// Paints production `branch_diff_landmark_element` and asserts room outline.
+    /// Fails if role/aria_label/id are removed from that helper.
+    #[gpui::test]
+    async fn branch_diff_landmark_paints_into_room_outline(cx: &mut TestAppContext) {
+        use gpui::{Context, IntoElement, OutlineDetail, Render, Window};
+
+        struct LandmarkProbe;
+
+        impl Render for LandmarkProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                branch_diff_landmark_element()
+            }
+        }
+
+        let window = cx.add_window(|_, _| LandmarkProbe);
+        let outline = cx
+            .update_window(window.into(), |_, window, cx| {
+                let _ = window.draw(cx);
+                window.a11y_outline(OutlineDetail::Room)
+            })
+            .unwrap();
+
+        assert!(
+            outline.contains(&format!("[Heading] \"{BRANCH_DIFF_A11Y_LABEL}\"")),
+            "room outline must include Branch Diff heading from production helper: {outline}"
+        );
+        assert!(
+            outline.contains("landmarks:") && !outline.contains("landmarks: 0"),
+            "room outline must report at least one landmark: {outline}"
+        );
+    }
+
+    /// Full ProjectDiff merge-base item also emits the Branch Diff heading landmark.
+    #[gpui::test]
+    async fn branch_diff_project_diff_paints_branch_diff_landmark(cx: &mut TestAppContext) {
+        use gpui::OutlineDetail;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "C",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        // Workspace handle only — ProjectDiff is the window root so its render
+        // path is what paints into the a11y tree.
+        let (multi_workspace, _) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let project_clone = project.clone();
+        let workspace_clone = workspace.clone();
+        let window = cx.add_window(move |window, cx| {
+            ProjectDiff::new(project_clone, workspace_clone, window, cx)
+        });
+
+        window
+            .update(cx, |project_diff, _window, cx| {
+                project_diff.branch_diff.update(cx, |branch_diff, cx| {
+                    branch_diff.set_diff_base(
+                        DiffBase::Merge {
+                            base_ref: "main".into(),
+                        },
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let is_merge = window
+            .read_with(cx, |project_diff, cx| {
+                matches!(project_diff.diff_base(cx), DiffBase::Merge { .. })
+            })
+            .unwrap();
+        assert!(is_merge, "test must paint a merge-base Branch Diff");
+
+        let outline = cx
+            .update_window(window.into(), |_, window, cx| {
+                let _ = window.draw(cx);
+                window.a11y_outline(OutlineDetail::Room)
+            })
+            .unwrap();
+
+        assert!(
+            outline.contains(&format!("[Heading] \"{BRANCH_DIFF_A11Y_LABEL}\"")),
+            "ProjectDiff merge-base paint must expose Branch Diff landmark: {outline}"
+        );
     }
 }

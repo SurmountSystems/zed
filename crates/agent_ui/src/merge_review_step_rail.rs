@@ -2,7 +2,10 @@ use git_ui::project_diff::{
     BranchDiffToolbar, MergeReviewBranchDiffControls, MergeReviewConflictOutcomeHint,
     MergeReviewConflictWorkshopPhase, MergeReviewGitMode, ReviewDiff,
 };
-use gpui::{Action, AnyElement, Context, FocusHandle, Hsla, ParentElement, Window, rgb};
+use gpui::{
+    Action, AnyElement, Context, ElementId, FocusHandle, Hsla, ParentElement, Role, SharedString,
+    Window, rgb,
+};
 use ui::{Color, Icon, IconName, IconSize, KeyBinding, Label, LabelSize, Tooltip, prelude::*};
 use zed_actions::surmount::{
     ConfirmMergeReviewDecisionKeepFork, ConfirmMergeReviewDecisionSynthesize,
@@ -24,6 +27,9 @@ pub const RAIL_BTN_SYNTHESIZE: &str = "Synthesize";
 pub const RAIL_BTN_COMPLETE_TESTS: &str = "Complete tests";
 pub const RAIL_BTN_PREVIEW_MERGE: &str = "Preview merge";
 pub const RAIL_BTN_DRAFT_COMMIT_MESSAGE: &str = "Draft commit message";
+
+/// AccessKit / room-outline landmark label for the merge-review step rail.
+pub const MERGE_REVIEW_RAIL_A11Y_LABEL: &str = "Merge review";
 
 /// Merge review workflow control border (`#0f0`), dark-mode first.
 pub fn merge_review_workflow_green_border() -> Hsla {
@@ -151,6 +157,39 @@ pub fn merge_review_primary_action(step: MergeReviewUiStep) -> MergeReviewPrimar
     }
 }
 
+/// Toolbar shell for the merge-review step rail (role+label shared with paint tests).
+pub fn merge_review_step_rail_container(
+    status_label: impl Into<SharedString>,
+) -> gpui::Stateful<Div> {
+    let status_label = status_label.into();
+    h_flex()
+        .id("merge-review-step-rail")
+        .role(Role::Toolbar)
+        .aria_label(MERGE_REVIEW_RAIL_A11Y_LABEL)
+        .gap_2()
+        .items_center()
+        .flex_wrap()
+        .child(
+            div()
+                .id("merge-review-rail-status")
+                .role(Role::Label)
+                .aria_label(status_label.clone())
+                .child(
+                    Label::new(status_label)
+                        .size(LabelSize::Default)
+                        .color(Color::Muted),
+                ),
+        )
+}
+
+/// AccessKit role+label for a merge-review rail control (must match production buttons).
+pub fn with_merge_review_rail_button_a11y(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+) -> gpui::Stateful<Div> {
+    div().id(id).role(Role::Button).aria_label(label)
+}
+
 pub fn render_merge_review_step_rail(
     toolbar: &BranchDiffToolbar,
     controls: &MergeReviewBranchDiffControls,
@@ -179,11 +218,7 @@ pub fn render_merge_review_step_rail(
     } else {
         format!("{} · {}", controls.progress_label, controls.step_label)
     };
-    let mut rail = h_flex().gap_2().items_center().flex_wrap().child(
-        Label::new(status_label)
-            .size(LabelSize::Default)
-            .color(Color::Muted),
-    );
+    let mut rail = merge_review_step_rail_container(status_label);
     for spec in workflow_button_specs(
         step,
         primary,
@@ -549,8 +584,7 @@ fn merge_review_workflow_button(
     let action_for_click = action.boxed_clone();
     let action_for_tooltip = action.boxed_clone();
     let keybinding = (!disabled).then(|| KeyBinding::for_action_in(action, focus_handle, cx));
-    div()
-        .id(id)
+    with_merge_review_rail_button_a11y(id, label)
         .h(px(32.))
         .px_2()
         .flex()

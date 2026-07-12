@@ -217,9 +217,15 @@ mod tests {
     #[test]
     fn test_retrieval_unknown_task_id_errors() {
         let scheduler = NativeBackgroundTaskScheduler::new();
-        let result = futures::executor::block_on(scheduler.retrieve_output("T-99-task-foo", false, None));
+        let result =
+            futures::executor::block_on(scheduler.retrieve_output("T-99-task-foo", false, None));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown monitor task id"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown monitor task id")
+        );
     }
 
     #[test]

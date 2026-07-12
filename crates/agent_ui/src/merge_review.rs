@@ -24,9 +24,9 @@ use ui::{
 use ui_input::InputField;
 use util::ResultExt as _;
 use workspace::{
-    Item, ItemHandle, ModalView, Panel, Toast, ToolbarItemEvent, ToolbarItemLocation,
-    ToolbarItemView, Workspace,
-    dock::{DockPosition, PanelEvent},
+    Item, ItemHandle, ModalView, Toast, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
+    Workspace,
+    dock::DockPosition,
     item::{ItemBufferKind, ItemEvent},
     notifications::{NotificationId, NotifyTaskExt},
 };
@@ -1837,12 +1837,9 @@ fn unzoom_agent_dock_for_merge_review(
         return;
     };
     log::info!("surmount merge review: unzooming {zoomed_position:?} dock for branch diff focus");
-    if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-        panel.update(cx, |panel, cx| {
-            panel.set_zoomed(false, window, cx);
-            cx.emit(PanelEvent::ZoomOut);
-        });
-    }
+    // Must not emit PanelEvent::ZoomOut here: restore runs inside workspace.update,
+    // and Dock's ZoomOut handler calls workspace.update again (double-lease panic).
+    workspace.unzoom_dock_panel::<AgentPanel>(window, cx);
     workspace.focus_center_pane(window, cx);
 }
 
@@ -3616,8 +3613,13 @@ pub fn merge_review_allow_file_navigation(
     cx: &mut App,
 ) -> bool {
     if let Some(toast) = merge_review_out_of_order_selection_toast(repo_path, cx) {
-        workspace.update(cx, |workspace, cx| {
-            workspace.show_toast(merge_review_toast(toast), cx);
+        // Defer toast: this guard runs from ProjectDiff::move_to_* under an active
+        // Workspace lease (queue select / restore). Nested workspace.update panics.
+        let toast = merge_review_toast(toast);
+        cx.defer(move |cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_toast(toast, cx);
+            });
         });
         false
     } else {
@@ -5256,26 +5258,27 @@ pub fn init(cx: &mut App) {
     })
     .detach();
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
-        let Some(_window) = window else {
+        let Some(window) = window else {
             return;
         };
         let git_store = workspace.project().read(cx).git_store().clone();
-        let workspace_weak = cx.entity().downgrade();
-        cx.subscribe(&git_store, move |_, _, event, cx| {
-            let git_changed = matches!(
-                event,
-                GitStoreEvent::ConflictsUpdated
-                    | GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged, _)
-            );
-            if !git_changed || !merge_review_session_active(cx) {
-                return;
-            }
-            workspace_weak
-                .update_in(cx, |_, window, cx| {
-                    spawn_refresh_merge_review_git_state(window, cx);
-                })
-                .log_err();
-        })
+        // subscribe_in already leases Workspace for the callback. Do not call
+        // workspace.update / update_in again here (entity_map double-lease panic).
+        cx.subscribe_in(
+            &git_store,
+            window,
+            move |_workspace, _, event, window, cx| {
+                let git_changed = matches!(
+                    event,
+                    GitStoreEvent::ConflictsUpdated
+                        | GitStoreEvent::RepositoryUpdated(_, RepositoryEvent::StatusesChanged, _)
+                );
+                if !git_changed || !merge_review_session_active(cx) {
+                    return;
+                }
+                spawn_refresh_merge_review_git_state(window, cx);
+            },
+        )
         .detach();
     })
     .detach();
@@ -7725,6 +7728,75 @@ paths = ["Cargo.toml"]
         assert_eq!(RAIL_BTN_DRAFT_COMMIT_MESSAGE, "Draft commit message");
     }
 
+    /// Paints production rail container + button a11y helpers into a live outline.
+    /// Fails if role/aria_label are removed from those helpers (used by real render).
+    #[gpui::test]
+    async fn merge_review_rail_paints_toolbar_and_button_labels(cx: &mut gpui::TestAppContext) {
+        use crate::merge_review_step_rail::{
+            MERGE_REVIEW_RAIL_A11Y_LABEL, RAIL_BTN_END, RAIL_BTN_REVIEW_DIFF,
+            merge_review_step_rail_container, with_merge_review_rail_button_a11y,
+        };
+        use crate::test_support::init_test;
+        use gpui::{
+            Context, IntoElement, OutlineDetail, ParentElement, Render, StatefulInteractiveElement,
+            Window,
+        };
+
+        init_test(cx);
+
+        struct RailProbe;
+
+        impl Render for RailProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                merge_review_step_rail_container("1/3 · Reviewing")
+                    .child(
+                        with_merge_review_rail_button_a11y(
+                            "merge-review-rail-review-diff",
+                            RAIL_BTN_REVIEW_DIFF,
+                        )
+                        .on_click(|_, _, _| {}),
+                    )
+                    .child(
+                        with_merge_review_rail_button_a11y("merge-review-rail-end", RAIL_BTN_END)
+                            .on_click(|_, _, _| {}),
+                    )
+            }
+        }
+
+        let window = cx.add_window(|_, _| RailProbe);
+        let outline = cx
+            .update_window(window.into(), |_, window, cx| {
+                let _ = window.draw(cx);
+                window.a11y_outline(OutlineDetail::Room)
+            })
+            .unwrap();
+
+        assert!(
+            outline.contains(&format!("[Toolbar] \"{MERGE_REVIEW_RAIL_A11Y_LABEL}\"")),
+            "room outline must include merge-review toolbar landmark: {outline}"
+        );
+        assert!(
+            outline.contains(&format!("[Button] \"{RAIL_BTN_REVIEW_DIFF}\"")),
+            "room outline must include Review Diff button: {outline}"
+        );
+        assert!(
+            outline.contains(&format!("[Button] \"{RAIL_BTN_END}\"")),
+            "room outline must include End merge review button: {outline}"
+        );
+        assert!(
+            outline.contains("interactive:") && !outline.contains("interactive: 0"),
+            "rail buttons must count as interactive: {outline}"
+        );
+        let landmark_line = outline
+            .lines()
+            .find(|line| line.contains("landmarks:"))
+            .unwrap_or("");
+        assert!(
+            !landmark_line.contains("landmarks: 0"),
+            "toolbar/status should contribute landmarks: {outline}"
+        );
+    }
+
     #[test]
     fn parse_merge_tree_preview_counts_conflicts_and_truncates() {
         let sample = "changed in both\n  base file\nmerged\nadded in remote\nremoved in remote\n";
@@ -9839,6 +9911,233 @@ paths = ["Cargo.toml"]
         });
 
         (workspace, cx)
+    }
+
+    /// Regression: restore must unzoom without emitting `PanelEvent::ZoomOut`, which
+    /// would nested-`workspace.update` from Dock and panic (entity_map double-lease).
+    #[gpui::test]
+    async fn test_restore_merge_review_layout_unzooms_without_nested_workspace_update(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, mut cx) = setup_zoomed_agent_workspace(cx).await;
+
+        let mut session = test_session_with_ambiguous_items(1);
+        session.focus_layout_active = true;
+        session.docks_collapsed = vec!["left".into()];
+        cx.update(|_window, cx| {
+            save_session(cx, &session).expect("save merge review session");
+        });
+
+        workspace.read_with(&cx, |workspace, _cx| {
+            assert!(
+                workspace.zoomed_dock_position().is_some(),
+                "precondition: agent dock zoomed before restore"
+            );
+        });
+
+        // Same lease as production restore paths (observe_new, ActiveItemChanged).
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            restore_merge_review_workspace_layout(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(&cx, |workspace, _cx| {
+            assert!(
+                workspace.zoomed_dock_position().is_none(),
+                "restore must clear workspace zoomed_position"
+            );
+        });
+
+        // Idempotent second restore inside the same update style must not panic either.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            restore_merge_review_workspace_layout(workspace, window, cx);
+            restore_merge_review_workspace_layout(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(&cx, |workspace, _cx| {
+            assert!(
+                workspace.zoomed_dock_position().is_none(),
+                "repeated restore must keep agent dock unzoomed"
+            );
+        });
+    }
+
+    /// Regression for cold-start panic:
+    /// `cannot update workspace::Workspace while it is already being updated`
+    /// when a persisted merge-review session restores while `initialize_agent_panel`
+    /// still calls `open_full_grok_immersive_from_workspace` (logs: restoring layout →
+    /// opening full grok surface → suppressing → selected queue file → panic).
+    #[gpui::test]
+    async fn test_cold_start_merge_review_open_full_grok_avoids_nested_workspace_update(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, mut cx) = setup_zoomed_agent_workspace(cx).await;
+
+        let mut session = test_session_with_ambiguous_items(1);
+        session.focus_layout_active = true;
+        session.queue_cursor_path = Some("Cargo.lock".into());
+        session.branch_diff_selected_path = Some("Cargo.lock".into());
+        session.docks_collapsed = vec!["left".into()];
+        cx.update(|_window, cx| {
+            save_session(cx, &session).expect("save merge review session");
+        });
+
+        workspace.read_with(&cx, |workspace, _cx| {
+            assert!(
+                workspace.zoomed_dock_position().is_some(),
+                "precondition: agent dock zoomed (simulates immersive race)"
+            );
+        });
+
+        // Same outer lease as production cold start stacking restore + open_full_grok +
+        // ActiveItemChanged re-restore while Workspace is already leased.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            restore_merge_review_workspace_layout(workspace, window, cx);
+            AgentPanel::open_full_grok_immersive_from_workspace(workspace, window, cx);
+            // ActiveItemChanged handler re-enters restore when dock is still zoomed.
+            if merge_review_workflow_engaged(cx) && workspace.zoomed_dock_position().is_some() {
+                restore_merge_review_workspace_layout(workspace, window, cx);
+            }
+            // focus_center_pane path after queue select must not re-lease Workspace.
+            workspace.focus_center_pane(window, cx);
+            restore_merge_review_workspace_layout(workspace, window, cx);
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(&cx, |workspace, cx| {
+            assert!(
+                workspace.zoomed_dock_position().is_none(),
+                "merge-review cold start must leave agent dock unzoomed"
+            );
+            let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                panic!("agent panel must exist");
+            };
+            let diagnostics = panel.read(cx).grok_immersive_diagnostics_for_tests(cx);
+            assert!(
+                !diagnostics.categorized_pending && !diagnostics.startup_in_progress,
+                "open_full_grok must suppress immersive startup under merge review (got {diagnostics})"
+            );
+        });
+    }
+
+    /// Regression: GitStore subscribe_in must not nested-`workspace.update` while the
+    /// subscription already leases Workspace (entity_map double-lease panic on cold
+    /// start when queue select triggers repo open / status updates).
+    #[gpui::test]
+    async fn test_merge_review_git_store_subscription_avoids_nested_workspace_update(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use project::git_store::{GitStoreEvent, RepositoryEvent, RepositoryId};
+
+        let (workspace, mut cx) = setup_zoomed_agent_workspace(cx).await;
+
+        let mut session = test_session_with_ambiguous_items(1);
+        session.focus_layout_active = true;
+        session.worktree_root = Some("/project".into());
+        cx.update(|_window, cx| {
+            save_session(cx, &session).expect("save merge review session");
+        });
+
+        // Install the fixed production-shaped handler against this workspace
+        // (observe_new only runs for workspaces created after merge_review::init).
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let git_store = workspace.project().read(cx).git_store().clone();
+            cx.subscribe_in(
+                &git_store,
+                window,
+                move |_workspace, _, event, window, cx| {
+                    let git_changed = matches!(
+                        event,
+                        GitStoreEvent::ConflictsUpdated
+                            | GitStoreEvent::RepositoryUpdated(
+                                _,
+                                RepositoryEvent::StatusesChanged,
+                                _,
+                            )
+                    );
+                    if !git_changed || !merge_review_session_active(cx) {
+                        return;
+                    }
+                    // Must not re-lease Workspace here (old path used workspace_weak.update_in).
+                    spawn_refresh_merge_review_git_state(window, cx);
+                },
+            )
+            .detach();
+        });
+
+        // Emit status events while holding a Workspace lease, matching cold-start race
+        // where ActiveItemChanged + git open status updates stack.
+        workspace.update_in(&mut cx, |workspace, _window, cx| {
+            let git_store = workspace.project().read(cx).git_store().clone();
+            git_store.update(cx, |_git_store, cx| {
+                cx.emit(GitStoreEvent::RepositoryUpdated(
+                    RepositoryId(0),
+                    RepositoryEvent::StatusesChanged,
+                    true,
+                ));
+                cx.emit(GitStoreEvent::ConflictsUpdated);
+            });
+        });
+        cx.run_until_parked();
+
+        // Nested lease would have already panicked. Session remains engaged.
+        cx.update(|_window, cx| {
+            assert!(
+                merge_review_workflow_engaged(cx),
+                "session must stay engaged after git-store events"
+            );
+        });
+    }
+
+    /// Regression: file-navigation guard toast must not nested-`workspace.update`
+    /// while ProjectDiff::move_to_* runs under an active Workspace lease.
+    #[gpui::test]
+    async fn test_merge_review_file_navigation_toast_defers_workspace_update(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), true), ("beta.rs".into(), false)],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+        let (workspace, mut cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        // Same outer lease as restore → queue select → diff.move_to_repo_relative_path.
+        // Before the fix, the blocked toast nested workspace.update and panicked here.
+        let blocked = workspace.update_in(&mut cx, |_, _window, cx| {
+            !merge_review_allow_file_navigation("beta.rs", cx.entity(), cx)
+        });
+        assert!(blocked, "out-of-order path must be blocked");
+        cx.run_until_parked();
+
+        // Deferred toast must land after the outer lease ends without panicking.
+        cx.update(|_window, cx| {
+            assert!(
+                merge_review_workflow_engaged(cx),
+                "session must stay engaged after deferred navigation toast"
+            );
+        });
     }
 
     fn branch_diff_base_refs(workspace: &Workspace, cx: &App) -> Vec<String> {

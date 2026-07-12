@@ -33,8 +33,8 @@ pub use thread_store::*;
 pub use tool_permissions::*;
 pub use tools::*;
 pub use verification::{
-    BestOfNCandidate, BestOfNResult, CwdRiskLabel, NATIVE_VERIFICATION_FRAGMENTS,
-    SelfCheckResult, VerificationContext, inject_verification_rules_for_native_profile,
+    BestOfNCandidate, BestOfNResult, CwdRiskLabel, NATIVE_VERIFICATION_FRAGMENTS, SelfCheckResult,
+    VerificationContext, inject_verification_rules_for_native_profile,
     perform_best_of_n_verification, run_self_check, validate_grok_build_output_formatting,
 };
 

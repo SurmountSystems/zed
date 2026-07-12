@@ -24,10 +24,19 @@ impl CwdRiskLabel {
         if is_plan_tool {
             return Self::PlanChange;
         }
-        if tool_name == "delete_path" || tool_name == "move_path" || tool_name == "terminal" || tool_name == "monitor" || tool_name == "spawn_agent" {
+        if tool_name == "delete_path"
+            || tool_name == "move_path"
+            || tool_name == "terminal"
+            || tool_name == "monitor"
+            || tool_name == "spawn_agent"
+        {
             return Self::Destructive;
         }
-        let is_write_tool = tool_name.contains("edit") || tool_name.contains("write") || tool_name.contains("create") || tool_name.contains("rename") || tool_name.contains("delete");
+        let is_write_tool = tool_name.contains("edit")
+            || tool_name.contains("write")
+            || tool_name.contains("create")
+            || tool_name.contains("rename")
+            || tool_name.contains("delete");
         if is_write_tool && !escapes_cwd {
             Self::Write
         } else if escapes_cwd {
@@ -97,7 +106,13 @@ pub struct BestOfNResult {
 impl BestOfNResult {
     pub fn select_best(candidates: Vec<BestOfNCandidate>, verification_turn: TurnId) -> Self {
         if candidates.is_empty() {
-            let dummy = BestOfNCandidate::new(0, String::new(), 0.0, verification_turn, CwdRiskLabel::ReadOnly);
+            let dummy = BestOfNCandidate::new(
+                0,
+                String::new(),
+                0.0,
+                verification_turn,
+                CwdRiskLabel::ReadOnly,
+            );
             return Self {
                 chosen_index: 0,
                 chosen: dummy.clone(),
@@ -149,14 +164,24 @@ pub fn validate_grok_build_output_formatting(text: &str) -> Vec<String> {
     let mut violations = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ") || trimmed.starts_with("– ") || trimmed.starts_with("— ") {
-            violations.push("Forbidden bullet list style detected; use numbered 1. 2. 3. form only".to_string());
+        if trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("• ")
+            || trimmed.starts_with("– ")
+            || trimmed.starts_with("— ")
+        {
+            violations.push(
+                "Forbidden bullet list style detected; use numbered 1. 2. 3. form only".to_string(),
+            );
             break;
         }
     }
     let has_numbered_without_alpha = text.lines().any(|line| {
         let t = line.trim_start();
-        t.chars().next().map_or(false, |c| c.is_ascii_digit()) && t.contains(". ") && !text.contains("A. ") && !text.contains("B. ")
+        t.chars().next().map_or(false, |c| c.is_ascii_digit())
+            && t.contains(". ")
+            && !text.contains("A. ")
+            && !text.contains("B. ")
     });
     if has_numbered_without_alpha {
         violations.push("Numbered list without required A. / B. alpha header (use A. 1. 2. B. 1. style for referenceability)".to_string());
@@ -173,7 +198,10 @@ pub fn run_self_check(draft: &str, context: &VerificationContext) -> SelfCheckRe
     if violations.is_empty() {
         return SelfCheckResult::clean(context.turn_id);
     }
-    let mut correction = format!("Self-check failed on turn {}. Correct the output to follow exact Grok Build rules. ", context.turn_id);
+    let mut correction = format!(
+        "Self-check failed on turn {}. Correct the output to follow exact Grok Build rules. ",
+        context.turn_id
+    );
     for v in &violations {
         correction.push_str(v);
         correction.push_str(". ");
@@ -202,9 +230,18 @@ where
 {
     let mut candidates: Vec<BestOfNCandidate> = Vec::with_capacity(n);
     for i in 0..n {
-        let simulated = format!("{} [candidate-{} for verification under turn {}]", prompt_segment, i, context.turn_id);
+        let simulated = format!(
+            "{} [candidate-{} for verification under turn {}]",
+            prompt_segment, i, context.turn_id
+        );
         let score = scorer(&simulated);
-        let cand = BestOfNCandidate::new(i as u32, simulated, score, context.turn_id, context.cwd_risk);
+        let cand = BestOfNCandidate::new(
+            i as u32,
+            simulated,
+            score,
+            context.turn_id,
+            context.cwd_risk,
+        );
         candidates.push(cand);
     }
     BestOfNResult::select_best(candidates, context.turn_id)
@@ -231,8 +268,12 @@ mod tests {
     #[test]
     fn test_turn_id_type_ascription_pin_serde_roundtrip_for_verification() {
         let the_turn_identifier: TurnId = TurnId::new(42);
-        let the_serialized_form: String = serde_json::to_string(&the_turn_identifier).expect("TurnId serialization required for verification artifacts and kickback regression");
-        let the_deserialized_turn: TurnId = serde_json::from_str(&the_serialized_form).expect("TurnId deserialization required for native verification and self-check roundtrips");
+        let the_serialized_form: String = serde_json::to_string(&the_turn_identifier).expect(
+            "TurnId serialization required for verification artifacts and kickback regression",
+        );
+        let the_deserialized_turn: TurnId = serde_json::from_str(&the_serialized_form).expect(
+            "TurnId deserialization required for native verification and self-check roundtrips",
+        );
         assert_eq!(the_turn_identifier, the_deserialized_turn);
         assert_eq!(format!("{}", the_turn_identifier), "T-42");
         assert_eq!(u32::from(the_turn_identifier), 42u32);
@@ -242,11 +283,30 @@ mod tests {
     #[test]
     fn test_best_of_n_selects_highest_self_check_score_with_turn_id() {
         let verification_turn: TurnId = TurnId::from(7u32);
-        let _context = VerificationContext::new(verification_turn, CwdRiskLabel::Write, true).with_slug("best-of-n-select");
+        let _context = VerificationContext::new(verification_turn, CwdRiskLabel::Write, true)
+            .with_slug("best-of-n-select");
         let candidates = vec![
-            BestOfNCandidate::new(0, "low fidelity plan".into(), 0.2, verification_turn, CwdRiskLabel::Write),
-            BestOfNCandidate::new(1, "highest fidelity after self check".into(), 0.95, verification_turn, CwdRiskLabel::Write),
-            BestOfNCandidate::new(2, "medium".into(), 0.5, verification_turn, CwdRiskLabel::Write),
+            BestOfNCandidate::new(
+                0,
+                "low fidelity plan".into(),
+                0.2,
+                verification_turn,
+                CwdRiskLabel::Write,
+            ),
+            BestOfNCandidate::new(
+                1,
+                "highest fidelity after self check".into(),
+                0.95,
+                verification_turn,
+                CwdRiskLabel::Write,
+            ),
+            BestOfNCandidate::new(
+                2,
+                "medium".into(),
+                0.5,
+                verification_turn,
+                CwdRiskLabel::Write,
+            ),
         ];
         let result = BestOfNResult::select_best(candidates, verification_turn);
         assert_eq!(result.chosen_index, 1);
@@ -258,9 +318,18 @@ mod tests {
 
     #[test]
     fn test_cwd_label_cases_display_and_from_tool_for_native_verification() {
-        assert_eq!(CwdRiskLabel::Write.display_label(Some("edit_file")), "Write");
-        assert_eq!(CwdRiskLabel::Destructive.display_label(Some("terminal_tool")), "Destructive");
-        assert_eq!(CwdRiskLabel::PlanChange.display_label(Some("todo_write")), "Plan Change");
+        assert_eq!(
+            CwdRiskLabel::Write.display_label(Some("edit_file")),
+            "Write"
+        );
+        assert_eq!(
+            CwdRiskLabel::Destructive.display_label(Some("terminal_tool")),
+            "Destructive"
+        );
+        assert_eq!(
+            CwdRiskLabel::PlanChange.display_label(Some("todo_write")),
+            "Plan Change"
+        );
         assert_eq!(CwdRiskLabel::ReadOnly.display_label(None), "Read-Only");
         let edit_in_cwd = CwdRiskLabel::from_tool_and_cwd("edit_file", false, false);
         assert_eq!(edit_in_cwd, CwdRiskLabel::Write);
@@ -274,12 +343,16 @@ mod tests {
     #[test]
     fn test_self_check_detects_violations_produces_kickback_with_turn_and_cwd() {
         let turn: TurnId = TurnId::new(23);
-        let context = VerificationContext::new(turn, CwdRiskLabel::PlanChange, true).with_slug("self-check-kickback");
+        let context = VerificationContext::new(turn, CwdRiskLabel::PlanChange, true)
+            .with_slug("self-check-kickback");
         let bad = "I am finished with everything. - use bullet\n1. step without alpha header";
         let result = run_self_check(bad, &context);
         assert!(!result.passed);
         assert!(!result.violations.is_empty());
-        let kickback = result.kickback_correction.clone().expect("kickback correction string required for E2E regression");
+        let kickback = result
+            .kickback_correction
+            .clone()
+            .expect("kickback correction string required for E2E regression");
         assert!(kickback.contains("T-23") || kickback.contains("turn 23"));
         assert!(kickback.contains("A. 1. 2."));
         assert!(kickback.contains("Plan Change"));
@@ -305,9 +378,14 @@ mod tests {
         let turn: TurnId = TurnId::from(11u32);
         let context = VerificationContext::new(turn, CwdRiskLabel::ReadOnly, true);
         let scorer = |candidate_text: &str| {
-            if candidate_text.contains("best") { 0.98 } else { 0.3 }
+            if candidate_text.contains("best") {
+                0.98
+            } else {
+                0.3
+            }
         };
-        let result = perform_best_of_n_verification("verify plan step for native grok", 3, &context, scorer);
+        let result =
+            perform_best_of_n_verification("verify plan step for native grok", 3, &context, scorer);
         assert!(result.chosen.self_check_score >= 0.3); // Injectable scorer controls the value; harness guarantees selection
         assert_eq!(result.candidates.len(), 3);
         assert_eq!(result.verification_turn_id, turn);
@@ -318,14 +396,20 @@ mod tests {
     #[test]
     fn test_e2e_kickback_regression_cwd_turnid_native_profile() {
         let turn: TurnId = TurnId::from(55u32);
-        let context = VerificationContext::new(turn, CwdRiskLabel::Destructive, true).with_slug("e2e-kickback-regression-cwd");
+        let context = VerificationContext::new(turn, CwdRiskLabel::Destructive, true)
+            .with_slug("e2e-kickback-regression-cwd");
         let violating_draft = "All current work is now finished. * bullet and escape without proper Destructive label on T-55.";
         let check = run_self_check(violating_draft, &context);
         assert!(!check.passed);
-        let correction = check.kickback_correction.clone().expect("correction for kickback E2E");
+        let correction = check
+            .kickback_correction
+            .clone()
+            .expect("correction for kickback E2E");
         assert!(correction.contains("55"));
         assert!(correction.contains("Destructive"));
-        assert!(correction.contains("Continue autonomous work") || correction.contains("reference"));
+        assert!(
+            correction.contains("Continue autonomous work") || correction.contains("reference")
+        );
         let _pin: SelfCheckResult = check;
     }
 
@@ -346,8 +430,10 @@ mod tests {
         let _pin_b: u32 = u32::from(turn);
         let s = format!("{}", turn);
         assert_eq!(s, "T-17");
-        let json = serde_json::to_string(&turn).expect("TurnId must serialize for native prompt TurnId refs and E2E kickback");
-        let back: TurnId = serde_json::from_str(&json).expect("TurnId must roundtrip for P4 fidelity across native/ACP");
+        let json = serde_json::to_string(&turn)
+            .expect("TurnId must serialize for native prompt TurnId refs and E2E kickback");
+        let back: TurnId = serde_json::from_str(&json)
+            .expect("TurnId must roundtrip for P4 fidelity across native/ACP");
         assert_eq!(turn, back);
         // Profile rule injection (idempotent, allocation cheap, only under native grok profile)
         let base = "Zed base instructions for agent";
@@ -375,23 +461,41 @@ mod tests {
     fn perf_validation_o1_cwd_labels_and_e2e_kickback_with_turnid_refs() {
         use std::time::Instant;
         // CWD risk classification cases (used in native verification + ZT-1 labels + prompt)
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("edit_file", false, false), CwdRiskLabel::Write);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("terminal_tool", true, false), CwdRiskLabel::Destructive);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("todo_write", false, true), CwdRiskLabel::PlanChange);
-        assert_eq!(CwdRiskLabel::from_tool_and_cwd("monitor", true, false), CwdRiskLabel::Destructive);
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("edit_file", false, false),
+            CwdRiskLabel::Write
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("terminal_tool", true, false),
+            CwdRiskLabel::Destructive
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("todo_write", false, true),
+            CwdRiskLabel::PlanChange
+        );
+        assert_eq!(
+            CwdRiskLabel::from_tool_and_cwd("monitor", true, false),
+            CwdRiskLabel::Destructive
+        );
         // E2E kickback regression under native profile with TurnId
         let turn: TurnId = TurnId::from(99u32);
-        let context = VerificationContext::new(turn, CwdRiskLabel::Destructive, true).with_slug("p4-13-perf-kickback");
+        let context = VerificationContext::new(turn, CwdRiskLabel::Destructive, true)
+            .with_slug("p4-13-perf-kickback");
         let start = Instant::now();
         for _ in 0..1000 {
             let draft = format!("done now on T-99 without proper label for task-{}", 0);
             let res = run_self_check(&draft, &context);
             assert!(!res.passed);
-            let corr = res.kickback_correction.expect("E2E kickback correction required");
+            let corr = res
+                .kickback_correction
+                .expect("E2E kickback correction required");
             assert!(corr.contains("99") || corr.contains("T-99"));
         }
         let kb_elapsed = start.elapsed();
-        assert!(kb_elapsed < std::time::Duration::from_millis(50), "kickback+TurnId+CWD O(1) for native; external ACP adds IPC latency per turn");
+        assert!(
+            kb_elapsed < std::time::Duration::from_millis(50),
+            "kickback+TurnId+CWD O(1) for native; external ACP adds IPC latency per turn"
+        );
     }
 
     #[test]

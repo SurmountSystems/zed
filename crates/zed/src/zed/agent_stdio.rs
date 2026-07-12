@@ -373,8 +373,11 @@ fn handle_request(request: AgentRequest, cx: &mut App) -> Result<()> {
             Some(node_raw) => match parse_node_id(node_raw) {
                 Ok(node_id) => match parse_a11y_action(request.a11y_action.as_deref()) {
                     Ok(action) => {
-                        match a11y_action_data(action, request.value.as_deref(), request.data.as_ref())
-                        {
+                        match a11y_action_data(
+                            action,
+                            request.value.as_deref(),
+                            request.data.as_ref(),
+                        ) {
                             Ok(data) => {
                                 if let Err(error) = dispatch_a11y_click(cx, node_id, action, data) {
                                     emit_error(id, &error);

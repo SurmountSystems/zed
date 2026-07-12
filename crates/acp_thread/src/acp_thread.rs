@@ -2177,7 +2177,9 @@ pub struct ToolCallUpdateTerminal {
 }
 
 /// Stable identifier for a native agent turn (Surmount / Grok Build fidelity).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct TurnId(u32);
 

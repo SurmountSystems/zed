@@ -125,6 +125,10 @@ struct MergeReviewArgs {
     action: String,
     #[arg(long, default_value = "room", value_parser = ["compact", "rich", "room"])]
     snapshot_detail: String,
+    /// Optional substrings that must appear in the post-start room outline
+    /// (`snapshot@text`). Example: `--expect "Branch Diff"`.
+    #[arg(long = "expect")]
+    expect: Vec<String>,
 }
 
 // ── TOON helpers (request encode + response scrape; no toon-format dep) ──────
@@ -1218,10 +1222,7 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
             &[("method", "wait"), ("ms", wait_ms.as_str())],
             Duration::from_millis(args.post_start_wait_ms + 15_000),
         )?;
-        println!(
-            "[method:wait post-start] ok ms={}",
-            args.post_start_wait_ms
-        );
+        println!("[method:wait post-start] ok ms={}", args.post_start_wait_ms);
     }
 
     let look2 = session.request_ok(
@@ -1240,6 +1241,22 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
         println!("--- post-start outline (first 40 lines) ---");
         for (i, line) in decoded.lines().take(40).enumerate() {
             println!("{:02}|{}", i + 1, line);
+        }
+    }
+
+    if !args.expect.is_empty() {
+        if !snapshot_satisfies(&look2_blob, &args.expect) {
+            session.pump();
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            session.shutdown_best_effort();
+            let missing = missing_snapshot_expects(&look2_blob, &args.expect);
+            bail!(
+                "merge-review adventure: post-start look missing expected substring(s) {missing:?}\n  preview={}",
+                extract_snapshot_preview(&look2_blob, 400)
+            );
+        }
+        for expect in &args.expect {
+            println!("  expect ok: {expect:?}");
         }
     }
 
@@ -1294,11 +1311,25 @@ fn print_merge_review_stderr_tail(stderr: &[String]) {
     );
     if interesting.is_empty() {
         println!("(none matched; last 25 stderr lines follow)");
-        for line in stderr.iter().rev().take(25).collect::<Vec<_>>().into_iter().rev() {
+        for line in stderr
+            .iter()
+            .rev()
+            .take(25)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
             println!("{line}");
         }
     } else {
-        for line in interesting.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
+        for line in interesting
+            .iter()
+            .rev()
+            .take(40)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
             println!("{line}");
         }
     }

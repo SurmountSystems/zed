@@ -134,7 +134,6 @@ pub fn load_proxy_env(cx: &mut App) -> HashMap<String, String> {
     env
 }
 
-
 /// Surmount in-process native Grok server skeleton (contract conformance for tests).
 pub struct GrokNativeServer;
 

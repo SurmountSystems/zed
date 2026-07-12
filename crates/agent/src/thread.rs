@@ -156,7 +156,6 @@ Example:
 
 The prior-turn summary and full history appear before these fragments; never use bare step numbers without the turn/task anchor."#;
 
-
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
 pub struct NoModelConfiguredError;
@@ -244,7 +243,6 @@ impl NativeTurnDriver {
             .update(cx, |thread, cx| thread.send_existing(cx))
     }
 }
-
 
 /// The ID of the user prompt that initiated a request.
 ///
@@ -4307,9 +4305,7 @@ impl Thread {
     }
 
     pub fn persona(&self) -> Option<AgentPersona> {
-        self.subagent_context
-            .as_ref()
-            .and_then(|ctx| ctx.persona)
+        self.subagent_context.as_ref().and_then(|ctx| ctx.persona)
     }
 
     pub fn plan_phase(&self) -> PlanPhase {

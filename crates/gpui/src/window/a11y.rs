@@ -1758,7 +1758,8 @@ mod tests {
             "compact also carries value (lean path is role/label/value/id): {compact}"
         );
         assert!(
-            compact.lines()
+            compact
+                .lines()
                 .any(|line| line.trim_start().starts_with("*[TextInput]")),
             "compact still marks focus: {compact}"
         );
