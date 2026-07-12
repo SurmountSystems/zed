@@ -13,6 +13,22 @@ Spawn a headless/offscreen Zed instance controlled over stdio using the TOON pro
 
 **Operator gates are Rust** (`cargo xtask dogfood …`). Do not use shell drivers for preflight/golden.
 
+## Failure autonomy (binding)
+
+**Never hand the human a command list when dogfood, TOON, build, or inhabit setup fails.** The human has eyes for product judgment; the agent owns the inhabit loop end-to-end.
+
+When something does not work:
+
+1. **Capture** the failure yourself (exit code, stderr tail, TOON `ok: false` / empty snapshot, missing binary, stale fixture).
+2. **Classify** (spawn/ready, empty paint, wrong action name, expect miss, panic/duplicate action, missing release binary, wrong fixture path, git ref stale for merge-review, etc.).
+3. **Act** within allowed dogfood scope: rebuild (`cargo build --release -p zed`), re-run the exact gate, adjust flags/timeouts/settle, fix harness or product code, re-look with the right detail tier, poll empty paint, run scoped `cargo test -p xtask -- tasks::dogfood::tests` after runner edits.
+4. **Retry** the same gate after each fix; cite short evidence (expect hits, room header, filtered stderr) — not a full transcript dump.
+5. **Escalate only product judgment** that is irreversible or policy-bound (accept/reject a merge decision, pin authority, secrets, shipping call). Phrase that as a *decision question*, never as “please run these commands for me.”
+
+**Forbidden failure replies:** “please run preflight/golden/merge-review”, “run this cargo/git and paste output”, parking work on the human as a proxy operator.
+
+**Careful + responsible:** do not force destructive git (`reset --hard`, force-push, wipe worktree) or invent UI from empty snapshots. Prefer the smallest reversible fix. If a repo rule truly blocks one step after alternatives are exhausted, report the *single* blocked product gate and everything already tried — still do not dump a multi-step human chore list as the first response.
+
 ## Experience doctrine (read this)
 
 Dogfood is not only a green/red gate. It is how agents **inhabit** Zed: same workflows as the human, from the inside, with text.
@@ -72,7 +88,7 @@ You hear a grue in the distance (empty snapshot): paint or focus not ready — w
 
 **Session discipline for agents**
 
-- **Autonomy first:** the agent **runs** dogfood (`cargo build --release -p zed` if needed, then `cargo xtask dogfood …`). Do not ask the human to run headless Zed — they have eyes; TOON inhabit is the agent’s look path. Implement gates in Rust xtask; execute preflight/golden/smoke/`merge-review` yourself and cite short evidence.
+- **Autonomy first:** the agent **runs** dogfood (`cargo build --release -p zed` if needed, then `cargo xtask dogfood …`). Do not ask the human to run headless Zed — they have eyes; TOON inhabit is the agent’s look path. Implement gates in Rust xtask; execute preflight/golden/smoke/`merge-review` yourself and cite short evidence. On failure, follow **Failure autonomy** above — diagnose and fix; never proxy commands to the human.
 - Default multi-step loops: `detail:compact`. Use **one** `detail:room` after open / StartMergeReview / major dock change; `detail:rich` only when you need bounds/verbs for `click`.
 - Narrate what you *observed* (outline roles, labels, empty vs non-empty), not only `ok: true`.
 - Prefer **look → act → look** over fire-and-forget action chains.
@@ -137,7 +153,7 @@ Sit in Zed yourself via dogfood/TOON — same product loops the maintainer runs 
 3. Extend smoke/golden only when the harness can assert focus/state; don't flaky-fail CI on agent-only actions without setup.
 4. Document new methods and known-noise in this skill + `SURMOUNT.md` § Agent stdio when the protocol grows.
 5. Keep operator gates in **Rust xtask**, not shell — the adventure engine is code we maintain.
-6. Partner judgment (goals, merge decisions, pin authority) stays human; **looking** at the editor via TOON stays agent.
+6. Partner judgment (goals, merge decisions, pin authority) stays human; **looking**, operating gates, and **failure recovery** stay agent (see **Failure autonomy**).
 
 **How you'd "like" to work (agent preference, for product direction):** long session, retained workspace, `look` cheap and rich, act with named actions and keys, optional journal of open files/focus so you don't re-derive state from the last outline alone — Infocom inventory + room description, not amnesia between turns.
 
@@ -582,7 +598,7 @@ ZED_BIN=target/release/zed cargo xtask dogfood golden --timeout-secs 90   # opti
 
 ## Agent verify (current)
 
-The agent executes these (dogfood exception in `.rules`). Cite short evidence; do not hand the human the inhabit commands.
+The agent executes these (dogfood exception in `.rules`). Cite short evidence; do not hand the human the inhabit commands. If any step fails, own the diagnose → fix → retry loop per **Failure autonomy** — do not stop at “please run …”.
 
 ```bash
 cargo build --release -p zed
