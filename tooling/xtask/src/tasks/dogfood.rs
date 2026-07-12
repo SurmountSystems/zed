@@ -34,7 +34,7 @@ enum DogfoodCommand {
     Golden(GoldenArgs),
     /// Automation smoke: open fixture, poll until non-empty snapshot (+ optional expects / action / keys).
     Smoke(SmokeArgs),
-    /// Headless merge-review start adventure: open Surmount fixture → StartMergeReview → wait → look → stderr tail.
+    /// Headless merge-review workshop: open Surmount root → Start → chrome expects → Preview → End.
     MergeReview(MergeReviewArgs),
 }
 
@@ -109,7 +109,9 @@ struct SmokeArgs {
 struct MergeReviewArgs {
     #[arg(long, env = "ZED_BIN")]
     bin: Option<PathBuf>,
-    /// Prefer SURMOUNT.md so the worktree root is a Surmount workspace when git is wired.
+    /// Surmount workspace root directory, or a file under it (parent is opened).
+    /// Prefer a directory so agent-stdio lands in a real project worktree, not a
+    /// single-file shell. Default: cargo workspace root when SURMOUNT.md exists.
     #[arg(long, env = "ZED_DOGFOOD_FIXTURE")]
     fixture: Option<PathBuf>,
     /// Settle after open (ms) before StartMergeReview.
@@ -125,10 +127,30 @@ struct MergeReviewArgs {
     action: String,
     #[arg(long, default_value = "room", value_parser = ["compact", "rich", "room"])]
     snapshot_detail: String,
-    /// Optional substrings that must appear in the post-start room outline
-    /// (`snapshot@text`). Example: `--expect "Branch Diff"`.
+    /// Substrings that must appear in the post-start room outline (`snapshot@text`).
+    /// When omitted, defaults to stable chrome: `Merge review`.
     #[arg(long = "expect")]
     expect: Vec<String>,
+    /// Only Start + post-start look/expects (skip Preview/End workshop steps).
+    #[arg(long, default_value_t = false)]
+    start_only: bool,
+    /// Settle after Preview / End actions (ms).
+    #[arg(long, default_value_t = 2500)]
+    step_wait_ms: u64,
+}
+
+/// Default post-start chrome expects when CLI `--expect` is empty.
+fn merge_review_default_expects() -> Vec<String> {
+    vec!["Merge review".to_string()]
+}
+
+/// Resolve expects for post-start look: CLI list, or default chrome.
+fn merge_review_post_start_expects(cli: &[String]) -> Vec<String> {
+    if cli.is_empty() {
+        merge_review_default_expects()
+    } else {
+        cli.to_vec()
+    }
 }
 
 // ── TOON helpers (request encode + response scrape; no toon-format dep) ──────
@@ -767,18 +789,39 @@ fn resolve_fixture(explicit: Option<PathBuf>) -> Result<PathBuf> {
     bail!("no --fixture and README.md missing at workspace root");
 }
 
-/// Prefer SURMOUNT.md at the cargo workspace root (Surmount merge-review detector).
-fn resolve_surmount_fixture(explicit: Option<PathBuf>) -> Result<PathBuf> {
+/// Resolve a Surmount **workspace root directory** for merge-review dogfood.
+///
+/// Opens a directory (not a single file) so git + Branch Diff see a real project
+/// worktree under agent-stdio. Accepts an explicit directory, a file under the
+/// root (parent is used), or defaults to the cargo workspace root when it has
+/// `SURMOUNT.md`.
+fn resolve_surmount_workspace(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
-        return resolve_fixture(Some(path));
+        let path = path.canonicalize().unwrap_or(path);
+        if path.is_dir() {
+            return Ok(path);
+        }
+        if path.is_file() {
+            let parent = path
+                .parent()
+                .map(|parent| parent.to_path_buf())
+                .context("fixture file has no parent directory")?;
+            return Ok(parent.canonicalize().unwrap_or(parent));
+        }
+        bail!(
+            "merge-review fixture is neither file nor directory: {}",
+            path.display()
+        );
     }
     let meta = workspace::load_workspace()?;
     let root = PathBuf::from(meta.workspace_root);
-    let surmount = root.join("SURMOUNT.md");
-    if surmount.is_file() {
-        return Ok(surmount.canonicalize().unwrap_or(surmount));
+    if root.join("SURMOUNT.md").is_file() {
+        return Ok(root.canonicalize().unwrap_or(root));
     }
-    resolve_fixture(None)
+    bail!(
+        "no Surmount workspace root (SURMOUNT.md missing at {}); pass --fixture <dir>",
+        root.display()
+    )
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────
@@ -1133,27 +1176,30 @@ pub fn run_dogfood(args: DogfoodArgs) -> Result<()> {
     }
 }
 
-/// Headless Start Merge Review adventure for debugging the Surmount workflow.
+/// Headless merge-review workshop: Start → chrome expects → Preview → End.
 ///
 /// Always records action ok/error and snapshot preview honestly. Dumps stderr
 /// lines that mention merge review / surmount so product toasts and populate
 /// logs are visible without inventing UI that did not paint.
 fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     let bin = args.bin.map(Ok).unwrap_or_else(default_bin)?;
-    let fixture = resolve_surmount_fixture(args.fixture)?;
+    let workspace_root = resolve_surmount_workspace(args.fixture)?;
     let timeout = Duration::from_secs(args.timeout_secs);
-    let fixture_str = fixture.display().to_string();
+    let workspace_str = workspace_root.display().to_string();
     let detail = args.snapshot_detail.as_str();
     let action_name = args.action.as_str();
+    let post_start_expects = merge_review_post_start_expects(&args.expect);
 
     println!(
-        "dogfood merge-review: bin={} fixture={} action={} detail={} wait_ms={} post_start_wait_ms={}",
+        "dogfood merge-review: bin={} workspace={} action={} detail={} wait_ms={} post_start_wait_ms={} start_only={} expects={:?}",
         bin.display(),
-        fixture.display(),
+        workspace_root.display(),
         action_name,
         detail,
         args.wait_ms,
         args.post_start_wait_ms,
+        args.start_only,
+        post_start_expects,
     );
 
     let mut session = DogfoodSession::spawn(&bin, timeout)?;
@@ -1164,12 +1210,13 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     )?;
     println!("[event:ready] ok");
 
+    // Open the Surmount repo root (directory worktree), not a single-file shell.
     session.request_ok(
         "open1",
-        &[("method", "open"), ("path", fixture_str.as_str())],
+        &[("method", "open"), ("path", workspace_str.as_str())],
         Duration::from_secs(20),
     )?;
-    println!("[method:open] ok path={fixture_str}");
+    println!("[method:open] ok workspace={workspace_str}");
 
     if args.wait_ms > 0 {
         let wait_ms = args.wait_ms.to_string();
@@ -1244,20 +1291,24 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
         }
     }
 
-    if !args.expect.is_empty() {
-        if !snapshot_satisfies(&look2_blob, &args.expect) {
-            session.pump();
-            print_merge_review_stderr_tail(&session.stderr_buf);
-            session.shutdown_best_effort();
-            let missing = missing_snapshot_expects(&look2_blob, &args.expect);
-            bail!(
-                "merge-review adventure: post-start look missing expected substring(s) {missing:?}\n  preview={}",
-                extract_snapshot_preview(&look2_blob, 400)
-            );
-        }
-        for expect in &args.expect {
-            println!("  expect ok: {expect:?}");
-        }
+    if !snapshot_satisfies(&look2_blob, &post_start_expects) {
+        session.pump();
+        print_merge_review_stderr_tail(&session.stderr_buf);
+        session.shutdown_best_effort();
+        let missing = missing_snapshot_expects(&look2_blob, &post_start_expects);
+        bail!(
+            "merge-review adventure: post-start look missing expected substring(s) {missing:?}\n  preview={}",
+            extract_snapshot_preview(&look2_blob, 400)
+        );
+    }
+    for expect in &post_start_expects {
+        println!("  post-start expect ok: {expect:?}");
+    }
+
+    if !args.start_only {
+        run_merge_review_workshop_steps(&mut session, detail, args.step_wait_ms)?;
+    } else {
+        println!("[workshop] skipped (--start-only)");
     }
 
     // inventory / theme are optional protocol toys — best-effort, non-fatal.
@@ -1288,6 +1339,120 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     session.shutdown_best_effort();
     println!("[method:shutdown] requested");
     println!("merge-review adventure finished (see stderr tail for populate / toast logs)");
+    Ok(())
+}
+
+/// Preview merge modal then End merge review — fail closed on action/look expects.
+fn run_merge_review_workshop_steps(
+    session: &mut DogfoodSession,
+    detail: &str,
+    step_wait_ms: u64,
+) -> Result<()> {
+    const PREVIEW_ACTION: &str = "surmount::PreviewMergeReviewMerge";
+    const END_ACTION: &str = "surmount::EndMergeReview";
+    const PREVIEW_EXPECT: &str = "Preview merge";
+
+    match session.request_ok(
+        "preview1",
+        &[("method", "action"), ("name", PREVIEW_ACTION)],
+        Duration::from_secs(20),
+    ) {
+        Ok(_) => println!("[method:action {PREVIEW_ACTION}] ok"),
+        Err(error) => {
+            session.pump();
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            session.shutdown_best_effort();
+            bail!("merge-review workshop: {PREVIEW_ACTION} failed: {error:#}");
+        }
+    }
+
+    if step_wait_ms > 0 {
+        let wait_ms = step_wait_ms.to_string();
+        session.request_ok(
+            "wait_preview",
+            &[("method", "wait"), ("ms", wait_ms.as_str())],
+            Duration::from_millis(step_wait_ms + 10_000),
+        )?;
+        println!("[method:wait post-preview] ok ms={step_wait_ms}");
+    }
+
+    let look_preview = session.request_ok(
+        "look_preview",
+        &snapshot_method_fields(detail),
+        Duration::from_secs(30),
+    )?;
+    let look_preview_blob = look_preview.join("\n");
+    println!(
+        "[method:look post-preview] empty={} preview={}",
+        classify_snapshot(&look_preview_blob),
+        extract_snapshot_preview(&look_preview_blob, 300)
+    );
+    let preview_expects = [PREVIEW_EXPECT.to_string()];
+    if !snapshot_satisfies(&look_preview_blob, &preview_expects) {
+        session.pump();
+        print_merge_review_stderr_tail(&session.stderr_buf);
+        session.shutdown_best_effort();
+        let missing = missing_snapshot_expects(&look_preview_blob, &preview_expects);
+        bail!(
+            "merge-review workshop: post-preview look missing {missing:?}\n  preview={}",
+            extract_snapshot_preview(&look_preview_blob, 400)
+        );
+    }
+    println!("  post-preview expect ok: {PREVIEW_EXPECT:?}");
+
+    // Dismiss modal so End is not blocked by overlay focus (best-effort).
+    let _ = session.request_ok(
+        "keys_esc",
+        &[("method", "keys"), ("keys", "escape")],
+        Duration::from_secs(10),
+    );
+
+    match session.request_ok(
+        "end1",
+        &[("method", "action"), ("name", END_ACTION)],
+        Duration::from_secs(20),
+    ) {
+        Ok(_) => println!("[method:action {END_ACTION}] ok"),
+        Err(error) => {
+            session.pump();
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            session.shutdown_best_effort();
+            bail!("merge-review workshop: {END_ACTION} failed: {error:#}");
+        }
+    }
+
+    if step_wait_ms > 0 {
+        let wait_ms = step_wait_ms.to_string();
+        session.request_ok(
+            "wait_end",
+            &[("method", "wait"), ("ms", wait_ms.as_str())],
+            Duration::from_millis(step_wait_ms + 10_000),
+        )?;
+        println!("[method:wait post-end] ok ms={step_wait_ms}");
+    }
+
+    let look_end = session.request_ok(
+        "look_end",
+        &snapshot_method_fields(detail),
+        Duration::from_secs(30),
+    )?;
+    let look_end_blob = look_end.join("\n");
+    println!(
+        "[method:look post-end] empty={} preview={}",
+        classify_snapshot(&look_end_blob),
+        extract_snapshot_preview(&look_end_blob, 300)
+    );
+    // Layout restore: require a non-empty outline; do not require session chrome.
+    if classify_snapshot(&look_end_blob) != "false" {
+        session.pump();
+        print_merge_review_stderr_tail(&session.stderr_buf);
+        session.shutdown_best_effort();
+        bail!(
+            "merge-review workshop: post-end look empty\n  preview={}",
+            extract_snapshot_preview(&look_end_blob, 400)
+        );
+    }
+    println!("[workshop] Preview + End complete");
     Ok(())
 }
 
@@ -1399,6 +1564,45 @@ mod tests {
             SmokeArgs::try_parse_from(["smoke", "--snapshot-detail", "css"]).is_err(),
             "unknown detail must fail clap value_parser"
         );
+    }
+
+    #[test]
+    fn merge_review_default_expects_when_cli_empty() {
+        assert_eq!(
+            merge_review_post_start_expects(&[]),
+            vec!["Merge review".to_string()]
+        );
+        let cli = vec!["Branch Diff".to_string(), "Base:".to_string()];
+        assert_eq!(merge_review_post_start_expects(&cli), cli);
+    }
+
+    #[test]
+    fn merge_review_args_start_only_and_step_wait_defaults() {
+        let defaults =
+            MergeReviewArgs::try_parse_from(["merge-review"]).expect("merge-review defaults");
+        assert!(!defaults.start_only);
+        assert_eq!(defaults.step_wait_ms, 2500);
+        assert!(defaults.expect.is_empty());
+        let start_only = MergeReviewArgs::try_parse_from(["merge-review", "--start-only"])
+            .expect("--start-only");
+        assert!(start_only.start_only);
+    }
+
+    #[test]
+    fn resolve_surmount_workspace_prefers_directory_over_file() {
+        let root = std::env::temp_dir().join(format!("dogfood-surmount-ws-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let surmount = root.join("SURMOUNT.md");
+        std::fs::write(&surmount, "# fork").unwrap();
+
+        let from_dir = super::resolve_surmount_workspace(Some(root.clone())).unwrap();
+        assert_eq!(from_dir, root.canonicalize().unwrap_or(root.clone()));
+
+        let from_file = super::resolve_surmount_workspace(Some(surmount)).unwrap();
+        assert_eq!(from_file, root.canonicalize().unwrap_or(root.clone()));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

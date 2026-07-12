@@ -1,3 +1,12 @@
+---
+name: zed-dogfood
+description: >-
+  Drive headless/offscreen Zed over agent-stdio with the TOON protocol for
+  dogfood, preflight, golden, and smoke sessions. Use when running cargo xtask
+  dogfood, writing agent-stdio scripts, debugging snapshot/look loops, or
+  validating Surmount agent UX from inside a live Zed process.
+---
+
 # Zed Dogfood — Agent Stdio Subagent Protocol
 
 Spawn a headless/offscreen Zed instance controlled over stdio using the TOON protocol (MCP-style).
@@ -63,12 +72,27 @@ You hear a grue in the distance (empty snapshot): paint or focus not ready — w
 
 **Session discipline for agents**
 
+- **Autonomy first:** the agent **runs** dogfood (`cargo build --release -p zed` if needed, then `cargo xtask dogfood …`). Do not ask the human to run headless Zed — they have eyes; TOON inhabit is the agent’s look path. Implement gates in Rust xtask; execute preflight/golden/smoke/`merge-review` yourself and cite short evidence.
+- Default multi-step loops: `detail:compact`. Use **one** `detail:room` after open / StartMergeReview / major dock change; `detail:rich` only when you need bounds/verbs for `click`.
 - Narrate what you *observed* (outline roles, labels, empty vs non-empty), not only `ok: true`.
 - Prefer **look → act → look** over fire-and-forget action chains.
 - Keep one long-lived process for a workflow; do not respawn between every method unless the process died.
 - Empty snapshot ≠ "UI doesn't exist"; often settle/focus. Poll (smoke) or `wait` then snapshot again.
 - Brittle id matching (`id:s1`) can fail while the outline is fine — prefer `ok: true` + outline content / `--expect` substrings.
 - You are a guest in the human's editor. Do not look down on the partner loop: without their goals and judgment, dogfood is a green checkbox with no plot.
+
+**Evidence / token discipline (parent thread)**
+
+Wire already caps **field** strings (`OUTLINE_STRING_MAX` = 80 in `gpui` a11y outline) and offers detail tiers. There is **no** whole-tree node cap — a busy workspace can still emit a large `snapshot@text`. Discipline is on the **parent agent**, not a new TOON method:
+
+| Do | Do not |
+|----|--------|
+| Cite **short** observations: expect hits, 3–10 outline lines, room header (`# window` / `# focus`), filtered product stderr | Paste full `snapshot@text` or full TOON transcripts into the parent context |
+| Prefer runner **previews** (`preview=…` from xtask) and merge-review stderr filter (`--- stderr merge-review related ---`) | Re-ingest entire dogfood stderr / log dumps |
+| Use `--expect` / role-label substrings as the gate; outline is proof, not homework | Require bounds digits, HSLA, or NodeId equality in default gates |
+| Escalate detail only when stuck (empty paint → room; need click → one rich) | Default every look to `room` or `rich` in multi-step loops |
+
+Optional later wire fields (e.g. focused-window-only look) only if they **cut turns** — no bloat methods for archive dumps.
 
 ### What you can feel (detail tiers)
 
@@ -93,25 +117,27 @@ detail:room
 
 When describing a session to the human, be honest: `look` gives **structure and labels**, not per-control pixel style. Optional `method:theme` / `feel` adds **global** theme ambience (name + a few tokens), never per-button CSS. Still *look*; still report the tree as place, not as JSON homework.
 
-## How agents should use Zed (and help the human)
+## How agents should use Zed (inhabit, not proxy)
 
-If you could sit in Zed yourself, aim for the same loops the maintainer runs on Surmount:
+Sit in Zed yourself via dogfood/TOON — same product loops the maintainer runs on Surmount, without asking them to drive headless:
 
 | Partner goal | Dogfood path | Why |
 |--------------|--------------|-----|
 | Prove the binary lives | `preflight` → ready + shutdown | Room exists |
 | Prove the UI tree is real | `golden` / `smoke` with file fixture + non-empty snapshot | Touch the chrome |
-| Surmount agent UX | `open` fixture → `agent::ToggleFocus` / `agent::Toggle` → snapshot → optional `agent::NewThread` / `agent::ToggleSearch` | Same agent-panel workflows as the human |
+| Surmount agent UX | `open` **workspace root** (or file) → `agent::ToggleFocus` / `agent::Toggle` → snapshot → optional `agent::NewThread` / `agent::ToggleSearch` | Same agent-panel workflows as the human |
+| Merge-review workshop | `cargo xtask dogfood merge-review` (Surmount root → Start → expects → Preview → End) | Real project + Branch Diff chrome; `--start-only` skips workshop |
 | Regression after merge/deps | preflight (+ golden when Linux) after rebuild | Don't break the adventure engine |
 | Creative / exploratory dogfood | Manual TOON session: look around, open real project files, drive palette (`file_finder::Toggle`), docks, keys | Experience, not only CI |
 
-**Help the human by:**
+**Agent owns the inhabit loop:**
 
-1. Running (or asking them to run) **gates** after material agent/UI/gpui changes — don't only reason about code.
-2. Preferring dogfood evidence ("snapshot after ToggleFocus showed …") over vibes when claiming UI behavior.
-3. Extending smoke/golden only when the harness can assert focus/state; don't flaky-fail CI on agent-only actions without setup.
-4. Documenting new methods and known-noise in this skill + `SURMOUNT.md` § Agent stdio when the protocol grows.
-5. Keeping operator gates in **Rust xtask**, not shell — the adventure engine is code we maintain.
+1. **Run** dogfood gates after material agent/UI/gpui changes — don't only reason about code, and don't ask the human to proxy headless Zed.
+2. Prefer dogfood evidence ("snapshot after ToggleFocus showed …") over vibes when claiming UI behavior.
+3. Extend smoke/golden only when the harness can assert focus/state; don't flaky-fail CI on agent-only actions without setup.
+4. Document new methods and known-noise in this skill + `SURMOUNT.md` § Agent stdio when the protocol grows.
+5. Keep operator gates in **Rust xtask**, not shell — the adventure engine is code we maintain.
+6. Partner judgment (goals, merge decisions, pin authority) stays human; **looking** at the editor via TOON stays agent.
 
 **How you'd "like" to work (agent preference, for product direction):** long session, retained workspace, `look` cheap and rich, act with named actions and keys, optional journal of open files/focus so you don't re-derive state from the last outline alone — Infocom inventory + room description, not amnesia between turns.
 
@@ -377,11 +403,24 @@ keys:ctrl-p
 
 ### `open`
 
-Prefer a **file** path (directory open may log `Is a directory`).
+Opens with **`ExistingWindow`** so dogfood reuses one window (no leftover empty shell).
+
+| Target | Use |
+|--------|-----|
+| **Directory** | Real project worktree (merge-review, Surmount root) |
+| **File** | Golden/smoke chrome checks; single-file worktree |
+
+Agent-stdio seeds `session.trust_all_worktrees: true` into a fresh `--user-data-dir` settings.json (skipped if settings already exist) so Restricted Mode does not block dogfood. Startup does **not** open an empty workspace — first `method:open` creates the window.
 
 ```text
 method:open
 id:5
+path:/home/user/project
+```
+
+```text
+method:open
+id:6
 path:/home/user/project/src/main.rs
 ```
 
@@ -453,7 +492,7 @@ Do not fail CI on ToggleSearch alone unless the harness can assert agent-thread 
 | `WARN [db] Opening fallback in-memory database` | Stateless / isolated user data |
 | `ERROR … recent_workspaces_query … database table is locked` | Concurrent SQLite under agent-stdio (`thread_metadata_store` remote-connection migration → `WorkspaceDb::recent_project_workspaces_ungrouped`). Non-fatal; migration only marks complete after success (`detach_and_log_err`). Prefer leave production alone — do not soft-fail empty + mark-complete. See SURMOUNT.md § Agent stdio. |
 | `ERROR [agent] Failed to authenticate provider: ChatGPT…` | Cloud provider not signed in |
-| `ERROR … Is a directory (os error 21)` | Prefer file path for `method:open` |
+| `ERROR … Is a directory (os error 21)` | Non-fatal when opening a directory worktree; merge-review intentionally opens the repo root |
 
 ## Observed (Linux headless)
 
@@ -463,8 +502,9 @@ Do not fail CI on ToggleSearch alone unless the harness can assert agent-thread 
 | `method:actions` / open / wait / action / keys | `ok: true` |
 | `method:snapshot` | Non-empty when frame has interactive roles (headless a11y + force-draw) |
 | `method:shutdown` | exits |
+| `dogfood merge-review` | Ready → Start (`Merge review`) → Preview (`Preview merge`) → End; non-empty room looks (Linux) |
 
-**Verify:** `cargo build --release -p zed` → `cargo xtask dogfood preflight` → `cargo xtask dogfood golden`.
+**Verify:** `cargo build --release -p zed` → preflight → golden; inhabit regression: `merge-review` with room detail (see Agent verify).
 
 ## Platform matrix (dogfood snapshot)
 
@@ -480,7 +520,7 @@ Agent-stdio itself is **cross-platform** (no OS gate on the feature). Snapshot s
 | **GPUI TestWindow** | No force-activate (trait default) | Intentionally no-op: unconditional activate would enable a11y trees on **every** windowed GPUI test (perf + new push/pop surface). Outline logic is covered by pure unit tests in `gpui` `window/a11y.rs`. Production agent-stdio uses Linux `HeadlessWindow`, not `TestPlatform`. |
 | **Default `PlatformWindow::a11y_init`** | No-op | Trait default; no activation. |
 
-**Human verify:** Linux release binary remains primary (`cargo build --release -p zed` → preflight → golden). On macOS/Windows, preflight/`event: ready` may still work if a binary exists; **do not expect non-empty golden/smoke snapshots** until a real headless window + force-activate path exists for that OS.
+**Agent verify (Linux primary):** agent runs `cargo build --release -p zed` → preflight → golden; after agent/UI/merge-review changes also `merge-review` (Start→Preview→End path is proven — re-run for regression, not as open product work). On macOS/Windows, preflight/`event: ready` may still work if a binary exists; **do not expect non-empty golden/smoke snapshots** until a real headless window + force-activate path exists for that OS.
 
 ## Build / release hygiene
 
@@ -510,7 +550,7 @@ Workflow: [`.github/workflows/dogfood_preflight.yml`](../../../.github/workflows
 - Free-disk step removes large unused GHA preinstalls before build; full release still needs adequate runner disk.
 - **Fork ops:** enable Actions on the Surmount remote and allow scheduled workflows (GitHub often disables cron on forks until Actions is on / the workflow has run once on the default branch), or nightly will never fire.
 
-**Local equivalent of the CI gate:**
+**Local equivalent of the CI gate (agent runs):**
 
 ```bash
 cargo build --release -p zed
@@ -526,7 +566,7 @@ ZED_BIN=target/release/zed cargo xtask dogfood golden --timeout-secs 90   # opti
 | Bounds scale | `@x,y w×h` are **scaled/physical px** (layout × `scale_factor`); not CSS logical. Documented; gates use role/label expects only. |
 | Click flaky without fixture | `method:click` is **manual/optional** — not in default golden/smoke until a stable fixture exists. |
 | Theme = global only | `theme`/`feel` samples `ActiveTheme` (name + a few tokens). Never per-control paint / CSS dump. |
-| Outline token bloat | Detail tiers; string truncation; landmarks only in `room`. |
+| Outline token bloat | Detail tiers; per-field `OUTLINE_STRING_MAX` (80); landmarks only in `room`. No whole-tree line cap — parent agents must not re-ingest full outlines/stderr (see Evidence / token discipline). |
 | No server wait-until | Poll stays runner-side (`cargo xtask dogfood smoke`). |
 | macOS/Windows non-empty snapshot | Unsupported until a real headless + force-activate path exists (see platform matrix). |
 
@@ -540,17 +580,22 @@ ZED_BIN=target/release/zed cargo xtask dogfood golden --timeout-secs 90   # opti
 - **R4 style decision (final):** **(b) `method:theme` / `feel`.** Per-control paint (“1px white, sharp corners”) stays **out of a11y forever** — AccessKit has no fill/radius; do not invent it. Spikes: (1) inspector element-id→style is feature-gated / wrong layer for dogfood; (2) `cx.theme()` / `ActiveTheme` is already global and cheap in `agent_stdio`. Shipped: global theme **name + appearance + background/border/text_accent** only — not a room-outline footer (keeps look structure pure), not a CSS dump. Prefer `look` + `inventory` for tactile structure; call `theme` when you want room atmosphere.
 - Maintainer pointer: `SURMOUNT.md` § Agent stdio.
 
-## Human verify (current)
+## Agent verify (current)
+
+The agent executes these (dogfood exception in `.rules`). Cite short evidence; do not hand the human the inhabit commands.
 
 ```bash
 cargo build --release -p zed
 cargo xtask dogfood preflight
 cargo xtask dogfood golden
 cargo xtask dogfood smoke --fixture "$PWD/README.md"
-# Unit / clippy (after a11y or agent_stdio edits):
-cargo test -p gpui outline
-cargo test -p gpui --lib -- window::a11y::tests
-cargo test -p zed agent_stdio
+ZED_BIN=target/release/zed cargo xtask dogfood merge-review \
+  --fixture "$PWD" --snapshot-detail room --timeout-secs 180
+# Unit tests after a11y / agent_stdio / dogfood runner edits (agent may run scoped dogfood tests):
 cargo test -p xtask -- tasks::dogfood::tests
-cargo clippy -p gpui -p xtask -- -D warnings
+# Clippy / broader cargo still follow normal .rules (human unless another exception):
+# cargo test -p gpui outline
+# cargo test -p gpui --lib -- window::a11y::tests
+# cargo test -p zed agent_stdio
+# cargo clippy -p gpui -p xtask -- -D warnings
 ```

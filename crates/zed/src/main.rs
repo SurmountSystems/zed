@@ -1586,9 +1586,10 @@ pub(crate) async fn restore_or_create_workspace(
             })
             .await?;
         }
-    } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None))
-        && !(cfg!(feature = "agent-stdio") && zed::agent_stdio::skip_onboarding())
-    {
+    } else if cfg!(feature = "agent-stdio") && zed::agent_stdio::skip_onboarding() {
+        // Headless dogfood: do not open an empty workspace window. method:open
+        // creates the first real project window so inventory/look stay single-window.
+    } else if matches!(kvp.read_kvp(FIRST_OPEN), Ok(None)) {
         cx.update(|cx| show_onboarding_view(app_state, cx)).await?;
     } else {
         cx.update(|cx| {

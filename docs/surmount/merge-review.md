@@ -1,6 +1,6 @@
 # Upstream merge review
 
-> **Status (2026-07-08):** Branch Diff workflow, heed3 session persistence (queue cursor, branch-diff selection, git SHA sync, UI state), and toast placement are implemented in `agent_ui` but **not fully dogfooded**. Treat merge-review UX and persistence as **unfinished** until a clean `cargo build --release -p zed` and an end-to-end merge session pass. `agent_ui` still has widespread upstream-merge compile damage (~200 errors: removed `AgentConfiguration`, ACP schema paths, queue/sandbox types); `git_ui` and `settings_ui` compile fixes landed separately.
+> **Status:** Branch Diff workflow, heed3 session persistence (queue cursor, branch-diff selection, git SHA sync, UI state), and toast placement are in tree. Headless dogfood: the **agent** runs `cargo xtask dogfood merge-review` (Surmount root, trusted user-data, Start → chrome expects `Merge review` → Preview → End unless `--start-only`). **R1 green** — inhabit Start→Preview→End proven on current release binary; re-run for regression. Stretch: Advance (R2), conflict Decide (R3). Operator skill: [`.agents/skills/zed-dogfood/SKILL.md`](../../.agents/skills/zed-dogfood/SKILL.md); plan: [`plans/0_agentic_dogfooding.md`](../../plans/0_agentic_dogfooding.md).
 
 How we merge `origin/main` into `surmount`: understand each change in context, build up an explanation as we go, and only bother a human when the machine is genuinely stuck.
 

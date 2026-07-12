@@ -10120,12 +10120,12 @@ paths = ["Cargo.toml"]
             crate::merge_review::init(cx);
             save_session(cx, &session).expect("save");
         });
-        let (workspace, mut cx) =
+        let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
         // Same outer lease as restore → queue select → diff.move_to_repo_relative_path.
         // Before the fix, the blocked toast nested workspace.update and panicked here.
-        let blocked = workspace.update_in(&mut cx, |_, _window, cx| {
+        let blocked = workspace.update_in(cx, |_, _window, cx| {
             !merge_review_allow_file_navigation("beta.rs", cx.entity(), cx)
         });
         assert!(blocked, "out-of-order path must be blocked");

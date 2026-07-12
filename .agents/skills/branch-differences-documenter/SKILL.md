@@ -1,6 +1,12 @@
 ---
 name: branch-differences-documenter
-description: Use for systematically producing a concise natural-language record of technical differences between Zed upstream main and the surmount branch. The skill actively guides a todo-driven, chunk-by-chunk or category-by-category review process. It proposes de-duplicated category structures and inserts explicit TODO: notes for any uncertainty or needed human judgment. Read-only git commands (diff, log, show, etc.) may be run autonomously per .rules; mutating git requires the human. Main conversation while this skill is active.
+description: >-
+  Use for systematically producing a concise natural-language record of technical
+  differences between Zed upstream main and the surmount branch. Guides a
+  todo-driven, chunk-by-chunk or category-by-category review. Proposes de-duplicated
+  category structures and inserts explicit TODO notes for uncertainty or human
+  judgment. Read-only git may run autonomously per .rules; mutating git requires
+  the human. Main conversation while this skill is active.
 ---
 
 # Branch Differences Documenter

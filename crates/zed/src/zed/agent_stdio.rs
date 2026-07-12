@@ -21,7 +21,7 @@
 //! | `click` | Dispatch AccessKit action on a node id from look (default `click`) |
 //! | `theme` / `feel` | Global theme ambience (name + a few tokens — not per-control paint) |
 //! | `actions` | List registered GPUI action names (double-colon form) |
-//! | `open` | Open a file path or URL in the workspace |
+//! | `open` | Open a file/directory path or URL (ExistingWindow; dirs = project worktree) |
 //! | `wait` | Sleep `ms` milliseconds on the GPUI executor |
 //! | `action` | Dispatch a registered GPUI action by name |
 //! | `keys` | Dispatch a keystroke string (e.g. `ctrl-p`) |
@@ -58,6 +58,7 @@ pub fn skip_onboarding() -> bool {
 /// Prepares the process environment for agent-stdio mode.
 ///
 /// Sets stateless + a11y flags, isolates user data, and routes logs to stderr.
+/// Seeds dogfood settings so worktrees open trusted (no Restricted Mode modal).
 pub fn prepare_environment(user_data_dir: Option<&str>) -> Result<PathBuf> {
     // SAFETY: called at process start before threads are spawned.
     unsafe {
@@ -83,7 +84,33 @@ pub fn prepare_environment(user_data_dir: Option<&str>) -> Result<PathBuf> {
         path
     };
 
+    seed_agent_stdio_settings(&data_dir)?;
+
     Ok(data_dir)
+}
+
+/// Write minimal settings for headless dogfood when the user-data dir has none.
+///
+/// `session.trust_all_worktrees` avoids Restricted Mode / Unrecognized Project
+/// modals that block language servers and merge-review chrome under a fresh
+/// `--user-data-dir`. Does not overwrite an existing settings.json (operators
+/// may pass a pre-seeded dir).
+fn seed_agent_stdio_settings(data_dir: &std::path::Path) -> Result<()> {
+    let config_dir = data_dir.join("config");
+    std::fs::create_dir_all(&config_dir).context("create agent-stdio config dir")?;
+    let settings_path = config_dir.join("settings.json");
+    if settings_path.exists() {
+        return Ok(());
+    }
+    const SEED: &str = concat!(
+        "{\n",
+        "  \"session\": {\n",
+        "    \"trust_all_worktrees\": true\n",
+        "  }\n",
+        "}\n",
+    );
+    std::fs::write(&settings_path, SEED).context("seed agent-stdio settings.json")?;
+    Ok(())
 }
 
 /// Writes the startup ready event to stdout (TOON, newline-terminated).
@@ -690,8 +717,11 @@ fn open_target(cx: &mut App, target: &str) -> Result<()> {
         format!("file://{target}")
     };
 
+    // Prefer the existing (or first) window so dogfood does not leave an empty
+    // shell window beside the real project after method:open.
     OpenListener::global(cx).open(RawOpenRequest {
         urls: vec![path],
+        open_behavior: Some(cli::OpenBehavior::ExistingWindow),
         ..Default::default()
     });
     Ok(())
@@ -983,6 +1013,22 @@ mod tests {
         // Honest ambience only — no per-control CSS dump fields.
         assert!(!text.contains("border-radius"), "{text}");
         assert!(!text.contains("1px solid"), "{text}");
+    }
+
+    #[test]
+    fn test_seed_agent_stdio_settings_writes_trust_once() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_agent_stdio_settings(dir.path()).unwrap();
+        let settings = dir.path().join("config/settings.json");
+        let body = std::fs::read_to_string(&settings).unwrap();
+        assert!(body.contains("trust_all_worktrees"));
+        assert!(body.contains("true"));
+        // Second call must not overwrite custom settings.
+        std::fs::write(&settings, "{\"custom\":true}\n").unwrap();
+        seed_agent_stdio_settings(dir.path()).unwrap();
+        let body = std::fs::read_to_string(&settings).unwrap();
+        assert!(body.contains("custom"));
+        assert!(!body.contains("trust_all_worktrees"));
     }
 
     #[test]
