@@ -63,11 +63,13 @@ G3 **Advance** product chrome + dogfood gates landed. Evidence (release binary):
 
 ### R3 — Conflict fixture path
 
-Resolve / Discuss / Synthesize headless path via **opt-in** fixture (not live Surmount `MERGE_HEAD` only).
+Resolve / Discuss / Synthesize headless path via **opt-in** fixture (not live Surmount `MERGE_HEAD` only). Clean Surmount = **PreMerge** (no conflict chrome) by design.
 
-- [x] Small conflict fixture: tempfile builder in dogfood (`--with-conflict`) + docs under `tooling/xtask/dogfood_fixtures/merge_review_conflict/README.md`
-- [x] Dogfood soft-gate for decision chrome when fixture active (conflict-specific hits: `Use Both` / `Resolve with Agent` / `Summarize this conflict` / Discuss-rail; **not** `Review Diff` alone); skip log if none; default adventure unchanged
-- G3 **Decide** product loop still optional beyond chrome gate; Start → Preview → End (+ optional Advance) remains the green default.
+- [x] Small conflict fixture: tempfile builder (`--with-conflict`) + bare offline **origin** + docs under `tooling/xtask/dogfood_fixtures/merge_review_conflict/README.md`
+- [x] Soft-gate decision chrome (conflict-specific; not `Review Diff` alone)
+- [x] `git::ReviewDiff` → dispatch stderr + rail **Summarizing…** when ACP posts (soft if offline)
+- [x] Conflict prompts self-contained (embeds + “do not open skill/tool host paths”); Start skips fetch when no origin remote
+- G3 full **Decide** (Discuss → Record → Next file with agent summary) still optional product depth beyond dogfood chrome/dispatch.
 
 ---
 

@@ -142,7 +142,7 @@ Sit in Zed yourself via dogfood/TOON — same product loops the maintainer runs 
 | Prove the binary lives | `preflight` → ready + shutdown | Room exists |
 | Prove the UI tree is real | `golden` / `smoke` with file fixture + non-empty snapshot | Touch the chrome |
 | Surmount agent UX | `open` **workspace root** (or file) → `agent::ToggleFocus` / `agent::Toggle` → snapshot → optional `agent::NewThread` / `agent::ToggleSearch` | Same agent-panel workflows as the human |
-| Merge-review workshop | `cargo xtask dogfood merge-review` (Surmount root → Start → expects → Preview → End) | **Proves chrome only** (labels, rail, Dialog path). In-Zed review behavior: [surmount-merge-review](../surmount-merge-review/SKILL.md). Optional `--with-advance` (path/cursor delta after NextFile — not mere “Next file” label). `--start-only` skips workshop |
+| Merge-review workshop | `cargo xtask dogfood merge-review` (Surmount root → Start → expects → Preview → End) | **PreMerge** chrome (Preview, Next file, Dialog). Clean Surmount has **no** conflict workshop — that needs `MERGE_HEAD`. In-Zed: [surmount-merge-review](../surmount-merge-review/SKILL.md). Optional `--with-advance` / `--with-conflict` |
 | Merge-review UX probe | `queue --script tooling/xtask/dogfood_queues/merge_review_ux.queue` (+ `--fixture` workspace root) | AND `expect:` gates (Next file, TextInput, Dialog); `hit:` is diagnostic OR only |
 | Regression after merge/deps | preflight (+ golden when Linux) after rebuild | Don't break the adventure engine |
 | Creative / exploratory dogfood | `cargo xtask dogfood queue --step …` (tracked TOON steps) | Experience without ad-hoc shell scripts |
@@ -296,6 +296,17 @@ ZED_BIN=target/release/zed cargo xtask dogfood queue \
 Also `--script path` (one step per line, `#` comments). Each step logs `[queue i/n] …` with ok/FAIL.
 
 **`merge-review --with-advance`:** after Start settle, dispatches `MergeReviewNextFile` and requires a **path/cursor delta** (outline path fingerprints or stderr “advanced to next file …”), not static “Next file” chrome. Default adventure stays Start→Preview→End (no Dialog/Advance required).
+
+### PreMerge vs MergeInProgress (merge-review)
+
+| Mode | When | Dogfood entry | Rail / chrome to expect |
+|------|------|---------------|-------------------------|
+| **PreMerge** | No `MERGE_HEAD` (clean Surmount) | default `merge-review` | Prepare · **Preview merge** · **Next file** · End |
+| **MergeInProgress** | `MERGE_HEAD` present | `--with-conflict` (temp fixture) or real `git merge` | **Review Diff** / Summarize this conflict · Use HEAD/theirs/Both · Resolve with Agent |
+
+Clean Surmount + Start is **not** missing conflict UI — there is no merge in progress. Conflict fixtures pin a bare **origin** offline so `git fetch origin` does not soft-fail.
+
+**`merge-review --with-conflict`:** tempfile conflicted tree → Start → soft decision-chrome gate → `git::ReviewDiff` → expect **Summarizing…** when dispatch logs (soft if ACP offline). Does **not** run Preview/End. Agent prompts are self-contained (embedded ours/theirs/working); do not expect host Surmount skill/tool path reads.
 
 ## I/O model
 
@@ -571,9 +582,9 @@ Do not fail CI on ToggleSearch alone unless the harness can assert agent-thread 
 | `method:actions` / open / wait / action / keys | `ok: true` |
 | `method:snapshot` | Non-empty when frame has interactive roles (headless a11y + force-draw) |
 | `method:shutdown` | exits |
-| `dogfood merge-review` | Ready → Start (`Merge review`, focus Preview merge, Next file rail, path labels, Branch Diff landmark) → Preview (`Dialog`) → End; non-empty room looks (Linux) |
+| `dogfood merge-review` | Ready → Start (`Merge review`, focus Preview merge, Next file rail, path labels, Branch Diff landmark) → Preview (`Dialog`) → End; non-empty room looks (Linux). **PreMerge only** on clean Surmount |
 | `merge-review --with-advance` | Same + NextFile path/cursor delta (opt-in); logs AC-B room `# focus:` after NextFile |
-| `merge-review --with-conflict` | Opt-in tempfile conflicted git tree (`MERGE_HEAD`); soft-gates decision chrome; skips Preview/End; default adventure unchanged without the flag |
+| `merge-review --with-conflict` | Opt-in tempfile `MERGE_HEAD` + bare origin; decision chrome + `git::ReviewDiff` → **Summarizing…** when dispatch ok; skips Preview/End; default adventure unchanged |
 | `queue` UX script | `merge_review_ux.queue` AND expects incl. TextInput after ToggleFocus |
 
 **Verify:** `cargo build --release -p zed` → preflight → golden; inhabit regression: `merge-review` / optional `--with-advance` / queue script (see Agent verify).

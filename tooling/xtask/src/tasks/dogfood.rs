@@ -1396,6 +1396,14 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
 
     if conflict_fixture_active {
         gate_merge_review_decision_chrome(&look2_blob);
+        // Deeper opt-in: Review Diff → rail Summarizing… (compact embeds; no Preview/End).
+        if !args.start_only {
+            run_merge_review_conflict_review_diff_step(
+                &mut session,
+                detail,
+                args.step_wait_ms,
+            )?;
+        }
     } else if args.with_conflict {
         println!(
             "[conflict] decision chrome gate skipped (fixture not active; default path does not require MERGE_HEAD)"
@@ -1407,13 +1415,15 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     } else if args.with_advance && args.start_only {
         println!("[advance] skipped (--start-only takes precedence over --with-advance)");
     } else if args.with_advance && conflict_fixture_active {
-        println!("[advance] skipped (conflict fixture path gates decision chrome, not Next file)");
+        println!("[advance] skipped (conflict fixture path gates decision chrome + Review Diff, not Next file)");
     }
 
     if !args.start_only && !conflict_fixture_active {
         run_merge_review_workshop_steps(&mut session, detail, args.step_wait_ms)?;
     } else if conflict_fixture_active {
-        println!("[workshop] skipped (conflict fixture: decision chrome only; Preview/End stays on default path)");
+        println!(
+            "[workshop] skipped (conflict fixture: decision chrome + Review Diff; Preview/End stays on default path)"
+        );
     } else {
         println!("[workshop] skipped (--start-only)");
     }
@@ -1731,6 +1741,136 @@ fn gate_merge_review_decision_chrome(post_start_blob: &str) {
     }
 }
 
+/// NodeId for a labeled button in a room/rich outline line, e.g. `[Button] "Review Diff" … #NodeId(42)`.
+/// Prefers interactive body lines (`[click]`) over `# focus:` header duplicates.
+fn outline_button_node_id(outline: &str, label: &str) -> Option<String> {
+    let needle = format!("[Button] \"{label}\"");
+    let mut fallback: Option<String> = None;
+    for line in outline.lines() {
+        if !line.contains(&needle) {
+            continue;
+        }
+        let Some(idx) = line.rfind("#NodeId(") else {
+            continue;
+        };
+        let rest = &line[idx + "#NodeId(".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        // Body controls advertise click; focus header lines often repeat a shorter id.
+        if line.contains("[click]") {
+            return Some(digits);
+        }
+        fallback = Some(digits);
+    }
+    fallback
+}
+
+/// After conflict Start settle: click **Review Diff** (or `git::ReviewDiff`) → **Summarizing…**.
+///
+/// Prefer a11y click on the rail primary — after Start, focus is often that button, and
+/// window-level `git::ReviewDiff` may not hit ProjectDiff listeners. Soft-skip if ACP offline.
+fn run_merge_review_conflict_review_diff_step(
+    session: &mut DogfoodSession,
+    detail: &str,
+    step_wait_ms: u64,
+) -> Result<()> {
+    const REVIEW_DIFF_ACTION: &str = "git::ReviewDiff";
+    const REVIEW_DIFF_LABEL: &str = "Review Diff";
+    let stderr_before = session.stderr_buf.len();
+
+    // Fresh look for NodeId (ids change each session).
+    let pre_look = session.request_ok(
+        "conflict_review_prelook",
+        &[("method", "look"), ("detail", detail)],
+        Duration::from_secs(30),
+    )?;
+    let pre_blob = pre_look.join("\n");
+    let pre_outline = extract_snapshot_text(&pre_blob)
+        .map(|t| decode_outline_escapes(&t))
+        .unwrap_or_default();
+
+    // Prefer a11y click on the rail primary when present; always also try window action
+    // (ProjectDiff listens for git::ReviewDiff when its surface holds focus).
+    if let Some(node_id) = outline_button_node_id(&pre_outline, REVIEW_DIFF_LABEL) {
+        match session.request_ok(
+            "conflict_review_click",
+            &[("method", "click"), ("node", node_id.as_str())],
+            Duration::from_secs(20),
+        ) {
+            Ok(_) => println!("[method:click Review Diff node={node_id}] ok"),
+            Err(error) => println!("[method:click Review Diff] warn: {error:#}"),
+        }
+    } else {
+        println!("[conflict] no \"Review Diff\" button NodeId in outline");
+    }
+
+    match session.request_ok(
+        "conflict_review_diff",
+        &[("method", "action"), ("name", REVIEW_DIFF_ACTION)],
+        Duration::from_secs(20),
+    ) {
+        Ok(_) => println!("[method:action {REVIEW_DIFF_ACTION}] ok"),
+        Err(error) => {
+            println!("[method:action {REVIEW_DIFF_ACTION}] warn: {error:#}");
+        }
+    }
+
+    // Rail moves to Summarizing… when dispatch posts the package (not full agent completion).
+    let settle_ms = step_wait_ms.max(2500).min(15_000);
+    if settle_ms > 0 {
+        let _ = session.request_ok(
+            "conflict_review_wait",
+            &[("method", "wait"), ("ms", &settle_ms.to_string())],
+            Duration::from_secs(settle_ms / 1000 + 5),
+        );
+        println!("[method:wait post-conflict-review-diff] ok ms={settle_ms}");
+    }
+
+    session.pump();
+    let look_lines = session.request_ok(
+        "conflict_review_look",
+        &[("method", "look"), ("detail", detail)],
+        Duration::from_secs(30),
+    )?;
+    let look_blob = look_lines.join("\n");
+    println!(
+        "[method:look post-conflict-review-diff] empty={} preview={}",
+        classify_snapshot(&look_blob),
+        extract_snapshot_preview(&look_blob, 200)
+    );
+
+    let outline = extract_snapshot_text(&look_blob)
+        .map(|t| decode_outline_escapes(&t))
+        .unwrap_or_default();
+    let summarizing = outline.contains("Summarizing");
+    let stderr_slice = &session.stderr_buf[stderr_before.min(session.stderr_buf.len())..];
+    let stderr_joined = stderr_slice.join("\n");
+    let dispatch_ok = stderr_joined.contains("Review Diff sent")
+        || stderr_joined.contains("conflict Review Diff dispatch")
+        || stderr_joined.contains("Review Diff requested");
+
+    if dispatch_ok {
+        println!("[conflict] Review Diff dispatch ok (stderr)");
+    } else {
+        println!(
+            "[conflict] skip: no Review Diff dispatch log (agent/ACP may be offline or click missed)"
+        );
+        return Ok(());
+    }
+
+    if summarizing {
+        println!("[conflict] Summarizing rail ok");
+    } else {
+        println!(
+            "[conflict] skip: rail has no \"Summarizing\" yet (dispatch ok; settle soft)"
+        );
+    }
+
+    Ok(())
+}
+
 /// Build a minimal conflicted git worktree under a tempfile (two branches, merge conflict).
 ///
 /// Used by `merge-review --with-conflict` so dogfood does not require live Surmount
@@ -1740,9 +1880,12 @@ fn prepare_merge_review_conflict_fixture() -> Result<(PathBuf, tempfile::TempDir
         .prefix("zed-dogfood-merge-conflict-")
         .tempdir()
         .context("create conflict fixture tempdir")?;
-    let root = keep.path().to_path_buf();
-    build_merge_review_conflict_git_tree(&root)?;
-    Ok((root, keep))
+    // Worktree + bare origin as **siblings** so origin.git is not a dirty path in Branch Diff.
+    let work = keep.path().join("worktree");
+    std::fs::create_dir_all(&work).context("mkdir conflict worktree")?;
+    let bare = keep.path().join("origin.git");
+    build_merge_review_conflict_git_tree(&work, &bare)?;
+    Ok((work, keep))
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
@@ -1762,7 +1905,7 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn build_merge_review_conflict_git_tree(root: &Path) -> Result<()> {
+fn build_merge_review_conflict_git_tree(root: &Path, bare_origin: &Path) -> Result<()> {
     std::fs::create_dir_all(root).context("mkdir conflict fixture root")?;
     git_in(root, &["init", "-b", "main"])?;
     git_in(root, &["config", "user.email", "dogfood@example.com"])?;
@@ -1834,6 +1977,35 @@ paths = [
         bail!("expected MERGE_HEAD after conflict merge; stderr={stderr}");
     }
     // Sanity: product default upstream must resolve.
+    git_in(root, &["rev-parse", "origin/main"])?;
+    // Bare origin **outside** the worktree so it is not a dirty path in Branch Diff.
+    // Fetch stays offline and quiet for Start's `git fetch origin`.
+    if let Some(parent) = bare_origin.parent() {
+        std::fs::create_dir_all(parent).context("mkdir bare origin parent")?;
+    }
+    let bare_str = bare_origin.to_str().context("bare origin path utf8")?;
+    let clone = Command::new("git")
+        .args(["clone", "--bare", "--quiet", ".", bare_str])
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "Dogfood")
+        .env("GIT_AUTHOR_EMAIL", "dogfood@example.com")
+        .env("GIT_COMMITTER_NAME", "Dogfood")
+        .env("GIT_COMMITTER_EMAIL", "dogfood@example.com")
+        .output()
+        .context("spawn git clone --bare for dogfood origin")?;
+    if !clone.status.success() {
+        bail!(
+            "git clone --bare failed: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+    }
+    let bare_path = bare_origin
+        .canonicalize()
+        .unwrap_or_else(|_| bare_origin.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    git_in(root, &["remote", "add", "origin", bare_path.as_str()])?;
+    git_in(root, &["fetch", "origin", "--quiet"])?;
     git_in(root, &["rev-parse", "origin/main"])?;
     Ok(())
 }
@@ -2585,24 +2757,62 @@ mod tests {
     }
 
     #[test]
+    fn outline_button_node_id_parses_review_diff() {
+        let outline = r#"
+# focus: [Button] "Review Diff" #NodeId(9)
+    *[Button] "Review Diff" @1046,73 105x32 [click,focus] #NodeId(7707873156005017608)
+    [Button] "Use Both" @0,0 10x10 [click] #NodeId(1)
+"#;
+        // Prefer [click] body line over `# focus:` header id.
+        assert_eq!(
+            outline_button_node_id(outline, "Review Diff").as_deref(),
+            Some("7707873156005017608")
+        );
+        assert_eq!(
+            outline_button_node_id(outline, "Use Both").as_deref(),
+            Some("1")
+        );
+        assert_eq!(outline_button_node_id(outline, "Missing"), None);
+    }
+
+    #[test]
     fn build_merge_review_conflict_git_tree_leaves_merge_head() {
         let keep = tempfile::Builder::new()
             .prefix("zed-dogfood-conflict-unit-")
             .tempdir()
             .expect("tempdir");
-        build_merge_review_conflict_git_tree(keep.path()).expect("build conflict fixture");
+        let work = keep.path().join("worktree");
+        std::fs::create_dir_all(&work).expect("worktree dir");
+        let bare = keep.path().join("origin.git");
+        build_merge_review_conflict_git_tree(&work, &bare).expect("build conflict fixture");
         assert!(
-            keep.path().join(".git").join("MERGE_HEAD").is_file(),
+            work.join(".git").join("MERGE_HEAD").is_file(),
             "fixture must leave MERGE_HEAD"
         );
         assert!(
-            keep.path().join("conflict.txt").is_file(),
+            work.join("conflict.txt").is_file(),
             "fixture must include conflict.txt"
         );
         assert!(
-            keep.path().join("SURMOUNT.md").is_file(),
+            work.join("SURMOUNT.md").is_file(),
             "fixture should carry Surmount marker for open"
         );
+        assert!(
+            bare.is_dir(),
+            "fixture must ship bare origin sibling (not inside worktree)"
+        );
+        assert!(
+            !work.join("origin.git").exists() && !work.join(".dogfood-origin.git").exists(),
+            "bare origin must not live inside the worktree (pollutes Branch Diff)"
+        );
+        let origin_url =
+            git_in(&work, &["remote", "get-url", "origin"]).expect("fixture must have origin remote");
+        assert!(
+            !origin_url.is_empty(),
+            "origin remote URL must be non-empty"
+        );
+        // Product Start calls fetch origin — must succeed offline.
+        git_in(&work, &["fetch", "origin", "--quiet"]).expect("fetch origin offline");
     }
 
     #[test]

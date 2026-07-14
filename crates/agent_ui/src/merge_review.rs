@@ -4294,8 +4294,18 @@ impl MergeReviewView {
         let project_for_workflow = project.clone();
         let task = window.spawn(cx, async move |cx| {
             let started = std::time::Instant::now();
-            if let Err(error) = run_git(&worktree_root, &["fetch", "origin"]).await {
-                log::warn!("surmount merge review: git fetch origin failed: {error:#}");
+            // Skip fetch when there is no origin remote (dogfood pin-only fixtures, offline trees).
+            match run_git(&worktree_root, &["remote", "get-url", "origin"]).await {
+                Ok(_) => {
+                    if let Err(error) = run_git(&worktree_root, &["fetch", "origin"]).await {
+                        log::warn!("surmount merge review: git fetch origin failed: {error:#}");
+                    }
+                }
+                Err(_) => {
+                    log::info!(
+                        "surmount merge review: skip git fetch origin (no origin remote; using local refs)"
+                    );
+                }
             }
             let mut session = populate_session_from_git(
                 project,
@@ -5446,6 +5456,8 @@ pub fn merge_review_plan_prompt(session: &MergeReviewSession) -> String {
          Native tools (do not run `script/surmount-merge-triage`, bash, or python): \
          `merge_review_triage` for the file list, `merge_review_diff` for per-path hunks, \
          `resolve_merge_conflict` for conflict resolution.\n\n\
+         Stay inside this worktree. Do not open skill files, tool source paths, or absolute paths \
+         outside the open project — especially not host Surmount paths when the worktree is a dogfood fixture.\n\n\
          Your tasks:\n\
          1. Propose an order to review by SURMOUNT section (conflicts first).\n\
          2. When I select a file, summarize the actual diff hunks: what changed, fork vs upstream, \
@@ -5494,12 +5506,14 @@ pub fn merge_review_conflict_file_prompt(
          SURMOUNT section: {section}\n\
          Starting guess: {guess}\n\n\
          {memory_section}\
-         Three embedded resources follow:\n\
+         Three embedded resources follow (self-contained — cite only these):\n\
          1. Fork (ours, git index stage 2)\n\
          2. Upstream (theirs, git index stage 3)\n\
          3. Working tree with conflict markers\n\n\
          Compare fork vs upstream carefully. Ask clarifying questions if either side is unclear.\n\
-         You may call `merge_review_conflict_sides` for structured region metadata.\n\
+         Prefer the embedded sides over opening files. Do not open skill files, tool `.rs` sources, \
+         or absolute paths outside this worktree.\n\
+         You may call `merge_review_conflict_sides` for structured region metadata if needed.\n\
          After markers are cleared, call `merge_review_record_decision` or `merge_review_verify_conflict_resolved`.\n\
          Write 3–6 concise sentences on what diverged and what resolution fits the fork.\n\
          End with a single line: Summary: …\n\
@@ -5507,7 +5521,7 @@ pub fn merge_review_conflict_file_prompt(
          Optionally add Decision: …, Rationale: …, and Tests: … (assertion descriptions for follow-up todos).\n\
          Do not resolve yet — never strip conflict markers unless the human directs synthesis.\n\
          This is a scoped single-file turn — do not use todo_write or plan entries.\n\
-         Only cite visible conflict text.",
+         Only cite visible conflict text from the embeds.",
         upstream = session.upstream_ref,
         path = path,
         section = item.surmount_section,
@@ -7074,6 +7088,14 @@ paths = ["Cargo.toml"]
         assert!(prompt.contains("merge_review_conflict_sides"));
         assert!(prompt.contains("Decision:"));
         assert!(prompt.contains("Tests:"));
+        assert!(
+            prompt.contains("Do not open skill files"),
+            "conflict prompt must keep the agent inside embedded sides / worktree"
+        );
+        assert!(
+            prompt.contains("self-contained"),
+            "conflict prompt must mark embeds as self-contained"
+        );
     }
 
     #[test]
@@ -10783,19 +10805,25 @@ paths = ["Cargo.toml"]
     /// PreMerge session + open gated Preview merge modal (shared by focus + Dialog paint tests).
     async fn open_preview_merge_modal_fixture(
         cx: &mut gpui::TestAppContext,
-    ) -> (Entity<Workspace>, &'static mut gpui::VisualTestContext) {
+    ) -> (Entity<Workspace>, gpui::VisualTestContext) {
         use crate::test_support::init_test;
+        use gpui::VisualTestContext;
         use project::FakeFs;
         use serde_json::json;
         use std::path::Path;
         use util::path;
+        use workspace::MultiWorkspace;
 
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/project"), json!({})).await;
         let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _| mw.workspace().clone())
+            .expect("workspace");
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
 
         let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
         let mut session = build_session(
@@ -10812,7 +10840,7 @@ paths = ["Cargo.toml"]
             save_session(cx, &session).expect("save");
         });
 
-        workspace.update_in(cx, |workspace, window, cx| {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
             open_merge_review_gated_merge_modal(workspace, window, cx);
         });
         cx.run_until_parked();
@@ -10823,9 +10851,9 @@ paths = ["Cargo.toml"]
     async fn merge_review_preview_modal_focus_handle_is_focused_on_open(
         cx: &mut gpui::TestAppContext,
     ) {
-        let (workspace, cx) = open_preview_merge_modal_fixture(cx).await;
+        let (workspace, mut cx) = open_preview_merge_modal_fixture(cx).await;
 
-        workspace.update_in(cx, |workspace, window, cx| {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
             let modal = workspace
                 .active_modal::<MergeReviewGatedMergeModal>(cx)
                 .expect("Preview merge modal must be active");
@@ -10846,9 +10874,9 @@ paths = ["Cargo.toml"]
     async fn merge_review_preview_modal_paints_dialog_role(cx: &mut gpui::TestAppContext) {
         use gpui::OutlineDetail;
 
-        let (workspace, cx) = open_preview_merge_modal_fixture(cx).await;
+        let (workspace, mut cx) = open_preview_merge_modal_fixture(cx).await;
 
-        workspace.update_in(cx, |workspace, _, cx| {
+        workspace.update_in(&mut cx, |workspace, _, cx| {
             assert!(
                 workspace
                     .active_modal::<MergeReviewGatedMergeModal>(cx)
