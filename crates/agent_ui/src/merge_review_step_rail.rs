@@ -218,6 +218,7 @@ pub fn render_merge_review_step_rail(
     } else {
         format!("{} · {}", controls.progress_label, controls.step_label)
     };
+    let primary_focus_handle = toolbar.merge_review_primary_focus_handle(cx);
     let mut rail = merge_review_step_rail_container(status_label);
     for spec in workflow_button_specs(
         step,
@@ -226,6 +227,9 @@ pub fn render_merge_review_step_rail(
         workshop_phase,
         controls.git_mode,
     ) {
+        let track_primary = spec.tier == MergeReviewWorkflowButtonTier::Primary
+            && !spec.disabled
+            && primary_focus_handle.is_some();
         rail = rail.child(merge_review_workflow_button(
             toolbar,
             spec.id,
@@ -235,6 +239,9 @@ pub fn render_merge_review_step_rail(
             spec.tooltip,
             spec.action.as_ref(),
             focus_handle,
+            track_primary
+                .then(|| primary_focus_handle.as_ref())
+                .flatten(),
             cx,
         ));
     }
@@ -247,6 +254,7 @@ pub fn render_merge_review_step_rail(
         "End merge review session and restore docks",
         &EndMergeReview,
         focus_handle,
+        None,
         cx,
     ))
     .into_any()
@@ -257,7 +265,7 @@ pub(crate) struct WorkflowButtonSpec {
     pub(crate) label: &'static str,
     pub(crate) tier: MergeReviewWorkflowButtonTier,
     disabled: bool,
-    tooltip: &'static str,
+    pub(crate) tooltip: &'static str,
     action: Box<dyn Action>,
 }
 
@@ -306,6 +314,17 @@ pub(crate) fn workflow_button_specs(
                 disabled: false,
                 tooltip: "Preview git merge-tree before running git merge (human-gated)",
                 action: Box::new(PreviewMergeReviewMerge),
+            },
+        );
+        push(
+            &mut specs,
+            WorkflowButtonSpec {
+                id: "merge-review-rail-next-file",
+                label: RAIL_BTN_NEXT_FILE,
+                tier: MergeReviewWorkflowButtonTier::Available,
+                disabled: false,
+                tooltip: "Select the next changed file for triage (before merge)",
+                action: Box::new(MergeReviewNextFile),
             },
         );
         return specs;
@@ -563,6 +582,7 @@ fn merge_review_workflow_button(
     tooltip_text: &'static str,
     action: &dyn Action,
     focus_handle: &FocusHandle,
+    track_focus_handle: Option<&FocusHandle>,
     cx: &mut Context<BranchDiffToolbar>,
 ) -> AnyElement {
     let green = merge_review_workflow_green_border();
@@ -596,6 +616,9 @@ fn merge_review_workflow_button(
             tier == MergeReviewWorkflowButtonTier::Primary && !disabled,
             |this| this.bg(merge_review_workflow_primary_fill()),
         )
+        .when_some(track_focus_handle.cloned(), |this, handle| {
+            this.track_focus(&handle).tab_index(0)
+        })
         .when(disabled, |this| this.opacity(0.4).cursor_not_allowed())
         .when(!disabled, |this| {
             this.cursor_pointer()

@@ -7,9 +7,9 @@ use git::status::FileStatus;
 use gpui::{
     Action, AnyElement, App, AvailableSpace, Bounds, ClickEvent, ClipboardItem, ContentMask,
     CursorStyle, DefiniteLength, Entity, Focusable as _, Hitbox, HitboxBehavior, Hsla, IntoElement,
-    Length, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
-    ShapedLine, SharedString, Styled, TextAlign, Window, WindowBackgroundAppearance, div, fill,
-    linear_color_stop, linear_gradient, point, px, size,
+    Length, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent, OUTLINE_STRING_MAX,
+    ParentElement, Pixels, ShapedLine, SharedString, Styled, TextAlign, Window,
+    WindowBackgroundAppearance, div, fill, linear_color_stop, linear_gradient, point, px, size,
 };
 use language::language_settings::ShowWhitespaceSetting;
 use multi_buffer::{Anchor, ExcerptBoundaryInfo};
@@ -828,10 +828,12 @@ pub(crate) fn render_buffer_header(
                                     }
                                     _ => filename.as_str().to_string(),
                                 };
+                                let path_label = path_aria_label(&full_path);
 
                                 path_header
                                     .child(
                                         ButtonLike::new("filename-button")
+                                            .aria_label(path_label)
                                             .when(ItemSettings::get_global(cx).file_icons, |this| {
                                                 let path = std::path::Path::new(filename.as_str());
                                                 let icon = FileIcons::get_icon(path, cx)
@@ -1100,4 +1102,103 @@ fn file_status_label_color(file_status: Option<FileStatus>) -> Color {
             Color::Default
         }
     })
+}
+
+/// Truncate a relative path for AccessKit / room-outline path labels.
+///
+/// Prefers the full path when it fits under [`OUTLINE_STRING_MAX`]; otherwise keeps
+/// the basename and as much trailing parent path as fits under a leading ellipsis
+/// (`…/…/basename`).
+fn path_aria_label(path: &str) -> String {
+    let char_count = path.chars().count();
+    if char_count <= OUTLINE_STRING_MAX {
+        return path.to_string();
+    }
+
+    let basename = path
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path);
+    let basename_len = basename.chars().count();
+
+    // Prefer the longest trailing path that starts at a separator and fits
+    // after a single leading ellipsis character.
+    let max_suffix = OUTLINE_STRING_MAX.saturating_sub(1);
+    for (byte_ix, ch) in path.char_indices() {
+        if ch == '/' || ch == '\\' {
+            let suffix = &path[byte_ix..];
+            if suffix.chars().count() <= max_suffix {
+                return format!("…{suffix}");
+            }
+        }
+    }
+
+    // No separator cut fits: keep basename if possible, else front-truncate.
+    let with_basename = format!("…/{basename}");
+    if with_basename.chars().count() <= OUTLINE_STRING_MAX {
+        return with_basename;
+    }
+    if basename_len <= OUTLINE_STRING_MAX {
+        return basename.to_string();
+    }
+    util::truncate_and_remove_front(path, OUTLINE_STRING_MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_aria_label_keeps_short_paths() {
+        let path = "crates/agent_ui/src/merge_review.rs";
+        assert_eq!(path_aria_label(path), path);
+        assert!(path_aria_label(path).contains("merge_review.rs"));
+        assert!(path_aria_label(path).contains("crates/"));
+    }
+
+    #[test]
+    fn path_aria_label_preserves_basename_when_truncating() {
+        let path = "very/long/project/path/that/exceeds/the/eighty/character/limit/agent_ui/src/merge_review.rs";
+        assert!(path.chars().count() > OUTLINE_STRING_MAX);
+
+        let label = path_aria_label(path);
+        assert!(label.chars().count() <= OUTLINE_STRING_MAX);
+        assert!(label.starts_with('…'));
+        assert!(
+            label.contains("merge_review.rs"),
+            "truncated aria_label must keep basename: {label}"
+        );
+    }
+
+    /// Contract: labels are path-derived (full / ellipsis-truncated / basename),
+    /// not the separate "Open File" ghost-button chrome string.
+    #[test]
+    fn path_aria_label_is_path_derived_not_open_file_chrome() {
+        for path in [
+            "crates/agent_ui/src/merge_review.rs",
+            "src/lib.rs",
+            "untitled",
+            "very/long/project/path/that/exceeds/the/eighty/character/limit/agent_ui/src/merge_review.rs",
+        ] {
+            let label = path_aria_label(path);
+            assert!(!label.is_empty(), "empty aria_label for path {path}");
+            assert!(
+                label.chars().count() <= OUTLINE_STRING_MAX,
+                "aria_label exceeds outline cap for {path}: {label}"
+            );
+            let path_shaped = label == path
+                || label.starts_with('…')
+                || path.ends_with(label.as_str());
+            assert!(
+                path_shaped,
+                "aria_label must be path-derived, got {label:?} for {path}"
+            );
+            assert_ne!(
+                label.as_str(),
+                "Open File",
+                "must not substitute Open File chrome for path {path}"
+            );
+        }
+    }
 }

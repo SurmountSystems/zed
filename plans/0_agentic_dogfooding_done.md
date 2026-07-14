@@ -80,9 +80,10 @@ Extend `cargo xtask dogfood merge-review` without shell drivers:
 | Expect chrome | default `--expect "Merge review"` when CLI empty | Done |
 | Preview | `surmount::PreviewMergeReviewMerge` + expect `Preview merge` (unless `--start-only`) | Done |
 | End | `surmount::EndMergeReview` + non-empty post-end look (unless `--start-only`) | Done |
-| Advance / conflict | Review Diff / Next file / conflict fixture | **Not done** — residual plan |
+| Advance / conflict | Review Diff / Next file / conflict fixture | Residual **R2/R3** living plan |
 
 - [x] Default chrome expects + Preview/End workshop in xtask (`--start-only` / `--step-wait-ms`)
+- [x] **R1 live green:** `cargo xtask dogfood merge-review` Start → Preview → End on release binary (room looks + expects)
 
 ### W3 — Token efficiency of the wire
 
@@ -92,6 +93,15 @@ Extend `cargo xtask dogfood merge-review` without shell drivers:
 - [x] No bloat methods — optional focused-window-only look only if it later **reduces** turns (explicit non-goal until then)
 
 **W3 residual = agent behavior, not missing wire.** No further Rust for this slice.
+
+### Queue runner + UX probe settle (landed)
+
+- [x] `cargo xtask dogfood queue` in `tooling/xtask/src/tasks/dogfood.rs` — steps `open|wait|action|look|expect|hit|lines|inventory|theme|click|stderr:merge|poll`, `--script`, tracking `[queue i/n]`
+- [x] Fixture `tooling/xtask/dogfood_queues/merge_review_ux.queue` — live UX probe **27/27** steps
+- [x] Skill queue docs in `.agents/skills/zed-dogfood/SKILL.md`
+- [x] **Settle rule (proven):** post-open **look (force-draw)** required before `surmount::StartMergeReview` or Start can no-op without chrome
+
+Residual product a11y from that probe → living plan **R2** (design [`plans/finished/merge_review_ux_a11y_design-c4e8a1f2.md`](./finished/merge_review_ux_a11y_design-c4e8a1f2.md)).
 
 ---
 
@@ -122,6 +132,7 @@ Extend `cargo xtask dogfood merge-review` without shell drivers:
 | Protocol smoke | `dogfood golden` / `smoke` | open → wait → look (+ optional action/keys) |
 | Merge workshop | `dogfood merge-review` | Surmount root → Start → chrome expects → Preview → End |
 | Start-only | `dogfood merge-review --start-only` | Skip Preview/End when debugging open/populate |
+| Queue | `dogfood queue --script …` | Agent TOON step runner; UX probes |
 
 ### Parent-agent rules (landed)
 

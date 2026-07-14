@@ -10,7 +10,7 @@ use git_ui::project_diff::ProjectDiff;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use gpui::{
     Action, App, AsyncApp, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, Render, ScrollHandle, SharedString, WeakEntity, Window,
+    Focusable, Render, Role, ScrollHandle, SharedString, WeakEntity, Window,
 };
 use project::{
     Project,
@@ -799,7 +799,11 @@ impl Render for MergeReviewGatedMergeModal {
         });
         let show_preview_hint =
             self.merge_result_text.is_none() && !self.loading && self.error.is_none();
+        let dialog_label: SharedString = format!("Preview merge · {}", self.upstream_ref).into();
         div()
+            .id("merge-review-gated-merge-modal")
+            .role(Role::Dialog)
+            .aria_label(dialog_label.clone())
             .key_context("MergeReviewGatedMergeModal")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| {
@@ -813,10 +817,11 @@ impl Render for MergeReviewGatedMergeModal {
                     .border_color(panel_border)
                     .bg(gpui::hsla(0., 0., 0.12, 1.))
                     .child(
-                        div().p_2().border_b_1().border_color(panel_border).child(
-                            Label::new(format!("Preview merge · {}", self.upstream_ref))
-                                .color(Color::Default),
-                        ),
+                        div()
+                            .p_2()
+                            .border_b_1()
+                            .border_color(panel_border)
+                            .child(Label::new(dialog_label).color(Color::Default)),
                     )
                     .child(
                         v_flex()
@@ -1001,6 +1006,13 @@ pub fn open_merge_review_gated_merge_modal(
             cx,
         )
     });
+    // Safe to focus now: ModalLayer already snapshotted previous_focus_handle in
+    // show_modal (via toggle_modal); this re-asserts AC-A alongside ModalLayer's
+    // deferred focus onto Focusable modals.
+    if let Some(modal) = workspace.active_modal::<MergeReviewGatedMergeModal>(cx) {
+        modal.focus_handle(cx).focus(window, cx);
+        log::info!("surmount merge review: focused Preview merge modal after open");
+    }
 }
 
 pub struct MergeReviewCommitMessageModal {
@@ -1964,24 +1976,59 @@ fn ensure_merge_review_focus_layout(
     }
 }
 
+fn merge_review_project_diff_for_upstream(
+    workspace: &Workspace,
+    upstream_ref: &str,
+    cx: &App,
+) -> Option<Entity<ProjectDiff>> {
+    workspace.items_of_type::<ProjectDiff>(cx).find(|item| {
+        matches!(
+            item.read(cx).diff_base(cx),
+            DiffBase::Merge { base_ref } if base_ref.as_ref() == upstream_ref
+        )
+    })
+}
+
 fn reveal_branch_diff_for_merge_review(
     workspace: &mut Workspace,
     upstream_ref: &str,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> bool {
-    let Some(diff) = workspace.items_of_type::<ProjectDiff>(cx).find(|item| {
-        matches!(
-            item.read(cx).diff_base(cx),
-            DiffBase::Merge { base_ref } if base_ref.as_ref() == upstream_ref
-        )
-    }) else {
+    let Some(diff) = merge_review_project_diff_for_upstream(workspace, upstream_ref, cx) else {
         return false;
     };
     unzoom_agent_dock_for_merge_review(workspace, window, cx);
     workspace.activate_item(&diff, true, true, window, cx);
     workspace.focus_center_pane(window, cx);
     true
+}
+
+/// After Start chrome is ready: focus the rail primary **Preview merge** control.
+fn focus_merge_review_primary_after_start(
+    workspace: &Workspace,
+    upstream_ref: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(diff) = merge_review_project_diff_for_upstream(workspace, upstream_ref, cx) else {
+        log::warn!("surmount merge review: no Branch Diff to focus primary Preview merge control");
+        return;
+    };
+    let handle = diff.read(cx).merge_review_primary_focus_handle();
+    handle.focus(window, cx);
+    log::info!("surmount merge review: focused primary Preview merge control after Start");
+}
+
+/// After Next file success: focus ProjectDiff (editor when non-empty — path-labeled headers).
+fn focus_merge_review_after_next_file(
+    diff: &Entity<ProjectDiff>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let handle = diff.focus_handle(cx);
+    handle.focus(window, cx);
+    log::info!("surmount merge review: focused ProjectDiff after Next file");
 }
 
 fn select_merge_review_queue_cursor_file(
@@ -2016,7 +2063,10 @@ fn select_merge_review_queue_cursor_file(
             save_session(cx, &session).log_err();
         }
         log::info!("surmount merge review: selected queue file {first_path}");
-        workspace.focus_center_pane(window, cx);
+        // MergeInProgress auto-select intentionally focuses the selected file surface
+        // (ProjectDiff editor), not the PreMerge Preview rail primary. That path is
+        // outside Start→Preview AC-A; PreMerge Start does not spawn queue select.
+        focus_merge_review_after_next_file(&diff, window, cx);
     }
     selected
 }
@@ -3834,7 +3884,7 @@ pub fn advance_merge_review_to_next_file_with_sync(
         log::info!("surmount merge review: advanced to next file {next_path}");
         prepare_merge_review_selected_file(&diff, &next_path, window, cx);
         workspace.activate_item(&diff, true, true, window, cx);
-        workspace.focus_center_pane(window, cx);
+        focus_merge_review_after_next_file(&diff, window, cx);
         notify_merge_review_ui_changed(workspace, cx);
     } else {
         log::warn!(
@@ -4157,7 +4207,8 @@ impl MergeReviewView {
                         return anyhow::Ok(());
                     };
                     let item_count = session_for_plan.items.len();
-                    workspace.update_in(cx, |workspace, _window, cx| {
+                    let upstream_for_focus = upstream_for_find.clone();
+                    workspace.update_in(cx, |workspace, window, cx| {
                         let toast = if item_count > 0 {
                             format!(
                                 "{MERGE_REVIEW_READY_TOAST} ({item_count} changed files.)"
@@ -4166,6 +4217,13 @@ impl MergeReviewView {
                             MERGE_REVIEW_READY_TOAST.to_string()
                         };
                         workspace.show_toast(merge_review_toast(toast), cx);
+                        // Product focus AC-A: rail primary Preview merge after chrome ready.
+                        focus_merge_review_primary_after_start(
+                            workspace,
+                            &upstream_for_focus,
+                            window,
+                            cx,
+                        );
                     })?;
                 }
                 anyhow::Ok(())
@@ -8027,12 +8085,8 @@ paths = ["Cargo.toml"]
         );
         assert_eq!(
             labels,
-            vec![RAIL_BTN_PREVIEW_MERGE],
-            "PreMerge must offer Preview merge as the only workflow button"
-        );
-        assert!(
-            !labels.contains(&RAIL_BTN_NEXT_FILE),
-            "PreMerge must not offer Next file"
+            vec![RAIL_BTN_PREVIEW_MERGE, RAIL_BTN_NEXT_FILE],
+            "PreMerge must offer Preview merge (primary) and Next file (available)"
         );
         assert!(
             !labels.contains(&RAIL_BTN_REVIEW_DIFF),
@@ -8056,7 +8110,7 @@ paths = ["Cargo.toml"]
     fn pre_merge_rail_preview_merge_is_only_primary_tier() {
         use crate::merge_review_step_rail::{
             MergeReviewPrimaryAction, MergeReviewUiStep, MergeReviewWorkflowButtonTier,
-            workflow_button_specs,
+            RAIL_BTN_NEXT_FILE, RAIL_BTN_PREVIEW_MERGE, workflow_button_specs,
         };
         use git_ui::project_diff::MergeReviewGitMode;
 
@@ -8067,12 +8121,25 @@ paths = ["Cargo.toml"]
             None,
             MergeReviewGitMode::PreMerge,
         );
-        assert_eq!(specs.len(), 1);
-        assert_eq!(
-            specs[0].label,
-            crate::merge_review_step_rail::RAIL_BTN_PREVIEW_MERGE
-        );
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].id, "merge-review-rail-preview-merge");
+        assert_eq!(specs[0].label, RAIL_BTN_PREVIEW_MERGE);
         assert_eq!(specs[0].tier, MergeReviewWorkflowButtonTier::Primary);
+        assert_eq!(specs[1].id, "merge-review-rail-next-file");
+        assert_eq!(specs[1].label, RAIL_BTN_NEXT_FILE);
+        assert_eq!(specs[1].tier, MergeReviewWorkflowButtonTier::Available);
+        assert_eq!(
+            specs[1].tooltip,
+            "Select the next changed file for triage (before merge)"
+        );
+        assert!(
+            specs
+                .iter()
+                .filter(|spec| spec.tier == MergeReviewWorkflowButtonTier::Primary)
+                .count()
+                == 1,
+            "only Preview merge may be Primary in PreMerge"
+        );
     }
 
     #[gpui::test]
@@ -8740,6 +8807,15 @@ paths = ["Cargo.toml"]
                 session.queue_cursor_path.as_deref(),
                 Some("beta.rs"),
                 "happy-path advance must persist cursor on next file"
+            );
+        });
+        // AC-A: Next file success focuses ProjectDiff::focus_handle (editor when non-empty).
+        // Path-labeled header controls have no separate FocusHandle yet (PR1 aria only);
+        // design allows this editor fallback.
+        workspace.update_in(&mut cx, |_workspace, window, cx| {
+            assert!(
+                diff.focus_handle(cx).is_focused(window),
+                "Next file must focus ProjectDiff editor/item focus_handle"
             );
         });
     }
@@ -10679,5 +10755,135 @@ paths = ["Cargo.toml"]
                 "workflow without SURMOUNT.md must not open Branch Diff"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn merge_review_primary_focus_handle_is_focused_after_start_helper(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, mut cx, diff, _project) =
+            setup_merge_review_branch_diff_fixture(cx, &[("alpha.rs", "alpha head\n")]).await;
+
+        // AC-A chrome-ready order (production open_merge_review_workflow):
+        // reveal_branch_diff focuses center, then focus_merge_review_primary_after_start wins.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            assert!(
+                reveal_branch_diff_for_merge_review(workspace, "origin/main", window, cx),
+                "fixture Branch Diff must be revealable for origin/main"
+            );
+            focus_merge_review_primary_after_start(workspace, "origin/main", window, cx);
+            let handle = diff.read(cx).merge_review_primary_focus_handle();
+            assert!(
+                handle.is_focused(window),
+                "primary Preview merge focus_handle must win after reveal + Start chrome-ready focus"
+            );
+        });
+    }
+
+    /// PreMerge session + open gated Preview merge modal (shared by focus + Dialog paint tests).
+    async fn open_preview_merge_modal_fixture(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<Workspace>, &'static mut gpui::VisualTestContext) {
+        use crate::test_support::init_test;
+        use project::FakeFs;
+        use serde_json::json;
+        use std::path::Path;
+        use util::path;
+
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [("alpha.rs".into(), false)],
+        );
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::PreMerge;
+        session.worktree_root = Some(path!("/project").into());
+        cx.update(|_, cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            open_merge_review_gated_merge_modal(workspace, window, cx);
+        });
+        cx.run_until_parked();
+        (workspace, cx)
+    }
+
+    #[gpui::test]
+    async fn merge_review_preview_modal_focus_handle_is_focused_on_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (workspace, cx) = open_preview_merge_modal_fixture(cx).await;
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let modal = workspace
+                .active_modal::<MergeReviewGatedMergeModal>(cx)
+                .expect("Preview merge modal must be active");
+            assert!(
+                modal.focus_handle(cx).is_focused(window),
+                "Preview merge modal focus_handle must be focused after open (AC-A)"
+            );
+        });
+    }
+
+    /// Paints the open Preview merge modal and asserts Dialog role + aria name.
+    ///
+    /// Dialog root intentionally combines `Role::Dialog` with `track_focus` (AC-A),
+    /// so GPUI classifies it as **interactive** (`Action::Focus`) and excludes it from
+    /// the landmark tally. Room still emits the interactive `[Dialog]` line dogfood
+    /// expects; AC-B can use `# focus: [Dialog] "Preview merge · …"`.
+    #[gpui::test]
+    async fn merge_review_preview_modal_paints_dialog_role(cx: &mut gpui::TestAppContext) {
+        use gpui::OutlineDetail;
+
+        let (workspace, cx) = open_preview_merge_modal_fixture(cx).await;
+
+        workspace.update_in(cx, |workspace, _, cx| {
+            assert!(
+                workspace
+                    .active_modal::<MergeReviewGatedMergeModal>(cx)
+                    .is_some(),
+                "Preview merge modal must be active for Dialog paint assert"
+            );
+        });
+
+        let outline = cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            window.a11y_outline(OutlineDetail::Room)
+        });
+
+        const DIALOG_LABEL: &str = "Preview merge · origin/main";
+        let dialog_line = outline
+            .lines()
+            .find(|line| line.contains("[Dialog]") && line.contains(DIALOG_LABEL));
+        let dialog_line = dialog_line.unwrap_or_else(|| {
+            panic!(
+                "room outline must include interactive [Dialog] line with Preview merge label: {outline}"
+            )
+        });
+        // track_focus → Action::Focus; room prints supported actions as [focus].
+        assert!(
+            dialog_line.contains("[focus]"),
+            "Preview Dialog root should advertise Focus (interactive dual-use): {dialog_line}"
+        );
+        // After open, product focus is on the modal (AC-A); room header should name Dialog.
+        assert!(
+            outline.lines().any(|line| {
+                line.starts_with("# focus:")
+                    && line.contains("[Dialog]")
+                    && line.contains(DIALOG_LABEL)
+            }),
+            "room # focus header should name Preview Dialog after open: {outline}"
+        );
     }
 }

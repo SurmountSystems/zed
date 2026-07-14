@@ -36,6 +36,8 @@ enum DogfoodCommand {
     Smoke(SmokeArgs),
     /// Headless merge-review workshop: open Surmount root → Start → chrome expects → Preview → End.
     MergeReview(MergeReviewArgs),
+    /// Agent-driven TOON step queue with per-step tracking (no ad-hoc shell scripts).
+    Queue(QueueArgs),
 }
 
 #[derive(Parser)]
@@ -134,9 +136,45 @@ struct MergeReviewArgs {
     /// Only Start + post-start look/expects (skip Preview/End workshop steps).
     #[arg(long, default_value_t = false)]
     start_only: bool,
-    /// Settle after Preview / End actions (ms).
+    /// After Start settle, run MergeReviewNextFile and require a path/cursor delta
+    /// before Preview. Default off — Start → Preview → End unchanged.
+    #[arg(long, default_value_t = false)]
+    with_advance: bool,
+    /// Build a tiny conflicted git tree under tempfile and gate decision chrome
+    /// (Discuss / Resolve / Synthesize) when the fixture exists. Default off —
+    /// does not require live Surmount MERGE_HEAD. Skips with a log if fixture
+    /// build fails or decision chrome is missing after Start.
+    #[arg(long, default_value_t = false)]
+    with_conflict: bool,
+    /// Settle after Preview / End / Advance actions (ms).
     #[arg(long, default_value_t = 2500)]
     step_wait_ms: u64,
+}
+
+#[derive(Parser)]
+struct QueueArgs {
+    #[arg(long, env = "ZED_BIN")]
+    bin: Option<PathBuf>,
+    /// Default path for a bare `open` step (file or directory).
+    #[arg(long, env = "ZED_DOGFOOD_FIXTURE")]
+    fixture: Option<PathBuf>,
+    #[arg(long, default_value_t = 180)]
+    timeout_secs: u64,
+    /// Default look detail when a step is bare `look` (compact|rich|room).
+    #[arg(long, default_value = "room", value_parser = ["compact", "rich", "room"])]
+    snapshot_detail: String,
+    /// TOON step (repeatable). See `parse_queue_step` / dogfood skill.
+    /// Examples: `open`, `open:/path`, `wait:4000`, `action:agent::ToggleFocus`,
+    /// `look:room`, `expect:Merge review`, `hit:Prepare|Review Diff`, `lines:40`,
+    /// `inventory`, `theme`, `stderr:merge`, `keys:ctrl-p`, `click:42`.
+    #[arg(long = "step")]
+    step: Vec<String>,
+    /// Optional script file: one step per line (`#` comments and blanks skipped).
+    #[arg(long)]
+    script: Option<PathBuf>,
+    /// Soft-fail `action` / `keys` / `click` (warn and continue). Default: hard-fail.
+    #[arg(long, default_value_t = false)]
+    soft_action: bool,
 }
 
 /// Default post-start chrome expects when CLI `--expect` is empty.
@@ -1173,17 +1211,44 @@ pub fn run_dogfood(args: DogfoodArgs) -> Result<()> {
         DogfoodCommand::Golden(a) => run_golden(a),
         DogfoodCommand::Smoke(a) => run_smoke(a),
         DogfoodCommand::MergeReview(a) => run_merge_review(a),
+        DogfoodCommand::Queue(a) => run_queue(a),
     }
 }
 
-/// Headless merge-review workshop: Start → chrome expects → Preview → End.
+/// Headless merge-review workshop: Start → chrome expects → [optional Advance] → Preview → End.
+///
+/// **Settle rule (binding):** after open (+ wait), run a pre-start `look` so force-draw
+/// paints chrome **before** `surmount::StartMergeReview`. Start no-ops without that paint.
 ///
 /// Always records action ok/error and snapshot preview honestly. Dumps stderr
 /// lines that mention merge review / surmount so product toasts and populate
 /// logs are visible without inventing UI that did not paint.
+/// Default adventure never requires Dialog, Advance, or conflict fixture
+/// (`--with-advance` / `--with-conflict` are opt-in).
 fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     let bin = args.bin.map(Ok).unwrap_or_else(default_bin)?;
-    let workspace_root = resolve_surmount_workspace(args.fixture)?;
+    // Keep tempfile root alive for the whole adventure when --with-conflict builds one.
+    let (workspace_root, conflict_fixture_keep) = if args.with_conflict {
+        match prepare_merge_review_conflict_fixture() {
+            Ok((root, keep)) => {
+                println!(
+                    "[conflict] fixture ready at {} (decision chrome gated when present)",
+                    root.display()
+                );
+                (root, Some(keep))
+            }
+            Err(error) => {
+                println!(
+                    "[conflict] skip: could not build tempfile conflict fixture ({error:#}); default adventure continues on Surmount workspace"
+                );
+                (resolve_surmount_workspace(args.fixture)?, None)
+            }
+        }
+    } else {
+        (resolve_surmount_workspace(args.fixture)?, None)
+    };
+    let conflict_fixture_active = conflict_fixture_keep.is_some();
+    let _conflict_fixture_keep = conflict_fixture_keep;
     let timeout = Duration::from_secs(args.timeout_secs);
     let workspace_str = workspace_root.display().to_string();
     let detail = args.snapshot_detail.as_str();
@@ -1191,7 +1256,7 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     let post_start_expects = merge_review_post_start_expects(&args.expect);
 
     println!(
-        "dogfood merge-review: bin={} workspace={} action={} detail={} wait_ms={} post_start_wait_ms={} start_only={} expects={:?}",
+        "dogfood merge-review: bin={} workspace={} action={} detail={} wait_ms={} post_start_wait_ms={} start_only={} with_advance={} with_conflict={} expects={:?}",
         bin.display(),
         workspace_root.display(),
         action_name,
@@ -1199,6 +1264,8 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
         args.wait_ms,
         args.post_start_wait_ms,
         args.start_only,
+        args.with_advance,
+        args.with_conflict,
         post_start_expects,
     );
 
@@ -1292,10 +1359,21 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     }
 
     if !snapshot_satisfies(&look2_blob, &post_start_expects) {
+        let missing = missing_snapshot_expects(&look2_blob, &post_start_expects);
+        if conflict_fixture_active {
+            // Conflict fixture is opt-in proof; do not fail the default green path.
+            session.pump();
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            println!(
+                "[conflict] skip: post-Start expects missing {missing:?}; decision chrome not gated"
+            );
+            session.shutdown_best_effort();
+            println!("merge-review adventure finished (conflict fixture soft-skip)");
+            return Ok(());
+        }
         session.pump();
         print_merge_review_stderr_tail(&session.stderr_buf);
         session.shutdown_best_effort();
-        let missing = missing_snapshot_expects(&look2_blob, &post_start_expects);
         bail!(
             "merge-review adventure: post-start look missing expected substring(s) {missing:?}\n  preview={}",
             extract_snapshot_preview(&look2_blob, 400)
@@ -1305,8 +1383,37 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
         println!("  post-start expect ok: {expect:?}");
     }
 
-    if !args.start_only {
+    // PR4b residual gate: Expand controls must not appear at negative Y in room outline.
+    if let Some(text) = extract_snapshot_text(&look2_blob) {
+        let outline = decode_outline_escapes(&text);
+        if let Some(bad) = first_expand_negative_y_line(&outline) {
+            session.pump();
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            session.shutdown_best_effort();
+            bail!("merge-review adventure: off-screen Expand in post-start outline: {bad}");
+        }
+    }
+
+    if conflict_fixture_active {
+        gate_merge_review_decision_chrome(&look2_blob);
+    } else if args.with_conflict {
+        println!(
+            "[conflict] decision chrome gate skipped (fixture not active; default path does not require MERGE_HEAD)"
+        );
+    }
+
+    if args.with_advance && !args.start_only && !conflict_fixture_active {
+        run_merge_review_advance_step(&mut session, detail, &look2_blob, args.step_wait_ms)?;
+    } else if args.with_advance && args.start_only {
+        println!("[advance] skipped (--start-only takes precedence over --with-advance)");
+    } else if args.with_advance && conflict_fixture_active {
+        println!("[advance] skipped (conflict fixture path gates decision chrome, not Next file)");
+    }
+
+    if !args.start_only && !conflict_fixture_active {
         run_merge_review_workshop_steps(&mut session, detail, args.step_wait_ms)?;
+    } else if conflict_fixture_active {
+        println!("[workshop] skipped (conflict fixture: decision chrome only; Preview/End stays on default path)");
     } else {
         println!("[workshop] skipped (--start-only)");
     }
@@ -1339,6 +1446,395 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     session.shutdown_best_effort();
     println!("[method:shutdown] requested");
     println!("merge-review adventure finished (see stderr tail for populate / toast logs)");
+    Ok(())
+}
+
+/// Regex for room outline bounds: `"Label" @x,y WxH` (y may be negative).
+fn outline_bounds_y(line: &str) -> Option<i64> {
+    // Match `@x,y` after a quoted label; y is signed.
+    let re = Regex::new(r#"@-?\d+,(-?\d+)\s+\d+x\d+"#).ok()?;
+    let caps = re.captures(line)?;
+    caps.get(1)?.as_str().parse().ok()
+}
+
+/// First outline line that looks like an Expand control with negative Y (PR4b).
+fn first_expand_negative_y_line(outline: &str) -> Option<String> {
+    for line in outline.lines() {
+        let lower = line.to_ascii_lowercase();
+        // Match Disclosure "Expand" / Expand Excerpt labels, not Action::Expand verb lists alone.
+        let is_expand_label = line.contains("\"Expand\"")
+            || line.contains("\"Expand Excerpt\"")
+            || lower.contains("[button] \"expand");
+        if !is_expand_label {
+            continue;
+        }
+        if outline_bounds_y(line).is_some_and(|y| y < 0) {
+            return Some(line.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Path-ish fingerprints from a room outline (basename segments on labeled buttons).
+/// Used by `--with-advance` to require a path/cursor delta after NextFile.
+fn path_fingerprints_from_outline(outline: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    // Quoted labels that look like paths (contain / or end with a common source suffix).
+    let re = Regex::new(r#"\"([^\"]+)\""#).expect("path fingerprint re");
+    for line in outline.lines() {
+        for caps in re.captures_iter(line) {
+            let label = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if label.is_empty() || label.len() > 120 {
+                continue;
+            }
+            let looks_like_path = label.contains('/')
+                || label.contains('\\')
+                || label.ends_with(".rs")
+                || label.ends_with(".toml")
+                || label.ends_with(".md")
+                || label.ends_with(".json")
+                || label.ends_with(".ts")
+                || label.ends_with(".tsx");
+            if !looks_like_path {
+                continue;
+            }
+            // Prefer basename for stable compare across truncation.
+            let base = label
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(label)
+                .trim_start_matches('…');
+            if base.is_empty() {
+                continue;
+            }
+            if !out.iter().any(|existing| existing == base) {
+                out.push(base.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// True when post-advance outline or stderr shows a different path than pre-capture.
+fn advance_shows_path_delta(pre_paths: &[String], post_outline: &str, stderr: &[String]) -> bool {
+    let post_paths = path_fingerprints_from_outline(post_outline);
+    if !pre_paths.is_empty() && !post_paths.is_empty() {
+        // Success if any post path is not in the pre set, or ordered first path changed.
+        if post_paths.iter().any(|p| !pre_paths.contains(p)) {
+            return true;
+        }
+        if pre_paths.first() != post_paths.first() {
+            return true;
+        }
+    }
+    // Product log: "advanced to next file {path}"
+    for line in stderr {
+        let lower = line.to_ascii_lowercase();
+        if let Some(idx) = lower.find("advanced to next file ") {
+            let path_part = line[idx + "advanced to next file ".len()..].trim();
+            let base = path_part.rsplit(['/', '\\']).next().unwrap_or(path_part);
+            if base.is_empty() {
+                continue;
+            }
+            if pre_paths.is_empty() || !pre_paths.iter().any(|p| p == base || path_part.contains(p))
+            {
+                return true;
+            }
+            // Path differs from first pre fingerprint.
+            if pre_paths
+                .first()
+                .is_some_and(|p| p != base && !path_part.ends_with(p.as_str()))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Optional `--with-advance`: NextFile after Start settle; success = path/cursor delta.
+fn run_merge_review_advance_step(
+    session: &mut DogfoodSession,
+    detail: &str,
+    post_start_blob: &str,
+    step_wait_ms: u64,
+) -> Result<()> {
+    const NEXT_ACTION: &str = "surmount::MergeReviewNextFile";
+
+    let pre_outline = extract_snapshot_text(post_start_blob)
+        .map(|t| decode_outline_escapes(&t))
+        .unwrap_or_default();
+    let pre_paths = path_fingerprints_from_outline(&pre_outline);
+    println!(
+        "[advance] pre-capture path fingerprints ({})={:?}",
+        pre_paths.len(),
+        pre_paths.iter().take(8).collect::<Vec<_>>()
+    );
+
+    // Single-file queue: NextFile may no-op — skip with log (not green success).
+    if !advance_has_enough_path_fingerprints(&pre_paths) {
+        println!(
+            "[advance] skip: need ≥2 path-labeled files in post-Start outline (found {}); not counting as success",
+            pre_paths.len()
+        );
+        return Ok(());
+    }
+
+    let stderr_before = session.stderr_buf.len();
+    match session.request_ok(
+        "advance1",
+        &[("method", "action"), ("name", NEXT_ACTION)],
+        Duration::from_secs(20),
+    ) {
+        Ok(_) => println!("[method:action {NEXT_ACTION}] ok"),
+        Err(error) => {
+            session.pump();
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            session.shutdown_best_effort();
+            bail!("merge-review advance: {NEXT_ACTION} failed: {error:#}");
+        }
+    }
+
+    if step_wait_ms > 0 {
+        let wait_ms = step_wait_ms.to_string();
+        session.request_ok(
+            "wait_advance",
+            &[("method", "wait"), ("ms", wait_ms.as_str())],
+            Duration::from_millis(step_wait_ms + 10_000),
+        )?;
+        println!("[method:wait post-advance] ok ms={step_wait_ms}");
+    }
+
+    let look_advance = session.request_ok(
+        "look_advance",
+        &snapshot_method_fields(detail),
+        Duration::from_secs(30),
+    )?;
+    let look_advance_blob = look_advance.join("\n");
+    session.pump();
+    let post_outline = extract_snapshot_text(&look_advance_blob)
+        .map(|t| decode_outline_escapes(&t))
+        .unwrap_or_default();
+    let stderr_delta: Vec<String> = session.stderr_buf[stderr_before..].to_vec();
+
+    if !advance_shows_path_delta(&pre_paths, &post_outline, &stderr_delta)
+        && !advance_shows_path_delta(&pre_paths, &post_outline, &session.stderr_buf)
+    {
+        print_merge_review_stderr_tail(&session.stderr_buf);
+        session.shutdown_best_effort();
+        bail!(
+            "merge-review advance: no path/cursor delta after {NEXT_ACTION} (static Next file chrome is not enough)\n  pre_paths={pre_paths:?}\n  post_paths={:?}\n  preview={}",
+            path_fingerprints_from_outline(&post_outline),
+            extract_snapshot_preview(&look_advance_blob, 300)
+        );
+    }
+    println!("[advance] path/cursor delta ok");
+
+    // AC-B: after multi-file NextFile success, if room reports focus it must not be
+    // solely Window. Default adventure never runs this step.
+    if let Some(focus_line) = room_focus_line(&post_outline) {
+        if room_focus_is_solely_window(focus_line) {
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            session.shutdown_best_effort();
+            bail!(
+                "merge-review advance AC-B: room # focus: still solely Window after NextFile ({focus_line})"
+            );
+        }
+        println!("[advance] AC-B focus ok: {focus_line}");
+    } else {
+        println!("[advance] AC-B: no # focus: line in post-advance outline (not hard-failing)");
+    }
+    Ok(())
+}
+
+/// True when post-Start path fingerprints are enough to exercise NextFile delta.
+fn advance_has_enough_path_fingerprints(pre_paths: &[String]) -> bool {
+    pre_paths.len() >= 2
+}
+
+/// Room `# focus:` line from a decoded outline, if present.
+fn room_focus_line(outline: &str) -> Option<&str> {
+    outline.lines().find(|line| line.starts_with("# focus:"))
+}
+
+/// True when the focus header is solely the root Window (AC-B failure shape).
+fn room_focus_is_solely_window(focus_line: &str) -> bool {
+    focus_line.starts_with("# focus:") && focus_line.contains("[Window]")
+}
+
+/// Conflict-specific decision chrome (not always-on labels like `"Review Diff"`).
+///
+/// Prefer stable product strings. Dynamic branch-named `Use …` buttons are optional
+/// extras via [`decision_chrome_dynamic_use_hits`] and never the sole generic gate.
+const MERGE_REVIEW_DECISION_CHROME_CONFLICT: &[&str] = &[
+    "Use Both",
+    "Resolve with Agent",
+    "Summarize this conflict",
+    "Discuss conflict",
+    "Take ours",
+    "Take theirs",
+    "Synthesize",
+];
+
+/// Stable conflict-specific needles present in `outline`.
+fn decision_chrome_hits(outline: &str) -> Vec<&'static str> {
+    MERGE_REVIEW_DECISION_CHROME_CONFLICT
+        .iter()
+        .copied()
+        .filter(|label| outline.contains(label))
+        .collect()
+}
+
+/// Optional dynamic conflict-bar labels like `"Use HEAD"` / `"Use origin/main"`.
+/// Excludes `"Use Both"` (stable list) and unrelated `"User …"` chrome.
+fn decision_chrome_dynamic_use_hits(outline: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    for line in outline.lines() {
+        if !line.contains("[Button]") {
+            continue;
+        }
+        let Some(start) = line.find("\"Use ") else {
+            continue;
+        };
+        let rest = &line[start + 1..];
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        let label = &rest[..end];
+        if label == "Use Both" {
+            continue;
+        }
+        if label.starts_with("Use ") && label.len() > "Use ".len() {
+            hits.push(label.to_string());
+        }
+    }
+    hits
+}
+
+/// Soft gate: log conflict-specific decision labels after Start on a conflict fixture.
+/// Never fails the run — fixture path is opt-in proof, not default green.
+/// `"Review Diff"` alone does **not** count.
+fn gate_merge_review_decision_chrome(post_start_blob: &str) {
+    let outline = extract_snapshot_text(post_start_blob)
+        .map(|t| decode_outline_escapes(&t))
+        .unwrap_or_default();
+    let hits = decision_chrome_hits(&outline);
+    let dynamic = decision_chrome_dynamic_use_hits(&outline);
+    if hits.is_empty() {
+        println!(
+            "[conflict] skip: no conflict-specific decision chrome in post-Start outline \
+             (need Use Both / Resolve with Agent / Summarize this conflict / Discuss-rail; \
+             Review Diff alone is not enough); dynamic Use hits={dynamic:?}"
+        );
+    } else {
+        println!("[conflict] decision chrome ok: stable={hits:?} dynamic_use={dynamic:?}");
+    }
+}
+
+/// Build a minimal conflicted git worktree under a tempfile (two branches, merge conflict).
+///
+/// Used by `merge-review --with-conflict` so dogfood does not require live Surmount
+/// `MERGE_HEAD`. Layout mirrors `tooling/xtask/dogfood_fixtures/merge_review_conflict/README.md`.
+fn prepare_merge_review_conflict_fixture() -> Result<(PathBuf, tempfile::TempDir)> {
+    let keep = tempfile::Builder::new()
+        .prefix("zed-dogfood-merge-conflict-")
+        .tempdir()
+        .context("create conflict fixture tempdir")?;
+    let root = keep.path().to_path_buf();
+    build_merge_review_conflict_git_tree(&root)?;
+    Ok((root, keep))
+}
+
+fn git_in(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Dogfood")
+        .env("GIT_AUTHOR_EMAIL", "dogfood@example.com")
+        .env("GIT_COMMITTER_NAME", "Dogfood")
+        .env("GIT_COMMITTER_EMAIL", "dogfood@example.com")
+        .output()
+        .with_context(|| format!("spawn git {}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git {} failed: {stderr}", args.join(" "));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn build_merge_review_conflict_git_tree(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root).context("mkdir conflict fixture root")?;
+    git_in(root, &["init", "-b", "main"])?;
+    git_in(root, &["config", "user.email", "dogfood@example.com"])?;
+    git_in(root, &["config", "user.name", "Dogfood"])?;
+    // Local fixture only — never inherit user commit.gpgsign / interactive gpg.
+    git_in(root, &["config", "commit.gpgsign", "false"])?;
+    git_in(root, &["config", "tag.gpgsign", "false"])?;
+    // Surmount workspace marker + minimal category manifest so StartMergeReview can load.
+    std::fs::write(
+        root.join("SURMOUNT.md"),
+        "# dogfood conflict fixture\n",
+    )
+    .context("write SURMOUNT.md")?;
+    std::fs::write(
+        root.join("surmount-merge-categories.toml"),
+        r#"version = 1
+
+[[rules]]
+category_id = "dogfood_conflict"
+surmount_section = "Dogfood conflict fixture"
+disposition = "conflict"
+risk = "low"
+paths = [
+  "conflict.txt",
+  "**/*",
+]
+"#,
+    )
+    .context("write surmount-merge-categories.toml")?;
+    std::fs::write(root.join("conflict.txt"), "base line\n").context("write base conflict.txt")?;
+    git_in(
+        root,
+        &[
+            "add",
+            "SURMOUNT.md",
+            "surmount-merge-categories.toml",
+            "conflict.txt",
+        ],
+    )?;
+    git_in(root, &["commit", "-m", "base"])?;
+    // StartMergeReview defaults to origin/main — pin remote-tracking ref at base.
+    let base_sha = git_in(root, &["rev-parse", "HEAD"])?;
+    git_in(
+        root,
+        &["update-ref", "refs/remotes/origin/main", base_sha.as_str()],
+    )?;
+    git_in(root, &["checkout", "-b", "theirs"])?;
+    std::fs::write(root.join("conflict.txt"), "theirs line\n").context("write theirs")?;
+    git_in(root, &["add", "conflict.txt"])?;
+    git_in(root, &["commit", "-m", "theirs"])?;
+    git_in(root, &["checkout", "main"])?;
+    std::fs::write(root.join("conflict.txt"), "ours line\n").context("write ours")?;
+    git_in(root, &["add", "conflict.txt"])?;
+    git_in(root, &["commit", "-m", "ours"])?;
+    // Merge should conflict and leave MERGE_HEAD.
+    let merge = Command::new("git")
+        .args(["merge", "--no-ff", "--no-edit", "theirs"])
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "Dogfood")
+        .env("GIT_AUTHOR_EMAIL", "dogfood@example.com")
+        .env("GIT_COMMITTER_NAME", "Dogfood")
+        .env("GIT_COMMITTER_EMAIL", "dogfood@example.com")
+        .output()
+        .context("spawn git merge")?;
+    // Conflict exits non-zero — that is expected.
+    let merge_head = root.join(".git").join("MERGE_HEAD");
+    if !merge_head.is_file() {
+        let stderr = String::from_utf8_lossy(&merge.stderr);
+        bail!("expected MERGE_HEAD after conflict merge; stderr={stderr}");
+    }
+    // Sanity: product default upstream must resolve.
+    git_in(root, &["rev-parse", "origin/main"])?;
     Ok(())
 }
 
@@ -1453,6 +1949,492 @@ fn run_merge_review_workshop_steps(
         );
     }
     println!("[workshop] Preview + End complete");
+    Ok(())
+}
+
+// ── Queue (agent TOON step runner) ───────────────────────────────────────────
+
+/// One tracked step in a dogfood queue session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueueStep {
+    Open(Option<String>),
+    Wait(u64),
+    Action(String),
+    Keys(String),
+    Look(String),
+    Expect(String),
+    Hit(Vec<String>),
+    Lines(usize),
+    Inventory,
+    Theme,
+    Click {
+        node: String,
+        a11y_action: Option<String>,
+    },
+    StderrMerge,
+    /// Poll look until outline contains needle or timeout_ms elapses.
+    /// Wire form: `poll:NEEDLE:TIMEOUT_MS` or `poll:NEEDLE:TIMEOUT_MS:DETAIL`.
+    Poll {
+        needle: String,
+        timeout_ms: u64,
+        detail: String,
+    },
+}
+
+/// Parse a single queue step string into a [`QueueStep`].
+fn parse_queue_step(raw: &str) -> Result<QueueStep> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("empty queue step");
+    }
+    let (head, tail) = match raw.split_once(':') {
+        Some((h, t)) => (h.trim(), Some(t.trim())),
+        None => (raw, None),
+    };
+    let head_l = head.to_ascii_lowercase();
+    match head_l.as_str() {
+        "open" => Ok(QueueStep::Open(
+            tail.filter(|t| !t.is_empty()).map(|t| t.to_string()),
+        )),
+        "wait" => {
+            let ms = tail
+                .context("wait step needs ms, e.g. wait:4000")?
+                .parse::<u64>()
+                .context("wait ms must be u64")?;
+            Ok(QueueStep::Wait(ms))
+        }
+        "action" => {
+            let name = tail.context("action step needs name, e.g. action:agent::ToggleFocus")?;
+            if name.is_empty() {
+                bail!("action name empty");
+            }
+            Ok(QueueStep::Action(name.to_string()))
+        }
+        "keys" => {
+            let keys = tail.context("keys step needs stroke, e.g. keys:ctrl-p")?;
+            Ok(QueueStep::Keys(keys.to_string()))
+        }
+        "look" | "snapshot" => {
+            let detail = tail.unwrap_or("room");
+            if !matches!(detail, "compact" | "rich" | "room") {
+                bail!("look detail must be compact|rich|room, got {detail:?}");
+            }
+            Ok(QueueStep::Look(detail.to_string()))
+        }
+        "expect" => {
+            let s = tail.context("expect step needs substring")?;
+            if s.is_empty() {
+                bail!("expect substring empty");
+            }
+            Ok(QueueStep::Expect(s.to_string()))
+        }
+        "hit" => {
+            let s = tail.context("hit step needs | -separated needles")?;
+            let needles: Vec<String> = s
+                .split('|')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect();
+            if needles.is_empty() {
+                bail!("hit step has no needles");
+            }
+            Ok(QueueStep::Hit(needles))
+        }
+        "lines" => {
+            let n = tail
+                .context("lines step needs count, e.g. lines:40")?
+                .parse::<usize>()
+                .context("lines count must be usize")?;
+            Ok(QueueStep::Lines(n))
+        }
+        "inventory" => Ok(QueueStep::Inventory),
+        "theme" | "feel" => Ok(QueueStep::Theme),
+        "click" => {
+            let rest = tail.context("click step needs node id, e.g. click:42 or click:42:focus")?;
+            let mut parts = rest.splitn(2, ':');
+            let node = parts.next().unwrap_or("").trim().to_string();
+            if node.is_empty() {
+                bail!("click node empty");
+            }
+            let a11y_action = parts
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            Ok(QueueStep::Click { node, a11y_action })
+        }
+        "stderr" => {
+            let kind = tail.unwrap_or("merge");
+            if kind != "merge" {
+                bail!("only stderr:merge is supported (got {kind:?})");
+            }
+            Ok(QueueStep::StderrMerge)
+        }
+        "poll" => {
+            // poll:TIMEOUT_MS:NEEDLE  (needle may contain spaces/colons)
+            let rest = tail.context("poll needs poll:TIMEOUT_MS:NEEDLE")?;
+            let (ms_s, needle) = rest
+                .split_once(':')
+                .context("poll needs poll:TIMEOUT_MS:NEEDLE")?;
+            let timeout_ms = ms_s
+                .trim()
+                .parse::<u64>()
+                .context("poll timeout_ms must be u64")?;
+            let needle = needle.trim();
+            if needle.is_empty() {
+                bail!("poll needle empty");
+            }
+            Ok(QueueStep::Poll {
+                needle: needle.to_string(),
+                timeout_ms,
+                detail: "room".to_string(),
+            })
+        }
+        other => bail!("unknown queue step {other:?} (raw={raw:?})"),
+    }
+}
+
+fn load_queue_steps(args: &QueueArgs) -> Result<Vec<QueueStep>> {
+    let mut raws: Vec<String> = args.step.clone();
+    if let Some(path) = &args.script {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read queue script {}", path.display()))?;
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            raws.push(line.to_string());
+        }
+    }
+    if raws.is_empty() {
+        bail!("dogfood queue needs at least one --step or --script entry");
+    }
+    raws.iter().map(|s| parse_queue_step(s)).collect()
+}
+
+fn decode_outline_escapes(text: &str) -> String {
+    text.replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\\"", "\"")
+        .replace("\\\\", "\\")
+}
+
+fn last_look_outline(last_look_blob: &Option<String>) -> Result<String> {
+    let blob = last_look_blob
+        .as_deref()
+        .context("no prior look/snapshot in this queue (run look: before expect/hit/lines)")?;
+    let text = extract_snapshot_text(blob).context("prior look missing snapshot@text")?;
+    Ok(decode_outline_escapes(&text))
+}
+
+/// Run an agent-authored TOON step queue with per-step tracking.
+fn run_queue(args: QueueArgs) -> Result<()> {
+    let steps = load_queue_steps(&args)?;
+    let bin = args.bin.map(Ok).unwrap_or_else(default_bin)?;
+    let timeout = Duration::from_secs(args.timeout_secs);
+    let default_detail = args.snapshot_detail.as_str();
+    let default_open = match &args.fixture {
+        Some(p) => Some(p.canonicalize().unwrap_or_else(|_| p.clone())),
+        None => None,
+    };
+
+    println!(
+        "dogfood queue: bin={} steps={} soft_action={} detail={} timeout_secs={}",
+        bin.display(),
+        steps.len(),
+        args.soft_action,
+        default_detail,
+        args.timeout_secs,
+    );
+
+    let mut session = DogfoodSession::spawn(&bin, timeout)?;
+    let ready = session.wait_until(0, |lines| lines.iter().any(|l| is_ready_line(l)), timeout)?;
+    println!("[event:ready] ok");
+    for line in ready.iter().take(4) {
+        println!("  {line}");
+    }
+
+    let mut last_look: Option<String> = None;
+    let total = steps.len();
+    let mut failed: Vec<String> = Vec::new();
+
+    for (index, step) in steps.iter().enumerate() {
+        let n = index + 1;
+        let step_id = format!("q{n}");
+        let remaining = session.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("dogfood queue: session deadline exhausted before step {n}/{total}");
+        }
+
+        match step {
+            QueueStep::Open(path_opt) => {
+                let path = match path_opt {
+                    Some(p) => PathBuf::from(p),
+                    None => default_open
+                        .clone()
+                        .context("open step has no path; pass open:/path or --fixture")?,
+                };
+                let path = path.canonicalize().unwrap_or(path);
+                let path_str = path.display().to_string();
+                match session.request_ok(
+                    &step_id,
+                    &[("method", "open"), ("path", path_str.as_str())],
+                    Duration::from_secs(30).min(remaining),
+                ) {
+                    Ok(_) => println!("[queue {n}/{total}] open ok path={path_str}"),
+                    Err(error) => {
+                        println!("[queue {n}/{total}] open FAIL: {error:#}");
+                        session.pump();
+                        print_merge_review_stderr_tail(&session.stderr_buf);
+                        session.shutdown_best_effort();
+                        bail!("queue step {n} open failed: {error:#}");
+                    }
+                }
+            }
+            QueueStep::Wait(ms) => {
+                let ms_s = ms.to_string();
+                session.request_ok(
+                    &step_id,
+                    &[("method", "wait"), ("ms", ms_s.as_str())],
+                    Duration::from_millis(*ms + 15_000).min(remaining),
+                )?;
+                println!("[queue {n}/{total}] wait ok ms={ms}");
+            }
+            QueueStep::Action(name) => {
+                match session.request_ok(
+                    &step_id,
+                    &[("method", "action"), ("name", name.as_str())],
+                    Duration::from_secs(30).min(remaining),
+                ) {
+                    Ok(_) => println!("[queue {n}/{total}] action ok name={name}"),
+                    Err(error) => {
+                        if args.soft_action {
+                            println!("[queue {n}/{total}] action WARN name={name}: {error:#}");
+                            failed.push(format!("action {name}: {error:#}"));
+                        } else {
+                            session.pump();
+                            print_merge_review_stderr_tail(&session.stderr_buf);
+                            session.shutdown_best_effort();
+                            bail!("queue step {n} action {name:?} failed: {error:#}");
+                        }
+                    }
+                }
+            }
+            QueueStep::Keys(keys) => {
+                match session.request_ok(
+                    &step_id,
+                    &[("method", "keys"), ("keys", keys.as_str())],
+                    Duration::from_secs(20).min(remaining),
+                ) {
+                    Ok(_) => println!("[queue {n}/{total}] keys ok keys={keys}"),
+                    Err(error) => {
+                        if args.soft_action {
+                            println!("[queue {n}/{total}] keys WARN keys={keys}: {error:#}");
+                            failed.push(format!("keys {keys}: {error:#}"));
+                        } else {
+                            session.shutdown_best_effort();
+                            bail!("queue step {n} keys failed: {error:#}");
+                        }
+                    }
+                }
+            }
+            QueueStep::Look(detail) => {
+                let detail = if detail.is_empty() {
+                    default_detail
+                } else {
+                    detail.as_str()
+                };
+                let lines = session.request_ok(
+                    &step_id,
+                    &snapshot_method_fields(detail),
+                    Duration::from_secs(30).min(remaining),
+                )?;
+                let blob = lines.join("\n");
+                last_look = Some(blob.clone());
+                let empty = classify_snapshot(&blob);
+                let preview = extract_snapshot_preview(&blob, 240);
+                let line_count = extract_snapshot_text(&blob)
+                    .map(|t| decode_outline_escapes(&t).lines().count())
+                    .unwrap_or(0);
+                println!(
+                    "[queue {n}/{total}] look ok detail={detail} empty={empty} lines={line_count} preview={preview}"
+                );
+            }
+            QueueStep::Expect(needle) => {
+                let outline = last_look_outline(&last_look)?;
+                if outline.contains(needle) {
+                    println!("[queue {n}/{total}] expect ok {needle:?}");
+                } else {
+                    session.pump();
+                    print_merge_review_stderr_tail(&session.stderr_buf);
+                    session.shutdown_best_effort();
+                    bail!(
+                        "queue step {n} expect missing {needle:?}\n  preview={}",
+                        outline.lines().take(12).collect::<Vec<_>>().join(" | ")
+                    );
+                }
+            }
+            QueueStep::Hit(needles) => {
+                let outline = last_look_outline(&last_look)?;
+                let mut hits = 0usize;
+                println!("[queue {n}/{total}] hit needles={needles:?}");
+                for line in outline.lines() {
+                    if needles.iter().any(|n| line.contains(n)) {
+                        println!("  HIT: {}", &line[..line.len().min(180)]);
+                        hits += 1;
+                    }
+                }
+                println!("  hit count={hits}");
+            }
+            QueueStep::Lines(count) => {
+                let outline = last_look_outline(&last_look)?;
+                println!("[queue {n}/{total}] lines first {count}");
+                for (i, line) in outline.lines().take(*count).enumerate() {
+                    println!("{:02}|{}", i + 1, line);
+                }
+            }
+            QueueStep::Inventory => {
+                let lines = session.request_ok(
+                    &step_id,
+                    &[("method", "inventory")],
+                    Duration::from_secs(15).min(remaining),
+                )?;
+                let blob = lines.join("\n");
+                println!("[queue {n}/{total}] inventory ok");
+                if let Some(caps) = Regex::new(r#""inventory@text":\s*"(.*)""#)
+                    .ok()
+                    .and_then(|re| re.captures(&blob))
+                {
+                    let text =
+                        decode_outline_escapes(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
+                    for line in text.lines().take(12) {
+                        println!("  {line}");
+                    }
+                }
+            }
+            QueueStep::Theme => {
+                let lines = session.request_ok(
+                    &step_id,
+                    &[("method", "theme")],
+                    Duration::from_secs(15).min(remaining),
+                )?;
+                let blob = lines.join("\n");
+                println!("[queue {n}/{total}] theme ok");
+                if let Some(caps) = Regex::new(r#""theme@text":\s*"(.*)""#)
+                    .ok()
+                    .and_then(|re| re.captures(&blob))
+                {
+                    let text =
+                        decode_outline_escapes(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
+                    for line in text.lines().take(8) {
+                        println!("  {line}");
+                    }
+                }
+            }
+            QueueStep::Click { node, a11y_action } => {
+                let mut fields: Vec<(&str, &str)> =
+                    vec![("method", "click"), ("node", node.as_str())];
+                if let Some(a) = a11y_action {
+                    fields.push(("a11y_action", a.as_str()));
+                }
+                match session.request_ok(&step_id, &fields, Duration::from_secs(20).min(remaining))
+                {
+                    Ok(_) => println!(
+                        "[queue {n}/{total}] click ok node={node} a11y={:?}",
+                        a11y_action
+                    ),
+                    Err(error) => {
+                        if args.soft_action {
+                            println!("[queue {n}/{total}] click WARN node={node}: {error:#}");
+                            failed.push(format!("click {node}: {error:#}"));
+                        } else {
+                            session.shutdown_best_effort();
+                            bail!("queue step {n} click failed: {error:#}");
+                        }
+                    }
+                }
+            }
+            QueueStep::StderrMerge => {
+                session.pump();
+                println!("[queue {n}/{total}] stderr:merge");
+                print_merge_review_stderr_tail(&session.stderr_buf);
+            }
+            QueueStep::Poll {
+                needle,
+                timeout_ms,
+                detail,
+            } => {
+                let detail = if detail.is_empty() {
+                    default_detail
+                } else {
+                    detail.as_str()
+                };
+                let poll_deadline = Instant::now() + Duration::from_millis(*timeout_ms);
+                let mut attempts = 0u32;
+                let mut last_preview: String;
+                loop {
+                    attempts += 1;
+                    let remaining = session.deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        bail!("queue step {n} poll: session deadline exhausted");
+                    }
+                    let poll_id = format!("{step_id}p{attempts}");
+                    let lines = session.request_ok(
+                        &poll_id,
+                        &snapshot_method_fields(detail),
+                        Duration::from_secs(20).min(remaining),
+                    )?;
+                    let blob = lines.join("\n");
+                    last_look = Some(blob.clone());
+                    last_preview = extract_snapshot_preview(&blob, 200);
+                    let outline = extract_snapshot_text(&blob)
+                        .map(|t| decode_outline_escapes(&t))
+                        .unwrap_or_default();
+                    if outline.contains(needle) {
+                        println!(
+                            "[queue {n}/{total}] poll ok needle={needle:?} attempts={attempts} preview={last_preview}"
+                        );
+                        break;
+                    }
+                    if Instant::now() >= poll_deadline {
+                        session.pump();
+                        print_merge_review_stderr_tail(&session.stderr_buf);
+                        session.shutdown_best_effort();
+                        bail!(
+                            "queue step {n} poll timed out after {timeout_ms}ms needle={needle:?} attempts={attempts}\n  preview={last_preview}"
+                        );
+                    }
+                    // Small settle between looks (runner-side; no server wait-until).
+                    let pause = Duration::from_millis(400)
+                        .min(poll_deadline.saturating_duration_since(Instant::now()));
+                    if !pause.is_zero() {
+                        let pause_ms = pause.as_millis().to_string();
+                        let wait_id = format!("{step_id}w{attempts}");
+                        let _ = session.request_ok(
+                            &wait_id,
+                            &[("method", "wait"), ("ms", pause_ms.as_str())],
+                            pause + Duration::from_secs(5),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    session.pump();
+    session.shutdown_best_effort();
+    println!("[method:shutdown] requested");
+    if failed.is_empty() {
+        println!("queue finished ok ({total} steps)");
+    } else {
+        println!(
+            "queue finished with {} soft failure(s): {:?}",
+            failed.len(),
+            failed
+        );
+    }
     Ok(())
 }
 
@@ -1581,11 +2563,213 @@ mod tests {
         let defaults =
             MergeReviewArgs::try_parse_from(["merge-review"]).expect("merge-review defaults");
         assert!(!defaults.start_only);
+        assert!(
+            !defaults.with_advance,
+            "default adventure must not require Advance"
+        );
         assert_eq!(defaults.step_wait_ms, 2500);
         assert!(defaults.expect.is_empty());
         let start_only = MergeReviewArgs::try_parse_from(["merge-review", "--start-only"])
             .expect("--start-only");
         assert!(start_only.start_only);
+        let with_advance = MergeReviewArgs::try_parse_from(["merge-review", "--with-advance"])
+            .expect("--with-advance");
+        assert!(with_advance.with_advance);
+        let with_conflict = MergeReviewArgs::try_parse_from(["merge-review", "--with-conflict"])
+            .expect("--with-conflict");
+        assert!(with_conflict.with_conflict);
+        assert!(
+            !defaults.with_conflict,
+            "default adventure must not require conflict fixture"
+        );
+    }
+
+    #[test]
+    fn build_merge_review_conflict_git_tree_leaves_merge_head() {
+        let keep = tempfile::Builder::new()
+            .prefix("zed-dogfood-conflict-unit-")
+            .tempdir()
+            .expect("tempdir");
+        build_merge_review_conflict_git_tree(keep.path()).expect("build conflict fixture");
+        assert!(
+            keep.path().join(".git").join("MERGE_HEAD").is_file(),
+            "fixture must leave MERGE_HEAD"
+        );
+        assert!(
+            keep.path().join("conflict.txt").is_file(),
+            "fixture must include conflict.txt"
+        );
+        assert!(
+            keep.path().join("SURMOUNT.md").is_file(),
+            "fixture should carry Surmount marker for open"
+        );
+    }
+
+    #[test]
+    fn decision_chrome_hits_require_conflict_specific_labels() {
+        for label in MERGE_REVIEW_DECISION_CHROME_CONFLICT {
+            assert!(!label.is_empty());
+            assert!(
+                label.chars().any(|c| c.is_ascii_alphabetic()),
+                "{label}"
+            );
+        }
+        assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Use Both"));
+        assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Resolve with Agent"));
+        assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Summarize this conflict"));
+        // Always-on MergeInProgress rail chrome must not be a sole decision proof.
+        assert!(!MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Review Diff"));
+
+        let only_review_diff = r#"
+  [Toolbar] "Merge review"
+    [Button] "Review Diff" @0,0 100x32
+"#;
+        assert!(
+            decision_chrome_hits(only_review_diff).is_empty(),
+            "Review Diff alone must not count as decision chrome"
+        );
+
+        let conflict_bar = r#"
+  [Label] "File 1/1 · conflict.txt · Summarize this conflict"
+  [Button] "Use Both" @0,0 59x23
+  [Button] "Resolve with Agent" @0,0 134x23
+  [Button] "Review Diff" @0,0 100x32
+"#;
+        let hits = decision_chrome_hits(conflict_bar);
+        assert!(hits.contains(&"Use Both"), "{hits:?}");
+        assert!(hits.contains(&"Resolve with Agent"), "{hits:?}");
+        assert!(hits.contains(&"Summarize this conflict"), "{hits:?}");
+        assert!(!hits.iter().any(|h| *h == "Review Diff"), "{hits:?}");
+
+        let miss = r#"  [Button] "Preview merge" @0,0 100x32 "#;
+        assert!(decision_chrome_hits(miss).is_empty());
+    }
+
+    #[test]
+    fn decision_chrome_dynamic_use_hits_optional_branch_names() {
+        let outline = r#"
+  [Button] "Use HEAD" @0,0 65x23 [click]
+  [Button] "Use theirs" @0,0 64x23 [click]
+  [Button] "Use Both" @0,0 59x23 [click]
+  [Button] "User menu" @0,0 22x22 [click]
+"#;
+        let dynamic = decision_chrome_dynamic_use_hits(outline);
+        assert!(dynamic.iter().any(|h| h == "Use HEAD"), "{dynamic:?}");
+        assert!(dynamic.iter().any(|h| h == "Use theirs"), "{dynamic:?}");
+        assert!(
+            !dynamic.iter().any(|h| h == "Use Both"),
+            "Use Both is stable, not dynamic: {dynamic:?}"
+        );
+        assert!(
+            !dynamic.iter().any(|h| h.contains("User")),
+            "User menu must not match: {dynamic:?}"
+        );
+    }
+
+    #[test]
+    fn advance_has_enough_path_fingerprints_precheck() {
+        assert!(!advance_has_enough_path_fingerprints(&[]));
+        assert!(!advance_has_enough_path_fingerprints(&[
+            "only.rs".to_string()
+        ]));
+        assert!(advance_has_enough_path_fingerprints(&[
+            "a.rs".to_string(),
+            "b.rs".to_string()
+        ]));
+        assert!(advance_has_enough_path_fingerprints(&[
+            "a.rs".to_string(),
+            "b.rs".to_string(),
+            "c.rs".to_string()
+        ]));
+    }
+
+    #[test]
+    fn room_focus_window_classifier() {
+        assert_eq!(
+            room_focus_line("# window: \"zed\"\n# focus: [Window] \"zed\" #NodeId(0)\n"),
+            Some("# focus: [Window] \"zed\" #NodeId(0)")
+        );
+        assert!(room_focus_is_solely_window(
+            "# focus: [Window] \"zed\" #NodeId(0)"
+        ));
+        assert!(!room_focus_is_solely_window(
+            "# focus: [Group] \"Branch Diff\" #NodeId(1)"
+        ));
+        assert!(!room_focus_is_solely_window(
+            "# focus: [Button] \"Preview merge\" #NodeId(2)"
+        ));
+        assert!(room_focus_line("no focus header\n").is_none());
+    }
+
+    #[test]
+    fn first_expand_negative_y_line_detects_offscreen_expand() {
+        let good = r#"  [Button] "Expand" @10,20 16x16 [click] #NodeId(1)"#;
+        assert!(first_expand_negative_y_line(good).is_none());
+        let bad = r#"  [Button] "Expand" @1142,-125 16x16 [click,focus] #NodeId(9)"#;
+        let hit = first_expand_negative_y_line(bad).expect("negative Y Expand");
+        assert!(hit.contains("Expand"));
+        assert!(hit.contains("-125"));
+        let excerpt_bad = r#"  [Button] "Expand Excerpt" @0,-40 20x20 #NodeId(2)"#;
+        assert!(first_expand_negative_y_line(excerpt_bad).is_some());
+    }
+
+    #[test]
+    fn path_fingerprints_and_advance_delta() {
+        let pre = r#"
+  [Button] "crates/a/foo.rs" @0,10 100x20
+  [Button] "crates/b/bar.rs" @0,40 100x20
+  [Button] "Next file →" @0,80 80x24
+"#;
+        let pre_paths = path_fingerprints_from_outline(pre);
+        assert!(pre_paths.contains(&"foo.rs".to_string()), "{pre_paths:?}");
+        assert!(pre_paths.contains(&"bar.rs".to_string()), "{pre_paths:?}");
+        assert!(
+            !pre_paths.iter().any(|p| p.contains("Next file")),
+            "{pre_paths:?}"
+        );
+
+        let post_same = pre;
+        assert!(!advance_shows_path_delta(&pre_paths, post_same, &[]));
+
+        let post_delta = r#"
+  [Button] "crates/b/bar.rs" @0,10 100x20
+  [Button] "crates/c/baz.rs" @0,40 100x20
+"#;
+        assert!(advance_shows_path_delta(&pre_paths, post_delta, &[]));
+
+        let stderr =
+            vec!["INFO surmount merge review: advanced to next file crates/b/bar.rs".into()];
+        // bar.rs may already be in pre_paths; still ok if log path differs from first fingerprint.
+        let pre_first_only = vec!["foo.rs".to_string()];
+        assert!(advance_shows_path_delta(
+            &pre_first_only,
+            post_same,
+            &stderr
+        ));
+
+        // Edges: empty pre/post without stderr → no delta.
+        assert!(!advance_shows_path_delta(&[], "", &[]));
+        assert!(!advance_shows_path_delta(
+            &["foo.rs".to_string()],
+            "",
+            &[]
+        ));
+        // Identical multi-path set, same first order, no stderr → no delta.
+        let identical_multi = r#"
+  [Button] "crates/a/foo.rs" @0,10 100x20
+  [Button] "crates/b/bar.rs" @0,40 100x20
+"#;
+        assert!(!advance_shows_path_delta(
+            &pre_paths,
+            identical_multi,
+            &[]
+        ));
+        // Reorder-only: same set, first path changed → delta.
+        let reordered = r#"
+  [Button] "crates/b/bar.rs" @0,10 100x20
+  [Button] "crates/a/foo.rs" @0,40 100x20
+"#;
+        assert!(advance_shows_path_delta(&pre_paths, reordered, &[]));
     }
 
     #[test]
@@ -1909,5 +3093,66 @@ ok: true
         assert!(!is_retryable_poll_error(&closed));
         let hard = anyhow::anyhow!("request id=snap1 returned ok: false\nerror: boom");
         assert!(!is_retryable_poll_error(&hard));
+    }
+
+    #[test]
+    fn parse_queue_step_core_verbs() {
+        assert_eq!(parse_queue_step("open").unwrap(), QueueStep::Open(None));
+        assert_eq!(
+            parse_queue_step("open:/tmp/x").unwrap(),
+            QueueStep::Open(Some("/tmp/x".into()))
+        );
+        assert_eq!(
+            parse_queue_step("wait:4000").unwrap(),
+            QueueStep::Wait(4000)
+        );
+        assert_eq!(
+            parse_queue_step("action:surmount::StartMergeReview").unwrap(),
+            QueueStep::Action("surmount::StartMergeReview".into())
+        );
+        assert_eq!(
+            parse_queue_step("look:room").unwrap(),
+            QueueStep::Look("room".into())
+        );
+        assert_eq!(
+            parse_queue_step("look").unwrap(),
+            QueueStep::Look("room".into())
+        );
+        assert_eq!(
+            parse_queue_step("expect:Merge review").unwrap(),
+            QueueStep::Expect("Merge review".into())
+        );
+        assert_eq!(
+            parse_queue_step("hit:Prepare|Review Diff").unwrap(),
+            QueueStep::Hit(vec!["Prepare".into(), "Review Diff".into()])
+        );
+        assert_eq!(parse_queue_step("lines:40").unwrap(), QueueStep::Lines(40));
+        assert_eq!(parse_queue_step("inventory").unwrap(), QueueStep::Inventory);
+        assert_eq!(parse_queue_step("theme").unwrap(), QueueStep::Theme);
+        assert_eq!(
+            parse_queue_step("click:42:focus").unwrap(),
+            QueueStep::Click {
+                node: "42".into(),
+                a11y_action: Some("focus".into()),
+            }
+        );
+        assert_eq!(
+            parse_queue_step("stderr:merge").unwrap(),
+            QueueStep::StderrMerge
+        );
+        assert_eq!(
+            parse_queue_step("poll:30000:Merge review").unwrap(),
+            QueueStep::Poll {
+                needle: "Merge review".into(),
+                timeout_ms: 30000,
+                detail: "room".into(),
+            }
+        );
+        assert!(parse_queue_step("nope").is_err());
+    }
+
+    #[test]
+    fn decode_outline_escapes_newlines() {
+        assert_eq!(decode_outline_escapes(r"a\nb"), "a\nb");
     }
 }

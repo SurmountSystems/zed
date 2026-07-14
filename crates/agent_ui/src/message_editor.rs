@@ -24,7 +24,7 @@ use editor::{
 use futures::{FutureExt as _, future::join_all};
 use gpui::{
     AppContext, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt, TextStyle,
+    Focusable, ImageFormat, KeyContext, Role, SharedString, Subscription, Task, TaskExt, TextStyle,
     WeakEntity,
 };
 use language::{Buffer, language_settings::InlayHintKind};
@@ -2028,8 +2028,13 @@ impl Focusable for MessageEditor {
 
 impl Render for MessageEditor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let editor_focus = self.editor.focus_handle(cx);
         div()
+            .id("agent-message-editor")
             .key_context("MessageEditor")
+            .role(Role::TextInput)
+            .aria_label("Agent message")
+            .track_focus(&editor_focus)
             .on_action(cx.listener(Self::chat))
             .on_action(cx.listener(Self::send_immediately))
             .on_action(cx.listener(Self::chat_with_follow))

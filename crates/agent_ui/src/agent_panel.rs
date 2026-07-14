@@ -2220,6 +2220,23 @@ impl AgentPanel {
         if !panel.read(cx).enabled(cx) {
             return;
         }
+        // Merge-review inhabit: force open+focus. `toggle_panel_focus` can close an already-open
+        // Right dock (or transfer focus away), which removes TextInput/composer landmarks from the
+        // room outline after agent::ToggleFocus during an engaged session.
+        if crate::merge_review::merge_review_workflow_engaged(cx) {
+            workspace.open_panel::<Self>(window, cx);
+            if let Some(panel) = workspace.focus_panel::<Self>(window, cx) {
+                panel.update(cx, |panel, cx| {
+                    panel.prepare_for_merge_review(window, cx);
+                    panel.expand_message_editor(window, cx);
+                    panel.focus_handle(cx).focus(window, cx);
+                    log::info!(
+                        "surmount merge review: ToggleFocus opened agent panel (message editor focus)"
+                    );
+                });
+            }
+            return;
+        }
         if panel.read(cx).grok_immersive_must_stay_maximized(cx) {
             workspace.open_panel::<Self>(window, cx);
             workspace.focus_panel::<Self>(window, cx);

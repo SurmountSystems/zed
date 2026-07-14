@@ -631,6 +631,14 @@ impl Default for OutlineOptions {
     }
 }
 
+/// True when the node's bounds lie entirely above the window (y1 <= 0).
+///
+/// Used to omit off-viewport Expand/Disclosure controls from room/rich outlines
+/// so dogfood looks do not report chrome at negative Y.
+fn node_bounds_fully_above_viewport(node: &accesskit::Node) -> bool {
+    node.bounds().is_some_and(|bounds| bounds.y1 <= 0.0)
+}
+
 /// Returns whether an AccessKit node should appear in agent-stdio UI snapshots.
 pub fn is_interactive_a11y_node(node: &accesskit::Node) -> bool {
     use accesskit::Action;
@@ -704,7 +712,11 @@ pub fn is_landmark_a11y_node(node: &accesskit::Node) -> bool {
     }
 }
 
-const OUTLINE_STRING_MAX: usize = 80;
+/// Max characters for AccessKit label/value/description fields in a11y outlines.
+///
+/// Callers that pre-truncate strings for outline consumption (e.g. path
+/// `aria_label`s) should use this same cap so room look does not re-truncate.
+pub const OUTLINE_STRING_MAX: usize = 80;
 
 fn truncate_outline_str(s: &str) -> String {
     if s.chars().count() <= OUTLINE_STRING_MAX {
@@ -965,7 +977,7 @@ pub(crate) fn format_a11y_outline_all_tiers(
             return;
         };
 
-        if is_interactive_a11y_node(node) {
+        if is_interactive_a11y_node(node) && !node_bounds_fully_above_viewport(node) {
             *interactive_count += 1;
             let rich_focused =
                 node_is_focused(id, focus, interactive_focus_mark, focus_on_interactive_body);
@@ -994,7 +1006,7 @@ pub(crate) fn format_a11y_outline_all_tiers(
                     OutlineDetail::Rich,
                 ));
             }
-        } else if is_landmark_a11y_node(node) {
+        } else if is_landmark_a11y_node(node) && !node_bounds_fully_above_viewport(node) {
             *landmark_count += 1;
             // Landmarks: exact focus only (no ancestor bubble onto landmarks).
             let focused = focus == Some(id);
@@ -1086,7 +1098,7 @@ pub fn format_a11y_outline(nodes: &[(NodeId, accesskit::Node)], options: Outline
             return;
         };
 
-        if is_interactive_a11y_node(node) {
+        if is_interactive_a11y_node(node) && !node_bounds_fully_above_viewport(node) {
             *interactive_count += 1;
             let focused = node_is_focused(id, options.focus, interactive_focus_mark, focus_on_body);
             body_lines.push(format_node_outline_line(
@@ -1096,7 +1108,10 @@ pub fn format_a11y_outline(nodes: &[(NodeId, accesskit::Node)], options: Outline
                 focused,
                 options.detail,
             ));
-        } else if include_landmarks && is_landmark_a11y_node(node) {
+        } else if include_landmarks
+            && is_landmark_a11y_node(node)
+            && !node_bounds_fully_above_viewport(node)
+        {
             *landmark_count += 1;
             // Landmarks: exact focus only.
             let focused = options.focus == Some(id);
@@ -1383,6 +1398,61 @@ mod tests {
         assert!(
             !outline.contains("GenericContainer"),
             "chrome not printed: {outline}"
+        );
+    }
+
+    #[test]
+    fn outline_omits_interactive_nodes_fully_above_viewport() {
+        use super::{OutlineDetail, OutlineOptions, format_a11y_outline};
+
+        let on_screen = NodeId(1);
+        let off_screen = NodeId(2);
+        let mut on_screen_node = accesskit::Node::new(Role::Button);
+        on_screen_node.set_label("Preview merge".to_string());
+        on_screen_node.add_action(accesskit::Action::Click);
+        on_screen_node.set_bounds(accesskit::Rect {
+            x0: 10.0,
+            y0: 20.0,
+            x1: 100.0,
+            y1: 48.0,
+        });
+        let mut off_screen_node = accesskit::Node::new(Role::Button);
+        off_screen_node.set_label("Expand".to_string());
+        off_screen_node.add_action(accesskit::Action::Click);
+        off_screen_node.set_bounds(accesskit::Rect {
+            x0: 1142.0,
+            y0: -125.0,
+            x1: 1160.0,
+            y1: -105.0,
+        });
+
+        let mut root = accesskit::Node::new(Role::Window);
+        root.set_label("Zed".to_string());
+        root.set_children(vec![on_screen, off_screen]);
+
+        let nodes = vec![
+            (super::ROOT_NODE_ID, root),
+            (on_screen, on_screen_node),
+            (off_screen, off_screen_node),
+        ];
+        let outline = format_a11y_outline(
+            &nodes,
+            OutlineOptions {
+                focus: Some(on_screen),
+                detail: OutlineDetail::Room,
+            },
+        );
+        assert!(
+            outline.contains("Preview merge"),
+            "on-screen control must remain: {outline}"
+        );
+        assert!(
+            !outline.contains("Expand"),
+            "fully above-viewport Expand must be omitted: {outline}"
+        );
+        assert!(
+            !outline.contains("@1142,-125"),
+            "negative-Y Expand bounds must not appear: {outline}"
         );
     }
 

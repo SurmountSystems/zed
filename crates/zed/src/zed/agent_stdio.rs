@@ -567,8 +567,11 @@ fn capture_inventory(cx: &mut App) -> Result<String, String> {
     let mut lines = Vec::new();
     let window_count = cx.windows().len();
     lines.push(format!("windows: {window_count}"));
+    // Headless often has no cx.active_window() while windows still exist; report honestly.
     if cx.active_window().is_some() {
         lines.push("active_window: yes".into());
+    } else if window_count > 0 {
+        lines.push("active_window: yes (headless-fallback)".into());
     } else {
         lines.push("active_window: (none)".into());
     }

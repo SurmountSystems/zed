@@ -1,0 +1,38 @@
+# Merge-review UX probe — AND expect gates (hit: is diagnostic OR only)
+# Settle: look:room before Start so force-draw paints chrome (Start no-ops without paint).
+open
+wait:4000
+look:room
+lines:15
+action:surmount::StartMergeReview
+wait:8000
+look:room
+expect:Merge review
+expect:Branch Diff
+expect:Preview merge
+expect:Next file
+# diagnostic only (OR needles — never a gate):
+hit:Prepare|focus:|Open File|Base:|Agent
+lines:45
+action:surmount::MergeReviewNextFile
+wait:3000
+look:room
+expect:Next file
+expect:Merge review
+hit:Prepare|Open File|Base:|focus:
+lines:45
+action:agent::ToggleFocus
+wait:2000
+look:room
+expect:TextInput
+hit:Agent|Thread|focus:|Merge review|Prepare
+inventory
+action:surmount::PreviewMergeReviewMerge
+wait:2500
+look:room
+expect:Preview merge
+expect:Dialog
+hit:Modal|focus:|Button
+lines:50
+stderr:merge
+action:surmount::EndMergeReview

@@ -63,7 +63,7 @@ pub(crate) mod a11y;
 mod prompts;
 
 pub use a11y::{
-    A11ySubtreeBuilder, OutlineDetail, OutlineOptions, format_a11y_outline,
+    A11ySubtreeBuilder, OUTLINE_STRING_MAX, OutlineDetail, OutlineOptions, format_a11y_outline,
     interactive_a11y_outline,
 };
 

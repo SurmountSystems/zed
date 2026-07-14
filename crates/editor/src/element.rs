@@ -1543,27 +1543,33 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        for (ix, crease_toggle) in crease_toggles.iter_mut().enumerate() {
-            if let Some(crease_toggle) = crease_toggle {
-                debug_assert!(gutter_settings.folds);
-                let available_space = size(
-                    AvailableSpace::MinContent,
-                    AvailableSpace::Definite(line_height * 0.55),
-                );
-                let crease_toggle_size = crease_toggle.layout_as_root(available_space, window, cx);
+        for (ix, crease_slot) in crease_toggles.iter_mut().enumerate() {
+            let Some(mut toggle) = crease_slot.take() else {
+                continue;
+            };
+            debug_assert!(gutter_settings.folds);
+            let available_space = size(
+                AvailableSpace::MinContent,
+                AvailableSpace::Definite(line_height * 0.55),
+            );
+            let crease_toggle_size = toggle.layout_as_root(available_space, window, cx);
 
-                let display_row = DisplayRow(start_row.0 + ix as u32);
-                let position = point(
-                    gutter_dimensions.width - gutter_dimensions.right_padding,
-                    line_height * (display_row.as_f64() - scroll_position.y) as f32,
-                );
-                let centering_offset = point(
-                    (gutter_dimensions.fold_area_width() - crease_toggle_size.width) / 2.,
-                    (line_height - crease_toggle_size.height) / 2.,
-                );
-                let origin = gutter_hitbox.origin + position + centering_offset;
-                crease_toggle.prepaint_as_root(origin, available_space, window, cx);
+            let display_row = DisplayRow(start_row.0 + ix as u32);
+            let position = point(
+                gutter_dimensions.width - gutter_dimensions.right_padding,
+                line_height * (display_row.as_f64() - scroll_position.y) as f32,
+            );
+            let centering_offset = point(
+                (gutter_dimensions.fold_area_width() - crease_toggle_size.width) / 2.,
+                (line_height - crease_toggle_size.height) / 2.,
+            );
+            let origin = gutter_hitbox.origin + position + centering_offset;
+            // Off-viewport Disclosure "Expand" must not enter the a11y tree (negative Y in room look).
+            if origin.y < px(0.) {
+                continue;
             }
+            toggle.prepaint_as_root(origin, available_space, window, cx);
+            *crease_slot = Some(toggle);
         }
     }
 
@@ -1573,10 +1579,18 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        for (expand_toggle, origin) in expand_toggles.iter_mut().flatten() {
+        for entry in expand_toggles.iter_mut() {
+            let Some((mut expand_toggle, origin)) = entry.take() else {
+                continue;
+            };
+            // Omit excerpt Expand controls laid out above the viewport from a11y.
+            if origin.y < px(0.) {
+                continue;
+            }
             let available_space = size(AvailableSpace::MinContent, AvailableSpace::MinContent);
             expand_toggle.layout_as_root(available_space, window, cx);
-            expand_toggle.prepaint_as_root(*origin, available_space, window, cx);
+            expand_toggle.prepaint_as_root(origin, available_space, window, cx);
+            *entry = Some((expand_toggle, origin));
         }
     }
 
@@ -2675,10 +2689,23 @@ impl EditorElement {
                     available_width + em_width - px(5.)
                 };
 
+                let position = point(
+                    git_gutter_width + px(1.),
+                    line_height
+                        * (DisplayRow(start_row.0 + ix as u32).as_f64() - scroll_position.y) as f32
+                        + px(1.),
+                );
+                let origin = gutter_hitbox.origin + position;
+                // Skip off-viewport expand toggles so room outline never shows Expand @x,y with y<0.
+                if origin.y < px(0.) {
+                    return None;
+                }
+
                 let toggle = IconButton::new(("expand", ix), icon_name)
                     .icon_color(Color::Custom(cx.theme().colors().editor_line_number))
                     .icon_size(IconSize::Custom(rems(editor_font_size / window.rem_size())))
                     .width(width)
+                    .aria_label("Expand Excerpt")
                     .on_click(move |_, window, cx| {
                         editor.update(cx, |editor, cx| {
                             editor.expand_excerpt(start_anchor, direction, window, cx);
@@ -2689,14 +2716,6 @@ impl EditorElement {
                         &crate::actions::ExpandExcerpts::default(),
                     ))
                     .into_any_element();
-
-                let position = point(
-                    git_gutter_width + px(1.),
-                    line_height
-                        * (DisplayRow(start_row.0 + ix as u32).as_f64() - scroll_position.y) as f32
-                        + px(1.),
-                );
-                let origin = gutter_hitbox.origin + position;
 
                 Some((toggle, origin))
             })

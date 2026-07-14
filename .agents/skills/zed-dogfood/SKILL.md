@@ -142,9 +142,11 @@ Sit in Zed yourself via dogfood/TOON — same product loops the maintainer runs 
 | Prove the binary lives | `preflight` → ready + shutdown | Room exists |
 | Prove the UI tree is real | `golden` / `smoke` with file fixture + non-empty snapshot | Touch the chrome |
 | Surmount agent UX | `open` **workspace root** (or file) → `agent::ToggleFocus` / `agent::Toggle` → snapshot → optional `agent::NewThread` / `agent::ToggleSearch` | Same agent-panel workflows as the human |
-| Merge-review workshop | `cargo xtask dogfood merge-review` (Surmount root → Start → expects → Preview → End) | Real project + Branch Diff chrome; `--start-only` skips workshop |
+| Merge-review workshop | `cargo xtask dogfood merge-review` (Surmount root → Start → expects → Preview → End) | **Proves chrome only** (labels, rail, Dialog path). In-Zed review behavior: [surmount-merge-review](../surmount-merge-review/SKILL.md). Optional `--with-advance` (path/cursor delta after NextFile — not mere “Next file” label). `--start-only` skips workshop |
+| Merge-review UX probe | `queue --script tooling/xtask/dogfood_queues/merge_review_ux.queue` (+ `--fixture` workspace root) | AND `expect:` gates (Next file, TextInput, Dialog); `hit:` is diagnostic OR only |
 | Regression after merge/deps | preflight (+ golden when Linux) after rebuild | Don't break the adventure engine |
-| Creative / exploratory dogfood | Manual TOON session: look around, open real project files, drive palette (`file_finder::Toggle`), docks, keys | Experience, not only CI |
+| Creative / exploratory dogfood | `cargo xtask dogfood queue --step …` (tracked TOON steps) | Experience without ad-hoc shell scripts |
+| Ad-hoc multi-step inhabit | `queue` with `look` / `hit` / `expect` / `action` / `stderr:merge` | Token-efficient agent UX probes |
 
 **Agent owns the inhabit loop:**
 
@@ -244,6 +246,56 @@ cargo xtask dogfood smoke --action agent::ToggleFocus --require-action
 Sequence: ready → open → optional wait → **poll snapshots** until non-empty (+ expects) → optional action/keys → if action/keys, poll again → shutdown.
 
 Poll errors: step timeouts soft-retry while budget remains; **zed exit**, **stdout close**, and snapshot **`ok: false` hard-fail immediately**.
+
+## Queue (agent step runner)
+
+Tracked multi-step TOON without shell scripts. Prefer this over one-off `mkfifo` / Python drivers.
+
+**Gate semantics:** each `expect:SUBSTR` is an **AND** assert on the last look (hard-fail if missing). `hit:A|B` is **diagnostic only** (OR needles printed) — never the sole product gate. Prefer multiple `expect:` lines over a single OR `hit:`.
+
+**Merge-review settle:** force-draw needs a room look (or wait) before Start; Start can no-op if chrome never painted. Tracked probe: `tooling/xtask/dogfood_queues/merge_review_ux.queue` (look-before-Start, AND expects for Merge review / Branch Diff / Preview / Next file / TextInput / Dialog).
+
+```bash
+ZED_BIN=target/release/zed cargo xtask dogfood queue \
+  --fixture /path/to/workspace \
+  --timeout-secs 180 \
+  --script tooling/xtask/dogfood_queues/merge_review_ux.queue
+# Or step-wise:
+ZED_BIN=target/release/zed cargo xtask dogfood queue \
+  --fixture /path/to/workspace \
+  --timeout-secs 180 \
+  --step open \
+  --step wait:4000 \
+  --step look:room \
+  --step 'action:surmount::StartMergeReview' \
+  --step wait:8000 \
+  --step look:room \
+  --step 'expect:Merge review' \
+  --step 'expect:Next file' \
+  --step 'hit:Prepare|Open File|Base:|focus:' \
+  --step lines:40 \
+  --step inventory \
+  --step stderr:merge \
+  --step 'action:surmount::EndMergeReview'
+```
+
+| Step | Role |
+|------|------|
+| `open` / `open:PATH` | `method:open` (`--fixture` if bare) |
+| `wait:MS` | settle |
+| `action:crate::Name` | GPUI action (hard-fail unless `--soft-action`) |
+| `keys:…` / `click:NODE` / `click:NODE:focus` | input |
+| `look` / `look:room\|rich\|compact` | snapshot; retained for later steps |
+| `expect:SUBSTR` | **AND gate** — last look outline must contain |
+| `hit:A\|B` | print matching outline lines only (OR diagnostic — not a gate) |
+| `lines:N` | first N outline lines |
+| `inventory` / `theme` | session bag / ambience |
+| `stderr:merge` | filtered product stderr |
+| `poll:TIMEOUT_MS:NEEDLE` | look until outline contains needle (or fail) |
+
+Also `--script path` (one step per line, `#` comments). Each step logs `[queue i/n] …` with ok/FAIL.
+
+**`merge-review --with-advance`:** after Start settle, dispatches `MergeReviewNextFile` and requires a **path/cursor delta** (outline path fingerprints or stderr “advanced to next file …”), not static “Next file” chrome. Default adventure stays Start→Preview→End (no Dialog/Advance required).
 
 ## I/O model
 
@@ -509,6 +561,7 @@ Do not fail CI on ToggleSearch alone unless the harness can assert agent-thread 
 | `ERROR … recent_workspaces_query … database table is locked` | Concurrent SQLite under agent-stdio (`thread_metadata_store` remote-connection migration → `WorkspaceDb::recent_project_workspaces_ungrouped`). Non-fatal; migration only marks complete after success (`detach_and_log_err`). Prefer leave production alone — do not soft-fail empty + mark-complete. See SURMOUNT.md § Agent stdio. |
 | `ERROR [agent] Failed to authenticate provider: ChatGPT…` | Cloud provider not signed in |
 | `ERROR … Is a directory (os error 21)` | Non-fatal when opening a directory worktree; merge-review intentionally opens the repo root |
+| fish/neofetch `ARG_MAX` / “Failed to load environment” | Local shell noise when fish runs heavy neofetch hooks; not a dogfood gate failure |
 
 ## Observed (Linux headless)
 
@@ -518,9 +571,12 @@ Do not fail CI on ToggleSearch alone unless the harness can assert agent-thread 
 | `method:actions` / open / wait / action / keys | `ok: true` |
 | `method:snapshot` | Non-empty when frame has interactive roles (headless a11y + force-draw) |
 | `method:shutdown` | exits |
-| `dogfood merge-review` | Ready → Start (`Merge review`) → Preview (`Preview merge`) → End; non-empty room looks (Linux) |
+| `dogfood merge-review` | Ready → Start (`Merge review`, focus Preview merge, Next file rail, path labels, Branch Diff landmark) → Preview (`Dialog`) → End; non-empty room looks (Linux) |
+| `merge-review --with-advance` | Same + NextFile path/cursor delta (opt-in); logs AC-B room `# focus:` after NextFile |
+| `merge-review --with-conflict` | Opt-in tempfile conflicted git tree (`MERGE_HEAD`); soft-gates decision chrome; skips Preview/End; default adventure unchanged without the flag |
+| `queue` UX script | `merge_review_ux.queue` AND expects incl. TextInput after ToggleFocus |
 
-**Verify:** `cargo build --release -p zed` → preflight → golden; inhabit regression: `merge-review` with room detail (see Agent verify).
+**Verify:** `cargo build --release -p zed` → preflight → golden; inhabit regression: `merge-review` / optional `--with-advance` / queue script (see Agent verify).
 
 ## Platform matrix (dogfood snapshot)
 
@@ -555,7 +611,7 @@ Workflow: [`.github/workflows/dogfood_preflight.yml`](../../../.github/workflows
 | Trigger | What runs |
 |---------|-----------|
 | **schedule** (nightly UTC `17 6 * * *`) | free disk → `cargo build --release -p zed` → `cargo xtask dogfood preflight --timeout-secs 90` → golden |
-| **workflow_dispatch** | Same build + preflight; golden when input `run_golden` is true (default true) |
+| **workflow_dispatch** | Same build + preflight; golden when input `run_golden` is true (default true); **merge-review** when input `run_merge_review` is true (**default false**, 180s, Surmount workspace fixture, room detail) |
 | **pull_request** | **Not** on the PR critical path (full release build is expensive) |
 
 - **Linux only** (`ubuntu-latest`). Non-empty snapshot dogfood is Linux headless–primary; macOS/Windows are unsupported for golden snapshot (see platform matrix).
@@ -565,6 +621,7 @@ Workflow: [`.github/workflows/dogfood_preflight.yml`](../../../.github/workflows
 - CI passes `--timeout-secs 90` on preflight (default CLI is 30s; cold runners can miss ready) and golden.
 - Free-disk step removes large unused GHA preinstalls before build; full release still needs adequate runner disk.
 - **Fork ops:** enable Actions on the Surmount remote and allow scheduled workflows (GitHub often disables cron on forks until Actions is on / the workflow has run once on the default branch), or nightly will never fire.
+- **Opt-in merge-review:** `workflow_dispatch` input `run_merge_review` (default **false**) runs `cargo xtask dogfood merge-review --fixture $GITHUB_WORKSPACE --snapshot-detail room --timeout-secs 180` after the release build. Not on schedule by default; never on PR.
 
 **Local equivalent of the CI gate (agent runs):**
 
@@ -574,6 +631,10 @@ ZED_BIN=target/release/zed cargo xtask dogfood preflight --timeout-secs 90
 ZED_BIN=target/release/zed cargo xtask dogfood golden --timeout-secs 90   # optional; Linux
 # equivalent: cargo xtask dogfood preflight --bin target/release/zed --timeout-secs 90
 ```
+
+## Parent agent terminal allow-list (R6)
+
+Parent/orchestrator terminal allow-lists must include dogfood inhabit commands (`cargo build --release -p zed`, `cargo xtask dogfood …`, and `target/release/zed` / `ZED_BIN`) so the agent can run the inhabit loop without human proxy.
 
 ## Residual risks (honest)
 
@@ -607,6 +668,13 @@ cargo xtask dogfood golden
 cargo xtask dogfood smoke --fixture "$PWD/README.md"
 ZED_BIN=target/release/zed cargo xtask dogfood merge-review \
   --fixture "$PWD" --snapshot-detail room --timeout-secs 180
+ZED_BIN=target/release/zed cargo xtask dogfood merge-review \
+  --with-advance --timeout-secs 180
+# Optional conflict decision chrome (tempfile MERGE_HEAD; soft-skip if chrome missing):
+ZED_BIN=target/release/zed cargo xtask dogfood merge-review \
+  --with-conflict --timeout-secs 180
+ZED_BIN=target/release/zed cargo xtask dogfood queue \
+  --fixture "$PWD" --script tooling/xtask/dogfood_queues/merge_review_ux.queue --timeout-secs 180
 # Unit tests after a11y / agent_stdio / dogfood runner edits (agent may run scoped dogfood tests):
 cargo test -p xtask -- tasks::dogfood::tests
 # Clippy / broader cargo still follow normal .rules (human unless another exception):

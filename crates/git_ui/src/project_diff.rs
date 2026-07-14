@@ -82,11 +82,14 @@ pub const BRANCH_DIFF_A11Y_LABEL: &str = "Branch Diff";
 /// Focus-tracked ProjectDiff roots are interactive (`Action::Focus`), so the
 /// landmark must be a separate child. Used by render and paint tests.
 pub fn branch_diff_landmark_element() -> impl IntoElement {
+    // Non-interactive, non-focusable place marker for room outline.
+    // Must report non-zero bounds (not size_0 / 0x0) so agents can locate it.
     div()
         .id("branch-diff-landmark")
         .role(Role::Heading)
         .aria_label(BRANCH_DIFF_A11Y_LABEL)
-        .size_0()
+        .w_full()
+        .h(px(1.))
         .overflow_hidden()
 }
 
@@ -105,6 +108,8 @@ pub struct ProjectDiff {
     buffer_subscriptions: HashMap<Arc<RelPath>, BufferSubscriptions>,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
+    /// Focus target for the merge-review rail primary control (Preview merge in PreMerge).
+    merge_review_primary_focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
     review_diff_in_flight: bool,
@@ -643,6 +648,7 @@ impl ProjectDiff {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
+        let merge_review_primary_focus_handle = cx.focus_handle();
         let multibuffer = cx.new(|cx| {
             let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
             multibuffer.set_all_diff_hunks_expanded(cx);
@@ -751,6 +757,7 @@ impl ProjectDiff {
             workspace: workspace.downgrade(),
             branch_diff,
             focus_handle,
+            merge_review_primary_focus_handle,
             editor,
             multibuffer,
             buffer_subscriptions: Default::default(),
@@ -767,6 +774,11 @@ impl ProjectDiff {
 
     pub fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
         self.branch_diff.read(cx).diff_base()
+    }
+
+    /// Focus handle for the merge-review rail primary workflow control (Preview merge).
+    pub fn merge_review_primary_focus_handle(&self) -> FocusHandle {
+        self.merge_review_primary_focus_handle.clone()
     }
 
     pub fn move_to_entry(
@@ -1627,12 +1639,23 @@ impl Render for ProjectDiff {
         let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
 
         let is_branch_diff_view = matches!(self.diff_base(cx), DiffBase::Merge { .. });
+        // Focusable path: empty → owned handle; non-empty → editor (Next file AC-A).
+        // Merge-base Branch Diff only: Role + track_focus(Focusable) so AccessKit room
+        // `# focus:` can leave Window (AC-B). Non-merge keeps plain owned track_focus
+        // (no Group role). Landmark Heading stays a separate non-focusable child.
+        let surface_focus = self.focus_handle(cx);
 
         div()
-            .track_focus(&self.focus_handle)
+            .id("project-diff-surface")
             .key_context(if is_empty { "EmptyPane" } else { "GitDiff" })
             .when(is_branch_diff_view, |this| {
-                this.on_action(cx.listener(Self::review_diff))
+                this.track_focus(&surface_focus)
+                    .role(Role::Group)
+                    .aria_label(BRANCH_DIFF_A11Y_LABEL)
+                    .on_action(cx.listener(Self::review_diff))
+            })
+            .when(!is_branch_diff_view, |this| {
+                this.track_focus(&self.focus_handle)
             })
             .bg(cx.theme().colors().editor_background)
             .flex()
@@ -2126,6 +2149,15 @@ impl BranchDiffToolbar {
 
     fn project_diff(&self, _: &App) -> Option<Entity<ProjectDiff>> {
         self.project_diff.as_ref()?.upgrade()
+    }
+
+    /// Primary merge-review rail control focus handle when Branch Diff is active.
+    pub fn merge_review_primary_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        Some(
+            self.project_diff(cx)?
+                .read(cx)
+                .merge_review_primary_focus_handle(),
+        )
     }
 
     pub fn dispatch_action(
@@ -3917,6 +3949,7 @@ mod tests {
             outline.contains("landmarks:") && !outline.contains("landmarks: 0"),
             "room outline must report at least one landmark: {outline}"
         );
+        assert_branch_diff_landmark_nonzero_nonfocusable(&outline);
     }
 
     /// Full ProjectDiff merge-base item also emits the Branch Diff heading landmark.
@@ -3980,5 +4013,149 @@ mod tests {
             outline.contains(&format!("[Heading] \"{BRANCH_DIFF_A11Y_LABEL}\"")),
             "ProjectDiff merge-base paint must expose Branch Diff landmark: {outline}"
         );
+        assert_branch_diff_landmark_nonzero_nonfocusable(&outline);
+    }
+
+    /// AC-B: after focusing ProjectDiff, room `# focus:` is not Window.
+    ///
+    /// This fixture exercises the **empty multibuffer** Focusable branch (owned
+    /// surface handle). Production Next file often focuses the **non-empty** editor
+    /// handle; both bind through the same merge-base `track_focus(Focusable)` +
+    /// `Role::Group` surface, so AccessKit reports Group either way. Editor itself
+    /// still does not register a11y focus — residual is covered by the Group surface.
+    #[gpui::test]
+    async fn branch_diff_project_diff_focus_reports_non_window_in_room(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::OutlineDetail;
+
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "C",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, _) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        let project_clone = project.clone();
+        let workspace_clone = workspace.clone();
+        let window = cx.add_window(move |window, cx| {
+            ProjectDiff::new(project_clone, workspace_clone, window, cx)
+        });
+
+        window
+            .update(cx, |project_diff, _window, cx| {
+                project_diff.branch_diff.update(cx, |branch_diff, cx| {
+                    branch_diff.set_diff_base(
+                        DiffBase::Merge {
+                            base_ref: "main".into(),
+                        },
+                        cx,
+                    );
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let empty_path = window
+            .read_with(cx, |project_diff, cx| {
+                project_diff.multibuffer.read(cx).is_empty()
+            })
+            .unwrap();
+        assert!(
+            empty_path,
+            "this paint path intentionally covers empty multibuffer Focusable (owned handle)"
+        );
+
+        let outline = cx
+            .update_window(window.into(), |project_diff, window, cx| {
+                project_diff.focus_handle(cx).focus(window, cx);
+                assert!(
+                    project_diff.focus_handle(cx).is_focused(window),
+                    "Focusable surface must be focused before paint"
+                );
+                let _ = window.draw(cx);
+                window.a11y_outline(OutlineDetail::Room)
+            })
+            .unwrap();
+
+        let focus_line = outline
+            .lines()
+            .find(|line| line.starts_with("# focus:"))
+            .unwrap_or_else(|| panic!("missing # focus: header: {outline}"));
+        assert!(
+            !focus_line.contains("[Window]"),
+            "AC-B: focused ProjectDiff must not leave room focus on Window alone: {focus_line}"
+        );
+        assert!(
+            focus_line.contains("[Group]") && focus_line.contains(BRANCH_DIFF_A11Y_LABEL),
+            "AC-B: expected Group Branch Diff focus surface: {focus_line}"
+        );
+    }
+
+    /// Room outline Branch Diff line must have width > 0, height > 0, and no Focus action.
+    fn assert_branch_diff_landmark_nonzero_nonfocusable(outline: &str) {
+        let needle = format!("[Heading] \"{BRANCH_DIFF_A11Y_LABEL}\"");
+        let line = outline
+            .lines()
+            .find(|line| line.contains(&needle))
+            .unwrap_or_else(|| panic!("missing Branch Diff heading line: {outline}"));
+
+        let at = line
+            .find('@')
+            .unwrap_or_else(|| panic!("Branch Diff landmark line missing bounds: {line}"));
+        let mut parts = line[at + 1..].split_whitespace();
+        let _xy = parts
+            .next()
+            .unwrap_or_else(|| panic!("Branch Diff bounds missing x,y: {line}"));
+        let wh = parts
+            .next()
+            .unwrap_or_else(|| panic!("Branch Diff bounds missing WxH: {line}"));
+        let (w_str, h_str) = wh
+            .split_once('x')
+            .unwrap_or_else(|| panic!("Branch Diff bounds not WxH: {line}"));
+        let width: i64 = w_str
+            .parse()
+            .unwrap_or_else(|_| panic!("Branch Diff width not i64: {line}"));
+        let height: i64 = h_str
+            .parse()
+            .unwrap_or_else(|_| panic!("Branch Diff height not i64: {line}"));
+        assert!(
+            width > 0 && height > 0,
+            "Branch Diff landmark must have non-zero bounds, got {width}x{height}: {line}"
+        );
+
+        assert!(
+            !outline_line_has_focus_action(line),
+            "Branch Diff landmark must remain non-focusable (no Action::Focus): {line}"
+        );
+    }
+
+    /// True when the outline line's action list (the `[…]` after bounds, before
+    /// `#NodeId`) contains the exact token `focus`. Ignores the role bracket
+    /// (e.g. `[Heading]`) and any other text.
+    fn outline_line_has_focus_action(line: &str) -> bool {
+        let Some(at) = line.find('@') else {
+            return false;
+        };
+        let after_bounds = &line[at..];
+        let end = after_bounds.find(" #NodeId(").unwrap_or(after_bounds.len());
+        let segment = &after_bounds[..end];
+        let Some(open) = segment.rfind('[') else {
+            return false;
+        };
+        let Some(close_rel) = segment[open..].find(']') else {
+            return false;
+        };
+        let actions = &segment[open + 1..open + close_rel];
+        actions.split(',').any(|action| action == "focus")
     }
 }

@@ -21,6 +21,10 @@ on:
         description: "Also run cargo xtask dogfood golden after preflight (Linux snapshot path)"
         type: boolean
         default: true
+      run_merge_review:
+        description: "Also run cargo xtask dogfood merge-review (long timeout; Surmount workspace fixture; opt-in only)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -83,3 +87,13 @@ jobs:
         # Optional: may be flaky under CI load; kept off PR critical path.
         if: ${{ github.event_name == 'schedule' || inputs.run_golden }}
         run: cargo xtask dogfood golden --timeout-secs 90 --fixture "$GITHUB_WORKSPACE/README.md"
+
+      - name: Dogfood merge-review (dispatch opt-in only)
+        # Default adventure Start→Preview→End; long timeout; room detail; Surmount checkout as fixture.
+        # Never on schedule by default (flaky risk) and never on pull_request.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_merge_review }}
+        run: >
+          cargo xtask dogfood merge-review
+          --fixture "$GITHUB_WORKSPACE"
+          --snapshot-detail room
+          --timeout-secs 180

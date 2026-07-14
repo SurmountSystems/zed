@@ -19,6 +19,15 @@ description: Use when syncing upstream main into the Surmount fork. Branch Diff 
 
 > RED/GREEN TDD WHEN DIAGNOSING BUGS: `cargo test -p agent_ui merge_review::tests::<test_name>`. One test at a time.
 
+## Dogfood vs this skill
+
+| Layer | Owner |
+|-------|--------|
+| **In-Zed review** (Branch Diff, rail, decisions, Plan Todos, SURMOUNT prose) | **This skill** — main conversation while active |
+| **Headless chrome proof** (Start → look → Preview → End, optional Advance, TextInput/Dialog expects) | [`zed-dogfood`](../zed-dogfood/SKILL.md) via `cargo xtask dogfood merge-review` / `queue` |
+
+Dogfood **proves labels and actions exist** in room outline; it does not replace reading diffs or recording outcomes. PreMerge rail is **Preview merge** (primary) + **Next file** (triage); **Review Diff** is for MergeInProgress, not Prepare. Operator residual plan: [`plans/0_agentic_dogfooding.md`](../../plans/0_agentic_dogfooding.md).
+
 ## Upstream services stripped
 
 On conflicts in `crates/client`, `crates/rpc`, `crates/telemetry`, or `assets/settings/default.json`: keep Surmount no-ops (no Zed Cloud sign-in, no outbound telemetry/metrics). See SURMOUNT.md § Upstream services stripped. Outcome is usually `keep_fork` unless the human opts back in.
