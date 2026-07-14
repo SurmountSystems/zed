@@ -4024,9 +4024,7 @@ mod tests {
     /// `Role::Group` surface, so AccessKit reports Group either way. Editor itself
     /// still does not register a11y focus — residual is covered by the Group surface.
     #[gpui::test]
-    async fn branch_diff_project_diff_focus_reports_non_window_in_room(
-        cx: &mut TestAppContext,
-    ) {
+    async fn branch_diff_project_diff_focus_reports_non_window_in_room(cx: &mut TestAppContext) {
         use gpui::OutlineDetail;
 
         init_test(cx);

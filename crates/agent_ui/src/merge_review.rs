@@ -3762,24 +3762,27 @@ pub fn next_merge_review_file_path(
     session: &MergeReviewSession,
     current_path: Option<&str>,
 ) -> Option<String> {
-    if merge_review_next_file_blocked_message(session, current_path).is_some() {
-        return None;
-    }
-    // Re-land on the queue cursor when UI selection lags behind after advance.
+    // Re-land before blocked checks: UI lag on an earlier path must still open the
+    // cursor even when nothing exists *after* the cursor (last queue item).
+    // Only when UI reports a *different* path — None/current==cursor walks past
+    // so successive Next-file does not stick on the same path forever.
     if let Some(cursor) = session.queue_cursor_path.as_deref() {
         let normalized = canonical_merge_review_path(session, cursor)
             .unwrap_or_else(|| cursor.replace('\\', "/"));
         if let Some(item) = session.items.iter().find(|item| item.path == normalized) {
             if item.review_state == MergeReviewState::NotReviewed {
-                let current_normalized = current_path.map(|current| {
-                    canonical_merge_review_path(session, current)
-                        .unwrap_or_else(|| current.replace('\\', "/"))
-                });
-                if current_normalized.as_deref() != Some(normalized.as_str()) {
-                    return Some(normalized);
+                if let Some(current) = current_path {
+                    let current_normalized = canonical_merge_review_path(session, current)
+                        .unwrap_or_else(|| current.replace('\\', "/"));
+                    if current_normalized != normalized {
+                        return Some(normalized);
+                    }
                 }
             }
         }
+    }
+    if merge_review_next_file_blocked_message(session, current_path).is_some() {
+        return None;
     }
     let start_index = merge_review_queue_search_start_index(session, current_path);
     let search_from = start_index.map(|index| index + 1).unwrap_or(0);
@@ -3824,7 +3827,7 @@ pub fn advance_merge_review_to_next_file_with_sync(
         return false;
     }
     let upstream_ref = session.upstream_ref.clone();
-    let current_path = workspace
+    let ui_path = workspace
         .items_of_type::<ProjectDiff>(cx)
         .find_map(|diff| {
             matches!(
@@ -3835,7 +3838,13 @@ pub fn advance_merge_review_to_next_file_with_sync(
         })
         .flatten()
         .and_then(|path| canonical_merge_review_path(&session, &path).or(Some(path)));
-    if let Some(current_path) = current_path.as_deref() {
+    // Prefer queue cursor as logical current so successive Next walks past a cursor
+    // when Branch Diff active path is missing or still lagging.
+    let logical_current = session
+        .queue_cursor_path
+        .clone()
+        .or_else(|| ui_path.clone());
+    if let Some(current_path) = logical_current.as_deref() {
         let fallback_worktree = worktree_root_for_merge_review(&workspace.project(), cx);
         let worktree_root = session
             .worktree_root
@@ -3852,8 +3861,8 @@ pub fn advance_merge_review_to_next_file_with_sync(
             }
         }
     }
-    let Some(next_path) = next_merge_review_file_path(&session, current_path.as_deref()) else {
-        let message = merge_review_next_file_blocked_message(&session, current_path.as_deref())
+    let Some(next_path) = next_merge_review_file_path(&session, logical_current.as_deref()) else {
+        let message = merge_review_next_file_blocked_message(&session, logical_current.as_deref())
             .unwrap_or_else(|| "Could not advance to the next file.".into());
         log::warn!("surmount merge review: Next file blocked: {message}");
         workspace.show_toast(merge_review_toast(message), cx);
@@ -4011,9 +4020,7 @@ pub fn apply_merge_review_dogfood_synthetic_summary(cx: &mut App) -> Result<Stri
         MERGE_REVIEW_DOGFOOD_SYNTHETIC_SUMMARY_REPLY,
         cx,
     )?;
-    log::info!(
-        "surmount merge review: dogfood synthetic summary capture ok path={captured}"
-    );
+    log::info!("surmount merge review: dogfood synthetic summary capture ok path={captured}");
     Ok(captured)
 }
 
@@ -4321,6 +4328,8 @@ impl MergeReviewView {
             .detach_and_notify_err(workspace_weak_for_err, window, cx);
     }
 
+    // `action` is forwarded on multi-window redirect (recursion is intentional).
+    #[allow(clippy::only_used_in_recursion)]
     fn start_review(
         workspace: &mut Workspace,
         action: &StartMergeReview,
@@ -6989,9 +6998,7 @@ Outcome: synthesize\n";
     }
 
     #[gpui::test]
-    fn apply_merge_review_agent_reply_for_path_rejects_unknown_path(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn apply_merge_review_agent_reply_for_path_rejects_unknown_path(cx: &mut gpui::TestAppContext) {
         use crate::test_support::init_test;
 
         init_test(cx);
@@ -7019,10 +7026,7 @@ Outcome: synthesize\n",
             let item = item_for_path(&session, &known).expect("item");
             assert_ne!(item.review_state, MergeReviewState::Summarized);
             assert!(item.summary.is_none());
-            assert_eq!(
-                session.pending_summary_path.as_deref(),
-                Some(unknown)
-            );
+            assert_eq!(session.pending_summary_path.as_deref(), Some(unknown));
             assert!(item.suggested_outcome.is_none());
         });
     }
@@ -8812,6 +8816,53 @@ Outcome: synthesize\n",
             next_merge_review_file_path(&session, Some("alpha.rs")).as_deref(),
             Some("beta.rs"),
             "cursor at beta.rs (NotReviewed) must re-land on cursor when UI selection lags on alpha.rs"
+        );
+    }
+
+    #[test]
+    fn next_merge_review_file_path_successive_advances_yield_distinct_paths() {
+        // Reproduces PreMerge dogfood stuck-cursor: after advancing to beta, a missing
+        // ProjectDiff active path (None) must not re-return beta forever.
+        let manifest = CategoryManifest::from_toml(TEST_MANIFEST).unwrap();
+        let mut session = build_session(
+            &manifest,
+            "abc".into(),
+            "origin/main".into(),
+            [
+                ("alpha.rs".into(), false),
+                ("beta.rs".into(), false),
+                ("gamma.rs".into(), false),
+            ],
+        );
+        // Simulate successive Next-file: set cursor each step; UI may report None.
+        assert_eq!(
+            next_merge_review_file_path(&session, None).as_deref(),
+            Some("alpha.rs")
+        );
+        set_merge_review_queue_cursor(&mut session, "alpha.rs");
+        assert_eq!(
+            next_merge_review_file_path(&session, None).as_deref(),
+            Some("beta.rs"),
+            "after cursor lands on alpha, next with no UI path must be beta (not re-land alpha)"
+        );
+        set_merge_review_queue_cursor(&mut session, "beta.rs");
+        assert_eq!(
+            next_merge_review_file_path(&session, None).as_deref(),
+            Some("gamma.rs"),
+            "after cursor lands on beta, next with no UI path must be gamma (not stuck on beta)"
+        );
+        set_merge_review_queue_cursor(&mut session, "gamma.rs");
+        // UI lag after gamma is open: current still alpha must re-land on gamma once
+        assert_eq!(
+            next_merge_review_file_path(&session, Some("alpha.rs")).as_deref(),
+            Some("gamma.rs"),
+            "UI lag re-land still works when current lags behind cursor"
+        );
+        // Logical current matches cursor: nothing after gamma
+        assert_eq!(
+            next_merge_review_file_path(&session, Some("gamma.rs")),
+            None,
+            "at last queue item, next must be None"
         );
     }
 

@@ -1187,9 +1187,8 @@ mod tests {
                 label.chars().count() <= OUTLINE_STRING_MAX,
                 "aria_label exceeds outline cap for {path}: {label}"
             );
-            let path_shaped = label == path
-                || label.starts_with('…')
-                || path.ends_with(label.as_str());
+            let path_shaped =
+                label == path || label.starts_with('…') || path.ends_with(label.as_str());
             assert!(
                 path_shaped,
                 "aria_label must be path-derived, got {label:?} for {path}"

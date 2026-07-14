@@ -1419,11 +1419,7 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
                 args.decide_live_agent,
                 review_diff_dispatched,
             )?;
-            run_merge_review_conflict_decide_step(
-                &mut session,
-                detail,
-                args.step_wait_ms,
-            )?;
+            run_merge_review_conflict_decide_step(&mut session, detail, args.step_wait_ms)?;
         }
     } else if args.with_conflict {
         println!(
@@ -1436,7 +1432,9 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     } else if args.with_advance && args.start_only {
         println!("[advance] skipped (--start-only takes precedence over --with-advance)");
     } else if args.with_advance && conflict_fixture_active {
-        println!("[advance] skipped (conflict fixture path gates decision chrome + Review Diff, not Next file)");
+        println!(
+            "[advance] skipped (conflict fixture path gates decision chrome + Review Diff, not Next file)"
+        );
     }
 
     if !args.start_only && !conflict_fixture_active {
@@ -2061,9 +2059,7 @@ fn run_merge_review_conflict_review_diff_step(
     if summarizing {
         println!("[conflict] Summarizing rail ok");
     } else {
-        println!(
-            "[conflict] skip: rail has no \"Summarizing\" yet (dispatch ok; settle soft)"
-        );
+        println!("[conflict] skip: rail has no \"Summarizing\" yet (dispatch ok; settle soft)");
     }
 
     Ok(true)
@@ -2102,8 +2098,8 @@ fn run_merge_review_conflict_summary_capture_step(
                 &[("method", "look"), ("detail", detail)],
                 Duration::from_secs(30),
             );
-            let stderr_joined = session.stderr_buf[stderr_before.min(session.stderr_buf.len())..]
-                .join("\n");
+            let stderr_joined =
+                session.stderr_buf[stderr_before.min(session.stderr_buf.len())..].join("\n");
             let capture_log = stderr_has_live_capture_log(&stderr_joined);
             // Capture log alone can settle even if look flakes (no need for rail outline).
             if capture_log {
@@ -2128,9 +2124,7 @@ fn run_merge_review_conflict_summary_capture_step(
                         );
                         break;
                     }
-                    println!(
-                        "[conflict] live look warn: {error:#}; retry within budget"
-                    );
+                    println!("[conflict] live look warn: {error:#}; retry within budget");
                     (String::new(), true)
                 }
             };
@@ -2147,9 +2141,7 @@ fn run_merge_review_conflict_summary_capture_step(
             );
             if live_capture_settled(verdict) {
                 // discuss_rail only reaches here (capture_log returned earlier).
-                println!(
-                    "[conflict] live settle ok verdict={verdict} rail={rail:?}"
-                );
+                println!("[conflict] live settle ok verdict={verdict} rail={rail:?}");
                 // Live evidence present — skip synthetic inject.
                 return Ok(());
             }
@@ -2335,38 +2327,37 @@ fn run_merge_review_conflict_decide_step(
 
     // Attempt → settle → evidence. Shared settle helper via inline waits.
     let mut attempt_idx = 0u32;
-    let try_evidence = |session: &mut DogfoodSession,
-                        attempt: &str,
-                        attempt_idx: u32|
-     -> Result<(String, bool)> {
-        if settle_ms > 0 {
-            let _ = session.request_ok(
-                &format!("conflict_decide_settle_{attempt_idx}"),
-                &[("method", "wait"), ("ms", &settle_ms.to_string())],
-                Duration::from_secs(settle_ms / 1000 + 5),
-            );
-        }
-        session.pump();
-        let look = session.request_ok(
-            &format!("conflict_decide_evidence_{attempt_idx}"),
-            &[("method", "look"), ("detail", detail)],
-            Duration::from_secs(30),
-        )?;
-        let post = extract_snapshot_text(&look.join("\n"))
-            .map(|t| decode_outline_escapes(&t))
-            .unwrap_or_default();
-        let stderr_delta = session.stderr_buf[stderr_mark.min(session.stderr_buf.len())..].join("\n");
-        let has = product_resolve_has_evidence(&stderr_delta, &pre_outline, &post);
-        if has {
-            println!("[conflict] product evidence ok via={attempt}");
-        } else {
-            println!(
-                "[conflict] soft-skip {attempt}: dispatch ok without product evidence \
+    let try_evidence =
+        |session: &mut DogfoodSession, attempt: &str, attempt_idx: u32| -> Result<(String, bool)> {
+            if settle_ms > 0 {
+                let _ = session.request_ok(
+                    &format!("conflict_decide_settle_{attempt_idx}"),
+                    &[("method", "wait"), ("ms", &settle_ms.to_string())],
+                    Duration::from_secs(settle_ms / 1000 + 5),
+                );
+            }
+            session.pump();
+            let look = session.request_ok(
+                &format!("conflict_decide_evidence_{attempt_idx}"),
+                &[("method", "look"), ("detail", detail)],
+                Duration::from_secs(30),
+            )?;
+            let post = extract_snapshot_text(&look.join("\n"))
+                .map(|t| decode_outline_escapes(&t))
+                .unwrap_or_default();
+            let stderr_delta =
+                session.stderr_buf[stderr_mark.min(session.stderr_buf.len())..].join("\n");
+            let has = product_resolve_has_evidence(&stderr_delta, &pre_outline, &post);
+            if has {
+                println!("[conflict] product evidence ok via={attempt}");
+            } else {
+                println!(
+                    "[conflict] soft-skip {attempt}: dispatch ok without product evidence \
                  (need resolve success log or rail delta)"
-            );
-        }
-        Ok((post, has))
-    };
+                );
+            }
+            Ok((post, has))
+        };
 
     if let Some(node_id) = outline_button_node_id(&pre_outline, USE_BOTH) {
         match session.request_ok(
@@ -2397,9 +2388,7 @@ fn run_merge_review_conflict_decide_step(
             Duration::from_secs(20),
         ) {
             Ok(_) => {
-                println!(
-                    "[method:action {RESOLVE_OURS}] dispatch-ok (not product proof yet)"
-                );
+                println!("[method:action {RESOLVE_OURS}] dispatch-ok (not product proof yet)");
                 let (post, has) = try_evidence(session, "resolve_ours", attempt_idx)?;
                 attempt_idx += 1;
                 last_post_outline = post;
@@ -2464,7 +2453,8 @@ fn run_merge_review_conflict_decide_step(
                 let next_outline = extract_snapshot_text(&next_look.join("\n"))
                     .map(|t| decode_outline_escapes(&t))
                     .unwrap_or_default();
-                let next_stderr = &session.stderr_buf[next_stderr_mark.min(session.stderr_buf.len())..];
+                let next_stderr =
+                    &session.stderr_buf[next_stderr_mark.min(session.stderr_buf.len())..];
                 if advance_shows_path_delta(&pre_paths, &next_outline, next_stderr) {
                     println!("[method:action {NEXT_FILE}] soft-ok (path/stderr advance evidence)");
                 } else {
@@ -2568,11 +2558,8 @@ fn build_merge_review_conflict_git_tree(root: &Path, bare_origin: &Path) -> Resu
     git_in(root, &["config", "commit.gpgsign", "false"])?;
     git_in(root, &["config", "tag.gpgsign", "false"])?;
     // Surmount workspace marker + minimal category manifest so StartMergeReview can load.
-    std::fs::write(
-        root.join("SURMOUNT.md"),
-        "# dogfood conflict fixture\n",
-    )
-    .context("write SURMOUNT.md")?;
+    std::fs::write(root.join("SURMOUNT.md"), "# dogfood conflict fixture\n")
+        .context("write SURMOUNT.md")?;
     std::fs::write(
         root.join("surmount-merge-categories.toml"),
         r#"version = 1
@@ -3423,9 +3410,8 @@ mod tests {
         ])
         .expect("--decide-live-agent");
         assert!(live.decide_live_agent && live.with_conflict);
-        let live_only =
-            MergeReviewArgs::try_parse_from(["merge-review", "--decide-live-agent"])
-                .expect("--decide-live-agent alone");
+        let live_only = MergeReviewArgs::try_parse_from(["merge-review", "--decide-live-agent"])
+            .expect("--decide-live-agent alone");
         assert!(live_only.decide_live_agent && !live_only.with_conflict);
     }
 
@@ -3478,8 +3464,8 @@ mod tests {
             !work.join("origin.git").exists() && !work.join(".dogfood-origin.git").exists(),
             "bare origin must not live inside the worktree (pollutes Branch Diff)"
         );
-        let origin_url =
-            git_in(&work, &["remote", "get-url", "origin"]).expect("fixture must have origin remote");
+        let origin_url = git_in(&work, &["remote", "get-url", "origin"])
+            .expect("fixture must have origin remote");
         assert!(
             !origin_url.is_empty(),
             "origin remote URL must be non-empty"
@@ -3492,10 +3478,7 @@ mod tests {
     fn decision_chrome_hits_require_conflict_specific_labels() {
         for label in MERGE_REVIEW_DECISION_CHROME_CONFLICT {
             assert!(!label.is_empty());
-            assert!(
-                label.chars().any(|c| c.is_ascii_alphabetic()),
-                "{label}"
-            );
+            assert!(label.chars().any(|c| c.is_ascii_alphabetic()), "{label}");
         }
         assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Use Both"));
         assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Resolve with Agent"));
@@ -3581,17 +3564,11 @@ mod tests {
     #[test]
     fn extract_synthetic_capture_path_and_log_markers() {
         let log = "surmount merge review: dogfood synthetic summary capture ok path=conflict.txt";
-        assert_eq!(
-            extract_synthetic_capture_path(log),
-            Some("conflict.txt")
-        );
+        assert_eq!(extract_synthetic_capture_path(log), Some("conflict.txt"));
         assert!(stderr_has_synthetic_capture_log(log));
 
         let for_form = "surmount merge review: captured summary for src/foo.rs";
-        assert_eq!(
-            extract_synthetic_capture_path(for_form),
-            Some("src/foo.rs")
-        );
+        assert_eq!(extract_synthetic_capture_path(for_form), Some("src/foo.rs"));
         assert!(stderr_has_synthetic_capture_log(for_form));
 
         // Toast is not production stderr protocol — must not green hard L2.
@@ -3697,7 +3674,9 @@ mod tests {
             "conflict Review Diff dispatch ok"
         ));
         assert!(stderr_has_review_diff_dispatch("Review Diff requested"));
-        assert!(!stderr_has_review_diff_dispatch("method:action git::ReviewDiff ok"));
+        assert!(!stderr_has_review_diff_dispatch(
+            "method:action git::ReviewDiff ok"
+        ));
         assert!(!stderr_has_review_diff_dispatch("unrelated noise"));
     }
 
@@ -3705,10 +3684,7 @@ mod tests {
     fn live_capture_log_and_poll_budget() {
         let live = "surmount merge review: captured summary for conflict.txt";
         assert!(stderr_has_live_capture_log(live));
-        assert_eq!(
-            extract_synthetic_capture_path(live),
-            Some("conflict.txt")
-        );
+        assert_eq!(extract_synthetic_capture_path(live), Some("conflict.txt"));
         // Synthetic inject marker is not live capture evidence.
         let synthetic =
             "surmount merge review: dogfood synthetic summary capture ok path=conflict.txt";
@@ -3734,8 +3710,7 @@ mod tests {
             "soft_skip"
         );
 
-        let success =
-            "surmount merge review: Resolved conflict.txt with `git checkout --ours` and staged with `git add`.";
+        let success = "surmount merge review: Resolved conflict.txt with `git checkout --ours` and staged with `git add`.";
         assert!(stderr_has_resolve_success(success));
         assert!(!stderr_has_resolve_success(
             "surmount merge review: conflict resolve ignored (no active file)"
@@ -3855,21 +3830,13 @@ mod tests {
 
         // Edges: empty pre/post without stderr → no delta.
         assert!(!advance_shows_path_delta(&[], "", &[]));
-        assert!(!advance_shows_path_delta(
-            &["foo.rs".to_string()],
-            "",
-            &[]
-        ));
+        assert!(!advance_shows_path_delta(&["foo.rs".to_string()], "", &[]));
         // Identical multi-path set, same first order, no stderr → no delta.
         let identical_multi = r#"
   [Button] "crates/a/foo.rs" @0,10 100x20
   [Button] "crates/b/bar.rs" @0,40 100x20
 "#;
-        assert!(!advance_shows_path_delta(
-            &pre_paths,
-            identical_multi,
-            &[]
-        ));
+        assert!(!advance_shows_path_delta(&pre_paths, identical_multi, &[]));
         // Reorder-only: same set, first path changed → delta.
         let reordered = r#"
   [Button] "crates/b/bar.rs" @0,10 100x20

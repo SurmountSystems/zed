@@ -433,13 +433,10 @@ async fn merge_review_triage_json(
         "manifest": "surmount-merge-categories.toml",
     });
     if let Some(skill_rel) = merge_review_triage_skill_path_if_present(worktree_root) {
-        triage
-            .as_object_mut()
-            .expect("triage object")
-            .insert(
-                "skill".into(),
-                serde_json::Value::String(skill_rel.to_string()),
-            );
+        triage.as_object_mut().expect("triage object").insert(
+            "skill".into(),
+            serde_json::Value::String(skill_rel.to_string()),
+        );
     }
     Ok(triage)
 }
