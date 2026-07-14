@@ -31,10 +31,15 @@ Default `merge-review` (no flag) never requires this fixture or live Surmount `M
 
 ## What `--with-conflict` gates
 
-1. **Decision chrome** (soft): conflict-specific labels (`Use Both` / `Resolve with Agent` / `Summarize this conflict` / Discuss-rail). `Review Diff` alone does **not** count.
-2. **Review Diff path** (soft if ACP offline): action `git::ReviewDiff` → stderr dispatch + rail **Summarizing…** when possible.
+1. **Decision chrome**: conflict-specific labels (`Use Both` / `Resolve with Agent` / `Summarize this conflict` / Discuss-rail). `Review Diff` alone does **not** count.
+2. **Review Diff path**: click/`git::ReviewDiff` → dispatch + rail **Summarizing…**.
+3. **Hard L2 summary capture:** `surmount::InjectMergeReviewDogfoodSummary` → production parser; greens only on capture log (`dogfood synthetic summary capture ok` / `captured summary for` / `capture ok path=…`). Discuss/Record **rail alone is not hard-green**. No Grok required.
+4. **Soft L3 decide act:** Use Both / resolve-ours after capture needs **product evidence** (resolve success log or rail delta) — bare TOON ok is not enough; soft-skip if unavailable.
+5. **Optional `--decide-live-agent`:** soft-poll live Grok after Review Diff; settle on capture log or Discuss/Record (`post_capture_rail`); budget `max(step_wait_ms, 30s).min(90s)`; live ok skips synthetic; soft-skip once → synthetic on timeout / look failure / no Review Diff.
 
 Preview/End stay on the default adventure only (not the conflict fixture path).
+
+Manual deeper inhabit (existing `MERGE_HEAD` workspace): `queue --script tooling/xtask/dogfood_queues/merge_review_conflict.queue`.
 
 ## Optional static copy
 

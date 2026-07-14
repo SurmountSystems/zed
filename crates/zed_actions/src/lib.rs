@@ -655,6 +655,8 @@ pub mod surmount {
             PreviewMergeReviewMerge,
             /// Draft merge commit message from session memory (human still runs `git commit`).
             DraftMergeReviewCommitMessage,
+            /// Dogfood/test: inject a fixed Summary:/Outcome: reply through production capture (no live agent).
+            InjectMergeReviewDogfoodSummary,
         ]
     );
 }

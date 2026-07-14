@@ -57,19 +57,23 @@ G3 **Advance** product chrome + dogfood gates landed. Evidence (release binary):
 - [x] Default `merge-review` Start→Preview→End green (no Dialog/Advance required on default CLI)
 - [x] **AC-B stretch:** ProjectDiff merge-base root is id + `Role::Group` “Branch Diff” + Focusable `track_focus` (empty = owned handle; non-empty Next file = editor handle via same binding). Room `# focus:` is Group after Next file (proven dogfood); Editor still has no native AccessKit focus registration — residual covered by Group surface. `--with-advance` hard-fails if focus is solely Window after multi-file NextFile success.
 
-**Non-goal:** full per-file ACP loop; synthetic dogfood chrome; OR-only hit gates. Conflict **Decide** has an opt-in fixture path (**R3**).
+**Non-goal:** full per-file ACP loop; OR-only hit gates; requiring live Grok for hard green. Conflict **Decide** hard spine is opt-in (`--with-conflict`); synthetic inject goes through production capture (not fake chrome).
 
 ---
 
-### R3 — Conflict fixture path
+### R3 — Conflict fixture path (**Decide residual closed at code**)
 
-Resolve / Discuss / Synthesize headless path via **opt-in** fixture (not live Surmount `MERGE_HEAD` only). Clean Surmount = **PreMerge** (no conflict chrome) by design.
+Resolve / Discuss / Synthesize headless path via **opt-in** fixture (not live Surmount `MERGE_HEAD` only). Clean Surmount = **PreMerge** (no conflict chrome) by design. **Hard green never requires Grok.**
 
 - [x] Small conflict fixture: tempfile builder (`--with-conflict`) + bare offline **origin** + docs under `tooling/xtask/dogfood_fixtures/merge_review_conflict/README.md`
 - [x] Soft-gate decision chrome (conflict-specific; not `Review Diff` alone)
 - [x] `git::ReviewDiff` → dispatch stderr + rail **Summarizing…** when ACP posts (soft if offline)
-- [x] Conflict prompts self-contained (embeds + “do not open skill/tool host paths”); Start skips fetch when no origin remote
-- G3 full **Decide** (Discuss → Record → Next file with agent summary) still optional product depth beyond dogfood chrome/dispatch.
+- [x] Conflict prompts self-contained (embeds only; ban skill/tool/`fs/read` host paths); Start skips fetch when no origin remote
+- [x] G3 **Decide** hard spine: Review Diff → Summarizing → **synthetic** Summary capture (`surmount::InjectMergeReviewDogfoodSummary` → production `set_pending_summary_capture` / `try_capture_merge_review_summary_from_reply`) → Discuss/Record + network-free Use Both / resolve-ours
+- [x] **Hard L2:** production capture log required (`dogfood synthetic summary capture ok` / `captured summary for` / `capture ok path=…`) — Discuss/Record **rail alone is not hard-green**
+- [x] **Soft L3:** decide act needs **product evidence** (resolve success log or rail/chrome delta) — bare TOON action ok is not enough; soft-skip if unavailable
+- [x] Optional `--decide-live-agent` (default off): soft poll after Review Diff; settle on production capture log **or** Discuss/Record after Summarizing clears (`post_capture_rail` — not Use Both); budget `max(step_wait_ms, 30s).min(90s)`; live ok **skips synthetic** (logs `verdict=capture_log` | `verdict=discuss_rail`); soft-skip once → synthetic hard spine on timeout / look failure / no Review Diff dispatch (operator log: `soft-skip live agent …`, not `verdict=soft_skip`)
+- Soft residual only: live agent **prose quality** (optional judgment); not a hard gate
 
 ---
 
@@ -120,7 +124,7 @@ R1 + queue closed ──► Plan 0 inhabit #1 met
         │
         ├─► R2 product a11y + AC-B Group focus + --with-advance  **Done**
         │
-        ├─► R3 Conflict fixture (--with-conflict soft gate)  **Done (opt-in)**
+        ├─► R3 Conflict Decide hard spine + optional live soft  **Done (opt-in)**
         │
         └─► R4 nightly preflight/golden + dispatch run_merge_review  **Done (opt-in)**
 R5 skill audit ── **Done**
@@ -133,7 +137,7 @@ R5 skill audit ── **Done**
 | 3 | R5 skill cross-link / coupling audit | **Done** | Soft |
 | 4 | R4 nightly checkbox confirm | **Done** (matches plan) | Soft |
 | 5 | R4 opt-in merge-review CI | **Done** (`run_merge_review` dispatch default false) | No |
-| 6 | R3 conflict fixture | **Done** (`--with-conflict` tempfile + soft decision chrome) | No |
+| 6 | R3 conflict Decide | **Done** (`--with-conflict` hard L2 capture-log; soft L3 product evidence; `--decide-live-agent` soft) | No |
 
 ---
 
@@ -153,7 +157,7 @@ R5 skill audit ── **Done**
 | **See** | Room look: merge toolbar / Base ref chrome | **R1 green** |
 | **Preview** | `PreviewMergeReviewMerge` + chrome | **R1 green** |
 | **Advance** | Path labels + Next file chrome; path/cursor delta; Review Diff when MergeInProgress | **R2 green** (`--with-advance` + queue) |
-| **Decide** | Conflict/decision actions with fixtures | **R3** |
+| **Decide** | Chrome + Review Diff → Summarizing → **synthetic capture** (production parser; L2 capture log hard) → Discuss/Record + resolve act (L3 product evidence soft) | **R3 hard-green** (`--with-conflict`, no Grok); optional `--decide-live-agent` soft-skip → synthetic |
 | **End** | `EndMergeReview` restores layout | **R1 green** |
 
 ---

@@ -306,7 +306,24 @@ Also `--script path` (one step per line, `#` comments). Each step logs `[queue i
 
 Clean Surmount + Start is **not** missing conflict UI — there is no merge in progress. Conflict fixtures pin a bare **origin** offline so `git fetch origin` does not soft-fail.
 
-**`merge-review --with-conflict`:** tempfile conflicted tree → Start → soft decision-chrome gate → `git::ReviewDiff` → expect **Summarizing…** when dispatch logs (soft if ACP offline). Does **not** run Preview/End. Agent prompts are self-contained (embedded ours/theirs/working); do not expect host Surmount skill/tool path reads.
+**`merge-review --with-conflict`:** tempfile conflicted tree → Start → decision chrome → Review Diff → **Summarizing…** → **hard synthetic capture** (`surmount::InjectMergeReviewDogfoodSummary` → production `Summary:`/`Outcome:` parser) → Discuss/Record + Use Both / resolve-ours. Does **not** run Preview/End. Prompts stay self-contained (embeds only). Manual: `merge_review_conflict.queue`.
+
+**Decide evidence (binding):**
+
+| Layer | Hard / soft | What greens |
+|-------|-------------|-------------|
+| **L2 capture** | **Hard** | Production capture log (`dogfood synthetic summary capture ok` / `captured summary for` / `capture ok path=…`). **Rail alone is not hard-green.** |
+| **L3 decide act** | Soft | Product evidence (resolve success log or rail/chrome delta) — **not** bare TOON action ok; soft-skip if unavailable |
+| **Next-file** (when exercised) | Path/cursor delta | Outline fingerprints or stderr advance log |
+
+**`--decide-live-agent` (default off):** soft poll for live Grok after Review Diff; hard green still does **not** require Grok.
+
+| Rule | Detail |
+|------|--------|
+| Settle ok | Production `captured summary for` **or** Discuss/Record rail after Summarizing clears (`post_capture_rail` — **not** Use Both) |
+| Budget | `max(step_wait_ms, 30s).min(90s)` — raise floor via `--step-wait-ms` |
+| On live ok | **Skip synthetic** inject; logs `verdict=capture_log` or `verdict=discuss_rail` |
+| Soft-skip → synthetic | Timeout, look failure within budget, or no Review Diff dispatch — once, then hard synthetic spine |
 
 ## I/O model
 
@@ -584,8 +601,9 @@ Do not fail CI on ToggleSearch alone unless the harness can assert agent-thread 
 | `method:shutdown` | exits |
 | `dogfood merge-review` | Ready → Start (`Merge review`, focus Preview merge, Next file rail, path labels, Branch Diff landmark) → Preview (`Dialog`) → End; non-empty room looks (Linux). **PreMerge only** on clean Surmount |
 | `merge-review --with-advance` | Same + NextFile path/cursor delta (opt-in); logs AC-B room `# focus:` after NextFile |
-| `merge-review --with-conflict` | Opt-in tempfile `MERGE_HEAD` + bare origin; decision chrome + `git::ReviewDiff` → **Summarizing…** when dispatch ok; skips Preview/End; default adventure unchanged |
+| `merge-review --with-conflict` | Hard Decide: chrome → Review Diff → Summarizing → **synthetic capture (L2 capture log hard)** → Discuss/Record + resolve (L3 product evidence soft); optional `--decide-live-agent` soft-skip → synthetic; skips Preview/End |
 | `queue` UX script | `merge_review_ux.queue` AND expects incl. TextInput after ToggleFocus |
+| `queue` conflict script | `merge_review_conflict.queue` deeper Decide inhabit on live/`MERGE_HEAD` workspace (manual) |
 
 **Verify:** `cargo build --release -p zed` → preflight → golden; inhabit regression: `merge-review` / optional `--with-advance` / queue script (see Agent verify).
 
@@ -681,11 +699,19 @@ ZED_BIN=target/release/zed cargo xtask dogfood merge-review \
   --fixture "$PWD" --snapshot-detail room --timeout-secs 180
 ZED_BIN=target/release/zed cargo xtask dogfood merge-review \
   --with-advance --timeout-secs 180
-# Optional conflict decision chrome (tempfile MERGE_HEAD; soft-skip if chrome missing):
+# Conflict Decide hard spine (synthetic Summary capture; no Grok required):
+# Cite short: L2 capture log / path, L3 resolve or rail delta, Summarizing→Discuss — not full transcripts/room dumps.
 ZED_BIN=target/release/zed cargo xtask dogfood merge-review \
   --with-conflict --timeout-secs 180
+# Optional soft live agent poll (soft-skip → synthetic; raise settle floor with --step-wait-ms):
+ZED_BIN=target/release/zed cargo xtask dogfood merge-review \
+  --with-conflict --decide-live-agent --timeout-secs 300
 ZED_BIN=target/release/zed cargo xtask dogfood queue \
   --fixture "$PWD" --script tooling/xtask/dogfood_queues/merge_review_ux.queue --timeout-secs 180
+# Manual deeper conflict inhabit (workspace with MERGE_HEAD):
+# ZED_BIN=target/release/zed cargo xtask dogfood queue \
+#   --fixture /path/with/MERGE_HEAD \
+#   --script tooling/xtask/dogfood_queues/merge_review_conflict.queue --timeout-secs 180
 # Unit tests after a11y / agent_stdio / dogfood runner edits (agent may run scoped dogfood tests):
 cargo test -p xtask -- tasks::dogfood::tests
 # Clippy / broader cargo still follow normal .rules (human unless another exception):

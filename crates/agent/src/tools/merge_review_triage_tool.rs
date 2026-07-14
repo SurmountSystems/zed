@@ -423,14 +423,31 @@ async fn merge_review_triage_json(
     let changed_files =
         collect_merge_review_changed_files(worktree_root, &name_status, &conflict_output);
     let changed_file_count = changed_files.len();
-    Ok(serde_json::json!({
+    // Only cite the skill path when it exists in *this* worktree (omit on dogfood fixtures /
+    // host-absolute Surmount skills that would tempt fs/read outside the open project).
+    let mut triage = serde_json::json!({
         "merge_base": merge_base,
         "upstream_ref": upstream_ref,
         "changed_files": changed_files,
         "changed_file_count": changed_file_count,
         "manifest": "surmount-merge-categories.toml",
-        "skill": ".agents/skills/surmount-merge-review/SKILL.md",
-    }))
+    });
+    if let Some(skill_rel) = merge_review_triage_skill_path_if_present(worktree_root) {
+        triage
+            .as_object_mut()
+            .expect("triage object")
+            .insert(
+                "skill".into(),
+                serde_json::Value::String(skill_rel.to_string()),
+            );
+    }
+    Ok(triage)
+}
+
+/// Worktree-relative skill path when present; `None` so triage never injects host Surmount paths.
+fn merge_review_triage_skill_path_if_present(worktree_root: &Path) -> Option<&'static str> {
+    const SKILL_REL: &str = ".agents/skills/surmount-merge-review/SKILL.md";
+    worktree_root.join(SKILL_REL).is_file().then_some(SKILL_REL)
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -682,6 +699,28 @@ mod tests {
         let input: MergeReviewTriageToolInput =
             serde_json::from_value(serde_json::json!({})).expect("defaults");
         assert_eq!(input.upstream_ref, "origin/main");
+    }
+
+    #[test]
+    fn merge_review_triage_skill_path_omits_when_missing_includes_when_present() {
+        let empty = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            merge_review_triage_skill_path_if_present(empty.path()),
+            None,
+            "dogfood fixture without skill must omit skill field"
+        );
+
+        let with_skill = tempfile::tempdir().expect("tempdir");
+        let skill_dir = with_skill
+            .path()
+            .join(".agents/skills/surmount-merge-review");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(skill_dir.join("SKILL.md"), "# skill\n").expect("skill file");
+        assert_eq!(
+            merge_review_triage_skill_path_if_present(with_skill.path()),
+            Some(".agents/skills/surmount-merge-review/SKILL.md"),
+            "Surmount worktree with skill cites worktree-relative path only"
+        );
     }
 
     #[test]

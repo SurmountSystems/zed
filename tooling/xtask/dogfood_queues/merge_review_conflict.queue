@@ -1,0 +1,41 @@
+# Merge-review conflict Decide probe — manual deeper inhabit (temp fixture or live MERGE_HEAD)
+# Prefer: cargo xtask dogfood merge-review --with-conflict (tempfile hard spine).
+# This queue is for a workspace that already has MERGE_HEAD / conflict chrome.
+#
+# Synthetic vs live Decide (runner contract — see zed-dogfood skill):
+#   Default hard spine (no Grok): Start → Review Diff → Summarizing →
+#     InjectMergeReviewDogfoodSummary → L2 hard on capture log only (rail alone ≠ green) →
+#     Use Both / resolve-ours / Record soft L3 (product evidence; soft-skip if unavailable).
+#   Optional --decide-live-agent: soft-poll (capture_log | discuss_rail); soft-skip → synthetic.
+#   Inject needs prior StartMergeReview + Review Diff pending (Summarizing / capture target).
+# Gate style: expect: is AND hard; hit: is diagnostic OR only.
+open
+wait:4000
+look:room
+lines:15
+action:surmount::StartMergeReview
+wait:10000
+look:room
+expect:Merge review
+# Decision chrome (conflict-specific; Review Diff alone is not enough):
+hit:Use Both|Resolve with Agent|Summarize this conflict|Discuss conflict|Review Diff
+lines:40
+# Review Diff path (soft in runner; here hard-expect button only when chrome painted)
+action:git::ReviewDiff
+wait:5000
+look:room
+hit:Summarizing|Discuss conflict|Record decision|Use Both|Review Diff
+lines:40
+# Hard L2 synthetic capture (same production path as runner; needs Start + Review Diff first):
+action:surmount::InjectMergeReviewDogfoodSummary
+wait:2000
+look:room
+# L2: capture ok path=… on stderr; Discuss/Record rail when painted
+hit:Discuss conflict|Record decision|Use Both|Keep fork|Take upstream
+lines:40
+# Soft L3 network-free decide proof when button present (soft-click may fail if node stale — re-look first)
+look:room
+hit:Use Both|Keep fork|Take upstream|Discuss conflict|Record decision
+lines:30
+inventory
+stderr:merge

@@ -41,10 +41,10 @@ use zed_actions::surmount::{
     ConfirmMergeReviewDecisionKeepFork, ConfirmMergeReviewDecisionSynthesize,
     ConfirmMergeReviewDecisionTakeUpstream, DiscussMergeReviewConflict,
     DraftMergeReviewCommitMessage, DraftMergeReviewSection, EndMergeReview,
-    MarkMergeReviewOpenQuestion, MergeReviewNextFile, OpenMergeReview,
-    OpenMergeReviewConflictTodos, PreviewMergeReviewMerge, RecordMergeReviewConflictDecision,
-    ResolveMergeReviewConflictOurs, ResolveMergeReviewConflictTheirs, StartMergeReview,
-    SynthesizeMergeReviewConflict,
+    InjectMergeReviewDogfoodSummary, MarkMergeReviewOpenQuestion, MergeReviewNextFile,
+    OpenMergeReview, OpenMergeReviewConflictTodos, PreviewMergeReviewMerge,
+    RecordMergeReviewConflictDecision, ResolveMergeReviewConflictOurs,
+    ResolveMergeReviewConflictTheirs, StartMergeReview, SynthesizeMergeReviewConflict,
 };
 
 pub const MANIFEST_FILE: &str = "surmount-merge-categories.toml";
@@ -3063,7 +3063,10 @@ pub fn merge_review_conflict_synthesize_prompt(
         "Synthesize a merge resolution for `{path}` under human direction.\n\
          SURMOUNT section: {}\n\
          Prior summary: {}\n\n\
-         Three embedded resources follow (ours / theirs / working with markers).\n\
+         Three embedded resources follow (self-contained — cite only these):\n\
+         1. Fork (ours)  2. Upstream (theirs)  3. Working tree with markers.\n\
+         Never open skill files, tool `.rs` sources, host absolute paths, or \
+         `fs/read_text_file` outside this worktree — the package is complete.\n\
          Use edit_file only to merge both sides into a clean hunk — never strip conflict markers \
          as the resolution mechanism unless synthesizing both sides.\n\
          After editing, confirm markers are cleared. End with Summary: … and Outcome: synthesize.\n\
@@ -3949,6 +3952,93 @@ pub fn try_capture_merge_review_summary_from_reply(
     }
     log::info!("surmount merge review: captured summary for {path}");
     Some(path)
+}
+
+/// Set pending capture for `path` and apply `reply_text` through production summary capture.
+///
+/// Pending path is set via `set_pending_summary_capture` (same canonicalization as Review Diff).
+/// Returns the captured path on success. Missing `Summary:` (or other capture failure) returns
+/// `Err` with item not `Summarized` and `pending_summary_path` still set (retries reset to 0);
+/// format-retry increment stays on the on-stop path.
+pub fn apply_merge_review_agent_reply_for_path(
+    path: &str,
+    reply_text: &str,
+    cx: &mut App,
+) -> Result<String> {
+    set_pending_summary_capture(cx, path)
+        .context("persist pending summary for agent reply inject")?;
+
+    try_capture_merge_review_summary_from_reply(reply_text, cx)
+        .with_context(|| format!("summary capture failed for {path}"))
+}
+
+/// Fixed agent-shaped reply for dogfood synthetic capture (hard Decide spine, no live Grok).
+pub const MERGE_REVIEW_DOGFOOD_SYNTHETIC_SUMMARY_REPLY: &str = "\
+Dogfood synthetic conflict summary for fixture path.\n\
+The ours and theirs sides diverge on a single line; product capture only needs format lines.\n\
+Summary: Dogfood fixture conflict between ours and theirs on the active file.\n\
+Outcome: synthesize\n\
+Decision: synthesize\n\
+Rationale: synthetic inject exercises production Summary capture without a live model.\n\
+Tests: markers cleared after product resolve path when used.\n";
+
+/// Apply a dogfood synthetic Summary:/Outcome: reply through the **same** capture path as agent stop.
+///
+/// Uses `pending_summary_path` when set (after Review Diff); otherwise the queue cursor / first
+/// unreviewed conflict path. Returns the captured path.
+pub fn apply_merge_review_dogfood_synthetic_summary(cx: &mut App) -> Result<String> {
+    let session = load_session(cx).context("no merge review session")?;
+    anyhow::ensure!(
+        session.focus_layout_active,
+        "merge review workflow not engaged"
+    );
+
+    let path = if let Some(pending) = session.pending_summary_path.clone() {
+        pending
+    } else if let Some(cursor) = session
+        .queue_cursor_path
+        .as_ref()
+        .and_then(|p| canonical_merge_review_path(&session, p))
+    {
+        cursor
+    } else {
+        first_unreviewed_merge_review_queue_path(&session)
+            .context("no pending or unreviewed merge-review path for synthetic summary")?
+    };
+
+    let captured = apply_merge_review_agent_reply_for_path(
+        &path,
+        MERGE_REVIEW_DOGFOOD_SYNTHETIC_SUMMARY_REPLY,
+        cx,
+    )?;
+    log::info!(
+        "surmount merge review: dogfood synthetic summary capture ok path={captured}"
+    );
+    Ok(captured)
+}
+
+fn inject_merge_review_dogfood_summary(
+    workspace: &mut Workspace,
+    _: &InjectMergeReviewDogfoodSummary,
+    _window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    match apply_merge_review_dogfood_synthetic_summary(cx) {
+        Ok(path) => {
+            notify_merge_review_ui_changed(workspace, cx);
+            workspace.show_toast(
+                merge_review_toast(format!("Dogfood: captured synthetic summary for {path}")),
+                cx,
+            );
+        }
+        Err(error) => {
+            log::warn!("surmount merge review: dogfood synthetic summary inject failed: {error:#}");
+            workspace.show_toast(
+                merge_review_toast(format!("Dogfood synthetic summary failed: {error:#}")),
+                cx,
+            );
+        }
+    }
 }
 
 pub fn try_capture_merge_review_summary(
@@ -5357,6 +5447,7 @@ pub fn init(cx: &mut App) {
         workspace.register_action(MergeReviewView::next_file);
         workspace.register_action(MergeReviewView::resolve_conflict_ours);
         workspace.register_action(MergeReviewView::resolve_conflict_theirs);
+        workspace.register_action(inject_merge_review_dogfood_summary);
         workspace.register_action(|workspace, _: &DiscussMergeReviewConflict, window, cx| {
             dispatch_merge_review_conflict_workshop(workspace, window, cx, false, None);
         });
@@ -5457,7 +5548,8 @@ pub fn merge_review_plan_prompt(session: &MergeReviewSession) -> String {
          `merge_review_triage` for the file list, `merge_review_diff` for per-path hunks, \
          `resolve_merge_conflict` for conflict resolution.\n\n\
          Stay inside this worktree. Do not open skill files, tool source paths, or absolute paths \
-         outside the open project — especially not host Surmount paths when the worktree is a dogfood fixture.\n\n\
+         outside the open project — especially not host Surmount paths when the worktree is a dogfood fixture.\n\
+         Never call `fs/read_text_file` on skill md, tool `.rs`, or absolute paths outside this worktree.\n\n\
          Your tasks:\n\
          1. Propose an order to review by SURMOUNT section (conflicts first).\n\
          2. When I select a file, summarize the actual diff hunks: what changed, fork vs upstream, \
@@ -5511,9 +5603,10 @@ pub fn merge_review_conflict_file_prompt(
          2. Upstream (theirs, git index stage 3)\n\
          3. Working tree with conflict markers\n\n\
          Compare fork vs upstream carefully. Ask clarifying questions if either side is unclear.\n\
-         Prefer the embedded sides over opening files. Do not open skill files, tool `.rs` sources, \
-         or absolute paths outside this worktree.\n\
-         You may call `merge_review_conflict_sides` for structured region metadata if needed.\n\
+         The package is complete: cite only the three embeds (ours / theirs / working).\n\
+         Never open skill files, tool `.rs` sources, host Surmount absolute paths, or any path \
+         outside this open worktree — do not call `fs/read_text_file` on those.\n\
+         Prefer `merge_review_conflict_sides` for structured region metadata if needed.\n\
          After markers are cleared, call `merge_review_record_decision` or `merge_review_verify_conflict_resolved`.\n\
          Write 3–6 concise sentences on what diverged and what resolution fits the fork.\n\
          End with a single line: Summary: …\n\
@@ -6713,6 +6806,227 @@ paths = ["Cargo.toml"]
         });
     }
 
+    #[gpui::test]
+    fn apply_merge_review_dogfood_synthetic_summary_captures_through_production_path(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let mut session = test_session_with_ambiguous_items(1);
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        let path = session.items[0].path.clone();
+        session.pending_summary_path = Some(path.clone());
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            let captured =
+                apply_merge_review_dogfood_synthetic_summary(cx).expect("synthetic capture");
+            assert_eq!(captured, path);
+            let session = load_session(cx).expect("session");
+            let item = item_for_path(&session, &path).expect("item");
+            assert_eq!(item.review_state, MergeReviewState::Summarized);
+            assert!(
+                item.summary
+                    .as_ref()
+                    .is_some_and(|s| s.contains("Dogfood fixture conflict")),
+                "summary={:?}",
+                item.summary
+            );
+            assert!(session.pending_summary_path.is_none());
+            assert_eq!(
+                item.suggested_outcome,
+                Some(MergeReviewSuggestedOutcome::Synthesize)
+            );
+            // Workshop phase binds on Conflict disposition; fixture is Ambiguous so
+            // `conflict_workshop_phase_for_item` is None. Summarized is the binding contract.
+            assert!(
+                MERGE_REVIEW_DOGFOOD_SYNTHETIC_SUMMARY_REPLY.contains("Summary:")
+                    && MERGE_REVIEW_DOGFOOD_SYNTHETIC_SUMMARY_REPLY.contains("Outcome:"),
+                "synthetic reply must include Summary:/Outcome: format lines"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn apply_merge_review_agent_reply_for_path_rejects_reply_without_summary(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let mut session = test_session_with_ambiguous_items(1);
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        let path = session.items[0].path.clone();
+        let prior_state = session.items[0].review_state;
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            let err = apply_merge_review_agent_reply_for_path(
+                &path,
+                "Agent prose without the required format lines.\nOutcome: synthesize\n",
+                cx,
+            )
+            .expect_err("missing Summary: must not capture");
+            assert!(
+                err.to_string().contains("summary capture failed"),
+                "err={err}"
+            );
+            let session = load_session(cx).expect("session");
+            let item = item_for_path(&session, &path).expect("item");
+            assert_eq!(item.review_state, prior_state);
+            assert_ne!(item.review_state, MergeReviewState::Summarized);
+            assert!(item.summary.is_none());
+            assert_eq!(session.pending_summary_path.as_deref(), Some(path.as_str()));
+            assert!(item.suggested_outcome.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn apply_merge_review_agent_reply_for_path_canonicalizes_alias_for_suggested_outcome(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let mut session = test_session_with_ambiguous_items(1);
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        session.items[0].path = ".cargo/audit.toml".into();
+        let session_path = session.items[0].path.clone();
+        let alias = "cargo/audit.toml";
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            let reply = "\
+Alias inject needs Summary and Outcome.\n\
+Summary: Fixture conflict via undotted branch-diff alias.\n\
+Outcome: synthesize\n";
+            let captured =
+                apply_merge_review_agent_reply_for_path(alias, reply, cx).expect("capture");
+            assert_eq!(captured, session_path);
+            let session = load_session(cx).expect("session");
+            let item = item_for_path(&session, &session_path).expect("item");
+            assert_eq!(item.review_state, MergeReviewState::Summarized);
+            assert!(
+                item.summary
+                    .as_ref()
+                    .is_some_and(|s| s.contains("undotted branch-diff alias")),
+                "summary={:?}",
+                item.summary
+            );
+            assert_eq!(
+                item.suggested_outcome,
+                Some(MergeReviewSuggestedOutcome::Synthesize)
+            );
+            assert!(session.pending_summary_path.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn apply_merge_review_dogfood_synthetic_summary_resolves_queue_cursor_when_no_pending(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let mut session = test_session_with_ambiguous_items(2);
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        session.pending_summary_path = None;
+        let path = session.items[1].path.clone();
+        session.queue_cursor_path = Some(path.clone());
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            let captured =
+                apply_merge_review_dogfood_synthetic_summary(cx).expect("synthetic capture");
+            assert_eq!(captured, path);
+            let session = load_session(cx).expect("session");
+            let item = item_for_path(&session, &path).expect("item");
+            assert_eq!(item.review_state, MergeReviewState::Summarized);
+            assert!(session.pending_summary_path.is_none());
+            assert_eq!(
+                item.suggested_outcome,
+                Some(MergeReviewSuggestedOutcome::Synthesize)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn apply_merge_review_agent_reply_for_path_rejects_empty_summary_line(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let mut session = test_session_with_ambiguous_items(1);
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        let path = session.items[0].path.clone();
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            let err = apply_merge_review_agent_reply_for_path(
+                &path,
+                "Prose only.\nSummary:   \nOutcome: synthesize\n",
+                cx,
+            )
+            .expect_err("empty Summary: body must not capture");
+            assert!(
+                err.to_string().contains("summary capture failed"),
+                "err={err}"
+            );
+            let session = load_session(cx).expect("session");
+            let item = item_for_path(&session, &path).expect("item");
+            assert_ne!(item.review_state, MergeReviewState::Summarized);
+            assert!(item.summary.is_none());
+            assert_eq!(session.pending_summary_path.as_deref(), Some(path.as_str()));
+            assert!(item.suggested_outcome.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn apply_merge_review_agent_reply_for_path_rejects_unknown_path(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_support::init_test;
+
+        init_test(cx);
+        let mut session = test_session_with_ambiguous_items(1);
+        session.focus_layout_active = true;
+        session.git_mode = git_ui::project_diff::MergeReviewGitMode::MergeInProgress;
+        let known = session.items[0].path.clone();
+        let unknown = "crates/missing/not_in_session.rs";
+        cx.update(|cx| {
+            crate::merge_review::init(cx);
+            save_session(cx, &session).expect("save");
+            let err = apply_merge_review_agent_reply_for_path(
+                unknown,
+                "\
+Summary: Should not attach to any item.\n\
+Outcome: synthesize\n",
+                cx,
+            )
+            .expect_err("unknown path must not capture");
+            assert!(
+                err.to_string().contains("summary capture failed"),
+                "err={err}"
+            );
+            let session = load_session(cx).expect("session");
+            let item = item_for_path(&session, &known).expect("item");
+            assert_ne!(item.review_state, MergeReviewState::Summarized);
+            assert!(item.summary.is_none());
+            assert_eq!(
+                session.pending_summary_path.as_deref(),
+                Some(unknown)
+            );
+            assert!(item.suggested_outcome.is_none());
+        });
+    }
+
     #[test]
     fn canonical_merge_review_path_matches_dotted_session_paths() {
         let session = test_session_with_ambiguous_items(1);
@@ -7088,13 +7402,49 @@ paths = ["Cargo.toml"]
         assert!(prompt.contains("merge_review_conflict_sides"));
         assert!(prompt.contains("Decision:"));
         assert!(prompt.contains("Tests:"));
+        // Full ban suite (conflict Review Diff package must stay on embeds).
         assert!(
-            prompt.contains("Do not open skill files"),
-            "conflict prompt must keep the agent inside embedded sides / worktree"
+            prompt.contains("Never open skill files"),
+            "conflict prompt must ban skill files"
         );
         assert!(
             prompt.contains("self-contained"),
             "conflict prompt must mark embeds as self-contained"
+        );
+        assert!(
+            prompt.contains("fs/read_text_file"),
+            "conflict prompt must ban host fs/read outside the worktree"
+        );
+        assert!(
+            prompt.contains("host Surmount"),
+            "conflict prompt must reject host Surmount absolute paths"
+        );
+        assert!(
+            prompt.contains("tool `.rs` sources") || prompt.contains("tool `.rs`"),
+            "conflict prompt must ban tool source reads"
+        );
+        let synthesize =
+            merge_review_conflict_synthesize_prompt(&session, item, "crates/editor/src/editor.rs");
+        assert!(
+            synthesize.contains("self-contained"),
+            "synthesize prompt must be self-contained"
+        );
+        assert!(
+            synthesize.contains("fs/read_text_file"),
+            "synthesize prompt must ban fs/read outside worktree"
+        );
+        assert!(
+            synthesize.contains("Never open skill files"),
+            "synthesize prompt must ban skill files"
+        );
+        let plan = merge_review_plan_prompt(&session);
+        assert!(
+            plan.contains("fs/read_text_file"),
+            "plan prompt must ban fs/read outside worktree"
+        );
+        assert!(
+            plan.contains("Do not open skill files") || plan.contains("skill files"),
+            "plan prompt must ban skill files"
         );
     }
 

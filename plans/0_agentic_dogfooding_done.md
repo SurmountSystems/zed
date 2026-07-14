@@ -80,7 +80,7 @@ Extend `cargo xtask dogfood merge-review` without shell drivers:
 | Expect chrome | default `--expect "Merge review"` when CLI empty | Done |
 | Preview | `surmount::PreviewMergeReviewMerge` + expect `Preview merge` (unless `--start-only`) | Done |
 | End | `surmount::EndMergeReview` + non-empty post-end look (unless `--start-only`) | Done |
-| Advance / conflict | Review Diff / Next file / conflict fixture | Residual **R2/R3** living plan |
+| Advance / conflict | Review Diff / Next file / conflict Decide hard spine | **R2 + R3 done** (living plan residual = live prose soft only) |
 
 - [x] Default chrome expects + Preview/End workshop in xtask (`--start-only` / `--step-wait-ms`)
 - [x] **R1 live green:** `cargo xtask dogfood merge-review` Start → Preview → End on release binary (room looks + expects)

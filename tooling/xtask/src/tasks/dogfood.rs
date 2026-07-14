@@ -146,7 +146,14 @@ struct MergeReviewArgs {
     /// build fails or decision chrome is missing after Start.
     #[arg(long, default_value_t = false)]
     with_conflict: bool,
-    /// Settle after Preview / End / Advance actions (ms).
+    /// With `--with-conflict`: soft-poll for **live** agent summary capture before
+    /// synthetic inject. Soft-skips on timeout then runs hard synthetic spine
+    /// (hard green never requires Grok). Live poll budget =
+    /// `max(step_wait_ms, 30_000).min(90_000)` ms (raise via `--step-wait-ms`).
+    #[arg(long, default_value_t = false)]
+    decide_live_agent: bool,
+    /// Settle after Preview / End / Advance actions (ms). Also floors the
+    /// `--decide-live-agent` soft poll budget (see that flag).
     #[arg(long, default_value_t = 2500)]
     step_wait_ms: u64,
 }
@@ -1256,7 +1263,7 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
     let post_start_expects = merge_review_post_start_expects(&args.expect);
 
     println!(
-        "dogfood merge-review: bin={} workspace={} action={} detail={} wait_ms={} post_start_wait_ms={} start_only={} with_advance={} with_conflict={} expects={:?}",
+        "dogfood merge-review: bin={} workspace={} action={} detail={} wait_ms={} post_start_wait_ms={} start_only={} with_advance={} with_conflict={} decide_live_agent={} expects={:?}",
         bin.display(),
         workspace_root.display(),
         action_name,
@@ -1266,6 +1273,7 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
         args.start_only,
         args.with_advance,
         args.with_conflict,
+        args.decide_live_agent,
         post_start_expects,
     );
 
@@ -1396,9 +1404,22 @@ fn run_merge_review(args: MergeReviewArgs) -> Result<()> {
 
     if conflict_fixture_active {
         gate_merge_review_decision_chrome(&look2_blob);
-        // Deeper opt-in: Review Diff → rail Summarizing… (compact embeds; no Preview/End).
+        // Hard Decide spine: Review Diff → Summarizing → synthetic capture (or soft live agent)
+        // → Discuss/Record chrome → product resolve. No Preview/End.
         if !args.start_only {
-            run_merge_review_conflict_review_diff_step(
+            let review_diff_dispatched = run_merge_review_conflict_review_diff_step(
+                &mut session,
+                detail,
+                args.step_wait_ms,
+            )?;
+            run_merge_review_conflict_summary_capture_step(
+                &mut session,
+                detail,
+                args.step_wait_ms,
+                args.decide_live_agent,
+                review_diff_dispatched,
+            )?;
+            run_merge_review_conflict_decide_step(
                 &mut session,
                 detail,
                 args.step_wait_ms,
@@ -1674,16 +1695,27 @@ fn room_focus_is_solely_window(focus_line: &str) -> bool {
 
 /// Conflict-specific decision chrome (not always-on labels like `"Review Diff"`).
 ///
-/// Prefer stable product strings. Dynamic branch-named `Use …` buttons are optional
-/// extras via [`decision_chrome_dynamic_use_hits`] and never the sole generic gate.
+/// Prefer stable product strings (aligned with merge-review rail / conflict bar).
+/// Dynamic branch-named `Use …` buttons are optional extras via
+/// [`decision_chrome_dynamic_use_hits`] and never the sole generic gate.
 const MERGE_REVIEW_DECISION_CHROME_CONFLICT: &[&str] = &[
     "Use Both",
     "Resolve with Agent",
     "Summarize this conflict",
     "Discuss conflict",
-    "Take ours",
-    "Take theirs",
+    "Keep fork",
+    "Take upstream",
+    "Record decision",
     "Synthesize",
+];
+
+/// Soft Decide rail labels after Review Diff / Summarizing (product strings only).
+const MERGE_REVIEW_DECIDE_RAIL: &[&str] = &[
+    "Discuss conflict",
+    "Record decision",
+    "Keep fork",
+    "Take upstream",
+    "Use Both",
 ];
 
 /// Stable conflict-specific needles present in `outline`.
@@ -1693,6 +1725,166 @@ fn decision_chrome_hits(outline: &str) -> Vec<&'static str> {
         .copied()
         .filter(|label| outline.contains(label))
         .collect()
+}
+
+/// Decide-rail needles present in `outline` (Discuss / Record / Use Both / …).
+fn decide_rail_hits(outline: &str) -> Vec<&'static str> {
+    MERGE_REVIEW_DECIDE_RAIL
+        .iter()
+        .copied()
+        .filter(|label| outline.contains(label))
+        .collect()
+}
+
+/// Soft poll may stop waiting for agent essay when settle chrome is ready.
+///
+/// Ready when Summarizing cleared with decide rail, or network-free **Use Both** is visible.
+fn decide_settle_ready(
+    still_summarizing: bool,
+    decide_hits: &[&str],
+    use_both_visible: bool,
+) -> bool {
+    (!still_summarizing && !decide_hits.is_empty()) || use_both_visible
+}
+
+/// Classify soft Decide product outcome (for logs + unit tests).
+fn decide_path_outcome(acted: bool, post_rail_nonempty: bool) -> &'static str {
+    if acted {
+        "acted"
+    } else if post_rail_nonempty {
+        "rail_present"
+    } else {
+        "soft_skip"
+    }
+}
+
+/// Hard L2 after synthetic inject: **capture stderr required**.
+/// Post-capture Discuss/Record rail is soft annotation only when capture ok — never greens alone.
+fn synthetic_capture_l2_verdict(capture_ok: bool, post_capture_rail: bool) -> &'static str {
+    match (capture_ok, post_capture_rail) {
+        (true, true) => "ok_capture_and_rail",
+        (true, false) => "ok_capture",
+        (false, _) => "fail",
+    }
+}
+
+/// Path from production capture log only (`capture ok path=…` / `captured summary for …`).
+/// Does not parse UI toast strings.
+fn extract_synthetic_capture_path(stderr: &str) -> Option<&str> {
+    for line in stderr.lines() {
+        for marker in ["capture ok path=", "captured summary for "] {
+            if let Some(rest) = line.split(marker).nth(1) {
+                let path = rest.split_whitespace().next().unwrap_or(rest).trim();
+                if !path.is_empty() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Production `log::info` capture markers only (not toast / inject-failed warns).
+fn stderr_has_synthetic_capture_log(stderr: &str) -> bool {
+    stderr.contains("dogfood synthetic summary capture ok")
+        || stderr.contains("captured summary for")
+}
+
+/// Post-capture workshop labels only (Discuss/Record). Excludes pre-capture Use Both chrome.
+fn post_capture_rail_hits(outline: &str) -> Vec<&'static str> {
+    ["Discuss conflict", "Record decision"]
+        .into_iter()
+        .filter(|label| outline.contains(label))
+        .collect()
+}
+
+/// Live-agent production capture log only (`captured summary for`), not toast or synthetic inject.
+fn stderr_has_live_capture_log(stderr: &str) -> bool {
+    stderr.contains("captured summary for")
+}
+
+/// Soft live-agent poll verdict (unit-tested).
+///
+/// - `capture_log` — production `captured summary for` present (skip synthetic)
+/// - `discuss_rail` — Summarizing cleared + Discuss/Record rail (skip synthetic)
+/// - `still_summarizing` — keep polling (not terminal)
+/// - `soft_skip` — budget exhausted; fall through to synthetic hard spine
+fn live_capture_settle_verdict(
+    capture_log: bool,
+    still_summarizing: bool,
+    post_capture_rail: bool,
+    timed_out: bool,
+) -> &'static str {
+    if capture_log {
+        "capture_log"
+    } else if !still_summarizing && post_capture_rail {
+        "discuss_rail"
+    } else if timed_out {
+        "soft_skip"
+    } else {
+        "still_summarizing"
+    }
+}
+
+fn live_capture_settled(verdict: &str) -> bool {
+    matches!(verdict, "capture_log" | "discuss_rail")
+}
+
+/// Live soft-poll budget: floor 30s for Grok latency, ceiling 90s; floor raised by `step_wait_ms`.
+fn live_capture_poll_budget_ms(step_wait_ms: u64) -> u64 {
+    step_wait_ms.max(30_000).min(90_000)
+}
+
+/// Production resolve success on stderr (`Resolved … git checkout …`), not ignore/fail warns.
+fn stderr_has_resolve_success(stderr: &str) -> bool {
+    if stderr.contains("conflict resolve ignored")
+        || stderr.contains("conflict resolve failed")
+        || stderr.contains("Could not resolve")
+    {
+        // Fall through: a later success line may still appear after an earlier ignore.
+    }
+    for line in stderr.lines() {
+        if line.contains("conflict resolve ignored") || line.contains("conflict resolve failed") {
+            continue;
+        }
+        if line.contains("Resolved ") && line.contains("git checkout") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Soft L3 product evidence: resolve success log or conflict chrome/rail delta.
+fn product_resolve_has_evidence(stderr_delta: &str, pre_outline: &str, post_outline: &str) -> bool {
+    if stderr_has_resolve_success(stderr_delta) {
+        return true;
+    }
+    // Use Both / Keep fork cleared after product resolve.
+    if pre_outline.contains("Use Both") && !post_outline.contains("Use Both") {
+        return true;
+    }
+    if pre_outline.contains("Keep fork") && !post_outline.contains("Keep fork") {
+        return true;
+    }
+    if pre_outline.contains("Take upstream") && !post_outline.contains("Take upstream") {
+        return true;
+    }
+    // Workshop advanced into Record after act.
+    if !pre_outline.contains("Record decision") && post_outline.contains("Record decision") {
+        return true;
+    }
+    false
+}
+
+/// Soft L3: `acted` only with product evidence — bare TOON dispatch ok is not enough.
+fn soft_l3_act_result(dispatch_ok: bool, has_evidence: bool) -> &'static str {
+    if dispatch_ok && has_evidence {
+        "acted"
+    } else if dispatch_ok {
+        "dispatch_only"
+    } else {
+        "no_dispatch"
+    }
 }
 
 /// Optional dynamic conflict-bar labels like `"Use HEAD"` / `"Use origin/main"`.
@@ -1767,15 +1959,23 @@ fn outline_button_node_id(outline: &str, label: &str) -> Option<String> {
     fallback
 }
 
+/// Review Diff product dispatch markers on stderr (not TOON action ok alone).
+fn stderr_has_review_diff_dispatch(stderr: &str) -> bool {
+    stderr.contains("Review Diff sent")
+        || stderr.contains("conflict Review Diff dispatch")
+        || stderr.contains("Review Diff requested")
+}
+
 /// After conflict Start settle: click **Review Diff** (or `git::ReviewDiff`) → **Summarizing…**.
 ///
 /// Prefer a11y click on the rail primary — after Start, focus is often that button, and
 /// window-level `git::ReviewDiff` may not hit ProjectDiff listeners. Soft-skip if ACP offline.
+/// Returns whether a Review Diff **dispatch log** was observed (gates live soft poll).
 fn run_merge_review_conflict_review_diff_step(
     session: &mut DogfoodSession,
     detail: &str,
     step_wait_ms: u64,
-) -> Result<()> {
+) -> Result<bool> {
     const REVIEW_DIFF_ACTION: &str = "git::ReviewDiff";
     const REVIEW_DIFF_LABEL: &str = "Review Diff";
     let stderr_before = session.stderr_buf.len();
@@ -1847,9 +2047,7 @@ fn run_merge_review_conflict_review_diff_step(
     let summarizing = outline.contains("Summarizing");
     let stderr_slice = &session.stderr_buf[stderr_before.min(session.stderr_buf.len())..];
     let stderr_joined = stderr_slice.join("\n");
-    let dispatch_ok = stderr_joined.contains("Review Diff sent")
-        || stderr_joined.contains("conflict Review Diff dispatch")
-        || stderr_joined.contains("Review Diff requested");
+    let dispatch_ok = stderr_has_review_diff_dispatch(&stderr_joined);
 
     if dispatch_ok {
         println!("[conflict] Review Diff dispatch ok (stderr)");
@@ -1857,7 +2055,7 @@ fn run_merge_review_conflict_review_diff_step(
         println!(
             "[conflict] skip: no Review Diff dispatch log (agent/ACP may be offline or click missed)"
         );
-        return Ok(());
+        return Ok(false);
     }
 
     if summarizing {
@@ -1866,6 +2064,462 @@ fn run_merge_review_conflict_review_diff_step(
         println!(
             "[conflict] skip: rail has no \"Summarizing\" yet (dispatch ok; settle soft)"
         );
+    }
+
+    Ok(true)
+}
+
+/// L2 summary capture: synthetic inject (hard) or soft live-agent wait.
+///
+/// Synthetic path calls production capture via `surmount::InjectMergeReviewDogfoodSummary`
+/// (same Summary:/Outcome: parser as agent stop). Live path polls production capture log
+/// (`captured summary for`) or Discuss/Record after Summarizing; soft-skips then synthetic.
+/// When `review_diff_dispatched` is false, live soft poll is skipped (no pending capture path).
+fn run_merge_review_conflict_summary_capture_step(
+    session: &mut DogfoodSession,
+    detail: &str,
+    step_wait_ms: u64,
+    decide_live_agent: bool,
+    review_diff_dispatched: bool,
+) -> Result<()> {
+    const INJECT: &str = "surmount::InjectMergeReviewDogfoodSummary";
+
+    if decide_live_agent && !review_diff_dispatched {
+        println!(
+            "[conflict] soft-skip live agent (no Review Diff dispatch; synthetic hard spine next)"
+        );
+    } else if decide_live_agent {
+        // Soft: production capture log or Discuss/Record after Summarizing clears.
+        // Budget: max(step_wait_ms, 30s) capped at 90s — never hard-fail without synthetic.
+        let poll_budget_ms = live_capture_poll_budget_ms(step_wait_ms);
+        let poll_slice_ms = 2_000u64;
+        let mut elapsed = 0u64;
+        let stderr_before = session.stderr_buf.len();
+        loop {
+            session.pump();
+            let look_result = session.request_ok(
+                &format!("live_capture_look_{elapsed}"),
+                &[("method", "look"), ("detail", detail)],
+                Duration::from_secs(30),
+            );
+            let stderr_joined = session.stderr_buf[stderr_before.min(session.stderr_buf.len())..]
+                .join("\n");
+            let capture_log = stderr_has_live_capture_log(&stderr_joined);
+            // Capture log alone can settle even if look flakes (no need for rail outline).
+            if capture_log {
+                let path = extract_synthetic_capture_path(&stderr_joined).unwrap_or("(unknown)");
+                println!("[conflict] live settle ok verdict=capture_log path={path}");
+                return Ok(());
+            }
+            let (outline, look_failed) = match look_result {
+                Ok(look) => {
+                    let blob = look.join("\n");
+                    let outline = extract_snapshot_text(&blob)
+                        .map(|t| decode_outline_escapes(&t))
+                        .unwrap_or_default();
+                    (outline, false)
+                }
+                Err(error) => {
+                    // Soft: flaky look must not abort before synthetic hard spine.
+                    let timed_out = elapsed >= poll_budget_ms;
+                    if timed_out {
+                        println!(
+                            "[conflict] soft-skip live agent (look failed: {error:#}; synthetic hard spine next)"
+                        );
+                        break;
+                    }
+                    println!(
+                        "[conflict] live look warn: {error:#}; retry within budget"
+                    );
+                    (String::new(), true)
+                }
+            };
+            // Discuss/Record only — not Use Both / Keep fork (pre-capture chrome).
+            let rail = post_capture_rail_hits(&outline);
+            // Look failure: treat as still waiting (no discuss_rail without outline).
+            let still_summarizing = look_failed || outline.contains("Summarizing");
+            let timed_out = elapsed >= poll_budget_ms;
+            let verdict = live_capture_settle_verdict(
+                false, // capture_log already handled above
+                still_summarizing,
+                !rail.is_empty(),
+                timed_out,
+            );
+            if live_capture_settled(verdict) {
+                // discuss_rail only reaches here (capture_log returned earlier).
+                println!(
+                    "[conflict] live settle ok verdict={verdict} rail={rail:?}"
+                );
+                // Live evidence present — skip synthetic inject.
+                return Ok(());
+            }
+            if verdict == "soft_skip" {
+                println!(
+                    "[conflict] soft-skip live agent (timeout {poll_budget_ms}ms; synthetic hard spine next)"
+                );
+                break;
+            }
+            let wait_ms = poll_slice_ms.min(poll_budget_ms.saturating_sub(elapsed).max(1));
+            let _ = session.request_ok(
+                &format!("live_capture_wait_{elapsed}"),
+                &[("method", "wait"), ("ms", &wait_ms.to_string())],
+                Duration::from_secs(wait_ms / 1000 + 5),
+            );
+            elapsed = elapsed.saturating_add(wait_ms);
+        }
+    }
+
+    // Hard spine: synthetic inject through production capture.
+    let stderr_before = session.stderr_buf.len();
+    match session.request_ok(
+        "conflict_synthetic_summary",
+        &[("method", "action"), ("name", INJECT)],
+        Duration::from_secs(20),
+    ) {
+        Ok(_) => println!("[method:action {INJECT}] ok"),
+        Err(error) => {
+            session.pump();
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            bail!(
+                "merge-review conflict: synthetic summary inject failed ({error:#})\n  \
+                 hard Decide spine requires surmount::InjectMergeReviewDogfoodSummary"
+            );
+        }
+    }
+
+    let settle_ms = step_wait_ms.max(1_500).min(8_000);
+    if settle_ms > 0 {
+        let _ = session.request_ok(
+            "conflict_capture_wait",
+            &[("method", "wait"), ("ms", &settle_ms.to_string())],
+            Duration::from_secs(settle_ms / 1000 + 5),
+        );
+        println!("[method:wait post-synthetic-capture] ok ms={settle_ms}");
+    }
+    session.pump();
+
+    let look = session.request_ok(
+        "conflict_capture_look",
+        &[("method", "look"), ("detail", detail)],
+        Duration::from_secs(30),
+    )?;
+    let blob = look.join("\n");
+    let outline = extract_snapshot_text(&blob)
+        .map(|t| decode_outline_escapes(&t))
+        .unwrap_or_default();
+    let post_rail = post_capture_rail_hits(&outline);
+    let stderr_joined =
+        session.stderr_buf[stderr_before.min(session.stderr_buf.len())..].join("\n");
+    let capture_ok = stderr_has_synthetic_capture_log(&stderr_joined);
+    let path = extract_synthetic_capture_path(&stderr_joined);
+    let path_display = path.unwrap_or("(unknown)");
+    let verdict = synthetic_capture_l2_verdict(capture_ok, !post_rail.is_empty());
+
+    match verdict {
+        "ok_capture_and_rail" => {
+            println!("[conflict] capture ok path={path_display} rail={post_rail:?}");
+        }
+        "ok_capture" => {
+            // Hard L2 green only on production capture log; Discuss/Record paint is soft.
+            println!(
+                "[conflict] capture ok path={path_display} (rail soft: no Discuss/Record yet)"
+            );
+        }
+        "fail" => {
+            session.pump();
+            print_merge_review_stderr_tail(&session.stderr_buf);
+            bail!(
+                "merge-review conflict: hard L2 capture failed after synthetic inject \
+                 (missing production capture log)\n  \
+                 expected stderr: dogfood synthetic summary capture ok path=…\n  \
+                 (pre-capture Use Both chrome is not L2 evidence; inject TOON-ok alone is not enough)"
+            );
+        }
+        other => bail!("merge-review conflict: unexpected L2 verdict {other}"),
+    }
+
+    Ok(())
+}
+
+/// After Review Diff / Summarizing: soft-prove a **decision path** without full Grok essays.
+///
+/// Prefers network-free product actions (`Use Both` / resolve ours) and optional soft poll for
+/// Discuss/Record chrome after summarize settles. Soft-skip when ACP/agent never settles —
+/// never hard-fail on agent quality. Hard contracts stay in chrome/dispatch steps only.
+fn run_merge_review_conflict_decide_step(
+    session: &mut DogfoodSession,
+    detail: &str,
+    step_wait_ms: u64,
+) -> Result<()> {
+    const USE_BOTH: &str = "Use Both";
+    const RESOLVE_OURS: &str = "surmount::ResolveMergeReviewConflictOurs";
+
+    // Soft poll: Summarizing may clear into Discuss/Record when ACP completes (no Grok → soft).
+    // On timeout we still try network-free Use Both / resolve-ours below (never early-return).
+    let poll_budget_ms = step_wait_ms.max(3_000).min(20_000);
+    let poll_slice_ms = 1_500u64;
+    let mut polls = 0u32;
+    let mut elapsed = 0u64;
+    let mut decide_hits: Vec<&'static str> = Vec::new();
+    let mut still_summarizing = false;
+    while elapsed <= poll_budget_ms {
+        session.pump();
+        let look_lines = session.request_ok(
+            &format!("conflict_decide_poll_{polls}"),
+            &[("method", "look"), ("detail", detail)],
+            Duration::from_secs(30),
+        )?;
+        let outline = extract_snapshot_text(&look_lines.join("\n"))
+            .map(|t| decode_outline_escapes(&t))
+            .unwrap_or_default();
+        still_summarizing = outline.contains("Summarizing");
+        decide_hits = decide_rail_hits(&outline);
+        let use_both_visible = outline.contains(USE_BOTH);
+        if decide_settle_ready(still_summarizing, &decide_hits, use_both_visible) {
+            if use_both_visible && still_summarizing {
+                println!(
+                    "[conflict] decide soft: Use Both visible (summarizing=true); \
+                     proceeding without waiting for agent essay"
+                );
+            } else {
+                println!(
+                    "[conflict] decide settle ok: summarizing={still_summarizing} \
+                     rail={decide_hits:?} polls={polls}"
+                );
+            }
+            break;
+        }
+        if elapsed + poll_slice_ms > poll_budget_ms {
+            break;
+        }
+        let _ = session.request_ok(
+            &format!("conflict_decide_wait_{polls}"),
+            &[("method", "wait"), ("ms", &poll_slice_ms.to_string())],
+            Duration::from_secs(poll_slice_ms / 1000 + 5),
+        );
+        elapsed += poll_slice_ms;
+        polls += 1;
+    }
+
+    if still_summarizing && decide_hits.is_empty() {
+        println!(
+            "[conflict] decide settle timeout (still Summarizing / empty rail); \
+             best-effort product resolve next"
+        );
+    } else if !decide_hits.is_empty() {
+        println!("[conflict] decide chrome soft: {decide_hits:?}");
+    }
+
+    // Soft L3 product resolve (network-free): Use Both → resolve-ours → Record when painted.
+    // `acted` only with product evidence (stderr resolve success or rail delta) — never on
+    // bare TOON dispatch ok. Soft-skip with one-line reason; never hard-fail default spine.
+    const RECORD: &str = "Record decision";
+    const NEXT_FILE: &str = "surmount::MergeReviewNextFile";
+
+    session.pump();
+    let pre_look = session.request_ok(
+        "conflict_decide_prelook",
+        &[("method", "look"), ("detail", detail)],
+        Duration::from_secs(30),
+    )?;
+    let pre_outline = extract_snapshot_text(&pre_look.join("\n"))
+        .map(|t| decode_outline_escapes(&t))
+        .unwrap_or_default();
+    let pre_paths = path_fingerprints_from_outline(&pre_outline);
+    let stderr_mark = session.stderr_buf.len();
+    let settle_ms = step_wait_ms.max(1_500).min(8_000);
+
+    let mut acted = false;
+    let mut act_reason = "none";
+    let mut last_post_outline = pre_outline.clone();
+
+    // Attempt → settle → evidence. Shared settle helper via inline waits.
+    let mut attempt_idx = 0u32;
+    let try_evidence = |session: &mut DogfoodSession,
+                        attempt: &str,
+                        attempt_idx: u32|
+     -> Result<(String, bool)> {
+        if settle_ms > 0 {
+            let _ = session.request_ok(
+                &format!("conflict_decide_settle_{attempt_idx}"),
+                &[("method", "wait"), ("ms", &settle_ms.to_string())],
+                Duration::from_secs(settle_ms / 1000 + 5),
+            );
+        }
+        session.pump();
+        let look = session.request_ok(
+            &format!("conflict_decide_evidence_{attempt_idx}"),
+            &[("method", "look"), ("detail", detail)],
+            Duration::from_secs(30),
+        )?;
+        let post = extract_snapshot_text(&look.join("\n"))
+            .map(|t| decode_outline_escapes(&t))
+            .unwrap_or_default();
+        let stderr_delta = session.stderr_buf[stderr_mark.min(session.stderr_buf.len())..].join("\n");
+        let has = product_resolve_has_evidence(&stderr_delta, &pre_outline, &post);
+        if has {
+            println!("[conflict] product evidence ok via={attempt}");
+        } else {
+            println!(
+                "[conflict] soft-skip {attempt}: dispatch ok without product evidence \
+                 (need resolve success log or rail delta)"
+            );
+        }
+        Ok((post, has))
+    };
+
+    if let Some(node_id) = outline_button_node_id(&pre_outline, USE_BOTH) {
+        match session.request_ok(
+            "conflict_decide_use_both",
+            &[("method", "click"), ("node", node_id.as_str())],
+            Duration::from_secs(20),
+        ) {
+            Ok(_) => {
+                println!("[method:click Use Both node={node_id}] dispatch-ok");
+                let (post, has) = try_evidence(session, "use_both", attempt_idx)?;
+                attempt_idx += 1;
+                last_post_outline = post;
+                if soft_l3_act_result(true, has) == "acted" {
+                    acted = true;
+                    act_reason = "use_both";
+                }
+            }
+            Err(error) => println!("[method:click Use Both] warn: {error:#}"),
+        }
+    } else {
+        println!("[conflict] no \"Use Both\" button NodeId; trying resolve-ours action");
+    }
+
+    if !acted {
+        match session.request_ok(
+            "conflict_decide_resolve_ours",
+            &[("method", "action"), ("name", RESOLVE_OURS)],
+            Duration::from_secs(20),
+        ) {
+            Ok(_) => {
+                println!(
+                    "[method:action {RESOLVE_OURS}] dispatch-ok (not product proof yet)"
+                );
+                let (post, has) = try_evidence(session, "resolve_ours", attempt_idx)?;
+                attempt_idx += 1;
+                last_post_outline = post;
+                if soft_l3_act_result(true, has) == "acted" {
+                    acted = true;
+                    act_reason = "resolve_ours";
+                }
+            }
+            Err(error) => {
+                println!("[method:action {RESOLVE_OURS}] soft-skip: {error:#}");
+            }
+        }
+    }
+
+    // Record when painted and resolve path had no product evidence (soft; never hard).
+    if !acted {
+        if let Some(node_id) = outline_button_node_id(&pre_outline, RECORD)
+            .or_else(|| outline_button_node_id(&last_post_outline, RECORD))
+        {
+            match session.request_ok(
+                "conflict_decide_record",
+                &[("method", "click"), ("node", node_id.as_str())],
+                Duration::from_secs(20),
+            ) {
+                Ok(_) => {
+                    println!("[method:click Record decision node={node_id}] dispatch-ok");
+                    let (post, has) = try_evidence(session, "record", attempt_idx)?;
+                    attempt_idx += 1;
+                    last_post_outline = post;
+                    if soft_l3_act_result(true, has) == "acted" {
+                        acted = true;
+                        act_reason = "record";
+                    }
+                }
+                Err(error) => println!("[method:click Record decision] soft-skip: {error:#}"),
+            }
+        }
+    }
+
+    // Optional soft Next file — soft-ok only with path/stderr advance evidence (same discipline).
+    if acted && (pre_outline.contains("Next file") || last_post_outline.contains("Next file")) {
+        let next_stderr_mark = session.stderr_buf.len();
+        match session.request_ok(
+            "conflict_decide_next_file",
+            &[("method", "action"), ("name", NEXT_FILE)],
+            Duration::from_secs(15),
+        ) {
+            Ok(_) => {
+                if settle_ms > 0 {
+                    let _ = session.request_ok(
+                        "conflict_decide_next_settle",
+                        &[("method", "wait"), ("ms", &settle_ms.to_string())],
+                        Duration::from_secs(settle_ms / 1000 + 5),
+                    );
+                }
+                session.pump();
+                let next_look = session.request_ok(
+                    "conflict_decide_next_look",
+                    &[("method", "look"), ("detail", detail)],
+                    Duration::from_secs(30),
+                )?;
+                let next_outline = extract_snapshot_text(&next_look.join("\n"))
+                    .map(|t| decode_outline_escapes(&t))
+                    .unwrap_or_default();
+                let next_stderr = &session.stderr_buf[next_stderr_mark.min(session.stderr_buf.len())..];
+                if advance_shows_path_delta(&pre_paths, &next_outline, next_stderr) {
+                    println!("[method:action {NEXT_FILE}] soft-ok (path/stderr advance evidence)");
+                } else {
+                    println!(
+                        "[method:action {NEXT_FILE}] soft-skip: dispatch-ok without advance evidence"
+                    );
+                }
+                last_post_outline = next_outline;
+            }
+            Err(error) => println!("[method:action {NEXT_FILE}] soft-skip: {error:#}"),
+        }
+    }
+
+    // Final post-look if we never ran evidence settle (no attempts painted).
+    if attempt_idx == 0 {
+        if settle_ms > 0 {
+            let _ = session.request_ok(
+                "conflict_decide_post_wait",
+                &[("method", "wait"), ("ms", &settle_ms.to_string())],
+                Duration::from_secs(settle_ms / 1000 + 5),
+            );
+        }
+        session.pump();
+        let post_look = session.request_ok(
+            "conflict_decide_postlook",
+            &[("method", "look"), ("detail", detail)],
+            Duration::from_secs(30),
+        )?;
+        last_post_outline = extract_snapshot_text(&post_look.join("\n"))
+            .map(|t| decode_outline_escapes(&t))
+            .unwrap_or_default();
+    }
+
+    let post_hits = decide_rail_hits(&last_post_outline);
+    let post_summarizing = last_post_outline.contains("Summarizing");
+    let outcome = decide_path_outcome(acted, !post_hits.is_empty());
+    println!(
+        "[conflict] decide post-look: acted={acted} via={act_reason} summarizing={post_summarizing} \
+         rail={post_hits:?} outcome={outcome} preview={}",
+        last_post_outline.chars().take(160).collect::<String>()
+    );
+    match outcome {
+        "acted" => {
+            println!(
+                "[conflict] Decide path soft-ok (product resolve via={act_reason}; no agent essay required)"
+            )
+        }
+        "rail_present" => {
+            println!(
+                "[conflict] Decide path soft-ok (rail present; product resolve evidence missed)"
+            )
+        }
+        _ => println!(
+            "[conflict] soft-skip Decide product act (no product evidence from Use Both / resolve-ours / Record; rail empty)"
+        ),
     }
 
     Ok(())
@@ -2754,6 +3408,25 @@ mod tests {
             !defaults.with_conflict,
             "default adventure must not require conflict fixture"
         );
+        assert!(
+            !defaults.decide_live_agent,
+            "default conflict spine must not require live Grok"
+        );
+        assert!(
+            !with_conflict.decide_live_agent,
+            "--with-conflict alone must stay synthetic hard spine"
+        );
+        let live = MergeReviewArgs::try_parse_from([
+            "merge-review",
+            "--with-conflict",
+            "--decide-live-agent",
+        ])
+        .expect("--decide-live-agent");
+        assert!(live.decide_live_agent && live.with_conflict);
+        let live_only =
+            MergeReviewArgs::try_parse_from(["merge-review", "--decide-live-agent"])
+                .expect("--decide-live-agent alone");
+        assert!(live_only.decide_live_agent && !live_only.with_conflict);
     }
 
     #[test]
@@ -2827,6 +3500,12 @@ mod tests {
         assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Use Both"));
         assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Resolve with Agent"));
         assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Summarize this conflict"));
+        assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Keep fork"));
+        assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Take upstream"));
+        assert!(MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Record decision"));
+        // Dead product labels — resolve uses git checkout, not these strings.
+        assert!(!MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Take ours"));
+        assert!(!MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Take theirs"));
         // Always-on MergeInProgress rail chrome must not be a sole decision proof.
         assert!(!MERGE_REVIEW_DECISION_CHROME_CONFLICT.contains(&"Review Diff"));
 
@@ -2853,6 +3532,223 @@ mod tests {
 
         let miss = r#"  [Button] "Preview merge" @0,0 100x32 "#;
         assert!(decision_chrome_hits(miss).is_empty());
+    }
+
+    #[test]
+    fn decide_rail_hits_and_settle_outcome_policy() {
+        let empty = decide_rail_hits("  [Button] \"Review Diff\"");
+        assert!(empty.is_empty(), "{empty:?}");
+
+        let outline = r#"
+  [Button] "Discuss conflict" @0,0 10x10
+  [Button] "Keep fork" @0,0 10x10
+  [Button] "Use Both" @0,0 10x10
+"#;
+        let hits = decide_rail_hits(outline);
+        assert!(hits.contains(&"Discuss conflict"), "{hits:?}");
+        assert!(hits.contains(&"Keep fork"), "{hits:?}");
+        assert!(hits.contains(&"Use Both"), "{hits:?}");
+        assert!(!hits.iter().any(|h| *h == "Review Diff"), "{hits:?}");
+
+        // Settled: Summarizing gone + rail present.
+        assert!(decide_settle_ready(false, &["Discuss conflict"], false));
+        // Still summarizing with empty rail → not ready.
+        assert!(!decide_settle_ready(true, &[], false));
+        // Use Both visible allows proceed even while summarizing.
+        assert!(decide_settle_ready(true, &[], true));
+        // Empty rail + not summarizing → not ready (wait/timeout then product act).
+        assert!(!decide_settle_ready(false, &[], false));
+
+        assert_eq!(decide_path_outcome(true, false), "acted");
+        assert_eq!(decide_path_outcome(true, true), "acted");
+        assert_eq!(decide_path_outcome(false, true), "rail_present");
+        assert_eq!(decide_path_outcome(false, false), "soft_skip");
+    }
+
+    #[test]
+    fn synthetic_capture_l2_verdict_requires_capture_log() {
+        // Hard green only when capture log present — Discuss/Record rail is soft annotation.
+        assert_eq!(
+            synthetic_capture_l2_verdict(true, true),
+            "ok_capture_and_rail"
+        );
+        assert_eq!(synthetic_capture_l2_verdict(true, false), "ok_capture");
+        // Pre-capture Use Both / empty rail without capture log → hard fail (not ok_rail_only).
+        assert_eq!(synthetic_capture_l2_verdict(false, true), "fail");
+        assert_eq!(synthetic_capture_l2_verdict(false, false), "fail");
+    }
+
+    #[test]
+    fn extract_synthetic_capture_path_and_log_markers() {
+        let log = "surmount merge review: dogfood synthetic summary capture ok path=conflict.txt";
+        assert_eq!(
+            extract_synthetic_capture_path(log),
+            Some("conflict.txt")
+        );
+        assert!(stderr_has_synthetic_capture_log(log));
+
+        let for_form = "surmount merge review: captured summary for src/foo.rs";
+        assert_eq!(
+            extract_synthetic_capture_path(for_form),
+            Some("src/foo.rs")
+        );
+        assert!(stderr_has_synthetic_capture_log(for_form));
+
+        // Toast is not production stderr protocol — must not green hard L2.
+        let toastish = "Dogfood: captured synthetic summary for notes.md";
+        assert_eq!(extract_synthetic_capture_path(toastish), None);
+        assert!(!stderr_has_synthetic_capture_log(toastish));
+
+        // Inject-failed warn must not set capture_ok.
+        let inject_fail =
+            "surmount merge review: dogfood synthetic summary inject failed: no pending path";
+        assert!(!stderr_has_synthetic_capture_log(inject_fail));
+        assert_eq!(extract_synthetic_capture_path(inject_fail), None);
+
+        assert_eq!(extract_synthetic_capture_path("unrelated noise"), None);
+        assert!(!stderr_has_synthetic_capture_log("unrelated noise"));
+    }
+
+    #[test]
+    fn post_capture_rail_excludes_pre_capture_use_both() {
+        let pre_only = r#"
+  [Button] "Use Both" @0,0 10x10
+  [Button] "Keep fork" @0,0 10x10
+  [Button] "Take upstream" @0,0 10x10
+"#;
+        assert!(
+            post_capture_rail_hits(pre_only).is_empty(),
+            "Use Both/Keep fork alone must not satisfy post-capture L2 rail"
+        );
+        let workshop = r#"
+  [Button] "Discuss conflict" @0,0 10x10
+  [Button] "Record decision" @0,0 10x10
+  [Button] "Use Both" @0,0 10x10
+"#;
+        let hits = post_capture_rail_hits(workshop);
+        assert!(hits.contains(&"Discuss conflict"), "{hits:?}");
+        assert!(hits.contains(&"Record decision"), "{hits:?}");
+        // Combined with no capture log → still hard fail (capture required).
+        assert_eq!(
+            synthetic_capture_l2_verdict(false, !hits.is_empty()),
+            "fail"
+        );
+    }
+
+    #[test]
+    fn live_capture_settle_verdict_edges() {
+        // Production capture log wins even while Summarizing.
+        assert_eq!(
+            live_capture_settle_verdict(true, true, false, false),
+            "capture_log"
+        );
+        assert!(live_capture_settled("capture_log"));
+        // Discuss/Record only after Summarizing clears.
+        assert_eq!(
+            live_capture_settle_verdict(false, false, true, false),
+            "discuss_rail"
+        );
+        assert!(live_capture_settled("discuss_rail"));
+        // Rail while still summarizing → keep polling (not discuss_rail).
+        assert_eq!(
+            live_capture_settle_verdict(false, true, true, false),
+            "still_summarizing"
+        );
+        assert!(!live_capture_settled("still_summarizing"));
+        // Pre-capture Use Both alone is not post-capture rail.
+        assert!(post_capture_rail_hits(r#"[Button] "Use Both""#).is_empty());
+        assert_eq!(
+            live_capture_settle_verdict(false, false, false, false),
+            "still_summarizing"
+        );
+        // Timeout → soft-skip (synthetic hard spine next); never hard-fail live.
+        assert_eq!(
+            live_capture_settle_verdict(false, true, false, true),
+            "soft_skip"
+        );
+        assert_eq!(
+            live_capture_settle_verdict(false, false, false, true),
+            "soft_skip"
+        );
+        assert!(!live_capture_settled("soft_skip"));
+        // Rail visible but Summarizing not cleared at budget end → soft_skip (not discuss_rail).
+        assert_eq!(
+            live_capture_settle_verdict(false, true, true, true),
+            "soft_skip"
+        );
+        // Capture log at timeout still settles (skip synthetic).
+        assert_eq!(
+            live_capture_settle_verdict(true, true, false, true),
+            "capture_log"
+        );
+        // Discuss/Record at timeout still settles.
+        assert_eq!(
+            live_capture_settle_verdict(false, false, true, true),
+            "discuss_rail"
+        );
+    }
+
+    #[test]
+    fn review_diff_dispatch_markers() {
+        assert!(stderr_has_review_diff_dispatch(
+            "surmount: Review Diff sent to agent for conflict.txt"
+        ));
+        assert!(stderr_has_review_diff_dispatch(
+            "conflict Review Diff dispatch ok"
+        ));
+        assert!(stderr_has_review_diff_dispatch("Review Diff requested"));
+        assert!(!stderr_has_review_diff_dispatch("method:action git::ReviewDiff ok"));
+        assert!(!stderr_has_review_diff_dispatch("unrelated noise"));
+    }
+
+    #[test]
+    fn live_capture_log_and_poll_budget() {
+        let live = "surmount merge review: captured summary for conflict.txt";
+        assert!(stderr_has_live_capture_log(live));
+        assert_eq!(
+            extract_synthetic_capture_path(live),
+            Some("conflict.txt")
+        );
+        // Synthetic inject marker is not live capture evidence.
+        let synthetic =
+            "surmount merge review: dogfood synthetic summary capture ok path=conflict.txt";
+        assert!(!stderr_has_live_capture_log(synthetic));
+        assert!(stderr_has_synthetic_capture_log(synthetic));
+        // Toast must not green live settle.
+        let toastish = "Dogfood: captured synthetic summary for notes.md";
+        assert!(!stderr_has_live_capture_log(toastish));
+        // Budget: default step_wait floors to 30s; raised by step_wait; ceiling 90s.
+        assert_eq!(live_capture_poll_budget_ms(2_500), 30_000);
+        assert_eq!(live_capture_poll_budget_ms(45_000), 45_000);
+        assert_eq!(live_capture_poll_budget_ms(120_000), 90_000);
+    }
+
+    #[test]
+    fn soft_l3_requires_product_evidence_not_dispatch_ok() {
+        assert_eq!(soft_l3_act_result(true, true), "acted");
+        assert_eq!(soft_l3_act_result(true, false), "dispatch_only");
+        assert_eq!(soft_l3_act_result(false, false), "no_dispatch");
+        // resolve-ours dispatch-ok without post-state change is not acted.
+        assert_eq!(
+            decide_path_outcome(soft_l3_act_result(true, false) == "acted", false),
+            "soft_skip"
+        );
+
+        let success =
+            "surmount merge review: Resolved conflict.txt with `git checkout --ours` and staged with `git add`.";
+        assert!(stderr_has_resolve_success(success));
+        assert!(!stderr_has_resolve_success(
+            "surmount merge review: conflict resolve ignored (no active file)"
+        ));
+        assert!(!stderr_has_resolve_success(
+            "surmount merge review: conflict resolve failed: git checkout failed"
+        ));
+
+        let pre = r#"[Button] "Use Both" @0,0 10x10"#;
+        let post_cleared = r#"[Button] "Next file →" @0,0 10x10"#;
+        assert!(product_resolve_has_evidence("", pre, post_cleared));
+        assert!(!product_resolve_has_evidence("", pre, pre));
+        assert!(product_resolve_has_evidence(success, pre, pre));
     }
 
     #[test]
